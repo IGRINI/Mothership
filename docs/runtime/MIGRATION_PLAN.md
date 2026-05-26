@@ -4,7 +4,7 @@ Step-by-step path from today's code to the agent runtime described in the
 [`runtime/`](README.md) docs — **without breaking the working chat**.
 
 - **Created:** 2026-05-26
-- **Status:** Phase 1 done (commit `22a3b6d`) · Phase 3 in progress
+- **Status:** Phase 1 done (`22a3b6d`) · Phase 3 done (`b2e9615`; T3.5 Unix/macOS open) · next: Phase 2 (tokio + RunActor) or T3.5
 - **How to use:** tick `- [ ]` → `- [x]` as tasks land. Update **Status** above with the
   current phase. Each phase should leave the streaming chat working — that is the
   regression gate.
@@ -68,13 +68,29 @@ Execution-model change. Do **after** Phase 1, not at the same time.
 
 Net-new, touches nothing existing. Implements [`PROCESS_SANDBOX.md`](PROCESS_SANDBOX.md).
 
-- [ ] **T3.1 — `ports` crate**: `ProcessSandbox` + `SpawnedProcess` traits + `MockSandbox`.
-- [ ] **T3.2 — Windows adapter** on `process-wrap` (Job Object). First, so it can be
-  verified locally on Windows.
-- [ ] **T3.3 — Parallel stdout/stderr drain + `OutputPolicy`** (bound memory + spill to
-  file; kill only on timeout/cancel). See [`OUTPUT_AND_IPC.md`](OUTPUT_AND_IPC.md).
-- [ ] **T3.4 — `kill_tree`** + a process-tree test (a script that spawns children).
-- [ ] **T3.5 — Unix adapter** (process group/session) + **macOS reaper**; verified in CI.
+- [x] **T3.1 — port + crate.** Done — crate `crates/process-sandbox` (trait + adapter live
+  together for now; can split into a `ports` crate later). `ProcessSandbox`/`SpawnedProcess`
+  + `ToolSpec`/`ToolExit` + `MockSandbox`; `platform_sandbox()` is the single `#[cfg]` root.
+- [x] **T3.2 — Windows adapter.** Done — `JobObjectSandbox` on `process-wrap` 9.1 (`tokio1`).
+  Tree-kill via `TerminateJobObject`; relies on process-wrap's internal `CREATE_SUSPENDED`
+  (race-free job assignment) — no hand-rolled Win32.
+- [ ] **T3.3 — drain + `OutputPolicy` — partial.** Parallel two-task drain done (invariant
+  enforced) + `BoundedCapture` (head+tail) honoring `memory_preview_bytes`. The rest of
+  `OutputPolicy` (`ui_stream_bytes_per_sec`, `agent_tail_bytes`, `spill_to_file`) are present
+  but no-op `TODO`s — finish in a follow-up.
+- [x] **T3.4 — `kill_tree` + test.** Done — integration test spawns `cmd /c ping`, finds the
+  `ping.exe` **grandchild** by ParentProcessId (CIM), kills the tree, asserts that exact PID is
+  gone. 9/9 tests pass on Windows.
+- [ ] **T3.5 — Unix adapter + macOS reaper.** Open. Currently a loud `unix.rs` stub
+  (`UnimplementedSandbox`) so the crate compiles on Linux/macOS; real impls + CI matrix next.
+
+**Review notes (commit `b2e9615`, verified `cargo test -p process-sandbox` 9/9 + leak test):**
+- Leak test green: `cargo tree -p mothership-core` has no `process-sandbox` / `process-wrap` / `async-trait`.
+- _Follow-up (verify):_ adapter sets `kill_on_drop(false)` and documents "no kill on drop", but
+  process-wrap's Job Object may use `KILL_ON_JOB_CLOSE` — confirm whether dropping a
+  `SpawnedProcess` without `kill_tree()` leaks the tree or kills it, then document the drop policy.
+- _Follow-up (minor):_ `SpawnedProcess::wait()` is documented idempotent-after-exit, but the
+  Windows impl calls the underlying `wait()` directly — harden the impl or relax the contract.
 
 ## Phase 4 — `ToolSupervisor` + first tool
 
