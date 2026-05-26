@@ -28,6 +28,8 @@ import {
   setSelectedModel,
 } from "../../shared/api/mothership";
 import { VirtualList } from "../../shared/ui/VirtualList";
+import { SolidMarkdown } from "solid-markdown";
+import remarkGfm from "remark-gfm";
 import mothershipLogoUrl from "../../assets/mothership-logo-sm.png";
 
 const projects: ProjectItem[] = [
@@ -373,7 +375,6 @@ function ConversationPane(props: {
           >
             <FileText size={15} />
           </button>
-          <span class="project-badge">Mothership</span>
         </div>
 
         <div class="agent-status-chip" title="Local agent connection">
@@ -559,29 +560,41 @@ function InspectorPane(props: {
 function MessageRow(props: { message: ChatMessage; transport?: string }) {
   const message = () => props.message;
   const isUser = () => message().role === "user";
+  const body = () =>
+    message().content ||
+    (message().status === "sending"
+      ? thinkingLabel(props.transport)
+      : "No content.");
 
-  // Minimal, scroll-cheap row: a CSS letter avatar (no <img>), text, and no
-  // per-message SVG action buttons. The rich avatar/icons made scrolling lag.
+  // Messenger layout: user on the right in a colored bubble, agent on the left
+  // with an avatar. Both render Markdown (GFM) via solid-markdown (component
+  // output, not innerHTML, so it is XSS-safe). Kept scroll-cheap: no per-message
+  // SVG buttons, no blurred shadows; rows already use content-visibility.
   return (
     <article
       classList={{
         "message-row": true,
+        "message-row--user": isUser(),
         "message-row--assistant": !isUser(),
       }}
     >
-      <Avatar role={message().role} />
+      <Show when={!isUser()}>
+        <Avatar role="assistant" />
+      </Show>
       <div class="message-row__content">
-        <div class="message-meta">
-          <strong>{isUser() ? "You" : "Mothership"}</strong>
-          <span>{formatMessageTime(message().createdAt)}</span>
+        <Show when={!isUser()}>
+          <div class="message-meta">
+            <strong>Mothership</strong>
+            <span>{formatMessageTime(message().createdAt)}</span>
+          </div>
+        </Show>
+        <div class="message-md">
+          <SolidMarkdown
+            renderingStrategy="reconcile"
+            remarkPlugins={[remarkGfm]}
+            children={body()}
+          />
         </div>
-
-        <p>
-          {message().content ||
-            (message().status === "sending"
-              ? thinkingLabel(props.transport)
-              : "No content.")}
-        </p>
       </div>
     </article>
   );
@@ -609,7 +622,8 @@ function Composer(props: {
         value={props.draft}
         onInput={(event) => props.onDraftChange(event.currentTarget.value)}
         onKeyDown={(event) => {
-          if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+          // Enter sends; Shift+Enter inserts a newline. (`isComposing` guards IME.)
+          if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
             event.preventDefault();
             props.onSend();
           }
@@ -619,14 +633,13 @@ function Composer(props: {
         <button class="icon-button" type="button" title="Attach file">
           <Paperclip size={17} />
         </button>
-        <span class="shortcut-pill">Ctrl+Enter</span>
         <button
           class="send-button"
           disabled={!canSend()}
           type="submit"
           title="Send message"
         >
-          <Send size={18} />
+          <Send size={16} />
         </button>
       </div>
     </form>

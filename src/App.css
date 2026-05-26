@@ -753,30 +753,39 @@ kbd,
 }
 
 .message-row {
-  display: grid;
-  grid-template-columns: 38px minmax(0, 1fr);
-  gap: 14px;
-  max-width: 760px;
-  min-height: 80px;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
 }
 
-.message-row--run {
-  min-height: 500px;
+.message-row--assistant {
+  justify-content: flex-start;
 }
 
-.message-row--artifact {
-  min-height: 178px;
+.message-row--user {
+  justify-content: flex-end;
 }
 
 .message-row__content {
   min-width: 0;
+  max-width: 680px;
+}
+
+/* User messages: right-aligned chat bubble. Solid accent fill, no blurred shadow
+   (blur repaints on scroll). */
+.message-row--user .message-row__content {
+  max-width: 72%;
+  border-radius: 14px 14px 4px 14px;
+  padding: 9px 13px;
+  background: #1d5fd6;
+  color: #f4f8fd;
 }
 
 .message-meta {
   display: flex;
   align-items: baseline;
   gap: 12px;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
 
 .message-meta strong {
@@ -785,21 +794,127 @@ kbd,
   font-weight: 800;
 }
 
-.message-meta span,
-.message-row p {
-  color: #9caaba;
-}
-
 .message-meta span {
+  color: #9caaba;
   font-size: 12px;
 }
 
-.message-row p {
-  max-width: 680px;
-  margin: 0 0 10px;
+/* Markdown body, both roles. Paint-cheap: no shadows. */
+.message-md {
+  color: #c7d2de;
   font-size: 14px;
   line-height: 1.55;
+}
+
+.message-md > :first-child {
+  margin-top: 0;
+}
+
+.message-md > :last-child {
+  margin-bottom: 0;
+}
+
+.message-md p {
+  margin: 0 0 8px;
   white-space: pre-wrap;
+}
+
+.message-md ul,
+.message-md ol {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+
+.message-md li {
+  margin: 2px 0;
+}
+
+.message-md a {
+  color: #8ab4ff;
+}
+
+.message-md code {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12.5px;
+  background: rgb(255 255 255 / 8%);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.message-md pre {
+  margin: 8px 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  background: #0b1622;
+  border: 1px solid #1b2a3a;
+  border-radius: 8px;
+}
+
+.message-md pre code {
+  padding: 0;
+  background: none;
+}
+
+.message-md h1,
+.message-md h2,
+.message-md h3,
+.message-md h4 {
+  margin: 10px 0 4px;
+  line-height: 1.2;
+  color: #eaf1f8;
+}
+
+.message-md h1 {
+  font-size: 19px;
+}
+
+.message-md h2 {
+  font-size: 17px;
+}
+
+.message-md h3 {
+  font-size: 15px;
+}
+
+.message-md blockquote {
+  margin: 6px 0;
+  padding-left: 10px;
+  border-left: 3px solid #2a3f57;
+  color: #9caaba;
+}
+
+.message-md table {
+  border-collapse: collapse;
+  margin: 6px 0;
+}
+
+.message-md th,
+.message-md td {
+  border: 1px solid #1b2a3a;
+  padding: 4px 8px;
+}
+
+.message-md img {
+  max-width: 100%;
+}
+
+/* Contrast for content inside the blue user bubble. */
+.message-row--user .message-md {
+  color: #f4f8fd;
+}
+
+.message-row--user .message-md a {
+  color: #ffffff;
+  text-decoration: underline;
+}
+
+.message-row--user .message-md code {
+  background: rgb(0 0 0 / 22%);
+}
+
+.message-row--user .message-md pre {
+  background: rgb(0 0 0 / 28%);
+  border-color: rgb(255 255 255 / 14%);
 }
 
 .conversation-state {
@@ -1057,26 +1172,31 @@ kbd,
 }
 
 .composer__actions {
-  display: grid;
-  grid-template-columns: 34px auto 42px;
-  align-items: end;
-  gap: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .send-button {
   display: grid;
-  width: 42px;
-  height: 38px;
+  width: 26px;
+  height: 26px;
   place-items: center;
-  border-radius: 8px;
-  background: linear-gradient(180deg, #2e82ff, #0f64ff);
+  border-radius: 7px;
+  background: transparent;
+  color: #c4d0dd;
+  cursor: pointer;
+}
+
+.send-button:hover:not(:disabled) {
+  background: rgb(255 255 255 / 12%);
   color: #ffffff;
 }
 
 .send-button:disabled {
-  cursor: not-allowed;
-  background: #1d2a39;
-  color: #7e8b99;
+  cursor: default;
+  background: transparent;
+  color: #5b6776;
 }
 
 .shortcut-pill {
