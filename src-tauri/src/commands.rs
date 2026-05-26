@@ -365,7 +365,7 @@ fn adapter_models(
     let mut adapter = mothership_adapter_host::Adapter::spawn(&entry.program)
         .map_err(|error| error.to_string())?;
     adapter.initialize().map_err(|error| error.to_string())?;
-    let models = adapter.models().map_err(|error| error.to_string())?;
+    let (models, _management) = adapter.models().map_err(|error| error.to_string())?;
     Ok(models
         .into_iter()
         .map(|model| mothership_core::LlmModel {

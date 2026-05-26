@@ -9,6 +9,7 @@
 //! A crashing adapter cannot take down the app: it lives in its own process and
 //! its failure surfaces as an error on the next read.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -18,7 +19,7 @@ use serde::Deserialize;
 
 pub mod protocol;
 
-use protocol::{ChatMessage, Model, Outbound, Request};
+use protocol::{AuthKind, ChatMessage, Model, ModelManagement, Outbound, Request, SettingsField};
 
 /// A spawned adapter process and the stdio pipes to talk to it.
 pub struct Adapter {
@@ -93,12 +94,47 @@ impl Adapter {
     }
 
     /// Reads the adapter's advertised models.
-    pub fn models(&mut self) -> Result<Vec<Model>> {
+    /// Reads the adapter's models and how its list is managed.
+    pub fn models(&mut self) -> Result<(Vec<Model>, ModelManagement)> {
         let id = self.next_id();
         self.send(&Request::GetModels { id })?;
         match self.recv()? {
-            Outbound::Models { models, .. } => Ok(models),
+            Outbound::Models {
+                models, management, ..
+            } => Ok((models, management)),
             other => bail!("unexpected reply to get_models: {other:?}"),
+        }
+    }
+
+    /// Reads the settings fields the adapter wants the UI to render.
+    pub fn settings_schema(&mut self) -> Result<Vec<SettingsField>> {
+        let id = self.next_id();
+        self.send(&Request::GetSettingsSchema { id })?;
+        match self.recv()? {
+            Outbound::SettingsSchema { fields, .. } => Ok(fields),
+            other => bail!("unexpected reply to get_settings_schema: {other:?}"),
+        }
+    }
+
+    /// Pushes the current settings values to the adapter (host resends them on
+    /// each spawn since adapter processes are short-lived).
+    pub fn set_settings(&mut self, values: BTreeMap<String, String>) -> Result<()> {
+        let id = self.next_id();
+        self.send(&Request::SetSettings { id, values })?;
+        match self.recv()? {
+            Outbound::Ack { id: got } if got == id => Ok(()),
+            other => bail!("unexpected reply to set_settings: {other:?}"),
+        }
+    }
+
+    /// Reads the adapter's auth scheme (the host stores API-key secrets in its
+    /// vault; oauth / external-process flows are owned by the adapter).
+    pub fn auth_schema(&mut self) -> Result<AuthKind> {
+        let id = self.next_id();
+        self.send(&Request::GetAuthSchema { id })?;
+        match self.recv()? {
+            Outbound::AuthSchema { auth, .. } => Ok(auth),
+            other => bail!("unexpected reply to get_auth_schema: {other:?}"),
         }
     }
 

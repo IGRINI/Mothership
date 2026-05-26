@@ -6,7 +6,9 @@
 
 use std::io::{BufRead, Write};
 
-use mothership_adapter_host::protocol::{Model, Outbound, Request};
+use mothership_adapter_host::protocol::{
+    AuthKind, Model, ModelManagement, Outbound, Request, SettingsField, SettingsFieldKind,
+};
 
 fn main() -> anyhow::Result<()> {
     let stdin = std::io::stdin();
@@ -38,11 +40,42 @@ fn main() -> anyhow::Result<()> {
                 &mut stdout,
                 &Outbound::Models {
                     id,
+                    management: ModelManagement::Fixed,
                     models: vec![Model {
                         id: "echo-1".to_string(),
                         label: "Echo 1".to_string(),
                         recommended: true,
                     }],
+                },
+            )?,
+            Request::GetSettingsSchema { id } => emit(
+                &mut stdout,
+                &Outbound::SettingsSchema {
+                    id,
+                    fields: vec![
+                        SettingsField {
+                            key: "endpoint".to_string(),
+                            label: "Endpoint".to_string(),
+                            kind: SettingsFieldKind::Text,
+                            required: false,
+                        },
+                        SettingsField {
+                            key: "api_key".to_string(),
+                            label: "API key".to_string(),
+                            kind: SettingsFieldKind::Secret,
+                            required: false,
+                        },
+                    ],
+                },
+            )?,
+            Request::SetSettings { id, .. } => emit(&mut stdout, &Outbound::Ack { id })?,
+            Request::GetAuthSchema { id } => emit(
+                &mut stdout,
+                &Outbound::AuthSchema {
+                    id,
+                    auth: AuthKind::ApiKey {
+                        label: "API key".to_string(),
+                    },
                 },
             )?,
             Request::ChatStart { id, messages, .. } => {

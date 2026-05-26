@@ -1,9 +1,10 @@
 //! End-to-end: spawn the sample echo adapter and drive the full protocol
 //! (initialize -> identity -> models -> streamed chat).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use mothership_adapter_host::protocol::ChatMessage;
+use mothership_adapter_host::protocol::{AuthKind, ChatMessage, ModelManagement, SettingsFieldKind};
 use mothership_adapter_host::Adapter;
 
 #[test]
@@ -19,10 +20,26 @@ fn echo_adapter_round_trip() {
     assert_eq!(provider_id, "echo");
     assert_eq!(label, "Echo Provider");
 
-    let models = adapter.models().expect("models");
+    let (models, management) = adapter.models().expect("models");
+    assert_eq!(management, ModelManagement::Fixed);
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, "echo-1");
     assert!(models[0].recommended);
+
+    let fields = adapter.settings_schema().expect("settings schema");
+    assert!(fields
+        .iter()
+        .any(|field| field.key == "api_key" && matches!(field.kind, SettingsFieldKind::Secret)));
+
+    adapter
+        .set_settings(BTreeMap::from([(
+            "endpoint".to_string(),
+            "https://example".to_string(),
+        )]))
+        .expect("set settings");
+
+    let auth = adapter.auth_schema().expect("auth schema");
+    assert!(matches!(auth, AuthKind::ApiKey { .. }));
 
     let mut deltas = Vec::new();
     let full = adapter
