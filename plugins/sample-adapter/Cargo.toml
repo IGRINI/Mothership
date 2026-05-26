@@ -1,0 +1,14 @@
+# Standalone (own workspace) — built only for wasm32-wasip2, never the host.
+[package]
+name = "sample-adapter"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.41"
+
+[workspace]

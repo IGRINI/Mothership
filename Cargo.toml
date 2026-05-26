@@ -1,9 +1,15 @@
 [workspace]
 members = [
   "crates/mothership-core",
+  "crates/mothership-plugin-host",
   "crates/process-sandbox",
   "src-sidecar",
   "src-tauri",
+]
+# Guest plugin crates compile to wasm32-wasip2 as components; they must not be
+# built for the host target, so they live outside the workspace.
+exclude = [
+  "plugins",
 ]
 resolver = "2"
 

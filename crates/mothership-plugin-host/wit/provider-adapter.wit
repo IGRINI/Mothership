@@ -1,0 +1,33 @@
+package mothership:plugin@0.1.0;
+
+/// The contract every provider-adapter plugin exports. Phase 1 covers identity
+/// + catalog (enough to register a plugin and show it in the UI). Later phases
+/// add the chat request-builder / event-parser exports and the host-provided
+/// http + secrets imports.
+world provider-adapter {
+    /// Static identity of a provider adapter, read by the host at load time to
+    /// register the provider and populate the UI (model picker + settings)
+    /// without rebuilding the app.
+    record adapter-info {
+        /// Stable provider id, e.g. "openai". Matches the auth/connection side.
+        provider-id: string,
+        /// Human-readable label shown in the UI.
+        provider-label: string,
+        /// ABI version this plugin was built against. The host refuses to load a
+        /// plugin outside its supported range rather than crashing on a binding
+        /// mismatch (the veche's wit-interface min/max note made operational).
+        abi-version: u32,
+    }
+
+    /// One entry in a provider's model catalog.
+    record model-info {
+        id: string,
+        label: string,
+        family: string,
+        description: string,
+        recommended: bool,
+    }
+
+    export info: func() -> adapter-info;
+    export bundled-models: func() -> list<model-info>;
+}
