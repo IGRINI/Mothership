@@ -9,13 +9,12 @@ use std::{
 
 use mothership_core::{
     auth::{
-        AuthMethod, AuthSession, CompleteAuthRequest, ConnectionStatus, FileCredentialVault,
-        OpenAiCodexOAuthAdapter, ProviderAuthService, ProviderConnection, ProviderConnectionId,
-        ProviderDescriptor, StartAuthRequest, StaticProviderAuthAdapterRegistry,
+        AuthMethod, AuthSession, CompleteAuthRequest, FileCredentialVault, OpenAiCodexOAuthAdapter,
+        ProviderAuthService, ProviderConnection, ProviderConnectionId, ProviderDescriptor,
+        StartAuthRequest, StaticProviderAuthAdapterRegistry,
     },
-    ChatConversation, ChatRunEvent, ChatRunEventKind, ChatThreadSummary, DashboardSnapshot,
-    LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest,
-    OpenAiCodexChatCompletionGateway, SendChatMessageResult, SidecarStatus,
+    ChatConversation, ChatRunEvent, ChatRunEventSink, ChatRunService, ChatThreadSummary,
+    DashboardSnapshot, SendChatMessageResult, SidecarStatus,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -85,7 +84,10 @@ pub fn send_chat_message(
 
     let database = state.database().clone();
     let run = result.clone();
-    std::thread::spawn(move || run_chat_completion(app, database, run));
+    std::thread::spawn(move || {
+        let mut sink = TauriChatRunSink { app };
+        ChatRunService::new(&database).run(&run, &mut sink);
+    });
 
     Ok(result)
 }
@@ -336,154 +338,19 @@ fn available_llm_models_for_connections(
     model_catalog.list_models(connections)
 }
 
-fn run_chat_completion(
-    app: AppHandle,
-    database: mothership_core::Database,
-    run: SendChatMessageResult,
-) {
-    emit_chat_run_event(
-        &app,
-        ChatRunEvent {
-            run_id: run.run_id.clone(),
-            chat_id: run.chat.id.clone(),
-            message_id: run.assistant_message.id.clone(),
-            kind: ChatRunEventKind::Started,
-            delta: None,
-            message: Some(run.assistant_message.clone()),
-            chat: Some(run.chat.clone()),
-            transport: None,
-            error: None,
-        },
-    );
-
-    if let Err(error) = complete_chat_run(&app, &database, &run) {
-        let event = database
-            .fail_chat_run(
-                &run.run_id,
-                &run.chat.id,
-                &run.assistant_message.id,
-                &error.to_string(),
-            )
-            .unwrap_or_else(|_| ChatRunEvent {
-                run_id: run.run_id.clone(),
-                chat_id: run.chat.id.clone(),
-                message_id: run.assistant_message.id.clone(),
-                kind: ChatRunEventKind::Failed,
-                delta: None,
-                message: None,
-                chat: None,
-                transport: None,
-                error: Some(error.to_string()),
-            });
-        emit_chat_run_event(&app, event);
-    }
-}
-
-fn complete_chat_run(
-    app: &AppHandle,
-    database: &mothership_core::Database,
-    run: &SendChatMessageResult,
-) -> mothership_core::Result<()> {
-    let selected_model = database.selected_llm_model()?;
-    if selected_model.model_id.trim().is_empty() {
-        return Err(mothership_core::MothershipError::InvalidRequest(
-            "no LLM model selected; connect a provider and choose a model first".to_string(),
-        ));
-    }
-
-    let connections = with_auth_service(database, |auth| auth.list_connections())?;
-    let connection = connections
-        .into_iter()
-        .find(|connection| {
-            connection.provider_id.as_str() == selected_model.provider_id
-                && connection.status == ConnectionStatus::Active
-        })
-        .ok_or_else(|| {
-            mothership_core::MothershipError::InvalidRequest(format!(
-                "no active provider connection for {}",
-                selected_model.provider_id
-            ))
-        })?;
-
-    let messages = database.llm_chat_context(&run.chat.id, &run.assistant_message.id, 80)?;
-    if messages.is_empty() {
-        return Err(mothership_core::MothershipError::InvalidRequest(
-            "chat context is empty".to_string(),
-        ));
-    }
-
-    let vault = FileCredentialVault::new(auth_store_path(database));
-    let mut sink = TauriChatRunSink {
-        app: app.clone(),
-        database: database.clone(),
-        run_id: run.run_id.clone(),
-        chat_id: run.chat.id.clone(),
-        assistant_message_id: run.assistant_message.id.clone(),
-    };
-
-    match selected_model.provider_id.as_str() {
-        OpenAiCodexOAuthAdapter::PROVIDER_ID => {
-            let gateway = OpenAiCodexChatCompletionGateway::new(&vault, &connection)?;
-            let system_prompt = mothership_core::chat_system_prompt(
-                &selected_model.provider_id,
-                &selected_model.model_id,
-            )?;
-            gateway.complete_chat(
-                LlmChatCompletionRequest {
-                    provider_id: selected_model.provider_id,
-                    model_id: selected_model.model_id,
-                    system_prompt,
-                    messages,
-                },
-                &mut sink,
-            )?;
-        }
-        provider_id => {
-            return Err(mothership_core::MothershipError::InvalidRequest(format!(
-                "chat runtime is not implemented for provider: {provider_id}"
-            )));
-        }
-    }
-
-    let event = database.complete_chat_run(&run.run_id, &run.chat.id, &run.assistant_message.id)?;
-    emit_chat_run_event(app, event);
-    Ok(())
-}
-
+/// Thin event adapter: forwards Core's chat-run events to the desktop UI.
+///
+/// All run orchestration and database writes live in
+/// [`mothership_core::ChatRunService`]; the host only plumbs the resulting
+/// events to the Tauri front end via the `chat-run-event` channel.
 struct TauriChatRunSink {
     app: AppHandle,
-    database: mothership_core::Database,
-    run_id: String,
-    chat_id: String,
-    assistant_message_id: String,
 }
 
-impl LlmChatCompletionEventSink for TauriChatRunSink {
-    fn transport_selected(&mut self, transport: mothership_core::LlmTransportKind) {
-        if let Ok(event) = self.database.mark_chat_run_transport(
-            &self.run_id,
-            &self.chat_id,
-            &self.assistant_message_id,
-            transport.as_str(),
-        ) {
-            emit_chat_run_event(&self.app, event);
-        }
+impl ChatRunEventSink for TauriChatRunSink {
+    fn emit(&mut self, event: ChatRunEvent) {
+        let _ = self.app.emit("chat-run-event", event);
     }
-
-    fn delta(&mut self, delta: &str) {
-        if let Ok(event) = self.database.append_chat_run_delta(
-            &self.run_id,
-            &self.chat_id,
-            &self.assistant_message_id,
-            delta,
-        ) {
-            emit_chat_run_event(&self.app, event);
-        }
-    }
-}
-
-fn emit_chat_run_event(app: &AppHandle, event: ChatRunEvent) {
-    let _ = app.emit("chat-run-event", event);
 }
 
 fn connector_providers(
