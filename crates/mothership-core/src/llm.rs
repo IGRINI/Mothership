@@ -143,6 +143,7 @@ pub enum LlmTransportKind {
     WebSocket,
     HttpSse,
     HttpJson,
+    Subprocess,
 }
 
 impl LlmTransportKind {
@@ -151,6 +152,7 @@ impl LlmTransportKind {
             Self::WebSocket => "websocket",
             Self::HttpSse => "http_sse",
             Self::HttpJson => "http_json",
+            Self::Subprocess => "subprocess",
         }
     }
 }

@@ -6,6 +6,7 @@ mod id;
 pub mod llm;
 pub mod model;
 pub mod run;
+pub mod subprocess_gateway;
 
 pub use chat::{
     ChatConversation, ChatMessage, ChatMessageRole, ChatMessageStatus, ChatRunContext,
@@ -24,3 +25,4 @@ pub use llm::{
 };
 pub use model::{ActivityEvent, DashboardMetric, DashboardSnapshot, SidecarStatus, WorkspaceItem};
 pub use run::ChatRunService;
+pub use subprocess_gateway::SubprocessChatGateway;
