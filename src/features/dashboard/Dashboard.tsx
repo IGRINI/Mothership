@@ -401,6 +401,7 @@ function ConversationPane(props: {
         getItemKey={(message) => message.id}
         items={props.messages}
         overscan={4}
+        scrollKey={props.activeChat?.id}
         stickToEnd
       >
         {(message) => (
