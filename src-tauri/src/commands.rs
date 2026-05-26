@@ -335,7 +335,53 @@ fn available_llm_models_for_connections(
     let llm_registry = mothership_core::default_llm_registry();
     let model_catalog =
         mothership_core::LlmModelCatalogService::new(database, &vault, &llm_registry);
-    model_catalog.list_models(connections)
+    let mut models = model_catalog.list_models(connections)?;
+    models.extend(plugin_models(database));
+    Ok(models)
+}
+
+/// Loads provider-adapter plugins from the app's plugins directory and returns
+/// the models they advertise, so a dropped-in plugin shows up in the picker
+/// without rebuilding the app. Plugin failures are logged and skipped — a bad
+/// plugin must never break the built-in model list.
+fn plugin_models(database: &mothership_core::Database) -> Vec<mothership_core::LlmModel> {
+    let host = match mothership_plugin_host::PluginHost::new() {
+        Ok(host) => host,
+        Err(error) => {
+            eprintln!("plugin host unavailable: {error}");
+            return Vec::new();
+        }
+    };
+
+    let mut models = Vec::new();
+    for (path, manifest) in host.scan(&plugins_store_path(database)) {
+        match manifest {
+            Ok(manifest) => {
+                for model in manifest.models {
+                    models.push(mothership_core::LlmModel {
+                        provider_id: manifest.provider_id.clone(),
+                        provider_label: manifest.provider_label.clone(),
+                        id: model.id,
+                        label: model.label,
+                        family: model.family,
+                        description: model.description,
+                        capabilities: vec!["text".to_string()],
+                        recommended: model.recommended,
+                    });
+                }
+            }
+            Err(error) => eprintln!("skipping plugin {}: {error}", path.display()),
+        }
+    }
+    models
+}
+
+fn plugins_store_path(database: &mothership_core::Database) -> PathBuf {
+    database
+        .path()
+        .parent()
+        .map(|path| path.join("plugins"))
+        .unwrap_or_else(|| PathBuf::from("plugins"))
 }
 
 /// Thin event adapter: forwards Core's chat-run events to the desktop UI.

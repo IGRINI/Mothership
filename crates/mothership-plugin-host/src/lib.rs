@@ -11,7 +11,7 @@
 //! socket, TLS, timeouts, observability and (later) auth injection. The backend
 //! is injectable so tests exercise the boundary without touching the network.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -143,6 +143,51 @@ impl PluginHost {
 
         Ok(LoadedPlugin { store, bindings })
     }
+
+    /// Loads a component, reads its manifest once, and unloads it. Use when only
+    /// the metadata is needed (e.g. to register the provider in the UI).
+    pub fn load_manifest(&self, path: &Path) -> Result<AdapterManifest> {
+        self.load(path)?.manifest()
+    }
+
+    /// Scans `dir` for `*.wasm` plugins and returns each path with its manifest.
+    /// A plugin that fails to load/validate is reported in place and skipped, so
+    /// one bad plugin can't break the rest of the list. A missing dir is empty.
+    pub fn scan(&self, dir: &Path) -> Vec<(PathBuf, Result<AdapterManifest>)> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("wasm") {
+                let manifest = self.load_manifest(&path);
+                found.push((path, manifest));
+            }
+        }
+        found
+    }
+}
+
+/// Stable, owned snapshot of a plugin's identity + catalog, read once at load.
+/// Lets the app register a plugin (show it in the model picker) without touching
+/// wasm bindgen types or keeping the instance resident.
+#[derive(Debug, Clone)]
+pub struct AdapterManifest {
+    pub provider_id: String,
+    pub provider_label: String,
+    pub abi_version: u32,
+    pub models: Vec<AdapterModel>,
+}
+
+/// One model a plugin advertises in its bundled catalog.
+#[derive(Debug, Clone)]
+pub struct AdapterModel {
+    pub id: String,
+    pub label: String,
+    pub family: String,
+    pub description: String,
+    pub recommended: bool,
 }
 
 /// A resident, instantiated plugin. Its native code lives in memory until this
@@ -169,6 +214,28 @@ impl LoadedPlugin {
         self.bindings
             .call_probe_status(&mut self.store, url)?
             .map_err(|error| anyhow::anyhow!("plugin probe-status failed: {error}"))
+    }
+
+    /// Reads the plugin's identity + bundled catalog into an owned manifest.
+    pub fn manifest(&mut self) -> Result<AdapterManifest> {
+        let info = self.info()?;
+        let models = self
+            .bundled_models()?
+            .into_iter()
+            .map(|model| AdapterModel {
+                id: model.id,
+                label: model.label,
+                family: model.family,
+                description: model.description,
+                recommended: model.recommended,
+            })
+            .collect();
+        Ok(AdapterManifest {
+            provider_id: info.provider_id,
+            provider_label: info.provider_label,
+            abi_version: info.abi_version,
+            models,
+        })
     }
 }
 
@@ -236,5 +303,37 @@ mod tests {
             .probe_status("https://example.invalid/x")
             .expect("probe-status");
         assert_eq!(status, 218);
+    }
+
+    #[test]
+    fn reads_manifest_from_component() {
+        let path = sample_component_path();
+        if !path.exists() {
+            eprintln!("skipping: sample component not built at {}", path.display());
+            return;
+        }
+        let host = PluginHost::with_http_backend(Arc::new(FakeHttp)).expect("build plugin host");
+        let manifest = host.load_manifest(&path).expect("read manifest");
+        assert_eq!(manifest.provider_id, "sample");
+        assert_eq!(manifest.provider_label, "Sample Provider");
+        assert_eq!(manifest.models.len(), 1);
+        assert!(manifest.models[0].recommended);
+    }
+
+    #[test]
+    fn scan_finds_sample_plugin() {
+        let path = sample_component_path();
+        if !path.exists() {
+            eprintln!("skipping: sample component not built");
+            return;
+        }
+        let dir = path.parent().expect("plugin dir");
+        let host = PluginHost::with_http_backend(Arc::new(FakeHttp)).expect("build plugin host");
+        let sample = host
+            .scan(dir)
+            .into_iter()
+            .filter_map(|(_, manifest)| manifest.ok())
+            .find(|manifest| manifest.provider_id == "sample");
+        assert!(sample.is_some(), "scan should find the sample plugin manifest");
     }
 }

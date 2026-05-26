@@ -20,6 +20,7 @@ tauri-build = { workspace = true, features = [] }
 
 [dependencies]
 mothership-core = { path = "../crates/mothership-core" }
+mothership-plugin-host = { path = "../crates/mothership-plugin-host" }
 serde.workspace = true
 serde_json.workspace = true
 tauri = { workspace = true, features = ["image-png"] }
