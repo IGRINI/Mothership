@@ -1,13 +1,17 @@
 //! Minimal sample provider-adapter plugin, compiled to a WASM component.
 //!
-//! It exports only the Phase 1 metadata contract (identity + bundled catalog),
-//! proving the host can load a component, read what it needs to show in the UI,
-//! and unload it — with no host imports, so the component is fully self-contained.
+//! Exports the Phase 1 metadata contract (identity + bundled catalog) and a
+//! `probe-status` diagnostic that drives a network request through the
+//! host-provided `host-http` capability — the plugin itself never opens a
+//! socket.
 
 wit_bindgen::generate!({
     world: "provider-adapter",
     path: "../../crates/mothership-plugin-host/wit",
 });
+
+// Host capability imported from the world.
+use mothership::plugin::host_http;
 
 struct SampleAdapter;
 
@@ -28,6 +32,10 @@ impl Guest for SampleAdapter {
             description: "A bundled model exported by the sample WASM adapter.".to_string(),
             recommended: true,
         }]
+    }
+
+    fn probe_status(url: String) -> Result<u16, String> {
+        host_http::fetch_status(&url)
     }
 }
 

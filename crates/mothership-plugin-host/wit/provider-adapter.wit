@@ -1,21 +1,26 @@
 package mothership:plugin@0.1.0;
 
-/// The contract every provider-adapter plugin exports. Phase 1 covers identity
-/// + catalog (enough to register a plugin and show it in the UI). Later phases
-/// add the chat request-builder / event-parser exports and the host-provided
-/// http + secrets imports.
+/// Host-owned network capability (decision B): plugins never open sockets — they
+/// ask the host to perform requests, so the host keeps ownership of sockets,
+/// TLS, timeouts, observability and (later) auth injection. v1 is a minimal
+/// status probe; this grows into full request/response + streaming + secrets.
+interface host-http {
+    /// Perform a GET and return the HTTP status code, or an error string.
+    fetch-status: func(url: string) -> result<u16, string>;
+}
+
+/// The contract every provider-adapter plugin exports, plus the host
+/// capabilities it imports. Phase 1 covers identity + catalog and the first
+/// host capability; later phases add chat request-building / event-parsing and
+/// streaming + secrets-as-handles.
 world provider-adapter {
-    /// Static identity of a provider adapter, read by the host at load time to
-    /// register the provider and populate the UI (model picker + settings)
-    /// without rebuilding the app.
+    import host-http;
+
+    /// Static identity, read by the host at load time to register the provider
+    /// and populate the UI (model picker + settings) without rebuilding the app.
     record adapter-info {
-        /// Stable provider id, e.g. "openai". Matches the auth/connection side.
         provider-id: string,
-        /// Human-readable label shown in the UI.
         provider-label: string,
-        /// ABI version this plugin was built against. The host refuses to load a
-        /// plugin outside its supported range rather than crashing on a binding
-        /// mismatch (the veche's wit-interface min/max note made operational).
         abi-version: u32,
     }
 
@@ -30,4 +35,9 @@ world provider-adapter {
 
     export info: func() -> adapter-info;
     export bundled-models: func() -> list<model-info>;
+
+    /// Diagnostic export: forwards to the host-http capability and returns what
+    /// it got, proving a plugin can drive a network request without owning a
+    /// socket. Real adapters will use this capability inside chat/catalog calls.
+    export probe-status: func(url: string) -> result<u16, string>;
 }

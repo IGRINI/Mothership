@@ -2778,6 +2778,7 @@ name = "mothership-plugin-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "reqwest",
  "wasmtime",
  "wasmtime-wasi",
 ]
