@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/mothership-adapter-host",
   "crates/mothership-core",
   "crates/mothership-plugin-host",
   "crates/process-sandbox",
