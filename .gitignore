@@ -1,0 +1,9 @@
+node_modules
+dist
+target
+target-tauri-dev/
+target-tauri-build/
+tmp/
+projects-to-research/
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep

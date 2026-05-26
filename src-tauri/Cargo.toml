@@ -1,0 +1,36 @@
+[package]
+name = "mothership-app"
+version.workspace = true
+description = "Mothership desktop shell"
+authors = ["Mothership"]
+edition.workspace = true
+license.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "mothership_app_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { workspace = true, features = [] }
+
+[dependencies]
+mothership-core = { path = "../crates/mothership-core" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { workspace = true, features = ["image-png"] }
+tauri-plugin-opener.workspace = true
+tauri-plugin-shell.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38.2"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+

@@ -1,0 +1,29 @@
+[workspace]
+members = [
+  "crates/mothership-core",
+  "src-sidecar",
+  "src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+getrandom = "0.2"
+reqwest = { version = "0.13.3", features = ["blocking", "form", "json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tauri = "2"
+tauri-build = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-shell = "2"
+thiserror = "2"
+tungstenite = { version = "0.28", features = ["native-tls"] }
+url = "2"

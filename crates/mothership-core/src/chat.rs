@@ -1,0 +1,99 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatThreadSummary {
+    pub id: String,
+    pub title: String,
+    pub preview: String,
+    pub message_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMessage {
+    pub id: String,
+    pub chat_id: String,
+    pub position: i64,
+    pub role: ChatMessageRole,
+    pub content: String,
+    pub status: ChatMessageStatus,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatMessageRole {
+    Assistant,
+    User,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatMessageStatus {
+    Complete,
+    Failed,
+    Sending,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatConversation {
+    pub chat: ChatThreadSummary,
+    pub messages: Vec<ChatMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendChatMessageResult {
+    pub run_id: String,
+    pub chat: ChatThreadSummary,
+    pub user_message: ChatMessage,
+    pub assistant_message: ChatMessage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatRunContext {
+    pub run_id: String,
+    pub chat_id: String,
+    pub assistant_message_id: String,
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatRunEvent {
+    pub run_id: String,
+    pub chat_id: String,
+    pub message_id: String,
+    pub kind: ChatRunEventKind,
+    pub delta: Option<String>,
+    pub message: Option<ChatMessage>,
+    pub chat: Option<ChatThreadSummary>,
+    pub transport: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatRunEventKind {
+    Started,
+    TransportSelected,
+    Delta,
+    Completed,
+    Failed,
+}
+
+pub trait ChatRunEventSink: Send {
+    fn emit(&mut self, event: ChatRunEvent);
+}
+
+pub struct NoopChatRunEventSink;
+
+impl ChatRunEventSink for NoopChatRunEventSink {
+    fn emit(&mut self, _event: ChatRunEvent) {}
+}
