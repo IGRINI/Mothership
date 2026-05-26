@@ -10,10 +10,11 @@
 //! its failure surfaces as an error on the next read.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 
 pub mod protocol;
 
@@ -139,5 +140,65 @@ impl Drop for Adapter {
         // process. A real supervisor would send a graceful shutdown first.
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// On-disk adapter manifest: `<plugins-dir>/<name>/adapter.json`. `program` is
+/// the adapter executable, resolved relative to the manifest's folder.
+#[derive(Debug, Clone, Deserialize)]
+struct ManifestFile {
+    provider_id: String,
+    provider_label: String,
+    program: String,
+}
+
+/// A discovered adapter: its identity and the executable that implements it.
+#[derive(Debug, Clone)]
+pub struct AdapterEntry {
+    pub provider_id: String,
+    pub provider_label: String,
+    pub program: PathBuf,
+}
+
+/// Adapters discovered under a plugins directory, keyed by provider id. Lets the
+/// core map a provider to the executable to spawn, with one uniform contract.
+#[derive(Debug, Default)]
+pub struct AdapterRegistry {
+    entries: Vec<AdapterEntry>,
+}
+
+impl AdapterRegistry {
+    /// Scans `dir` for `<name>/adapter.json` manifests. A missing directory is an
+    /// empty registry; malformed or unreadable manifests are skipped.
+    pub fn scan(dir: &Path) -> Self {
+        let mut entries = Vec::new();
+        if let Ok(read_dir) = std::fs::read_dir(dir) {
+            for entry in read_dir.flatten() {
+                let folder = entry.path();
+                let manifest_path = folder.join("adapter.json");
+                let Ok(text) = std::fs::read_to_string(&manifest_path) else {
+                    continue;
+                };
+                let Ok(manifest) = serde_json::from_str::<ManifestFile>(&text) else {
+                    continue;
+                };
+                entries.push(AdapterEntry {
+                    provider_id: manifest.provider_id,
+                    provider_label: manifest.provider_label,
+                    program: folder.join(manifest.program),
+                });
+            }
+        }
+        Self { entries }
+    }
+
+    pub fn find(&self, provider_id: &str) -> Option<&AdapterEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.provider_id == provider_id)
+    }
+
+    pub fn entries(&self) -> &[AdapterEntry] {
+        &self.entries
     }
 }

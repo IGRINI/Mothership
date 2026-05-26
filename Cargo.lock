@@ -2755,8 +2755,8 @@ dependencies = [
 name = "mothership-app"
 version = "0.1.0"
 dependencies = [
+ "mothership-adapter-host",
  "mothership-core",
- "mothership-plugin-host",
  "serde",
  "serde_json",
  "tauri",

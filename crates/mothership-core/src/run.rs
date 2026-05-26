@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use mothership_adapter_host::AdapterRegistry;
+
 use crate::auth::{
     ConnectionStatus, FileCredentialVault, ProviderAuthService, ProviderConnection,
     StaticProviderAuthAdapterRegistry,
@@ -7,8 +9,9 @@ use crate::auth::{
 use crate::chat::{ChatRunEvent, ChatRunEventKind, ChatRunEventSink, SendChatMessageResult};
 use crate::llm::{
     chat_completion_gateway, chat_system_prompt, LlmChatCompletionEventSink,
-    LlmChatCompletionRequest, LlmTransportKind,
+    LlmChatCompletionGateway, LlmChatCompletionRequest, LlmTransportKind,
 };
+use crate::subprocess_gateway::SubprocessChatGateway;
 use crate::{Database, MothershipError, Result};
 
 const CHAT_CONTEXT_LIMIT: i64 = 80;
@@ -86,44 +89,82 @@ impl<'a> ChatRunService<'a> {
             ));
         }
 
-        let connection = self
-            .active_connection(&selected_model.provider_id)?
-            .ok_or_else(|| {
-                MothershipError::InvalidRequest(format!(
-                    "no active provider connection for {}",
-                    selected_model.provider_id
-                ))
-            })?;
-
-        let messages =
-            database.llm_chat_context(&run.chat.id, &run.assistant_message.id, CHAT_CONTEXT_LIMIT)?;
-        if messages.is_empty() {
-            return Err(MothershipError::InvalidRequest(
-                "chat context is empty".to_string(),
-            ));
+        // Route to a subprocess adapter if one provides this model; otherwise use
+        // the built-in (Codex) path, which needs an active provider connection
+        // and a registered system prompt. Each branch fetches the chat context
+        // itself so the built-in path keeps its original guard order
+        // (connection before context).
+        let adapters = AdapterRegistry::scan(&plugins_store_path(database));
+        if let Some(entry) = adapters.find(&selected_model.provider_id) {
+            let messages = database.llm_chat_context(
+                &run.chat.id,
+                &run.assistant_message.id,
+                CHAT_CONTEXT_LIMIT,
+            )?;
+            if messages.is_empty() {
+                return Err(MothershipError::InvalidRequest(
+                    "chat context is empty".to_string(),
+                ));
+            }
+            let mut llm_sink = DbForwardingSink {
+                database,
+                run_id: &run.run_id,
+                chat_id: &run.chat.id,
+                assistant_message_id: &run.assistant_message.id,
+                sink,
+            };
+            // The adapter owns its own system prompt for now; auth + settings
+            // flow through the contract in a later step.
+            SubprocessChatGateway::new(entry.program.clone()).complete_chat(
+                LlmChatCompletionRequest {
+                    provider_id: selected_model.provider_id,
+                    model_id: selected_model.model_id,
+                    system_prompt: String::new(),
+                    messages,
+                },
+                &mut llm_sink,
+            )?;
+        } else {
+            let connection = self
+                .active_connection(&selected_model.provider_id)?
+                .ok_or_else(|| {
+                    MothershipError::InvalidRequest(format!(
+                        "no active provider connection for {}",
+                        selected_model.provider_id
+                    ))
+                })?;
+            let messages = database.llm_chat_context(
+                &run.chat.id,
+                &run.assistant_message.id,
+                CHAT_CONTEXT_LIMIT,
+            )?;
+            if messages.is_empty() {
+                return Err(MothershipError::InvalidRequest(
+                    "chat context is empty".to_string(),
+                ));
+            }
+            let vault = FileCredentialVault::new(auth_store_path(database));
+            let mut llm_sink = DbForwardingSink {
+                database,
+                run_id: &run.run_id,
+                chat_id: &run.chat.id,
+                assistant_message_id: &run.assistant_message.id,
+                sink,
+            };
+            let system_prompt =
+                chat_system_prompt(&selected_model.provider_id, &selected_model.model_id)?;
+            let gateway =
+                chat_completion_gateway(&selected_model.provider_id, &vault, &connection)?;
+            gateway.complete_chat(
+                LlmChatCompletionRequest {
+                    provider_id: selected_model.provider_id,
+                    model_id: selected_model.model_id,
+                    system_prompt,
+                    messages,
+                },
+                &mut llm_sink,
+            )?;
         }
-
-        let vault = FileCredentialVault::new(auth_store_path(database));
-        let mut llm_sink = DbForwardingSink {
-            database,
-            run_id: &run.run_id,
-            chat_id: &run.chat.id,
-            assistant_message_id: &run.assistant_message.id,
-            sink,
-        };
-
-        let system_prompt =
-            chat_system_prompt(&selected_model.provider_id, &selected_model.model_id)?;
-        let gateway = chat_completion_gateway(&selected_model.provider_id, &vault, &connection)?;
-        gateway.complete_chat(
-            LlmChatCompletionRequest {
-                provider_id: selected_model.provider_id,
-                model_id: selected_model.model_id,
-                system_prompt,
-                messages,
-            },
-            &mut llm_sink,
-        )?;
 
         let event =
             database.complete_chat_run(&run.run_id, &run.chat.id, &run.assistant_message.id)?;
@@ -188,6 +229,14 @@ fn auth_store_path(database: &Database) -> PathBuf {
         .parent()
         .map(|path| path.join("auth"))
         .unwrap_or_else(|| PathBuf::from("auth"))
+}
+
+fn plugins_store_path(database: &Database) -> PathBuf {
+    database
+        .path()
+        .parent()
+        .map(|path| path.join("plugins"))
+        .unwrap_or_else(|| PathBuf::from("plugins"))
 }
 
 #[cfg(test)]

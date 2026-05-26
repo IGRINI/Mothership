@@ -345,35 +345,40 @@ fn available_llm_models_for_connections(
 /// without rebuilding the app. Plugin failures are logged and skipped — a bad
 /// plugin must never break the built-in model list.
 fn plugin_models(database: &mothership_core::Database) -> Vec<mothership_core::LlmModel> {
-    let host = match mothership_plugin_host::PluginHost::new() {
-        Ok(host) => host,
-        Err(error) => {
-            eprintln!("plugin host unavailable: {error}");
-            return Vec::new();
-        }
-    };
-
+    let registry = mothership_adapter_host::AdapterRegistry::scan(&plugins_store_path(database));
     let mut models = Vec::new();
-    for (path, manifest) in host.scan(&plugins_store_path(database)) {
-        match manifest {
-            Ok(manifest) => {
-                for model in manifest.models {
-                    models.push(mothership_core::LlmModel {
-                        provider_id: manifest.provider_id.clone(),
-                        provider_label: manifest.provider_label.clone(),
-                        id: model.id,
-                        label: model.label,
-                        family: model.family,
-                        description: model.description,
-                        capabilities: vec!["text".to_string()],
-                        recommended: model.recommended,
-                    });
-                }
-            }
-            Err(error) => eprintln!("skipping plugin {}: {error}", path.display()),
+    for entry in registry.entries() {
+        match adapter_models(entry) {
+            Ok(list) => models.extend(list),
+            Err(error) => eprintln!("skipping adapter {}: {error}", entry.provider_id),
         }
     }
     models
+}
+
+/// Spawns an adapter just long enough to read its advertised models. Each call
+/// starts and drops a child process; model listing is infrequent so this is
+/// fine for now (a resident registry can come later).
+fn adapter_models(
+    entry: &mothership_adapter_host::AdapterEntry,
+) -> std::result::Result<Vec<mothership_core::LlmModel>, String> {
+    let mut adapter = mothership_adapter_host::Adapter::spawn(&entry.program)
+        .map_err(|error| error.to_string())?;
+    adapter.initialize().map_err(|error| error.to_string())?;
+    let models = adapter.models().map_err(|error| error.to_string())?;
+    Ok(models
+        .into_iter()
+        .map(|model| mothership_core::LlmModel {
+            provider_id: entry.provider_id.clone(),
+            provider_label: entry.provider_label.clone(),
+            id: model.id,
+            label: model.label,
+            family: "Adapter".to_string(),
+            description: String::new(),
+            capabilities: vec!["text".to_string()],
+            recommended: model.recommended,
+        })
+        .collect())
 }
 
 fn plugins_store_path(database: &mothership_core::Database) -> PathBuf {
