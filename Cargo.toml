@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/mothership-core",
+  "crates/process-sandbox",
   "src-sidecar",
   "src-tauri",
 ]
@@ -13,8 +14,10 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
+async-trait = "0.1"
 base64 = "0.22"
 getrandom = "0.2"
+process-wrap = { version = "9.1", features = ["tokio1"] }
 reqwest = { version = "0.13.3", features = ["blocking", "form", "json"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -25,5 +28,6 @@ tauri-build = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-shell = "2"
 thiserror = "2"
+tokio = { version = "1", features = ["full"] }
 tungstenite = { version = "0.28", features = ["native-tls"] }
 url = "2"

@@ -1,0 +1,30 @@
+[package]
+name = "process-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-platform process-isolation port (ProcessSandbox) and per-OS adapters: spawn a tool process, drain its output in parallel, and reliably kill its whole process tree."
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+# process-wrap is cross-platform: it internally #[cfg]-gates the Windows-only
+# `windows` crate behind its `job-object` feature (on by default). The `tokio1`
+# feature provides the tokio::process integration we use in the Windows adapter.
+process-wrap.workspace = true
+
+# --- Future per-OS adapter deps (T3.5) -------------------------------------
+# The Windows adapter needs no extra crate beyond process-wrap. The real Unix
+# adapter + macOS reaper land later; their platform crates go here, target-gated
+# so e.g. libproc/kqueue never compile on Windows. Kept as a guide, intentionally
+# empty for now.
+#
+# [target.'cfg(target_os = "linux")'.dependencies]
+# cgroups-rs = "..."   # cgroup v2 escalation
+#
+# [target.'cfg(target_os = "macos")'.dependencies]
+# libproc = "..."      # descendant enumeration for the reaper
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util", "macros", "rt-multi-thread"] }
