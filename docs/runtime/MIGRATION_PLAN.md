@@ -4,7 +4,7 @@ Step-by-step path from today's code to the agent runtime described in the
 [`runtime/`](README.md) docs — **without breaking the working chat**.
 
 - **Created:** 2026-05-26
-- **Status:** not started
+- **Status:** Phase 1 done (commit `22a3b6d`) · Phase 3 in progress
 - **How to use:** tick `- [ ]` → `- [x]` as tasks land. Update **Status** above with the
   current phase. Each phase should leave the streaming chat working — that is the
   regression gate.
@@ -27,18 +27,30 @@ scale limits.** Each step keeps chat green.
 
 Implements the "Core owns behavior" rule. No new dependencies. Fixes divergence #1.
 
-- [ ] **T1.1 — `ChatRunService` in Core.** Move the logic from `complete_chat_run`
-  (`src-tauri/src/commands.rs`, ~L382) into a new `crates/mothership-core/src/run.rs`:
-  model/connection selection, context build, gateway call, complete/fail handling.
-  Signature `run(&Database, ChatRunContext, &mut dyn ChatRunEventSink)`. Reuse the
-  existing `ChatRunEventSink` port (`crates/mothership-core/src/chat.rs`, ~L91).
-  - _Done when:_ Core compiles with the run logic; nothing platform-specific added.
-- [ ] **T1.2 — Thin the host.** `TauriChatRunSink` stays in `src-tauri` (it is the
-  event adapter); the `std::thread::spawn` stays for now but calls `ChatRunService`.
-  - _Done when:_ `src-tauri` run code is only event plumbing.
-- [ ] **T1.3 — Core unit test** for a run using `NoopChatRunEventSink` / a test sink.
-  - _Done when:_ a run can be exercised without Tauri.
-- [ ] **Regression gate:** chat still streams identically end-to-end.
+- [x] **T1.1 — `ChatRunService` in Core.** Done — `crates/mothership-core/src/run.rs`.
+  Took `&SendChatMessageResult` instead of `ChatRunContext` (the host already has it
+  post-`begin_chat_run`, and the `Started` event needs the full chat/message objects).
+  Behavior byte-identical.
+- [x] **T1.2 — Thin the host.** Done — `TauriChatRunSink` reduced to `{ app }` +
+  `emit("chat-run-event")`; `send_chat_message` keeps `std::thread::spawn` and calls
+  `ChatRunService::new(&db).run(...)`. Old `run_chat_completion`/`complete_chat_run` removed.
+- [x] **T1.3 — Core unit test.** Done — 3 offline error-path tests (no model / no active
+  connection / empty context) with a capturing sink asserting `Started → Failed`.
+- [ ] **Regression gate — partial.** `cargo test -p mothership-core` 30/0 ✓,
+  `cargo check -p mothership-app` ✓. **UI smoke test still pending** (live streaming not
+  auto-verifiable — run the app and send a message before calling this fully done).
+
+**Review notes (commit `22a3b6d`, reviewed against `git diff`):**
+- DB↔emit untangling is clean: DB writes live in a private `DbForwardingSink` (Core),
+  host sink is emit-only. Scope was exactly the chat-run path; `core/Cargo.toml` untouched.
+- _Follow-up (low):_ `cargo tree -p mothership-core` still shows `tokio` — transitive via
+  `reqwest` default features (pre-existing, not from this change). To make Core truly
+  tokio-free: `reqwest { default-features = false }` + a blocking feature set. Platform GUI
+  crates (tauri/wry/winit/gtk/objc) are absent, so the leak-test holds for *platform* crates.
+- _Follow-up (low):_ `auth_store_path` helper now duplicated in `run.rs` / `commands.rs` /
+  `src-sidecar`. Consider centralizing in Core.
+- _Deferred:_ happy-path unit test needs a `&dyn LlmChatCompletionGateway` seam to fake the
+  gateway — do it when Phase 2/4 touches the gateway anyway.
 
 ## Phase 2 — tokio + `RunActor` + cancellation
 
