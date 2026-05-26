@@ -339,13 +339,23 @@ impl<'a> LlmModelCatalogService<'a> {
             return Ok(cache.models.clone());
         }
 
-        let catalog = self
-            .load_remote_catalog(adapter, connection)?
-            .ok_or_else(|| {
-                MothershipError::InvalidRequest(format!(
+        let catalog = match self.load_remote_catalog(adapter, connection) {
+            Ok(Some(catalog)) => catalog,
+            Ok(None) => {
+                return Err(MothershipError::InvalidRequest(format!(
                     "connector does not implement remote model catalog: {provider_id}"
-                ))
-            })?;
+                )))
+            }
+            // Remote fetch failed (e.g. transient network error after retries). Fall
+            // back to the last cached catalog if we have one — even if stale — rather
+            // than failing the whole connector view with an error.
+            Err(error) => {
+                if let Some(cache) = cached.as_ref().filter(|cache| !cache.models.is_empty()) {
+                    return Ok(cache.models.clone());
+                }
+                return Err(error);
+            }
+        };
 
         if catalog.models.is_empty() {
             return Err(MothershipError::InvalidRequest(format!(
@@ -1121,59 +1131,107 @@ struct CodexRemoteCatalog {
     etag: Option<String>,
 }
 
+const MODEL_CATALOG_FETCH_MAX_ATTEMPTS: u32 = 3;
+
+/// Exponential backoff (with jitter) for retrying transient model-catalog fetch
+/// failures. `attempt` is the just-failed attempt number (1-based). Capped at ~2s.
+fn model_fetch_retry_delay(attempt: u32) -> std::time::Duration {
+    let base_ms = 250u64.saturating_mul(1u64 << attempt.saturating_sub(1).min(4));
+    let capped = base_ms.min(2000);
+    std::time::Duration::from_millis(capped + pseudo_jitter_ms(capped / 3))
+}
+
+/// Cheap, non-cryptographic jitter in `0..=max` ms (derived from the clock) so
+/// retries don't fire in lockstep. No extra dependency needed.
+fn pseudo_jitter_ms(max: u64) -> u64 {
+    if max == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos() as u64)
+        .unwrap_or(0);
+    nanos % (max + 1)
+}
+
 fn request_codex_models(
     client: &Client,
     endpoint: &str,
     credential: &CodexCredentialPayload,
 ) -> Result<CodexModelsHttpResult> {
     let url = codex_models_url(endpoint)?;
-    let mut request = client
-        .get(url)
-        .timeout(MODEL_CATALOG_FETCH_TIMEOUT)
-        .bearer_auth(credential.access_token.trim());
-
-    if let Some(account_id) = credential
+    let account_id = credential
         .account_id
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        request = request.header("ChatGPT-Account-Id", account_id);
-    }
+        .filter(|value| !value.is_empty());
 
-    let response = request.send().map_err(|error| {
-        MothershipError::InvalidRequest(format!("Codex models fetch failed: {error}"))
-    })?;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
 
-    if response.status() == StatusCode::UNAUTHORIZED {
-        return Ok(CodexModelsHttpResult::Unauthorized);
-    }
+        let mut request = client
+            .get(&url)
+            .timeout(MODEL_CATALOG_FETCH_TIMEOUT)
+            .bearer_auth(credential.access_token.trim());
+        if let Some(account_id) = account_id {
+            request = request.header("ChatGPT-Account-Id", account_id);
+        }
 
-    if !response.status().is_success() {
+        let response = match request.send() {
+            Ok(response) => response,
+            // Transport-level failure (DNS / connect / TLS / timeout): retriable.
+            Err(error) => {
+                if attempt < MODEL_CATALOG_FETCH_MAX_ATTEMPTS {
+                    std::thread::sleep(model_fetch_retry_delay(attempt));
+                    continue;
+                }
+                return Err(MothershipError::InvalidRequest(format!(
+                    "Codex models fetch failed after {attempt} attempts: {error}"
+                )));
+            }
+        };
+
         let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(MothershipError::InvalidRequest(format!(
-            "Codex models fetch rejected: {status}: {}",
-            sanitize_provider_error(&body)
-        )));
+
+        if status == StatusCode::UNAUTHORIZED {
+            return Ok(CodexModelsHttpResult::Unauthorized);
+        }
+
+        // Retry transient server-side failures (429 / 5xx). Other 4xx are terminal
+        // (auth/bad request) — retrying just delays the error.
+        if (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+            && attempt < MODEL_CATALOG_FETCH_MAX_ATTEMPTS
+        {
+            std::thread::sleep(model_fetch_retry_delay(attempt));
+            continue;
+        }
+
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            return Err(MothershipError::InvalidRequest(format!(
+                "Codex models fetch rejected: {status}: {}",
+                sanitize_provider_error(&body)
+            )));
+        }
+
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let body = response.bytes().map_err(|error| {
+            MothershipError::InvalidRequest(format!("Codex models body read failed: {error}"))
+        })?;
+        let payload: CodexModelsResponse = serde_json::from_slice(&body).map_err(|error| {
+            MothershipError::InvalidRequest(format!("invalid Codex models response: {error}"))
+        })?;
+
+        return Ok(CodexModelsHttpResult::Success(CodexRemoteCatalog {
+            models: codex_remote_models_to_llm(payload.models),
+            etag,
+        }));
     }
-
-    let etag = response
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned);
-    let body = response.bytes().map_err(|error| {
-        MothershipError::InvalidRequest(format!("Codex models body read failed: {error}"))
-    })?;
-    let payload: CodexModelsResponse = serde_json::from_slice(&body).map_err(|error| {
-        MothershipError::InvalidRequest(format!("invalid Codex models response: {error}"))
-    })?;
-
-    Ok(CodexModelsHttpResult::Success(CodexRemoteCatalog {
-        models: codex_remote_models_to_llm(payload.models),
-        etag,
-    }))
 }
 
 fn codex_models_url(endpoint: &str) -> Result<String> {
