@@ -332,7 +332,7 @@ fn available_llm_models_for_connections(
     connections: &[ProviderConnection],
 ) -> mothership_core::Result<Vec<mothership_core::LlmModel>> {
     let vault = FileCredentialVault::new(auth_store_path(database));
-    let llm_registry = mothership_core::StaticLlmConnectorRegistry::with_openai_codex();
+    let llm_registry = mothership_core::default_llm_registry();
     let model_catalog =
         mothership_core::LlmModelCatalogService::new(database, &vault, &llm_registry);
     model_catalog.list_models(connections)
@@ -359,7 +359,7 @@ fn connector_providers(
     models: Vec<mothership_core::LlmModel>,
     selected_model: &mothership_core::SelectedLlmModel,
 ) -> Vec<ConnectorProviderSummary> {
-    let llm_registry = mothership_core::StaticLlmConnectorRegistry::with_openai_codex();
+    let llm_registry = mothership_core::default_llm_registry();
     let mut provider_ids = BTreeSet::new();
     for provider in &auth_providers {
         provider_ids.insert(provider.id.as_str().to_string());

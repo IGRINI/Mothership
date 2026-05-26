@@ -15,12 +15,12 @@ pub use chat::{
 pub use database::Database;
 pub use error::{MothershipError, Result};
 pub use llm::{
-    chat_system_prompt, connector_settings_schema, default_llm_model, find_llm_model,
-    ConnectorModelManagementKind, ConnectorModelManagementSchema, ConnectorSettingsSchema,
-    LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest, LlmChatMessage,
-    LlmChatRole, LlmModel, LlmModelCatalogCache, LlmModelCatalogRepository, LlmModelCatalogService,
-    LlmTransportKind, OpenAiCodexChatCompletionGateway, SelectedLlmModel,
-    StaticLlmConnectorRegistry,
+    chat_completion_gateway, chat_system_prompt, connector_settings_schema, default_llm_model,
+    default_llm_registry, find_llm_model, ConnectorModelManagementKind,
+    ConnectorModelManagementSchema, ConnectorSettingsSchema, LlmChatCompletionEventSink,
+    LlmChatCompletionGateway, LlmChatCompletionRequest, LlmChatMessage, LlmChatRole, LlmModel,
+    LlmModelCatalogCache, LlmModelCatalogRepository, LlmModelCatalogService, LlmTransportKind,
+    OpenAiCodexChatCompletionGateway, SelectedLlmModel, StaticLlmConnectorRegistry,
 };
 pub use model::{ActivityEvent, DashboardMetric, DashboardSnapshot, SidecarStatus, WorkspaceItem};
 pub use run::ChatRunService;

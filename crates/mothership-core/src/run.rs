@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 
 use crate::auth::{
-    ConnectionStatus, FileCredentialVault, OpenAiCodexOAuthAdapter, ProviderAuthService,
-    ProviderConnection, StaticProviderAuthAdapterRegistry,
+    ConnectionStatus, FileCredentialVault, ProviderAuthService, ProviderConnection,
+    StaticProviderAuthAdapterRegistry,
 };
 use crate::chat::{ChatRunEvent, ChatRunEventKind, ChatRunEventSink, SendChatMessageResult};
 use crate::llm::{
-    chat_system_prompt, LlmChatCompletionEventSink, LlmChatCompletionGateway,
-    LlmChatCompletionRequest, LlmTransportKind, OpenAiCodexChatCompletionGateway,
+    chat_completion_gateway, chat_system_prompt, LlmChatCompletionEventSink,
+    LlmChatCompletionRequest, LlmTransportKind,
 };
 use crate::{Database, MothershipError, Result};
 
@@ -112,27 +112,18 @@ impl<'a> ChatRunService<'a> {
             sink,
         };
 
-        match selected_model.provider_id.as_str() {
-            OpenAiCodexOAuthAdapter::PROVIDER_ID => {
-                let gateway = OpenAiCodexChatCompletionGateway::new(&vault, &connection)?;
-                let system_prompt =
-                    chat_system_prompt(&selected_model.provider_id, &selected_model.model_id)?;
-                gateway.complete_chat(
-                    LlmChatCompletionRequest {
-                        provider_id: selected_model.provider_id,
-                        model_id: selected_model.model_id,
-                        system_prompt,
-                        messages,
-                    },
-                    &mut llm_sink,
-                )?;
-            }
-            provider_id => {
-                return Err(MothershipError::InvalidRequest(format!(
-                    "chat runtime is not implemented for provider: {provider_id}"
-                )));
-            }
-        }
+        let system_prompt =
+            chat_system_prompt(&selected_model.provider_id, &selected_model.model_id)?;
+        let gateway = chat_completion_gateway(&selected_model.provider_id, &vault, &connection)?;
+        gateway.complete_chat(
+            LlmChatCompletionRequest {
+                provider_id: selected_model.provider_id,
+                model_id: selected_model.model_id,
+                system_prompt,
+                messages,
+            },
+            &mut llm_sink,
+        )?;
 
         let event =
             database.complete_chat_run(&run.run_id, &run.chat.id, &run.assistant_message.id)?;

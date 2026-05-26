@@ -218,6 +218,20 @@ pub trait LlmConnectorAdapter: Send + Sync {
         None
     }
 
+    /// Builds the chat-completion gateway for this provider, borrowing the
+    /// credential vault and the active connection. Providers that do not
+    /// implement chat leave the default, which reports an unsupported provider.
+    fn chat_gateway<'a>(
+        &self,
+        _vault: &'a dyn CredentialVault,
+        _connection: &'a ProviderConnection,
+    ) -> Result<Box<dyn LlmChatCompletionGateway + 'a>> {
+        Err(MothershipError::InvalidRequest(format!(
+            "chat completion is not implemented for provider: {}",
+            self.provider_id()
+        )))
+    }
+
     fn remote_model_catalog(
         &self,
         _input: RemoteModelCatalogInput<'_>,
@@ -283,6 +297,21 @@ impl StaticLlmConnectorRegistry {
             .iter()
             .find(|adapter| adapter.provider_id() == provider_id)
             .and_then(|adapter| adapter.chat_system_prompt(model_id))
+    }
+
+    pub fn chat_gateway<'a>(
+        &self,
+        provider_id: &str,
+        vault: &'a dyn CredentialVault,
+        connection: &'a ProviderConnection,
+    ) -> Result<Box<dyn LlmChatCompletionGateway + 'a>> {
+        self.adapters
+            .iter()
+            .find(|adapter| adapter.provider_id() == provider_id)
+            .ok_or_else(|| {
+                MothershipError::InvalidRequest(format!("unknown provider: {provider_id}"))
+            })?
+            .chat_gateway(vault, connection)
     }
 }
 
@@ -939,6 +968,16 @@ impl LlmConnectorAdapter for OpenAiCodexLlmConnector {
         (!model_id.trim().is_empty()).then(|| DEFAULT_CODEX_CHAT_SYSTEM_PROMPT.to_string())
     }
 
+    fn chat_gateway<'a>(
+        &self,
+        vault: &'a dyn CredentialVault,
+        connection: &'a ProviderConnection,
+    ) -> Result<Box<dyn LlmChatCompletionGateway + 'a>> {
+        Ok(Box::new(OpenAiCodexChatCompletionGateway::new(
+            vault, connection,
+        )?))
+    }
+
     fn remote_model_catalog(
         &self,
         input: RemoteModelCatalogInput<'_>,
@@ -1013,8 +1052,25 @@ pub fn openai_codex_model_catalog() -> Vec<LlmModel> {
     ]
 }
 
-pub fn default_llm_model() -> LlmModel {
+/// Composition root for the bundled LLM connectors. Providers that ship with
+/// the app are registered here; runtime-loaded plugins will extend the registry
+/// this function returns.
+pub fn default_llm_registry() -> StaticLlmConnectorRegistry {
     StaticLlmConnectorRegistry::with_openai_codex()
+}
+
+/// Builds the chat-completion gateway for `provider_id` from the default
+/// connector registry, borrowing the vault and the active connection.
+pub fn chat_completion_gateway<'a>(
+    provider_id: &str,
+    vault: &'a dyn CredentialVault,
+    connection: &'a ProviderConnection,
+) -> Result<Box<dyn LlmChatCompletionGateway + 'a>> {
+    default_llm_registry().chat_gateway(provider_id, vault, connection)
+}
+
+pub fn default_llm_model() -> LlmModel {
+    default_llm_registry()
         .list_models()
         .into_iter()
         .find(|model| model.recommended)
@@ -1022,17 +1078,17 @@ pub fn default_llm_model() -> LlmModel {
 }
 
 pub fn find_llm_model(provider_id: &str, model_id: &str) -> Option<LlmModel> {
-    StaticLlmConnectorRegistry::with_openai_codex().find_model(provider_id, model_id)
+    default_llm_registry().find_model(provider_id, model_id)
 }
 
 pub fn connector_settings_schema(provider_id: &str) -> Result<ConnectorSettingsSchema> {
-    StaticLlmConnectorRegistry::with_openai_codex()
+    default_llm_registry()
         .settings_schema(provider_id)
         .ok_or_else(|| MothershipError::InvalidRequest(format!("unknown provider: {provider_id}")))
 }
 
 pub fn chat_system_prompt(provider_id: &str, model_id: &str) -> Result<String> {
-    StaticLlmConnectorRegistry::with_openai_codex()
+    default_llm_registry()
         .chat_system_prompt(provider_id, model_id)
         .filter(|prompt| !prompt.trim().is_empty())
         .ok_or_else(|| {

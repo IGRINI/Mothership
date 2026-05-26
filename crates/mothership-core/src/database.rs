@@ -531,7 +531,7 @@ impl Database {
 
     pub fn list_llm_models(&self) -> Result<Vec<LlmModel>> {
         let connection = self.connect()?;
-        let registry = crate::llm::StaticLlmConnectorRegistry::with_openai_codex();
+        let registry = crate::llm::default_llm_registry();
         let bundled = registry.list_bundled_models();
         let provider_ids = bundled
             .iter()
