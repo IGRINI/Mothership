@@ -188,12 +188,26 @@ struct ManifestFile {
     program: String,
 }
 
-/// A discovered adapter: its identity and the executable that implements it.
+/// A discovered adapter: its identity, the executable that implements it, and
+/// the folder it lives in (where its `settings.json` is read from).
 #[derive(Debug, Clone)]
 pub struct AdapterEntry {
     pub provider_id: String,
     pub provider_label: String,
     pub program: PathBuf,
+    pub dir: PathBuf,
+}
+
+impl AdapterEntry {
+    /// Loads `<dir>/settings.json` (a flat `string -> string` map) that the host
+    /// pushes to the adapter on each spawn. A missing or invalid file yields no
+    /// settings. Secrets live here too (YOLO/full-trust mode).
+    pub fn load_settings(&self) -> BTreeMap<String, String> {
+        std::fs::read_to_string(self.dir.join("settings.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
 }
 
 /// Adapters discovered under a plugins directory, keyed by provider id. Lets the
@@ -221,7 +235,8 @@ impl AdapterRegistry {
                 entries.push(AdapterEntry {
                     provider_id: manifest.provider_id,
                     provider_label: manifest.provider_label,
-                    program: folder.join(manifest.program),
+                    program: folder.join(&manifest.program),
+                    dir: folder,
                 });
             }
         }

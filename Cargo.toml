@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "adapters/openrouter",
   "crates/mothership-adapter-host",
   "crates/mothership-core",
   "crates/mothership-plugin-host",

@@ -1,0 +1,5 @@
+{
+  "provider_id": "openrouter",
+  "provider_label": "OpenRouter",
+  "program": "openrouter-adapter.exe"
+}

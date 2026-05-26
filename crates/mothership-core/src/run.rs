@@ -113,9 +113,11 @@ impl<'a> ChatRunService<'a> {
                 assistant_message_id: &run.assistant_message.id,
                 sink,
             };
-            // The adapter owns its own system prompt for now; auth + settings
-            // flow through the contract in a later step.
-            SubprocessChatGateway::new(entry.program.clone()).complete_chat(
+            // The adapter owns its own system prompt for now. Settings (api key,
+            // base url, user model list) are pushed from the adapter's
+            // settings.json on spawn.
+            SubprocessChatGateway::with_settings(entry.program.clone(), entry.load_settings())
+                .complete_chat(
                 LlmChatCompletionRequest {
                     provider_id: selected_model.provider_id,
                     model_id: selected_model.model_id,

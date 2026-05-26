@@ -5,6 +5,7 @@
 //! This is how the core chats through any process-based provider — a normal HTTP
 //! adapter or one that drives an external CLI — without knowing which it is.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use mothership_adapter_host::protocol::ChatMessage;
@@ -21,12 +22,23 @@ use crate::{MothershipError, Result};
 /// drop). Pooling / resident instances can come later if startup cost matters.
 pub struct SubprocessChatGateway {
     program: PathBuf,
+    settings: BTreeMap<String, String>,
 }
 
 impl SubprocessChatGateway {
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            settings: BTreeMap::new(),
+        }
+    }
+
+    /// Same, but with the settings the host pushes to the adapter (api key, base
+    /// url, user model list, …) right after initialization.
+    pub fn with_settings(program: impl Into<PathBuf>, settings: BTreeMap<String, String>) -> Self {
+        Self {
+            program: program.into(),
+            settings,
         }
     }
 }
@@ -43,6 +55,11 @@ impl LlmChatCompletionGateway for SubprocessChatGateway {
         adapter.initialize().map_err(|error| {
             MothershipError::InvalidRequest(format!("adapter initialize failed: {error}"))
         })?;
+        if !self.settings.is_empty() {
+            adapter.set_settings(self.settings.clone()).map_err(|error| {
+                MothershipError::InvalidRequest(format!("adapter set_settings failed: {error}"))
+            })?;
+        }
 
         sink.transport_selected(LlmTransportKind::Subprocess);
 

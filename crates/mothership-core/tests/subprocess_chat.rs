@@ -71,3 +71,37 @@ fn streams_chat_through_subprocess_adapter() {
     assert_eq!(sink.text.trim(), "hello brave world");
     assert_eq!(sink.transports, vec![LlmTransportKind::Subprocess]);
 }
+
+#[test]
+fn pushes_settings_before_streaming() {
+    let path = echo_adapter_path();
+    if !path.exists() {
+        eprintln!("skipping: echo adapter not built at {}", path.display());
+        return;
+    }
+
+    let settings = std::collections::BTreeMap::from([
+        ("api_key".to_string(), "secret-value".to_string()),
+        ("endpoint".to_string(), "https://example".to_string()),
+    ]);
+    let gateway = SubprocessChatGateway::with_settings(path, settings);
+    let mut sink = RecordingSink::default();
+
+    let full = gateway
+        .complete_chat(
+            LlmChatCompletionRequest {
+                provider_id: "echo".to_string(),
+                model_id: "echo-1".to_string(),
+                system_prompt: String::new(),
+                messages: vec![LlmChatMessage {
+                    role: LlmChatRole::User,
+                    content: "ping pong".to_string(),
+                }],
+            },
+            &mut sink,
+        )
+        .expect("chat after settings push");
+
+    // The adapter accepted set_settings (no error) and still streamed.
+    assert_eq!(full.trim(), "ping pong");
+}
