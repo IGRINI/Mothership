@@ -4,6 +4,7 @@ target
 target-tauri-dev/
 target-tauri-build/
 tmp/
+traces/
 projects-to-research/
 src-tauri/binaries/*
 !src-tauri/binaries/.gitkeep

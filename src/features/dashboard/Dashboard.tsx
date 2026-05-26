@@ -3,7 +3,6 @@ import {
   ChevronDown,
   Circle,
   Clock,
-  Copy,
   FileText,
   Folder,
   GitBranch,
@@ -13,8 +12,6 @@ import {
   Search,
   Send,
   Terminal,
-  ThumbsDown,
-  ThumbsUp,
 } from "lucide-solid";
 import { listen } from "@tauri-apps/api/event";
 
@@ -31,7 +28,7 @@ import {
   setSelectedModel,
 } from "../../shared/api/mothership";
 import { VirtualList } from "../../shared/ui/VirtualList";
-import mothershipLogoUrl from "../../assets/mothership-logo.png";
+import mothershipLogoUrl from "../../assets/mothership-logo-sm.png";
 
 const projects: ProjectItem[] = [
   {
@@ -561,62 +558,30 @@ function InspectorPane(props: {
 
 function MessageRow(props: { message: ChatMessage; transport?: string }) {
   const message = () => props.message;
+  const isUser = () => message().role === "user";
 
+  // Minimal, scroll-cheap row: a CSS letter avatar (no <img>), text, and no
+  // per-message SVG action buttons. The rich avatar/icons made scrolling lag.
   return (
     <article
       classList={{
         "message-row": true,
-        "message-row--assistant": message().role === "assistant",
+        "message-row--assistant": !isUser(),
       }}
     >
       <Avatar role={message().role} />
       <div class="message-row__content">
         <div class="message-meta">
-          <strong>{message().role === "user" ? "You" : "Mothership"}</strong>
+          <strong>{isUser() ? "You" : "Mothership"}</strong>
           <span>{formatMessageTime(message().createdAt)}</span>
         </div>
 
         <p>
-          <Show
-            when={message().content}
-            fallback={
-              message().status === "sending"
-                ? thinkingLabel(props.transport)
-                : "No content."
-            }
-          >
-            {message().content}
-          </Show>
+          {message().content ||
+            (message().status === "sending"
+              ? thinkingLabel(props.transport)
+              : "No content.")}
         </p>
-
-        <Show when={message().role === "assistant"}>
-          <div class="message-actions">
-            <button
-              class="icon-button icon-button--ghost"
-              type="button"
-              title="Like"
-            >
-              <ThumbsUp size={15} />
-            </button>
-            <button
-              class="icon-button icon-button--ghost"
-              type="button"
-              title="Dislike"
-            >
-              <ThumbsDown size={15} />
-            </button>
-            <button
-              class="icon-button icon-button--ghost"
-              type="button"
-              title="Copy"
-              onClick={() =>
-                void navigator.clipboard?.writeText(message().content)
-              }
-            >
-              <Copy size={15} />
-            </button>
-          </div>
-        </Show>
       </div>
     </article>
   );

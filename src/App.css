@@ -739,6 +739,17 @@ kbd,
 
 .message-list .virtual-list__row {
   padding: 8px 22px;
+  /* Skip rendering/painting messages that are scrolled off-screen, so scrolling
+     only pays for the visible rows (avatars, icons, shadows) instead of every
+     message every frame. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 120px;
+}
+
+/* The blurred box-shadow on the agent avatar gets re-rasterized on every scroll
+   frame; drop it inside the message list (kept in the sidebar/title bar). */
+.message-row .brand-mark {
+  box-shadow: none;
 }
 
 .message-row {
