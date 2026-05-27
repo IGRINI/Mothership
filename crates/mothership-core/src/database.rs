@@ -581,16 +581,9 @@ impl Database {
         validate_identifier("provider_id", provider_id)?;
         validate_identifier("model_id", model_id)?;
 
-        if !self
-            .list_llm_models()?
-            .iter()
-            .any(|model| model.provider_id == provider_id && model.id == model_id)
-        {
-            return Err(MothershipError::InvalidRequest(format!(
-                "unsupported model: {provider_id}/{model_id}"
-            )));
-        }
-
+        // The core is provider-agnostic and just persists the choice. Validation
+        // against the available adapter models happens at the app layer, which
+        // knows the installed adapters.
         let connection = self.connect()?;
         let now = current_timestamp();
         connection.execute(
@@ -1287,7 +1280,6 @@ mod tests {
     fn chat_message_creates_persistent_conversation() {
         let database_path = temp_database_path("chat_message_creates_persistent_conversation");
         let database = Database::open(database_path.clone()).expect("open database");
-        cache_remote_model(&database, "test-model");
         database
             .set_selected_llm_model("openai", "test-model")
             .expect("select model");
@@ -1325,7 +1317,6 @@ mod tests {
     fn empty_chat_receives_title_from_first_message() {
         let database_path = temp_database_path("empty_chat_receives_title_from_first_message");
         let database = Database::open(database_path.clone()).expect("open database");
-        cache_remote_model(&database, "test-model");
         database
             .set_selected_llm_model("openai", "test-model")
             .expect("select model");
@@ -1346,7 +1337,6 @@ mod tests {
         let database_path =
             temp_database_path("startup_recovery_marks_interrupted_assistant_runs_failed");
         let database = Database::open(database_path.clone()).expect("open database");
-        cache_remote_model(&database, "test-model");
         database
             .set_selected_llm_model("openai", "test-model")
             .expect("select model");
@@ -1374,76 +1364,34 @@ mod tests {
     }
 
     #[test]
-    fn selected_model_persists_and_rejects_unknown_models() {
+    fn selected_model_persists_across_reopen() {
         let database_path = temp_database_path("selected_model_persists");
         let database = Database::open(database_path.clone()).expect("open database");
-        cache_remote_model(&database, "gpt-5.3-codex");
 
         let selected = database
-            .set_selected_llm_model("openai", "gpt-5.3-codex")
+            .set_selected_llm_model("some-adapter", "some-model")
             .expect("select model");
-        assert_eq!(selected.provider_id, "openai");
-        assert_eq!(selected.model_id, "gpt-5.3-codex");
-
-        let rejected = database.set_selected_llm_model("openai", "unknown-model");
-        assert!(rejected.is_err());
+        assert_eq!(selected.provider_id, "some-adapter");
+        assert_eq!(selected.model_id, "some-model");
 
         drop(database);
 
         let reopened = Database::open(database_path.clone()).expect("reopen database");
         let restored = reopened.selected_llm_model().expect("selected model");
-        assert_eq!(restored.model_id, "gpt-5.3-codex");
+        assert_eq!(restored.provider_id, "some-adapter");
+        assert_eq!(restored.model_id, "some-model");
 
         let _ = fs::remove_file(database_path);
     }
 
     #[test]
-    fn selected_model_accepts_cached_remote_catalog() {
-        let database_path = temp_database_path("selected_model_accepts_cached_remote_catalog");
-        let database = Database::open(database_path.clone()).expect("open database");
-        cache_remote_model(&database, "remote-only");
-
-        let selected = database
-            .set_selected_llm_model("openai", "remote-only")
-            .expect("select cached remote model");
-
-        assert_eq!(selected.model_id, "remote-only");
-
-        let _ = fs::remove_file(database_path);
-    }
-
-    #[test]
-    fn remote_catalog_models_are_empty_without_cache() {
+    fn builtin_model_list_is_empty() {
         let database_path = temp_database_path("remote_catalog_models_are_empty_without_cache");
         let database = Database::open(database_path.clone()).expect("open database");
 
         assert!(database.list_llm_models().expect("list models").is_empty());
 
         let _ = fs::remove_file(database_path);
-    }
-
-    fn cache_remote_model(database: &Database, model_id: &str) {
-        let remote_model = LlmModel {
-            provider_id: "openai".to_string(),
-            provider_label: "OpenAI".to_string(),
-            id: model_id.to_string(),
-            label: model_id.to_string(),
-            family: "Codex".to_string(),
-            description: "Remote model".to_string(),
-            capabilities: vec!["text".to_string()],
-            recommended: true,
-        };
-
-        database
-            .save_llm_model_catalog_cache(&LlmModelCatalogCache {
-                provider_id: "openai".to_string(),
-                models: vec![remote_model],
-                etag: Some("\"etag\"".to_string()),
-                fetched_at: current_timestamp(),
-                expires_at: (current_timestamp().parse::<u64>().expect("timestamp") + 300)
-                    .to_string(),
-            })
-            .expect("save cache");
     }
 
     fn temp_database_path(name: &str) -> PathBuf {

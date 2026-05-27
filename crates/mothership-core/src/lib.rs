@@ -21,7 +21,7 @@ pub use llm::{
     ConnectorModelManagementSchema, ConnectorSettingsSchema, LlmChatCompletionEventSink,
     LlmChatCompletionGateway, LlmChatCompletionRequest, LlmChatMessage, LlmChatRole, LlmModel,
     LlmModelCatalogCache, LlmModelCatalogRepository, LlmModelCatalogService, LlmTransportKind,
-    OpenAiCodexChatCompletionGateway, SelectedLlmModel, StaticLlmConnectorRegistry,
+    SelectedLlmModel, StaticLlmConnectorRegistry,
 };
 pub use model::{ActivityEvent, DashboardMetric, DashboardSnapshot, SidecarStatus, WorkspaceItem};
 pub use run::ChatRunService;
