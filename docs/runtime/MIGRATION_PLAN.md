@@ -4,7 +4,7 @@ Step-by-step path from today's code to the agent runtime described in the
 [`runtime/`](README.md) docs — **without breaking the working chat**.
 
 - **Created:** 2026-05-26
-- **Status:** Phase 1 done (`22a3b6d`) · Phase 3 done (`b2e9615`; T3.5 Unix/macOS open) · next: Phase 2 (tokio + RunActor) or T3.5
+- **Status:** Phase 1 done (`22a3b6d`) · Phase 3 done (`b2e9615`; T3.5 Unix/macOS open) · **Sidecar split done (2026-05-27)** — Core now runs out-of-process ahead of Phase 5, see note below · next: Phase 2 (tokio + RunActor) or T3.5
 - **How to use:** tick `- [ ]` → `- [x]` as tasks land. Update **Status** above with the
   current phase. Each phase should leave the streaming chat working — that is the
   regression gate.
@@ -13,12 +13,13 @@ Step-by-step path from today's code to the agent runtime described in the
 
 A working `chat + LLM + auth` vertical slice exists, but:
 
-- run orchestration lives in `src-tauri` (`run_chat_completion` / `complete_chat_run`),
-  not in Core — violates "move behavior to Core" in [`../ARCHITECTURE.md`](../ARCHITECTURE.md);
 - a "run" is a `std::thread::spawn`, not an actor (no cancel / mailbox / reconnect);
 - Core is synchronous (no tokio);
-- there is no tool execution, no `ProcessSandbox`, no resource control;
-- the sidecar is a one-shot CLI; chat streaming runs in-process in the host.
+- there is no tool execution, no `ProcessSandbox`, no resource control.
+
+Resolved since this plan was written:
+- run orchestration moved into Core (`ChatRunService`, `ConnectorService`) — "move behavior to Core";
+- **the sidecar is now a long-running daemon, not a one-shot CLI.** Core runs *in it*; the desktop host is a thin client over a newline-JSON protocol (`mothership-core::ipc`). See the note at the end of Phase 5 for why this was pulled forward.
 
 Guiding order: **relocate → change execution model → add data-plane → wire tools →
 scale limits.** Each step keeps chat green.
@@ -109,8 +110,29 @@ Only needed once concurrent runs/tools exist. Premature before that.
 - [ ] **T5.2 — Event batching / coalescing** (today: one DB write + emit per delta — the
   un-batched hot path; batch when it bites).
 
-_Also deferred:_ turning the one-shot sidecar into a long-running streaming runtime —
-after the in-process actor model works, not before.
+### Sidecar split — pulled forward (done 2026-05-27)
+
+This plan originally deferred the long-running sidecar to "after the actor model."
+That sequencing was reversed deliberately, and the split was done first:
+
+- **Why now:** coupling accretes. Every module built against the in-host assumption
+  makes the boundary more expensive to extract later. The surface was minimal at this
+  point (13 ops), and the transport mechanism already existed (the `mothership-adapter-host`
+  NDJSON-over-stdio pattern). Doing it while small was cheaper than doing it after piling
+  modules on top — and a boundary you don't *run* as a process isn't enforced, so the
+  discipline rots. (A `veche` committee review concurred: extraction now, not a runtime
+  rewrite; keep actor/agent semantics off the wire as additive enum variants.)
+- **What landed:** Core (DB, vault, adapters, chat runs) runs in `src-sidecar` as a daemon;
+  the host is a thin client (`src-tauri/src/sidecar.rs` supervisor + `commands.rs` pass-through).
+  Protocol in `mothership-core::ipc`: Hello/Initialize/Ready handshake, correlated
+  request/response, operation-centric streamed events, typed errors, version handshake.
+  Windows Job Object (`src-tauri/src/job.rs`, `KILL_ON_JOB_CLOSE`) ties the sidecar +
+  its adapter subtree to the host's lifetime. Verified by `src-sidecar/tests/protocol_handshake.rs`.
+- **What this does NOT include (still future, additively):** the tokio `RunActor` model
+  (Phase 2) and `ProcessSandbox`-backed tool execution (Phase 4) move *inside* the sidecar
+  behind the same protocol — `CoreRequest`/`CoreEvent` gain `Run`/`ToolCall` variants without
+  a redesign. Per-adapter sub-jobs (vs. the current host-level job) are deferred; a sidecar
+  crash can briefly orphan an in-flight adapter until host exit closes the job.
 
 ## Guardrail (cheap, any time)
 

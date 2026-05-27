@@ -50,7 +50,7 @@ Desktop UI and Phone UI are clients.
 └────────────────────┘
 ```
 
-Future phone and web clients must connect to the same Agent API contract. Even while v1 runs Core inside the Tauri process, Core should be designed as if it can become a separate local server or sidecar.
+Future phone and web clients must connect to the same Agent API contract. Core now runs **out of the Tauri process**, in a long-running sidecar: the desktop host is a thin client that speaks a newline-delimited JSON protocol to it (see [Provider Auth](PROVIDER_AUTH.md) and the sidecar protocol in `mothership-core::ipc`). This makes the "Core can become a separate local server" property real and enforced, not aspirational — a boundary you actually run as a process can't silently rot.
 
 ## Layers
 
@@ -534,9 +534,9 @@ Do not build:
 
 The current codebase is an early scaffold. The target mapping is:
 
-- `crates/mothership-core/`: grows toward Agent Core modules, domain, ports, use cases, repositories.
-- `src-tauri/`: desktop host, Tauri command adapter, sidecar launching, platform integration.
-- `src-sidecar/`: sidecar process, future candidate for hosting Core/runtime jobs.
+- `crates/mothership-core/`: Agent Core — domain, application services (`ChatRunService`, `ConnectorService`), repositories, and the host↔sidecar wire protocol (`ipc`). Runs in the sidecar process.
+- `src-sidecar/`: the long-running Core host process. Owns the database, the credential vault, and provider-adapter subprocesses; serves the host over stdio.
+- `src-tauri/`: thin desktop host — window/webview, the sidecar supervisor (spawn, handshake, request/response correlation, crash-restart), and Tauri commands that forward to the sidecar. Holds no database or adapters.
 - `src/`: thin SolidJS desktop client.
 - `docs/`: product and architecture source of truth.
 

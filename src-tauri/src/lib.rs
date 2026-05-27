@@ -1,9 +1,10 @@
 mod commands;
+mod job;
 mod platform;
 mod sidecar;
 mod state;
 
-use mothership_core::Database;
+use sidecar::Sidecar;
 use state::AppState;
 use tauri::Manager;
 
@@ -18,10 +19,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
+            // The host opens nothing: the sidecar owns the database (open,
+            // migrate, recover interrupted runs) once we send it the path.
             let database_path = app.path().app_data_dir()?.join("mothership.sqlite3");
-            let database = Database::open(database_path)?;
-            database.recover_interrupted_chat_runs()?;
-            app.manage(AppState::new(database));
+            let sidecar = Sidecar::start(app.handle(), database_path);
+            app.manage(AppState::new(sidecar));
             platform::configure_webview_platform(app);
             Ok(())
         })

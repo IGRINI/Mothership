@@ -2771,8 +2771,6 @@ dependencies = [
 name = "mothership-app"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
- "mothership-adapter-host",
  "mothership-core",
  "serde",
  "serde_json",
@@ -2780,6 +2778,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tauri-plugin-shell",
+ "tokio",
  "webview2-com",
  "windows 0.61.3",
 ]

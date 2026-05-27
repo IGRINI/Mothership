@@ -1,8 +1,10 @@
 pub mod auth;
 pub mod chat;
+pub mod connectors;
 pub mod database;
 pub mod error;
 mod id;
+pub mod ipc;
 pub mod llm;
 pub mod model;
 pub mod run;
@@ -12,6 +14,9 @@ pub use chat::{
     ChatConversation, ChatMessage, ChatMessageRole, ChatMessageStatus, ChatRunContext,
     ChatRunEvent, ChatRunEventKind, ChatRunEventSink, ChatThreadSummary, NoopChatRunEventSink,
     SendChatMessageResult,
+};
+pub use connectors::{
+    AuthProcessRegistry, ConnectorProviderSummary, ConnectorService, ConnectorSettingsSnapshot,
 };
 pub use database::Database;
 pub use error::{MothershipError, Result};
