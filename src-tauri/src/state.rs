@@ -24,13 +24,6 @@ impl AppState {
         &self.database
     }
 
-    /// Records the process id of an in-flight `authenticate` for `provider_id`.
-    pub fn set_auth_process(&self, provider_id: &str, pid: u32) {
-        if let Ok(mut map) = self.auth_processes.lock() {
-            map.insert(provider_id.to_string(), pid);
-        }
-    }
-
     /// Removes and returns the in-flight `authenticate` pid for `provider_id`.
     /// Returns `None` if there isn't one (or another caller already took it —
     /// which is how the authenticate command learns it was cancelled).
@@ -39,5 +32,12 @@ impl AppState {
             .lock()
             .ok()
             .and_then(|mut map| map.remove(provider_id))
+    }
+
+    /// A shared handle to the in-flight auth-process table, so the blocking
+    /// `authenticate` work (run off-thread) can register/clear its pid without
+    /// borrowing the non-`Send` `State`.
+    pub fn auth_processes(&self) -> Arc<Mutex<HashMap<String, u32>>> {
+        Arc::clone(&self.auth_processes)
     }
 }

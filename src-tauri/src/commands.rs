@@ -1,6 +1,7 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
+    sync::Mutex,
 };
 
 use mothership_core::{
@@ -133,17 +134,36 @@ pub fn save_adapter_settings(
 /// Runs an adapter's own auth flow (e.g. Codex browser OAuth) on demand, driven
 /// by the "Authorize" button. The adapter owns the flow end-to-end; the host
 /// only spawns it, seeds any stored settings, wires the secret sink so the
-/// resulting token lands in the shared vault, and waits for completion. Blocks
-/// until the adapter acks (the user finishes the browser flow) or errors.
+/// resulting token lands in the shared vault, and waits for completion.
+///
+/// `authenticate` blocks for up to the adapter's timeout (the user finishing the
+/// browser flow), so the real work runs on a blocking thread — this command is
+/// async and must NOT block the UI thread. Cancel / leaving Settings terminate
+/// the spawned process.
 #[tauri::command]
-pub fn authenticate_adapter(
+pub async fn authenticate_adapter(
     state: State<'_, AppState>,
     provider_id: String,
 ) -> Result<ConnectorSettingsSnapshot, String> {
-    let database = state.database();
+    let database = state.database().clone();
+    let auth_processes = state.auth_processes();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        run_authenticate(&database, &auth_processes, &provider_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// The blocking half of [`authenticate_adapter`], run off the UI thread.
+fn run_authenticate(
+    database: &mothership_core::Database,
+    auth_processes: &Mutex<HashMap<String, u32>>,
+    provider_id: &str,
+) -> Result<ConnectorSettingsSnapshot, String> {
     let registry = mothership_adapter_host::AdapterRegistry::scan(&plugins_store_path(database));
     let entry = registry
-        .find(&provider_id)
+        .find(provider_id)
         .ok_or_else(|| format!("unknown adapter: {provider_id}"))?;
 
     let vault = FileCredentialVault::new(auth_store_path(database));
@@ -151,7 +171,7 @@ pub fn authenticate_adapter(
         mothership_adapter_host::Adapter::spawn(&entry.program).map_err(|e| e.to_string())?;
 
     let sink_vault = vault.clone();
-    let sink_provider = provider_id.clone();
+    let sink_provider = provider_id.to_string();
     adapter.set_store_secret_handler(move |values| {
         if let Err(error) = sink_vault.merge_adapter_settings(&sink_provider, values) {
             eprintln!("failed to persist adapter secret for {sink_provider}: {error}");
@@ -160,20 +180,25 @@ pub fn authenticate_adapter(
 
     adapter.initialize().map_err(|e| e.to_string())?;
     let settings = vault
-        .load_adapter_settings(&provider_id)
+        .load_adapter_settings(provider_id)
         .map_err(to_command_error)?;
     if !settings.is_empty() {
         adapter.set_settings(settings).map_err(|e| e.to_string())?;
     }
 
     // Register the process so `cancel_authenticate_adapter` (or leaving Settings)
-    // can terminate this flow. `authenticate` blocks until the user finishes the
-    // browser flow, cancels, or the adapter's own timeout fires.
-    state.set_auth_process(&provider_id, adapter.process_id());
+    // can terminate this flow.
+    if let Ok(mut map) = auth_processes.lock() {
+        map.insert(provider_id.to_string(), adapter.process_id());
+    }
     let result = adapter.authenticate();
     // If our registration is already gone, a cancel took it and killed us — treat
     // that as a clean (not error) outcome.
-    let cancelled = state.take_auth_process(&provider_id).is_none();
+    let cancelled = auth_processes
+        .lock()
+        .ok()
+        .and_then(|mut map| map.remove(provider_id))
+        .is_none();
     drop(adapter);
 
     match result {
@@ -199,15 +224,16 @@ pub fn cancel_authenticate_adapter(
 
 /// Best-effort terminate a child process by id (a spawned adapter). The host can
 /// always kill an adapter — crash isolation is a core part of the contract.
+/// Fire-and-forget (`spawn`, not `output`) so it never blocks the caller.
 fn kill_process(pid: u32) {
     #[cfg(windows)]
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/F"])
-        .output();
+        .spawn();
     #[cfg(unix)]
     let _ = std::process::Command::new("kill")
         .args(["-9", &pid.to_string()])
-        .output();
+        .spawn();
 }
 
 /// Logs an adapter out by forgetting its stored credential in the shared vault.
