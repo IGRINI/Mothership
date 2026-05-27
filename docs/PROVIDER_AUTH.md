@@ -252,8 +252,10 @@ Connect/Disconnect UI больше нет. Адаптеры авторизуют
 
 ### Codex (`adapters/codex`)
 
-Полностью самодостаточный. Зависит только от SDK-протокола и сырых крейтов,
-никогда — на `mothership-core`. Auth — ленивый: первый чат без валидного
+Построен на общем SDK (`mothership-adapter-sdk` — stdio-рантайм + транспорты) и
+`mothership-openai-responses` (Responses-формы + фолбэк + парсинг); сам владеет
+только провайдер-спецификой (OAuth, модели, request-wiring). Никогда не зависит
+от `mothership-core`. Async (tokio). Auth — ленивый: первый чат без валидного
 credential открывает браузер для логина.
 
 - provider id: `codex`; auth schema: `oauth_internal`;
@@ -266,10 +268,17 @@ credential открывает браузер для логина.
 - account id извлекается из claims JWT (`chatgpt_account_id`);
 - модели: `GET https://chatgpt.com/backend-api/codex/models?client_version=0.133.0`
   с `Authorization: Bearer` и `ChatGPT-Account-Id`. `get_models` **никогда** не
-  открывает браузер: без credential возвращается пустой список;
-- chat: SSE `POST https://chatgpt.com/backend-api/codex/responses`
-  (`{ model, input, stream:true, store:false }`), парсинг `delta`/
-  `response.completed`;
+  открывает браузер: без credential возвращается пустой список; список кэшируется
+  на 5 минут;
+- chat: **WS-primary → SSE → HTTP-JSON фолбэк** к `…/codex/responses`. Сначала
+  persistent Responses-WebSocket (`wss://`, beta `responses_websockets=2026-02-06`,
+  ленивый коннект, переиспользование между ходами, idle-close, per-process); при
+  до-`committed` сбое — фолбэк на HTTP-SSE, затем нестриминговый HTTP-JSON; после
+  первого токена («committed») сбой не ретраится. **Структурный** парсинг событий
+  по `type` (`response.output_text.delta` → ответ; `response.reasoning_*` → НЕ
+  подмешивается в ответ; `response.completed`/`failed`). Idle-таймауты на чтении
+  (SSE 45 c, WS-кадр 20 c). Дефолтный system prompt — богатый (если кор не прислал
+  свой);
 - credential **не** хранится рядом с адаптером: host пушит его через
   `set_settings` под ключом `credential`, а адаптер возвращает выпущенный/
   обновлённый токен через `StoreSecret` в общий vault.
