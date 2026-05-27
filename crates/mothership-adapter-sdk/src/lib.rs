@@ -17,6 +17,7 @@
 
 pub use mothership_adapter_protocol as protocol;
 
+pub mod http;
 pub mod sse;
 pub mod ws;
 
@@ -61,8 +62,10 @@ pub trait ProviderAdapter: Send {
         Ok(())
     }
 
-    /// The models this provider offers and how its list is managed.
-    async fn models(&mut self) -> Result<(ModelManagement, Vec<Model>)> {
+    /// The models this provider offers and how its list is managed. `ctx` lets
+    /// the adapter persist a credential it refreshed while fetching the list.
+    async fn models(&mut self, ctx: &Context) -> Result<(ModelManagement, Vec<Model>)> {
+        let _ = ctx;
         Ok((ModelManagement::Fixed, Vec::new()))
     }
 
@@ -238,7 +241,7 @@ async fn dispatch<A: ProviderAdapter>(
             Ok(()) => send(outbox, Outbound::Ack { id }),
             Err(error) => send_error(outbox, id, error),
         },
-        Request::GetModels { id } => match adapter.models().await {
+        Request::GetModels { id } => match adapter.models(ctx).await {
             Ok((management, models)) => send(
                 outbox,
                 Outbound::Models {

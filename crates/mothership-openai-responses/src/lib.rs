@@ -80,9 +80,9 @@ impl Endpoint {
 /// Run one chat turn against a Responses backend, trying WebSocket first (when a
 /// session slot is provided and enabled), then SSE, then non-streaming JSON.
 ///
-/// `ws` is the caller's persistent session slot: `Some(slot)` enables the WS
-/// tier (the slot is lazily connected and reused across turns); `None` disables
-/// it. Returns which transport produced the answer.
+/// `ws` is the caller's persistent session (it owns the slot and the WS-specific
+/// headers): `Some(session)` enables the WS tier (connected lazily, reused across
+/// turns); `None` disables it. Returns which transport produced the answer.
 #[allow(clippy::too_many_arguments)]
 pub async fn chat(
     client: &reqwest::Client,
@@ -91,21 +91,13 @@ pub async fn chat(
     model: &str,
     instructions: &str,
     messages: &[ChatMessage],
-    ws: Option<&mut Option<WsSession>>,
-    on_delta: &mut dyn FnMut(&str),
+    ws: Option<&mut WsSession>,
+    on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> Result<Transport> {
     let mut committed = false;
 
     // 1. WebSocket (primary), when enabled.
-    if let Some(slot) = ws {
-        if slot.is_none() {
-            *slot = Some(WsSession::new(
-                endpoint.wss_url.clone(),
-                auth_headers.to_vec(),
-                WS_SESSION_IDLE,
-            ));
-        }
-        let session = slot.as_mut().expect("ws session present");
+    if let Some(session) = ws {
         match chat_ws(session, model, instructions, messages, &mut committed, on_delta).await {
             Ok(()) => return Ok(Transport::WebSocket),
             Err(error) => {
@@ -140,7 +132,7 @@ async fn chat_ws(
     instructions: &str,
     messages: &[ChatMessage],
     committed: &mut bool,
-    on_delta: &mut dyn FnMut(&str),
+    on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> Result<()> {
     let body = build_request(model, instructions, messages, true);
     session.send_text(body.to_string()).await?;
@@ -178,7 +170,7 @@ async fn chat_sse(
     instructions: &str,
     messages: &[ChatMessage],
     committed: &mut bool,
-    on_delta: &mut dyn FnMut(&str),
+    on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> Result<()> {
     let body = build_request(model, instructions, messages, true);
     let response = http::post_stream(client, &endpoint.https_url, auth_headers, &body).await?;
@@ -210,7 +202,7 @@ async fn chat_json(
     model: &str,
     instructions: &str,
     messages: &[ChatMessage],
-    on_delta: &mut dyn FnMut(&str),
+    on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> Result<()> {
     let body = build_request(model, instructions, messages, false);
     let value = http::post_json(

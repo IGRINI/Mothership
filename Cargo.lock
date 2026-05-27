@@ -527,14 +527,17 @@ name = "codex-adapter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "getrandom 0.2.17",
- "mothership-adapter-host",
+ "mothership-adapter-sdk",
+ "mothership-openai-responses",
  "open",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
  "url",
 ]
 
