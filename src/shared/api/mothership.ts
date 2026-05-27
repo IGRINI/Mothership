@@ -151,6 +151,18 @@ export interface ConnectorConnectionSummary {
   updatedAt: string;
 }
 
+export interface AdapterSettingsField {
+  key: string;
+  label: string;
+  kind: "text" | "secret" | "bool";
+  required: boolean;
+}
+
+export interface AdapterSettingsView {
+  fields: AdapterSettingsField[];
+  values: Record<string, string>;
+}
+
 export interface ConnectorProviderSummary {
   id: string;
   label: string;
@@ -160,6 +172,7 @@ export interface ConnectorProviderSummary {
   connections: ConnectorConnectionSummary[];
   models: LlmModel[];
   selectedModelId?: string | null;
+  adapterSettings?: AdapterSettingsView | null;
 }
 
 export interface ConnectorSettingsSnapshot {
@@ -288,6 +301,33 @@ export function setSelectedModel(
   return invoke<ConnectorSettingsSnapshot>("set_selected_model", {
     providerId,
     modelId,
+  });
+}
+
+export function saveAdapterSettings(
+  providerId: string,
+  values: Record<string, string>,
+): Promise<ConnectorSettingsSnapshot> {
+  if (!isTauriRuntime()) {
+    const snapshot = getPreviewConnectorSettings();
+    snapshot.providers = snapshot.providers.map((provider) =>
+      provider.id === providerId && provider.adapterSettings
+        ? {
+            ...provider,
+            adapterSettings: {
+              ...provider.adapterSettings,
+              values: { ...values },
+            },
+          }
+        : provider,
+    );
+    previewConnectorSettings = markSelectedModel(snapshot);
+    return Promise.resolve(copyConnectorSettings(previewConnectorSettings));
+  }
+
+  return invoke<ConnectorSettingsSnapshot>("save_adapter_settings", {
+    providerId,
+    values,
   });
 }
 
@@ -590,6 +630,46 @@ function getPreviewConnectorSettings() {
         models: previewModels,
         selectedModelId: "gpt-5.5",
       },
+      {
+        id: "openrouter",
+        label: "OpenRouter",
+        status: "not_available",
+        settingsSchema: {
+          modelManagement: {
+            kind: "editable_list",
+            title: "Models",
+            description: "Add the OpenRouter models you want to use.",
+            addModelLabel: "Add model",
+          },
+        },
+        authMethods: [],
+        connections: [],
+        models: [],
+        selectedModelId: null,
+        adapterSettings: {
+          fields: [
+            {
+              key: "api_key",
+              label: "OpenRouter API key",
+              kind: "secret",
+              required: true,
+            },
+            {
+              key: "base_url",
+              label: "Base URL (optional)",
+              kind: "text",
+              required: false,
+            },
+            {
+              key: "models",
+              label: "Models (comma-separated)",
+              kind: "text",
+              required: false,
+            },
+          ],
+          values: {},
+        },
+      },
     ],
     selectedModel: {
       providerId: "openai",
@@ -751,6 +831,14 @@ function copyConnectorSettings(
         ...model,
         capabilities: [...model.capabilities],
       })),
+      adapterSettings: provider.adapterSettings
+        ? {
+            fields: provider.adapterSettings.fields.map((field) => ({
+              ...field,
+            })),
+            values: { ...provider.adapterSettings.values },
+          }
+        : provider.adapterSettings,
     })),
   };
 }

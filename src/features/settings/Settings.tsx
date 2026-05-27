@@ -13,12 +13,14 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import {
+  AdapterSettingsView,
   AuthSession,
   ConnectorProviderSummary,
   ConnectorSettingsSnapshot,
   completeProviderAuth,
   disconnectProviderConnection,
   getConnectorSettings,
+  saveAdapterSettings,
   setSelectedModel,
   startProviderOAuthLogin,
 } from "../../shared/api/mothership";
@@ -163,6 +165,20 @@ export function Settings(props: { onBack: () => void }) {
     }
   }
 
+  async function saveAdapter(
+    providerId: string,
+    values: Record<string, string>,
+  ) {
+    setError("");
+
+    try {
+      setSettings(await saveAdapterSettings(providerId, values));
+      setStatus("Adapter settings saved.");
+    } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    }
+  }
+
   async function pollUntilConnected(providerId: string) {
     const deadline = Date.now() + 300_000;
 
@@ -243,6 +259,9 @@ export function Settings(props: { onBack: () => void }) {
                     onSelectModel={(modelId) =>
                       void selectModel(provider.id, modelId)
                     }
+                    onSaveSettings={(values) =>
+                      void saveAdapter(provider.id, values)
+                    }
                   />
                 )}
               </For>
@@ -304,6 +323,7 @@ function ConnectorCard(props: {
   onConnect: () => void;
   onDisconnect: (connectionId: string) => void;
   onSelectModel: (modelId: string) => void;
+  onSaveSettings: (values: Record<string, string>) => void;
   provider: ConnectorProviderSummary;
   selectedModelId?: string;
 }) {
@@ -420,7 +440,78 @@ function ConnectorCard(props: {
           </For>
         </div>
       </div>
+
+      <Show when={props.provider.adapterSettings}>
+        {(settings) => (
+          <AdapterSettingsForm
+            view={settings()}
+            onSave={props.onSaveSettings}
+          />
+        )}
+      </Show>
     </article>
+  );
+}
+
+function AdapterSettingsForm(props: {
+  view: AdapterSettingsView;
+  onSave: (values: Record<string, string>) => void;
+}) {
+  const [values, setValues] = createSignal<Record<string, string>>({
+    ...props.view.values,
+  });
+  const setField = (key: string, value: string) =>
+    setValues((current) => ({ ...current, [key]: value }));
+
+  return (
+    <div class="connector-card__block">
+      <h4>Settings</h4>
+      <div class="adapter-settings">
+        <For
+          each={props.view.fields}
+          fallback={<p class="muted-line">No settings.</p>}
+        >
+          {(field) => (
+            <label class="adapter-setting">
+              <span>
+                {field.label}
+                {field.required ? " *" : ""}
+              </span>
+              <Show
+                when={field.kind === "bool"}
+                fallback={
+                  <input
+                    type={field.kind === "secret" ? "password" : "text"}
+                    value={values()[field.key] ?? ""}
+                    onInput={(event) =>
+                      setField(field.key, event.currentTarget.value)
+                    }
+                  />
+                }
+              >
+                <input
+                  type="checkbox"
+                  checked={values()[field.key] === "true"}
+                  onChange={(event) =>
+                    setField(
+                      field.key,
+                      event.currentTarget.checked ? "true" : "false",
+                    )
+                  }
+                />
+              </Show>
+            </label>
+          )}
+        </For>
+        <button
+          class="settings-primary-button"
+          type="button"
+          onClick={() => props.onSave(values())}
+        >
+          Save settings
+        </button>
+      </div>
+    </div>
   );
 }
 

@@ -122,6 +122,22 @@ pub fn set_selected_model(
 }
 
 #[tauri::command]
+pub fn save_adapter_settings(
+    state: State<'_, AppState>,
+    provider_id: String,
+    values: BTreeMap<String, String>,
+) -> Result<ConnectorSettingsSnapshot, String> {
+    let database = state.database();
+    let registry = mothership_adapter_host::AdapterRegistry::scan(&plugins_store_path(database));
+    let entry = registry
+        .find(&provider_id)
+        .ok_or_else(|| format!("unknown adapter: {provider_id}"))?;
+    let json = serde_json::to_string_pretty(&values).map_err(|error| error.to_string())?;
+    std::fs::write(entry.dir.join("settings.json"), json).map_err(|error| error.to_string())?;
+    connector_settings_snapshot(database).map_err(to_command_error)
+}
+
+#[tauri::command]
 pub fn start_provider_auth(
     state: State<'_, AppState>,
     provider_id: String,
@@ -279,6 +295,25 @@ struct ConnectorProviderSummary {
     connections: Vec<ConnectorConnectionSummary>,
     models: Vec<mothership_core::LlmModel>,
     selected_model_id: Option<String>,
+    /// Present for subprocess adapters: the settings fields they declare plus
+    /// their current values, so the UI can render and save a config form.
+    adapter_settings: Option<AdapterSettingsView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdapterSettingsView {
+    fields: Vec<AdapterSettingsFieldView>,
+    values: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdapterSettingsFieldView {
+    key: String,
+    label: String,
+    kind: String,
+    required: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -313,9 +348,16 @@ fn connector_settings_snapshot(
     })?;
     let models = available_llm_models_for_connections(database, &providers.1)?;
     let selected_model = database.selected_llm_model()?;
+    let adapter_settings = adapter_settings_views(database);
 
     Ok(ConnectorSettingsSnapshot {
-        providers: connector_providers(providers.0, providers.1, models, &selected_model),
+        providers: connector_providers(
+            providers.0,
+            providers.1,
+            models,
+            &selected_model,
+            &adapter_settings,
+        ),
         selected_model,
     })
 }
@@ -387,6 +429,49 @@ fn adapter_models(
         .collect())
 }
 
+/// Spawns each installed adapter once to read the settings fields it declares,
+/// pairing them with the values currently saved in its settings.json. Used by
+/// the UI to render a per-adapter config form.
+fn adapter_settings_views(
+    database: &mothership_core::Database,
+) -> BTreeMap<String, AdapterSettingsView> {
+    let registry = mothership_adapter_host::AdapterRegistry::scan(&plugins_store_path(database));
+    let mut views = BTreeMap::new();
+    for entry in registry.entries() {
+        if let Some(view) = adapter_settings_view(entry) {
+            views.insert(entry.provider_id.clone(), view);
+        }
+    }
+    views
+}
+
+fn adapter_settings_view(
+    entry: &mothership_adapter_host::AdapterEntry,
+) -> Option<AdapterSettingsView> {
+    use mothership_adapter_host::protocol::SettingsFieldKind;
+
+    let mut adapter = mothership_adapter_host::Adapter::spawn(&entry.program).ok()?;
+    adapter.initialize().ok()?;
+    let fields = adapter.settings_schema().ok()?;
+    Some(AdapterSettingsView {
+        fields: fields
+            .into_iter()
+            .map(|field| AdapterSettingsFieldView {
+                key: field.key,
+                label: field.label,
+                kind: match field.kind {
+                    SettingsFieldKind::Text => "text",
+                    SettingsFieldKind::Secret => "secret",
+                    SettingsFieldKind::Bool => "bool",
+                }
+                .to_string(),
+                required: field.required,
+            })
+            .collect(),
+        values: entry.load_settings(),
+    })
+}
+
 fn plugins_store_path(database: &mothership_core::Database) -> PathBuf {
     database
         .path()
@@ -415,6 +500,7 @@ fn connector_providers(
     connections: Vec<ProviderConnection>,
     models: Vec<mothership_core::LlmModel>,
     selected_model: &mothership_core::SelectedLlmModel,
+    adapter_settings: &BTreeMap<String, AdapterSettingsView>,
 ) -> Vec<ConnectorProviderSummary> {
     let llm_registry = mothership_core::default_llm_registry();
     let mut provider_ids = BTreeSet::new();
@@ -455,6 +541,7 @@ fn connector_providers(
                 .any(|connection| connection.status == "active");
             let selected_model_id = (selected_model.provider_id == provider_id)
                 .then(|| selected_model.model_id.clone());
+            let adapter_settings_view = adapter_settings.get(&provider_id).cloned();
 
             ConnectorProviderSummary {
                 id: provider_id.clone(),
@@ -494,6 +581,7 @@ fn connector_providers(
                 connections: provider_connections,
                 models: provider_models,
                 selected_model_id,
+                adapter_settings: adapter_settings_view,
             }
         })
         .collect()

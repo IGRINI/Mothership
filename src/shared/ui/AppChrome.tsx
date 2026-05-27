@@ -10,7 +10,21 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-const appWindow = getCurrentWindow();
+// Resolve the Tauri window lazily and only inside the Tauri runtime. Calling
+// getCurrentWindow() at module load reads window.__TAURI_INTERNALS__.metadata,
+// which is undefined in a plain browser and throws — that would block the whole
+// app from mounting, including its intended browser preview mode. Outside Tauri
+// this returns null and the window controls become no-ops.
+let cachedAppWindow: ReturnType<typeof getCurrentWindow> | null | undefined;
+function appWindow() {
+  if (cachedAppWindow === undefined) {
+    cachedAppWindow =
+      typeof window !== "undefined" && "__TAURI_INTERNALS__" in window
+        ? getCurrentWindow()
+        : null;
+  }
+  return cachedAppWindow;
+}
 const isMac = /Mac/i.test(navigator.platform);
 const openFindEvent = "mothership-open-find";
 
@@ -103,7 +117,7 @@ function WindowResizeHandle(props: WindowResizeHandleProps) {
 
     event.preventDefault();
     event.stopPropagation();
-    void appWindow.startResizeDragging(props.direction);
+    void appWindow()?.startResizeDragging(props.direction);
   };
 
   return (
@@ -355,11 +369,11 @@ function TitleBar() {
     }
 
     if (event.detail === 2) {
-      void appWindow.toggleMaximize();
+      void appWindow()?.toggleMaximize();
       return;
     }
 
-    void appWindow.startDragging();
+    void appWindow()?.startDragging();
   };
 
   return (
@@ -397,21 +411,21 @@ function MacTrafficControls() {
         type="button"
         title="Close"
         aria-label="Close"
-        onClick={() => void appWindow.close()}
+        onClick={() => void appWindow()?.close()}
       />
       <button
         class="traffic-button traffic-button--minimize"
         type="button"
         title="Minimize"
         aria-label="Minimize"
-        onClick={() => void appWindow.minimize()}
+        onClick={() => void appWindow()?.minimize()}
       />
       <button
         class="traffic-button traffic-button--maximize"
         type="button"
         title="Maximize"
         aria-label="Maximize"
-        onClick={() => void appWindow.toggleMaximize()}
+        onClick={() => void appWindow()?.toggleMaximize()}
       />
     </div>
   );
@@ -422,20 +436,20 @@ function WindowControls() {
     <div class="window-controls" aria-label="Window controls">
       <WindowControlButton
         label="Minimize"
-        onClick={() => appWindow.minimize()}
+        onClick={() => void appWindow()?.minimize()}
       >
         <Minus size={15} />
       </WindowControlButton>
       <WindowControlButton
         label="Maximize"
-        onClick={() => appWindow.toggleMaximize()}
+        onClick={() => void appWindow()?.toggleMaximize()}
       >
         <Square size={13} />
       </WindowControlButton>
       <WindowControlButton
         label="Close"
         danger
-        onClick={() => appWindow.close()}
+        onClick={() => void appWindow()?.close()}
       >
         <X size={16} />
       </WindowControlButton>
@@ -447,7 +461,7 @@ interface WindowControlButtonProps {
   children: JSX.Element;
   danger?: boolean;
   label: string;
-  onClick: () => Promise<void>;
+  onClick: () => void;
 }
 
 function WindowControlButton(props: WindowControlButtonProps) {

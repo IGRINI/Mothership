@@ -8,6 +8,17 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [solid()],
 
+  // Scan only the app entry. The repo vendors research projects under
+  // projects-to-research/ whose own index.html files would otherwise be pulled
+  // into Vite's dependency scan (their deps aren't installed here), breaking
+  // `vite`/`tauri dev`.
+  optimizeDeps: {
+    entries: ["index.html"],
+    // Force pre-bundling of CJS deps in the markdown chain so their default
+    // exports interop correctly under Vite's native ESM dev server.
+    include: ["debug", "extend", "solid-markdown", "remark-gfm"],
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

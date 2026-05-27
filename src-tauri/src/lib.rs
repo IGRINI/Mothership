@@ -35,6 +35,7 @@ pub fn run() {
             commands::get_dashboard_snapshot,
             commands::list_chats,
             commands::run_sidecar_status,
+            commands::save_adapter_settings,
             commands::send_chat_message,
             commands::set_selected_model,
             commands::start_provider_auth,
