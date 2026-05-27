@@ -1,7 +1,9 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use mothership_adapter_host::AdapterRegistry;
 
+use crate::adapter_pool::AdapterPool;
 use crate::auth::FileCredentialVault;
 use crate::chat::{ChatRunEvent, ChatRunEventKind, ChatRunEventSink, SendChatMessageResult};
 use crate::llm::{
@@ -21,11 +23,12 @@ const CHAT_CONTEXT_LIMIT: i64 = 80;
 /// forwarded to the injected [`ChatRunEventSink`].
 pub struct ChatRunService<'a> {
     database: &'a Database,
+    pool: Arc<AdapterPool>,
 }
 
 impl<'a> ChatRunService<'a> {
-    pub fn new(database: &'a Database) -> Self {
-        Self { database }
+    pub fn new(database: &'a Database, pool: Arc<AdapterPool>) -> Self {
+        Self { database, pool }
     }
 
     /// Runs the chat completion for `run` to completion, emitting `Started`,
@@ -108,12 +111,7 @@ impl<'a> ChatRunService<'a> {
         // user model list, OAuth tokens, …) live in the app's shared credential
         // vault, keyed by provider, and are pushed to the adapter on spawn.
         let vault = FileCredentialVault::new(auth_store_path(database));
-        SubprocessChatGateway::new(
-            entry.program.clone(),
-            selected_model.provider_id.clone(),
-            vault,
-        )
-        .complete_chat(
+        SubprocessChatGateway::new(Arc::clone(&self.pool), entry.clone(), vault).complete_chat(
             LlmChatCompletionRequest {
                 provider_id: selected_model.provider_id,
                 model_id: selected_model.model_id,
@@ -276,7 +274,7 @@ mod tests {
 
         let run = run_handle(&database);
         let mut sink = CapturingSink::default();
-        ChatRunService::new(&database).run(&run, &mut sink);
+        ChatRunService::new(&database, Arc::new(AdapterPool::new())).run(&run, &mut sink);
 
         assert_eq!(
             sink.kinds(),

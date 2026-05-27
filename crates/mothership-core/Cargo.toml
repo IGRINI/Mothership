@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 mothership-adapter-host = { path = "../mothership-adapter-host" }
+anyhow.workspace = true
 base64.workspace = true
 getrandom.workspace = true
 reqwest.workspace = true

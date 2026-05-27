@@ -22,8 +22,8 @@ use mothership_core::ipc::{
     ClientFrame, CoreEvent, CoreError, CoreRequest, CoreResponse, ServerFrame, PROTOCOL_VERSION,
 };
 use mothership_core::{
-    AuthProcessRegistry, ChatRunEvent, ChatRunEventSink, ChatRunService, ConnectorService, Database,
-    SendChatMessageResult,
+    AdapterPool, AuthProcessRegistry, ChatRunEvent, ChatRunEventSink, ChatRunService,
+    ConnectorService, Database, SendChatMessageResult,
 };
 
 /// Frames queued for the writer thread, which alone owns stdout.
@@ -63,6 +63,9 @@ fn serve() -> anyhow::Result<()> {
 
     // In-flight auth flows live here now (the host no longer tracks adapter PIDs).
     let auth_registry: Arc<AuthProcessRegistry> = Arc::new(AuthProcessRegistry::default());
+    // Resident adapter processes, reused across operations instead of spawning
+    // one per request.
+    let pool = Arc::new(AdapterPool::new());
 
     // Phase 3: serve. Each request runs on its own worker so a slow flow can't
     // stall the reader or sibling requests.
@@ -84,7 +87,10 @@ fn serve() -> anyhow::Result<()> {
                 let database = database.clone();
                 let outbox = outbox.clone();
                 let auth_registry = Arc::clone(&auth_registry);
-                thread::spawn(move || handle_request(id, request, database, outbox, auth_registry));
+                let pool = Arc::clone(&pool);
+                thread::spawn(move || {
+                    handle_request(id, request, database, outbox, auth_registry, pool)
+                });
             }
             ClientFrame::Shutdown => break,
             // Initialize after the handshake is a protocol slip; ignore it.
@@ -142,21 +148,22 @@ fn handle_request(
     database: Database,
     outbox: Outbox,
     auth_registry: Arc<AuthProcessRegistry>,
+    pool: Arc<AdapterPool>,
 ) {
     // Streaming requests answer immediately with the persisted placeholder, then
     // stream the run; handle them before the uniform request/response path.
     if let CoreRequest::SendChatMessage { chat_id, content } = &request {
         let started = database.begin_chat_run(chat_id.as_deref(), content);
-        run_chat_message(id, started, database, outbox);
+        run_chat_message(id, started, database, outbox, pool);
         return;
     }
     if let CoreRequest::RetryChatMessage { chat_id } = &request {
         let started = database.begin_retry_run(chat_id);
-        run_chat_message(id, started, database, outbox);
+        run_chat_message(id, started, database, outbox, pool);
         return;
     }
 
-    let result = compute(request, &database, &auth_registry);
+    let result = compute(request, &database, &auth_registry, &pool);
     let _ = match result {
         Ok(response) => outbox.send(ServerFrame::Response { id, result: response }),
         Err(error) => outbox.send(ServerFrame::Error { id, error }),
@@ -168,6 +175,7 @@ fn compute(
     request: CoreRequest,
     database: &Database,
     auth_registry: &AuthProcessRegistry,
+    pool: &Arc<AdapterPool>,
 ) -> Result<CoreResponse, CoreError> {
     Ok(match request {
         CoreRequest::DashboardSnapshot => CoreResponse::Dashboard(database.snapshot()?),
@@ -183,28 +191,28 @@ fn compute(
             CoreResponse::Chat(database.get_chat(&chat_id, limit.unwrap_or(200))?)
         }
         CoreRequest::ConnectorSettings => {
-            CoreResponse::ConnectorSettings(ConnectorService::new(database).snapshot()?)
+            CoreResponse::ConnectorSettings(ConnectorService::new(database, Arc::clone(pool)).snapshot()?)
         }
         CoreRequest::SetSelectedModel {
             provider_id,
             model_id,
         } => CoreResponse::ConnectorSettings(
-            ConnectorService::new(database).set_selected_model(&provider_id, &model_id)?,
+            ConnectorService::new(database, Arc::clone(pool)).set_selected_model(&provider_id, &model_id)?,
         ),
         CoreRequest::SaveAdapterSettings {
             provider_id,
             values,
         } => CoreResponse::ConnectorSettings(
-            ConnectorService::new(database).save_adapter_settings(&provider_id, values)?,
+            ConnectorService::new(database, Arc::clone(pool)).save_adapter_settings(&provider_id, values)?,
         ),
         CoreRequest::Authenticate { provider_id } => CoreResponse::ConnectorSettings(
-            ConnectorService::new(database).authenticate(&provider_id, auth_registry)?,
+            ConnectorService::new(database, Arc::clone(pool)).authenticate(&provider_id, auth_registry)?,
         ),
         CoreRequest::CancelAuthenticate { provider_id } => CoreResponse::ConnectorSettings(
-            ConnectorService::new(database).cancel_authenticate(&provider_id, auth_registry)?,
+            ConnectorService::new(database, Arc::clone(pool)).cancel_authenticate(&provider_id, auth_registry)?,
         ),
         CoreRequest::Logout { provider_id } => {
-            CoreResponse::ConnectorSettings(ConnectorService::new(database).logout(&provider_id)?)
+            CoreResponse::ConnectorSettings(ConnectorService::new(database, Arc::clone(pool)).logout(&provider_id)?)
         }
         CoreRequest::SidecarStatus => CoreResponse::SidecarStatus(database.sidecar_status()?),
         // Streaming cases handled in `handle_request` before reaching here.
@@ -222,6 +230,7 @@ fn run_chat_message(
     started: mothership_core::Result<SendChatMessageResult>,
     database: Database,
     outbox: Outbox,
+    pool: Arc<AdapterPool>,
 ) {
     match started {
         Ok(started) => {
@@ -230,7 +239,7 @@ fn run_chat_message(
                 result: CoreResponse::ChatMessageStarted(started.clone()),
             });
             let mut sink = ProtocolChatRunSink { outbox };
-            ChatRunService::new(&database).run(&started, &mut sink);
+            ChatRunService::new(&database, pool).run(&started, &mut sink);
         }
         Err(error) => {
             let _ = outbox.send(ServerFrame::Error {

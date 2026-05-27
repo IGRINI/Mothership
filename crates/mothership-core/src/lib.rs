@@ -1,3 +1,4 @@
+pub mod adapter_pool;
 pub mod auth;
 pub mod chat;
 pub mod connectors;
@@ -15,6 +16,7 @@ pub use chat::{
     ChatRunEvent, ChatRunEventKind, ChatRunEventSink, ChatThreadSummary, NoopChatRunEventSink,
     SendChatMessageResult,
 };
+pub use adapter_pool::AdapterPool;
 pub use connectors::{
     AuthProcessRegistry, ConnectorProviderSummary, ConnectorService, ConnectorSettingsSnapshot,
 };

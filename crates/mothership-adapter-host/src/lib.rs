@@ -21,13 +21,17 @@ pub mod protocol;
 
 use protocol::{AuthKind, ChatMessage, Model, ModelManagement, Outbound, Request, SettingsField};
 
+/// Handler the host registers to persist secrets an adapter pushes via the
+/// `StoreSecret` side channel (e.g. a freshly minted/refreshed OAuth token).
+type StoreSecretSink = Box<dyn FnMut(BTreeMap<String, String>) + Send>;
+
 /// A spawned adapter process and the stdio pipes to talk to it.
 pub struct Adapter {
     child: Child,
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
     next_id: u64,
-    store_secret_sink: Option<Box<dyn FnMut(BTreeMap<String, String>) + Send>>,
+    store_secret_sink: Option<StoreSecretSink>,
 }
 
 impl Adapter {

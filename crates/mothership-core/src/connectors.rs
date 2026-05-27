@@ -13,13 +13,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
 use mothership_adapter_host::protocol::{AuthKind, SettingsFieldKind};
 use mothership_adapter_host::{Adapter, AdapterEntry, AdapterRegistry};
 
+use crate::adapter_pool::AdapterPool;
 use crate::auth::FileCredentialVault;
 use crate::llm::{
     ConnectorModelManagementKind, ConnectorModelManagementSchema, ConnectorSettingsSchema, LlmModel,
@@ -94,11 +95,12 @@ struct AdapterInfo {
 /// [`crate::ChatRunService`]; cheap to construct per request.
 pub struct ConnectorService<'a> {
     database: &'a Database,
+    pool: Arc<AdapterPool>,
 }
 
 impl<'a> ConnectorService<'a> {
-    pub fn new(database: &'a Database) -> Self {
-        Self { database }
+    pub fn new(database: &'a Database, pool: Arc<AdapterPool>) -> Self {
+        Self { database, pool }
     }
 
     /// The full Connectors snapshot: every installed adapter's models, settings
@@ -166,18 +168,11 @@ impl<'a> ConnectorService<'a> {
         let vault = self.vault();
         let registry = AdapterRegistry::scan(&self.plugins_dir());
         if let Some(entry) = registry.find(provider_id) {
-            if let Ok(settings) = vault.load_adapter_settings(provider_id) {
-                if !settings.is_empty() {
-                    if let Ok(mut adapter) = Adapter::spawn(&entry.program) {
-                        if adapter.initialize().is_ok() {
-                            // Seed the adapter with the stored credential so it can
-                            // revoke it, then ask it to log out. All best-effort.
-                            let _ = adapter.set_settings(settings);
-                            let _ = adapter.logout();
-                        }
-                    }
-                }
-            }
+            // Best-effort server-side revoke via the (resident) adapter — the pool
+            // seeds it with the stored credential — then drop the resident so it no
+            // longer holds the revoked token.
+            let _ = self.pool.with(entry, &vault, |adapter| adapter.logout());
+            self.pool.evict(provider_id);
         }
         vault.delete_adapter_settings(provider_id)?;
         self.snapshot()
@@ -268,7 +263,7 @@ impl<'a> ConnectorService<'a> {
         let vault = self.vault();
         let mut models = Vec::new();
         for entry in registry.entries() {
-            match adapter_models(entry, &vault) {
+            match adapter_models(&self.pool, entry, &vault) {
                 Ok(list) => models.extend(list),
                 Err(error) => eprintln!("skipping adapter {}: {error}", entry.provider_id),
             }
@@ -282,7 +277,7 @@ impl<'a> ConnectorService<'a> {
         let vault = self.vault();
         let mut infos = BTreeMap::new();
         for entry in registry.entries() {
-            if let Some(info) = adapter_info(entry, &vault) {
+            if let Some(info) = adapter_info(&self.pool, entry, &vault) {
                 infos.insert(entry.provider_id.clone(), info);
             }
         }
@@ -344,20 +339,13 @@ pub fn kill_process(pid: u32) {
 /// for now (a resident registry can come later). Settings (which can drive the
 /// model list, e.g. OpenRouter's user-defined list) come from the shared vault.
 fn adapter_models(
+    pool: &AdapterPool,
     entry: &AdapterEntry,
     vault: &FileCredentialVault,
 ) -> std::result::Result<Vec<LlmModel>, String> {
-    let mut adapter = Adapter::spawn(&entry.program).map_err(|error| error.to_string())?;
-    adapter.initialize().map_err(|error| error.to_string())?;
-    let settings = vault
-        .load_adapter_settings(&entry.provider_id)
+    let (models, _management) = pool
+        .with(entry, vault, |adapter| adapter.models())
         .map_err(|error| error.to_string())?;
-    if !settings.is_empty() {
-        adapter
-            .set_settings(settings)
-            .map_err(|error| error.to_string())?;
-    }
-    let (models, _management) = adapter.models().map_err(|error| error.to_string())?;
     Ok(models
         .into_iter()
         .map(|model| LlmModel {
@@ -373,11 +361,21 @@ fn adapter_models(
         .collect())
 }
 
-fn adapter_info(entry: &AdapterEntry, vault: &FileCredentialVault) -> Option<AdapterInfo> {
-    let mut adapter = Adapter::spawn(&entry.program).ok()?;
-    adapter.initialize().ok()?;
-    let fields = adapter.settings_schema().ok()?;
-    let auth_kind = match adapter.auth_schema().ok()? {
+fn adapter_info(
+    pool: &AdapterPool,
+    entry: &AdapterEntry,
+    vault: &FileCredentialVault,
+) -> Option<AdapterInfo> {
+    // One round-trip over the (resident) adapter reads both its settings form
+    // and its auth scheme.
+    let (fields, auth) = pool
+        .with(entry, vault, |adapter| {
+            let fields = adapter.settings_schema()?;
+            let auth = adapter.auth_schema()?;
+            Ok((fields, auth))
+        })
+        .ok()?;
+    let auth_kind = match auth {
         AuthKind::None => "none",
         AuthKind::ApiKey { .. } => "api_key",
         AuthKind::OauthInternal => "oauth_internal",

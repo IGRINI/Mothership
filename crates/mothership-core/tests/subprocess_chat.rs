@@ -3,13 +3,26 @@
 //! adapter from `mothership-adapter-host`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use mothership_adapter_host::AdapterEntry;
 use mothership_core::auth::FileCredentialVault;
 use mothership_core::{
-    LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest, LlmChatMessage,
-    LlmChatRole, LlmTransportKind, SubprocessChatGateway,
+    AdapterPool, LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest,
+    LlmChatMessage, LlmChatRole, LlmTransportKind, SubprocessChatGateway,
 };
+
+/// Builds a gateway over a fresh single-process pool pointed at the echo adapter.
+fn echo_gateway(path: PathBuf, vault: FileCredentialVault) -> SubprocessChatGateway {
+    let entry = AdapterEntry {
+        provider_id: "echo".to_string(),
+        provider_label: "Echo".to_string(),
+        program: path,
+        icon: None,
+    };
+    SubprocessChatGateway::new(Arc::new(AdapterPool::new()), entry, vault)
+}
 
 /// A `FileCredentialVault` rooted at a unique temp directory, so each test gets
 /// an isolated shared-credential store.
@@ -62,7 +75,7 @@ fn streams_chat_through_subprocess_adapter() {
         return;
     }
 
-    let gateway = SubprocessChatGateway::new(path, "echo", temp_vault("stream"));
+    let gateway = echo_gateway(path, temp_vault("stream"));
     let mut sink = RecordingSink::default();
 
     let full = gateway
@@ -103,7 +116,7 @@ fn pushes_settings_before_streaming() {
     vault
         .save_adapter_settings("echo", &settings)
         .expect("seed adapter settings");
-    let gateway = SubprocessChatGateway::new(path, "echo", vault);
+    let gateway = echo_gateway(path, vault);
     let mut sink = RecordingSink::default();
 
     let full = gateway
