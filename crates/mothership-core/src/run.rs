@@ -243,6 +243,8 @@ mod tests {
             content: String::new(),
             status: ChatMessageStatus::Sending,
             created_at: "0".to_string(),
+            provider_id: None,
+            model_id: None,
         };
         let user_message = ChatMessage {
             id: "chat_message_user_test".to_string(),
@@ -252,6 +254,8 @@ mod tests {
             content: "Hello there".to_string(),
             status: ChatMessageStatus::Complete,
             created_at: "0".to_string(),
+            provider_id: None,
+            model_id: None,
         };
 
         SendChatMessageResult {

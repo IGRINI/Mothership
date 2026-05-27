@@ -260,6 +260,8 @@ impl Database {
             content: content.to_string(),
             status: ChatMessageStatus::Complete,
             created_at: now.clone(),
+            provider_id: None,
+            model_id: None,
         };
         let mut assistant_message = ChatMessage {
             id: generate_id("chat_message")?,
@@ -269,6 +271,9 @@ impl Database {
             content: String::new(),
             status: ChatMessageStatus::Sending,
             created_at: now.clone(),
+            // Attribute the reply to the model that will produce it.
+            provider_id: Some(selected_model.provider_id.clone()),
+            model_id: Some(selected_model.model_id.clone()),
         };
 
         user_message.position = insert_chat_message(&tx, &user_message)?;
@@ -349,13 +354,15 @@ impl Database {
         tx.execute(
             "
             UPDATE chat_messages
-            SET content = '', status = ?2
+            SET content = '', status = ?2, provider_id = ?4, model_id = ?5
             WHERE id = ?1 AND chat_id = ?3
             ",
             params![
                 assistant_message.id,
                 chat_status_to_db(ChatMessageStatus::Sending),
-                chat_id
+                chat_id,
+                selected_model.provider_id,
+                selected_model.model_id
             ],
         )?;
 
@@ -373,9 +380,12 @@ impl Database {
                 ..chat
             },
             user_message,
+            // Re-attribute to the model the retry will actually use.
             assistant_message: ChatMessage {
                 content: String::new(),
                 status: ChatMessageStatus::Sending,
+                provider_id: Some(selected_model.provider_id.clone()),
+                model_id: Some(selected_model.model_id.clone()),
                 ..assistant_message
             },
         })
@@ -706,6 +716,8 @@ fn migrate(connection: &Connection) -> Result<()> {
             content TEXT NOT NULL,
             status TEXT NOT NULL,
             created_at TEXT NOT NULL,
+            provider_id TEXT,
+            model_id TEXT,
             FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
         );
 
@@ -742,6 +754,39 @@ fn migrate(connection: &Connection) -> Result<()> {
         params![5_i64, current_timestamp()],
     )?;
 
+    // Migration 6: per-message model attribution. The CREATE above already has
+    // these columns for fresh databases; ALTER brings existing ones up to date
+    // (guarded, so re-running is a no-op).
+    add_column_if_missing(connection, "chat_messages", "provider_id", "TEXT")?;
+    add_column_if_missing(connection, "chat_messages", "model_id", "TEXT")?;
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+        params![6_i64, current_timestamp()],
+    )?;
+
+    Ok(())
+}
+
+/// Adds a column to a table if it isn't already present. `table` and `column`
+/// are fixed internal identifiers (never user input), so the formatted SQL is
+/// safe. SQLite has no `ADD COLUMN IF NOT EXISTS`, hence the PRAGMA check.
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let present = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(std::result::Result::ok)
+        .any(|name| name == column);
+    if !present {
+        connection.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -874,9 +919,9 @@ fn select_chat_messages(
 ) -> Result<Vec<ChatMessage>> {
     let mut statement = connection.prepare(
         "
-        SELECT id, chat_id, rowid, role, content, status, created_at
+        SELECT id, chat_id, rowid, role, content, status, created_at, provider_id, model_id
         FROM (
-            SELECT rowid, id, chat_id, role, content, status, created_at
+            SELECT rowid, id, chat_id, role, content, status, created_at, provider_id, model_id
             FROM chat_messages
             WHERE chat_id = ?1
             ORDER BY rowid DESC
@@ -895,8 +940,8 @@ fn select_chat_messages(
 fn insert_chat_message(connection: &Connection, message: &ChatMessage) -> Result<i64> {
     connection.execute(
         "
-        INSERT INTO chat_messages (id, chat_id, role, content, status, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        INSERT INTO chat_messages (id, chat_id, role, content, status, created_at, provider_id, model_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         ",
         params![
             message.id,
@@ -904,7 +949,9 @@ fn insert_chat_message(connection: &Connection, message: &ChatMessage) -> Result
             chat_role_to_db(message.role),
             message.content,
             chat_status_to_db(message.status),
-            message.created_at
+            message.created_at,
+            message.provider_id,
+            message.model_id
         ],
     )?;
 
@@ -915,7 +962,7 @@ fn select_chat_message_by_id(connection: &Connection, message_id: &str) -> Resul
     connection
         .query_row(
             "
-            SELECT id, chat_id, rowid, role, content, status, created_at
+            SELECT id, chat_id, rowid, role, content, status, created_at, provider_id, model_id
             FROM chat_messages
             WHERE id = ?1
             ",
@@ -938,7 +985,7 @@ fn select_last_message_by_role(
     connection
         .query_row(
             "
-            SELECT id, chat_id, rowid, role, content, status, created_at
+            SELECT id, chat_id, rowid, role, content, status, created_at, provider_id, model_id
             FROM chat_messages
             WHERE chat_id = ?1 AND role = ?2
             ORDER BY rowid DESC
@@ -1018,6 +1065,8 @@ fn chat_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessag
         content: row.get(4)?,
         status: chat_status_from_db(&status_value)?,
         created_at: row.get(6)?,
+        provider_id: row.get(7)?,
+        model_id: row.get(8)?,
     })
 }
 

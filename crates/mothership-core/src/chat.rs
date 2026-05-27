@@ -21,6 +21,13 @@ pub struct ChatMessage {
     pub content: String,
     pub status: ChatMessageStatus,
     pub created_at: String,
+    /// For assistant messages, the provider/model that produced this reply (so
+    /// the UI can attribute it to the right adapter + model). `None` for user
+    /// messages and for messages written before attribution was recorded.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]

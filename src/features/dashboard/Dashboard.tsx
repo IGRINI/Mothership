@@ -432,6 +432,7 @@ function ConversationPane(props: {
             transport={props.runTransports[message.id]}
             isBusy={props.isSending}
             onRetry={props.onRetry}
+            settings={props.connectorSettings}
           />
         )}
       </VirtualList>
@@ -587,11 +588,14 @@ function MessageRow(props: {
   transport?: string;
   isBusy?: boolean;
   onRetry?: () => void;
+  settings?: ConnectorSettingsSnapshot;
 }) {
   const message = () => props.message;
   const isUser = () => message().role === "user";
   const isFailed = () =>
     message().role === "assistant" && message().status === "failed";
+  const attribution = () =>
+    resolveAttribution(props.settings, message().providerId, message().modelId);
   const body = () =>
     message().content ||
     (message().status === "sending"
@@ -615,12 +619,12 @@ function MessageRow(props: {
           }}
         >
           <Show when={!isUser()}>
-            <Avatar role="assistant" />
+            <Avatar role="assistant" iconUrl={attribution().icon} />
           </Show>
           <div class="message-row__content">
             <Show when={!isUser()}>
               <div class="message-meta">
-                <strong>Mothership</strong>
+                <strong>{attribution().name}</strong>
                 <span>{formatMessageTime(message().createdAt)}</span>
               </div>
             </Show>
@@ -814,14 +818,21 @@ function ProjectRow(props: { project: ProjectItem }) {
   );
 }
 
-function Avatar(props: { role: "assistant" | "user" }) {
+function Avatar(props: { role: "assistant" | "user"; iconUrl?: string | null }) {
   if (props.role === "user") {
     return <div class="avatar avatar--message avatar--user">You</div>;
   }
 
   return (
     <div class="avatar avatar--message avatar--agent">
-      <BrandMark compact />
+      <Show when={props.iconUrl} fallback={<BrandMark compact />}>
+        <img
+          class="avatar__adapter-icon"
+          src={props.iconUrl!}
+          alt=""
+          draggable={false}
+        />
+      </Show>
     </div>
   );
 }
@@ -955,6 +966,25 @@ function unixTimestampToDate(timestamp: string) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Resolves an assistant message's provider/model into a display name + adapter
+ * icon, using the live connector list. Falls back to "Mothership" (and the
+ * built-in logo) for user messages or when the producing adapter is unknown.
+ */
+function resolveAttribution(
+  settings: ConnectorSettingsSnapshot | undefined,
+  providerId?: string | null,
+  modelId?: string | null,
+): { name: string; icon?: string | null } {
+  if (!providerId) {
+    return { name: "Mothership", icon: undefined };
+  }
+  const provider = settings?.providers.find((item) => item.id === providerId);
+  const model = provider?.models.find((item) => item.id === modelId);
+  const name = model?.label ?? modelId ?? provider?.label ?? "Mothership";
+  return { name, icon: provider?.icon ?? undefined };
 }
 
 /**

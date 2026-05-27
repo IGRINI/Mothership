@@ -57,6 +57,10 @@ export interface ChatMessage {
   content: string;
   status: ChatMessageStatus;
   createdAt: string;
+  /** For assistant messages: the provider/model that produced the reply, so the
+   * UI can show the adapter icon + model name. Null for user messages. */
+  providerId?: string | null;
+  modelId?: string | null;
 }
 
 export interface ChatConversation {
@@ -496,6 +500,8 @@ function sendPreviewChatMessage(
       "Preview mode cannot reach the desktop LLM runtime. Run the Tauri app to test provider-backed chat.",
     status: "complete",
     createdAt: now,
+    providerId: "codex",
+    modelId: "gpt-5.5",
   };
 
   getPreviewMessages(chat.id).push(userMessage, assistantMessage);
