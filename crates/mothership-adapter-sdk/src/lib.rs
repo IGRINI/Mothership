@@ -18,12 +18,19 @@
 pub use mothership_adapter_protocol as protocol;
 
 pub mod sse;
+pub mod ws;
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
+
+/// How often the runtime nudges the adapter's [`ProviderAdapter::on_idle`] while
+/// no request is in flight, so it can release idle resources (e.g. close a
+/// WebSocket). The adapter decides the actual idle threshold.
+const IDLE_TICK: Duration = Duration::from_secs(5);
 
 use protocol::{
     AuthKind, ChatMessage, Model, ModelManagement, Outbound, Request, SettingsField,
@@ -80,6 +87,13 @@ pub trait ProviderAdapter: Send {
     async fn logout(&mut self, ctx: &Context) -> Result<()> {
         let _ = ctx;
         Ok(())
+    }
+
+    /// Called periodically by the runtime while no request is in flight. Use it
+    /// to release idle resources — e.g. close a WebSocket that's been quiet — so
+    /// the process stays warm but holds nothing open. Default: no-op.
+    async fn on_idle(&mut self, ctx: &Context) {
+        let _ = ctx;
     }
 }
 
@@ -140,20 +154,39 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
         outbox: outbox.clone(),
     };
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Some(line) = lines.next_line().await? {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let request: Request = match serde_json::from_str(trimmed) {
-            Ok(request) => request,
-            Err(error) => {
-                eprintln!("adapter-sdk: ignoring unparseable request: {error}");
-                continue;
+    // Read stdin on a dedicated task so the main loop can `select!` an idle timer
+    // against requests without ever cancelling a half-read line (`next_line` is
+    // not cancel-safe; channel `recv` is).
+    let (requests_tx, mut requests) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if requests_tx.send(line).is_err() {
+                break;
             }
-        };
-        dispatch(&mut adapter, &ctx, &outbox, request).await;
+        }
+        // Dropping requests_tx on stdin EOF closes the channel below.
+    });
+
+    loop {
+        tokio::select! {
+            line = requests.recv() => {
+                let Some(line) = line else { break }; // stdin closed
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Request>(trimmed) {
+                    Ok(request) => dispatch(&mut adapter, &ctx, &outbox, request).await,
+                    Err(error) => {
+                        eprintln!("adapter-sdk: ignoring unparseable request: {error}");
+                    }
+                }
+            }
+            _ = tokio::time::sleep(IDLE_TICK) => {
+                adapter.on_idle(&ctx).await;
+            }
+        }
     }
 
     drop(outbox);
