@@ -98,11 +98,15 @@ pub enum CoreRequest {
 }
 
 /// Terminal success payloads, one per [`CoreRequest`] shape.
+// Adjacently tagged (`{"ok": "...", "data": ...}`) rather than internally
+// tagged: an internally-tagged enum cannot serialize a newtype variant whose
+// payload is a sequence (e.g. `ChatList(Vec<_>)`) — there's nowhere to put the
+// tag on a JSON array. Adjacent tagging handles every variant shape.
 // These are wire DTOs exchanged at human-interaction rates and consumed once per
 // request; the size spread between variants doesn't justify boxing each payload.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "ok", rename_all = "snake_case")]
+#[serde(tag = "ok", content = "data", rename_all = "snake_case")]
 pub enum CoreResponse {
     Dashboard(DashboardSnapshot),
     ChatList(Vec<ChatThreadSummary>),

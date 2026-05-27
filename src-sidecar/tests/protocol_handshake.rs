@@ -92,7 +92,47 @@ fn sidecar_handshake_and_dashboard_roundtrip() {
         other => panic!("expected Response, got {other:?}"),
     }
 
-    // 6. Clean shutdown on request.
+    // 6. Create a chat, then list chats. `ListChats` returns a sequence payload,
+    // which is the exact shape that must survive serialization end to end
+    // (a regression guard for enum tagging).
+    write_frame(
+        &mut stdin,
+        &ClientFrame::Request {
+            id: 3,
+            request: CoreRequest::CreateChat,
+        },
+    );
+    match read_frame(&mut reader) {
+        ServerFrame::Response { id, result } => {
+            assert_eq!(id, 3);
+            assert!(
+                matches!(result, CoreResponse::Chat(_)),
+                "expected Chat, got {result:?}"
+            );
+        }
+        other => panic!("expected Response, got {other:?}"),
+    }
+    write_frame(
+        &mut stdin,
+        &ClientFrame::Request {
+            id: 4,
+            request: CoreRequest::ListChats { limit: None },
+        },
+    );
+    match read_frame(&mut reader) {
+        ServerFrame::Response { id, result } => {
+            assert_eq!(id, 4);
+            match result {
+                CoreResponse::ChatList(chats) => {
+                    assert_eq!(chats.len(), 1, "the chat we just created should be listed");
+                }
+                other => panic!("expected ChatList, got {other:?}"),
+            }
+        }
+        other => panic!("expected Response, got {other:?}"),
+    }
+
+    // 7. Clean shutdown on request.
     write_frame(&mut stdin, &ClientFrame::Shutdown);
     drop(stdin);
     let _ = child.wait();
