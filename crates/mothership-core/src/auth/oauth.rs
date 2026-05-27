@@ -32,11 +32,6 @@ pub fn pkce_challenge_s256(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest)
 }
 
-pub fn decode_base64_url_json(value: &str) -> Option<serde_json::Value> {
-    let bytes = URL_SAFE_NO_PAD.decode(value).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
 fn generate_pkce_verifier(length: usize) -> Result<String> {
     let mut bytes = vec![0_u8; length];
     fill_random(&mut bytes)?;

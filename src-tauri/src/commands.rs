@@ -9,9 +9,9 @@ use std::{
 
 use mothership_core::{
     auth::{
-        AuthMethod, AuthSession, CompleteAuthRequest, FileCredentialVault, OpenAiCodexOAuthAdapter,
-        ProviderAuthService, ProviderConnection, ProviderConnectionId, ProviderDescriptor,
-        StartAuthRequest, StaticProviderAuthAdapterRegistry,
+        AuthMethod, AuthSession, CompleteAuthRequest, FileCredentialVault, ProviderAuthService,
+        ProviderConnection, ProviderConnectionId, ProviderDescriptor, StartAuthRequest,
+        StaticProviderAuthAdapterRegistry,
     },
     ChatConversation, ChatRunEvent, ChatRunEventSink, ChatRunService, ChatThreadSummary,
     DashboardSnapshot, SendChatMessageResult, SidecarStatus,
@@ -190,12 +190,6 @@ pub fn start_provider_oauth_login(
     provider_id: String,
     auth_method_id: String,
 ) -> Result<AuthSession, String> {
-    if provider_id != OpenAiCodexOAuthAdapter::PROVIDER_ID
-        || auth_method_id != OpenAiCodexOAuthAdapter::AUTH_METHOD_ID
-    {
-        return Err("browser OAuth listener is only implemented for OpenAI Codex".to_string());
-    }
-
     if !state.try_begin_oauth_listener() {
         return Err(
             "OAuth authorization is already in progress. Finish the current browser flow first."
@@ -632,7 +626,7 @@ fn with_auth_service<T>(
     run: impl FnOnce(&ProviderAuthService<'_>) -> mothership_core::Result<T>,
 ) -> mothership_core::Result<T> {
     let vault = FileCredentialVault::new(auth_store_path(database));
-    let registry = StaticProviderAuthAdapterRegistry::with_openai_codex();
+    let registry = StaticProviderAuthAdapterRegistry::with_mock_adapter();
     let service = ProviderAuthService::new(database, &vault, &registry);
     run(&service)
 }
@@ -667,7 +661,7 @@ fn wait_for_oauth_callback(listener: TcpListener, active: &AtomicBool) -> Result
                     .ok_or_else(|| "invalid OAuth callback request".to_string())?;
                 let callback_url = format!(
                     "{}{}",
-                    OpenAiCodexOAuthAdapter::default_redirect_uri(),
+                    "http://localhost:1455/auth/callback",
                     path.strip_prefix("/auth/callback").unwrap_or_default()
                 );
                 let body = oauth_callback_success_page();

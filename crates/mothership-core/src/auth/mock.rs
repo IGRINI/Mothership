@@ -5,8 +5,7 @@ use crate::{MothershipError, Result};
 use super::{
     AdapterAuthCompletion, AdapterStartAuthInput, AdapterStartAuthResult, AuthMethod, AuthMethodId,
     AuthMethodKind, AuthMode, AuthNextAction, AuthSessionStatus, CredentialKind,
-    OpenAiCodexOAuthAdapter, ProviderAuthAdapter, ProviderId, SecretMaterial, SecretPayload,
-    StaticProviderAuthAdapterRegistry,
+    ProviderAuthAdapter, ProviderId, SecretMaterial, SecretPayload, StaticProviderAuthAdapterRegistry,
 };
 
 pub struct MockProviderAuthAdapter;
@@ -103,16 +102,5 @@ impl ProviderAuthAdapter for MockProviderAuthAdapter {
 impl StaticProviderAuthAdapterRegistry {
     pub fn with_mock_adapter() -> Self {
         Self::new(vec![Box::new(MockProviderAuthAdapter)])
-    }
-
-    pub fn with_openai_codex() -> Self {
-        Self::new(vec![Box::new(OpenAiCodexOAuthAdapter::default())])
-    }
-
-    pub fn with_mock_and_openai_codex() -> Self {
-        Self::new(vec![
-            Box::new(MockProviderAuthAdapter),
-            Box::new(OpenAiCodexOAuthAdapter::default()),
-        ])
     }
 }

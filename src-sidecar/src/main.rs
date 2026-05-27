@@ -1,17 +1,10 @@
-use std::{
-    env,
-    io::{BufRead, BufReader, Write},
-    net::TcpListener,
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::{env, path::PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use mothership_core::{
     auth::{
-        CompleteAuthRequest, FileCredentialVault, MockProviderAuthAdapter, OpenAiCodexOAuthAdapter,
-        ProviderAuthService, ProviderConnectionId, StartAuthRequest,
-        StaticProviderAuthAdapterRegistry,
+        CompleteAuthRequest, FileCredentialVault, MockProviderAuthAdapter, ProviderAuthService,
+        ProviderConnectionId, StartAuthRequest, StaticProviderAuthAdapterRegistry,
     },
     Database,
 };
@@ -74,53 +67,6 @@ fn run() -> Result<()> {
                 Ok(())
             })?;
         }
-        Request::AuthOpenAiStart { database_path } => {
-            with_auth_service(database_path, |auth| {
-                let session = auth.start_auth(StartAuthRequest {
-                    provider_id: OpenAiCodexOAuthAdapter::PROVIDER_ID.into(),
-                    auth_method_id: OpenAiCodexOAuthAdapter::AUTH_METHOD_ID.into(),
-                })?;
-                println!("{}", serde_json::to_string(&session)?);
-                Ok(())
-            })?;
-        }
-        Request::AuthOpenAiComplete {
-            database_path,
-            session_id,
-            callback_url,
-        } => {
-            with_auth_service(database_path, |auth| {
-                let connection = auth.complete_auth(CompleteAuthRequest {
-                    session_id: session_id.into(),
-                    payload: json!({ "callbackUrl": callback_url }),
-                })?;
-                println!("{}", serde_json::to_string(&connection)?);
-                Ok(())
-            })?;
-        }
-        Request::AuthOpenAiLogin { database_path } => {
-            with_auth_service(database_path, |auth| {
-                let listener = TcpListener::bind("127.0.0.1:1455")?;
-                listener.set_nonblocking(true)?;
-                let session = auth.start_auth(StartAuthRequest {
-                    provider_id: OpenAiCodexOAuthAdapter::PROVIDER_ID.into(),
-                    auth_method_id: OpenAiCodexOAuthAdapter::AUTH_METHOD_ID.into(),
-                })?;
-                let url = session
-                    .next_action
-                    .authorization_url
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("OpenAI auth session has no authorization URL"))?;
-                eprintln!("Open this URL in your browser:\n{url}\n");
-                let callback_url = wait_for_oauth_callback(&listener)?;
-                let connection = auth.complete_auth(CompleteAuthRequest {
-                    session_id: session.id,
-                    payload: json!({ "callbackUrl": callback_url }),
-                })?;
-                println!("{}", serde_json::to_string(&connection)?);
-                Ok(())
-            })?;
-        }
     }
 
     Ok(())
@@ -143,17 +89,6 @@ enum Request {
     AuthDisconnect {
         database_path: PathBuf,
         connection_id: String,
-    },
-    AuthOpenAiStart {
-        database_path: PathBuf,
-    },
-    AuthOpenAiComplete {
-        database_path: PathBuf,
-        session_id: String,
-        callback_url: String,
-    },
-    AuthOpenAiLogin {
-        database_path: PathBuf,
     },
 }
 
@@ -210,22 +145,6 @@ impl Request {
                     connection_id,
                 })
             }
-            Some("openai-start") => {
-                let database_path = parse_database_path(args)?;
-                Ok(Request::AuthOpenAiStart { database_path })
-            }
-            Some("openai-complete") => {
-                let (database_path, session_id, callback_url) = parse_openai_complete_args(args)?;
-                Ok(Request::AuthOpenAiComplete {
-                    database_path,
-                    session_id,
-                    callback_url,
-                })
-            }
-            Some("openai-login") => {
-                let database_path = parse_database_path(args)?;
-                Ok(Request::AuthOpenAiLogin { database_path })
-            }
             Some(command) => Err(anyhow!("unsupported auth command: {command}")),
             None => Err(anyhow!("missing auth command")),
         }
@@ -238,7 +157,7 @@ fn with_auth_service<T>(
 ) -> Result<T> {
     let database = Database::open(database_path).context("open SQLite database")?;
     let vault = FileCredentialVault::new(auth_store_path(&database));
-    let registry = StaticProviderAuthAdapterRegistry::with_mock_and_openai_codex();
+    let registry = StaticProviderAuthAdapterRegistry::with_mock_adapter();
     let service = ProviderAuthService::new(&database, &vault, &registry);
     run(&service)
 }
@@ -307,37 +226,6 @@ fn parse_disconnect_args(args: impl Iterator<Item = String>) -> Result<(PathBuf,
     Ok((database_path, connection_id))
 }
 
-fn parse_openai_complete_args(
-    args: impl Iterator<Item = String>,
-) -> Result<(PathBuf, String, String)> {
-    let mut database_path = None;
-    let mut session_id = None;
-    let mut callback_url = None;
-
-    parse_named_args(args, |name, value| match name {
-        "--database" => {
-            database_path = Some(PathBuf::from(value));
-            Ok(())
-        }
-        "--session" => {
-            session_id = Some(value);
-            Ok(())
-        }
-        "--callback-url" => {
-            callback_url = Some(value);
-            Ok(())
-        }
-        unknown => Err(anyhow!(
-            "unsupported auth openai-complete argument: {unknown}"
-        )),
-    })?;
-
-    let database_path = database_path.ok_or_else(|| anyhow!("missing --database path"))?;
-    let session_id = session_id.ok_or_else(|| anyhow!("missing --session id"))?;
-    let callback_url = callback_url.ok_or_else(|| anyhow!("missing --callback-url"))?;
-    Ok((database_path, session_id, callback_url))
-}
-
 fn parse_named_args(
     mut args: impl Iterator<Item = String>,
     mut handle: impl FnMut(&str, String) -> Result<()>,
@@ -350,42 +238,4 @@ fn parse_named_args(
     }
 
     Ok(())
-}
-
-fn wait_for_oauth_callback(listener: &TcpListener) -> Result<String> {
-    let deadline = Instant::now() + Duration::from_secs(300);
-
-    loop {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let mut reader = BufReader::new(stream.try_clone()?);
-                let mut request_line = String::new();
-                reader.read_line(&mut request_line)?;
-                let path = request_line
-                    .split_whitespace()
-                    .nth(1)
-                    .ok_or_else(|| anyhow!("invalid OAuth callback request"))?;
-                let callback_url = format!(
-                    "{}{}",
-                    OpenAiCodexOAuthAdapter::default_redirect_uri(),
-                    path.strip_prefix("/auth/callback").unwrap_or_default()
-                );
-                let body = "<!doctype html><title>Mothership</title><p>Authorization received. You can close this window.</p>";
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                )?;
-                return Ok(callback_url);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(anyhow!("OAuth callback timed out"));
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
 }
