@@ -4,6 +4,7 @@ members = [
   "adapters/openrouter",
   "crates/mothership-adapter-host",
   "crates/mothership-adapter-protocol",
+  "crates/mothership-adapter-sdk",
   "crates/mothership-core",
   "crates/process-sandbox",
   "src-sidecar",

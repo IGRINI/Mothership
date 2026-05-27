@@ -1,0 +1,18 @@
+[package]
+name = "mothership-adapter-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Adapter-side SDK: provider authors implement `ProviderAdapter`; the SDK owns
+# the stdio JSON-RPC runtime, framing, dispatch, and the StoreSecret side
+# channel. Transport primitives (HTTP/SSE/WebSocket) + OAuth helpers land here
+# next so adapters stop hand-rolling them. Depends on the protocol contract, not
+# on the host or app core.
+[dependencies]
+mothership-adapter-protocol = { path = "../mothership-adapter-protocol" }
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true }
