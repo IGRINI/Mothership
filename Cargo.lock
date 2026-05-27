@@ -644,9 +644,14 @@ name = "codex-adapter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "getrandom 0.2.17",
  "mothership-adapter-host",
- "mothership-core",
+ "reqwest",
+ "serde",
  "serde_json",
+ "sha2",
+ "url",
 ]
 
 [[package]]
