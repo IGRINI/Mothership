@@ -3,6 +3,7 @@ members = [
   "adapters/codex",
   "adapters/openrouter",
   "crates/mothership-adapter-host",
+  "crates/mothership-adapter-protocol",
   "crates/mothership-core",
   "crates/process-sandbox",
   "src-sidecar",

@@ -17,7 +17,10 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-pub mod protocol;
+// The protocol now lives in its own crate so the adapter SDK can depend on it
+// without pulling in this host runtime. Re-exported as `protocol` so existing
+// `mothership_adapter_host::protocol::*` paths keep working unchanged.
+pub use mothership_adapter_protocol as protocol;
 
 use protocol::{AuthKind, ChatMessage, Model, ModelManagement, Outbound, Request, SettingsField};
 

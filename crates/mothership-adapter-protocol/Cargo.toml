@@ -1,0 +1,10 @@
+[package]
+name = "mothership-adapter-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The wire-protocol types shared by the host runtime, the adapter SDK, and any
+# out-of-tree adapter. Pure data definitions — no transport, no runtime.
+[dependencies]
+serde.workspace = true

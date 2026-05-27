@@ -1,10 +1,15 @@
-//! Wire protocol between the core and an adapter process: newline-delimited JSON.
+//! Wire protocol between the host and an adapter process: newline-delimited JSON.
 //!
 //! The host sends one [`Request`] per line; the adapter replies with one or more
 //! [`Outbound`] messages per line, each echoing the originating request `id`. A
 //! chat request produces a stream of `Delta`s terminated by `Done` (or `Error`).
 //! Every provider — HTTP, WebSocket, or one that spawns an external CLI — speaks
-//! this same contract, so the core never learns how the adapter talks upstream.
+//! this same contract, so the host never learns how the adapter talks upstream.
+//!
+//! This crate is the single source of truth for the contract. It is depended on
+//! by the host runtime (`mothership-adapter-host`), the Rust adapter SDK
+//! (`mothership-adapter-sdk`), and is the documented boundary any out-of-tree /
+//! non-Rust adapter implements.
 
 use std::collections::BTreeMap;
 

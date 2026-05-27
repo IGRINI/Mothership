@@ -2289,8 +2289,16 @@ name = "mothership-adapter-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "mothership-adapter-protocol",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "mothership-adapter-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
