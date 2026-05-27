@@ -1,0 +1,11 @@
+[package]
+name = "codex-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mothership-adapter-host = { path = "../../crates/mothership-adapter-host" }
+mothership-core = { path = "../../crates/mothership-core" }
+serde_json.workspace = true
+anyhow.workspace = true
