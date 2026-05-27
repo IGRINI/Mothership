@@ -90,23 +90,6 @@ export interface ChatRunEvent {
   error?: string | null;
 }
 
-export interface AuthSession {
-  id: string;
-  providerId: string;
-  authMethodId: string;
-  mode: string;
-  status: string;
-  nextAction: {
-    authorizationUrl?: string | null;
-    userCode?: string | null;
-    verificationUri?: string | null;
-    message?: string | null;
-  };
-  expiresAt?: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
 export interface LlmModel {
   providerId: string;
   providerLabel: string;
@@ -133,28 +116,12 @@ export interface SelectedLlmModel {
   updatedAt: string;
 }
 
-export interface ConnectorAuthMethodSummary {
-  id: string;
-  kind: string;
-  label: string;
-  description: string;
-}
-
-export interface ConnectorConnectionSummary {
-  id: string;
-  providerId: string;
-  authMethodId: string;
-  status: string;
-  accountLabel?: string | null;
-  accountEmail?: string | null;
-  expiresAt?: string | null;
-  updatedAt: string;
-}
+export type AdapterSettingsFieldKind = "text" | "secret" | "bool" | "string_list";
 
 export interface AdapterSettingsField {
   key: string;
   label: string;
-  kind: "text" | "secret" | "bool";
+  kind: AdapterSettingsFieldKind;
   required: boolean;
 }
 
@@ -163,15 +130,22 @@ export interface AdapterSettingsView {
   values: Record<string, string>;
 }
 
+export type AdapterAuthKind =
+  | "none"
+  | "api_key"
+  | "oauth_internal"
+  | "external_process";
+
 export interface ConnectorProviderSummary {
   id: string;
   label: string;
-  status: string;
+  /** The adapter's own icon as a data URI, if it ships one. */
+  icon?: string | null;
   settingsSchema: ConnectorSettingsSchema;
-  authMethods: ConnectorAuthMethodSummary[];
-  connections: ConnectorConnectionSummary[];
   models: LlmModel[];
   selectedModelId?: string | null;
+  authKind: AdapterAuthKind;
+  authenticated: boolean;
   adapterSettings?: AdapterSettingsView | null;
 }
 
@@ -331,91 +305,46 @@ export function saveAdapterSettings(
   });
 }
 
-export function startProviderAuth(
+export function authenticateAdapter(
   providerId: string,
-  authMethodId: string,
-): Promise<AuthSession> {
-  if (!isTauriRuntime()) {
-    return Promise.resolve(createPreviewAuthSession(providerId, authMethodId));
-  }
-
-  return invoke<AuthSession>("start_provider_auth", {
-    providerId,
-    authMethodId,
-  });
-}
-
-export function startProviderOAuthLogin(
-  providerId: string,
-  authMethodId: string,
-): Promise<AuthSession> {
-  if (!isTauriRuntime()) {
-    addPreviewConnection(providerId, authMethodId);
-    return Promise.resolve(createPreviewAuthSession(providerId, authMethodId));
-  }
-
-  return invoke<AuthSession>("start_provider_oauth_login", {
-    providerId,
-    authMethodId,
-  });
-}
-
-export function completeProviderAuth(
-  sessionId: string,
-  callbackUrl: string,
 ): Promise<ConnectorSettingsSnapshot> {
   if (!isTauriRuntime()) {
-    const session = previewAuthSessions.get(sessionId);
-    if (session) {
-      addPreviewConnection(session.providerId, session.authMethodId);
-    }
-    return Promise.resolve(
-      copyConnectorSettings(getPreviewConnectorSettings()),
-    );
+    return Promise.resolve(copyConnectorSettings(getPreviewConnectorSettings()));
   }
 
-  return invoke<ConnectorSettingsSnapshot>("complete_provider_auth", {
-    sessionId,
-    callbackUrl,
+  return invoke<ConnectorSettingsSnapshot>("authenticate_adapter", {
+    providerId,
   });
 }
 
-export function disconnectProviderConnection(
-  connectionId: string,
+export function cancelAuthenticateAdapter(
+  providerId: string,
 ): Promise<ConnectorSettingsSnapshot> {
   if (!isTauriRuntime()) {
-    const snapshot = getPreviewConnectorSettings();
-    snapshot.providers = snapshot.providers.map((provider) => ({
-      ...provider,
-      connections: provider.connections.filter(
-        (connection) => connection.id !== connectionId,
-      ),
-      status: provider.connections.some(
-        (connection) => connection.id !== connectionId,
-      )
-        ? "connected"
-        : provider.authMethods.length > 0
-          ? "not_connected"
-          : "not_available",
-    }));
-    previewConnectorSettings = markSelectedModel(snapshot);
-    return Promise.resolve(copyConnectorSettings(previewConnectorSettings));
+    return Promise.resolve(copyConnectorSettings(getPreviewConnectorSettings()));
   }
 
-  return invoke<ConnectorSettingsSnapshot>("disconnect_provider_connection", {
-    connectionId,
+  return invoke<ConnectorSettingsSnapshot>("cancel_authenticate_adapter", {
+    providerId,
   });
+}
+
+export function logoutAdapter(
+  providerId: string,
+): Promise<ConnectorSettingsSnapshot> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve(copyConnectorSettings(getPreviewConnectorSettings()));
+  }
+
+  return invoke<ConnectorSettingsSnapshot>("logout_adapter", { providerId });
 }
 
 let previewSnapshot: DashboardSnapshot | null = null;
 let previewChats: ChatThreadSummary[] | null = null;
 const previewMessages = new Map<string, ChatMessage[]>();
 let previewConnectorSettings: ConnectorSettingsSnapshot | null = null;
-const previewAuthSessions = new Map<string, AuthSession>();
 let previewChatSequence = 0;
 let previewMessageSequence = 0;
-let previewConnectionSequence = 0;
-let previewAuthSessionSequence = 0;
 
 function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -605,35 +534,26 @@ function getPreviewConnectorSettings() {
   previewConnectorSettings ??= markSelectedModel({
     providers: [
       {
-        id: "openai",
-        label: "OpenAI",
-        status: "not_connected",
+        id: "codex",
+        label: "Codex",
         settingsSchema: {
           modelManagement: {
             kind: "remote_catalog",
-            title: "Codex models",
+            title: "Models",
             description:
-              "Models are fetched from the Codex backend and cached locally for a short time.",
+              "Models are fetched from the Codex backend after you authorize.",
             addModelLabel: null,
           },
         },
-        authMethods: [
-          {
-            id: "codex_oauth_browser",
-            kind: "oauth_browser",
-            label: "ChatGPT Plus/Pro via Codex OAuth",
-            description:
-              "Browser OAuth flow compatible with Codex subscription access.",
-          },
-        ],
-        connections: [],
         models: previewModels,
         selectedModelId: "gpt-5.5",
+        authKind: "oauth_internal",
+        authenticated: true,
+        adapterSettings: { fields: [], values: {} },
       },
       {
         id: "openrouter",
         label: "OpenRouter",
-        status: "not_available",
         settingsSchema: {
           modelManagement: {
             kind: "editable_list",
@@ -642,10 +562,10 @@ function getPreviewConnectorSettings() {
             addModelLabel: "Add model",
           },
         },
-        authMethods: [],
-        connections: [],
         models: [],
         selectedModelId: null,
+        authKind: "api_key",
+        authenticated: false,
         adapterSettings: {
           fields: [
             {
@@ -662,8 +582,8 @@ function getPreviewConnectorSettings() {
             },
             {
               key: "models",
-              label: "Models (comma-separated)",
-              kind: "text",
+              label: "Models",
+              kind: "string_list",
               required: false,
             },
           ],
@@ -672,7 +592,7 @@ function getPreviewConnectorSettings() {
       },
     ],
     selectedModel: {
-      providerId: "openai",
+      providerId: "codex",
       modelId: "gpt-5.5",
       updatedAt: currentTimestamp(),
     },
@@ -747,57 +667,6 @@ const previewModels: LlmModel[] = [
   },
 ];
 
-function createPreviewAuthSession(
-  providerId: string,
-  authMethodId: string,
-): AuthSession {
-  const now = currentTimestamp();
-  const session: AuthSession = {
-    id: `preview-auth-session-${++previewAuthSessionSequence}`,
-    providerId,
-    authMethodId,
-    mode: "browser",
-    status: "pending",
-    nextAction: {
-      authorizationUrl: "https://auth.openai.com/oauth/authorize",
-      message: "Preview auth session.",
-    },
-    expiresAt: null,
-    createdAt: now,
-    updatedAt: now,
-  };
-  previewAuthSessions.set(session.id, session);
-  return session;
-}
-
-function addPreviewConnection(providerId: string, authMethodId: string) {
-  const snapshot = getPreviewConnectorSettings();
-  const now = currentTimestamp();
-  snapshot.providers = snapshot.providers.map((provider) => {
-    if (provider.id !== providerId) {
-      return provider;
-    }
-
-    return {
-      ...provider,
-      status: "connected",
-      connections: [
-        {
-          id: `preview-connection-${++previewConnectionSequence}`,
-          providerId,
-          authMethodId,
-          status: "active",
-          accountLabel: "Preview Account",
-          accountEmail: "preview@example.local",
-          expiresAt: null,
-          updatedAt: now,
-        },
-      ],
-    };
-  });
-  previewConnectorSettings = markSelectedModel(snapshot);
-}
-
 function markSelectedModel(
   snapshot: ConnectorSettingsSnapshot,
 ): ConnectorSettingsSnapshot {
@@ -823,10 +692,6 @@ function copyConnectorSettings(
       settingsSchema: {
         modelManagement: { ...provider.settingsSchema.modelManagement },
       },
-      authMethods: provider.authMethods.map((method) => ({ ...method })),
-      connections: provider.connections.map((connection) => ({
-        ...connection,
-      })),
       models: provider.models.map((model) => ({
         ...model,
         capabilities: [...model.capabilities],

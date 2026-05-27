@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use mothership_adapter_host::AdapterRegistry;
 
+use crate::auth::FileCredentialVault;
 use crate::chat::{ChatRunEvent, ChatRunEventKind, ChatRunEventSink, SendChatMessageResult};
 use crate::llm::{
     LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest, LlmTransportKind,
@@ -104,17 +105,23 @@ impl<'a> ChatRunService<'a> {
             sink,
         };
         // The adapter owns its own system prompt; settings (api key, base url,
-        // user model list, …) are pushed from its settings.json on spawn.
-        SubprocessChatGateway::with_settings(entry.program.clone(), entry.load_settings())
-            .complete_chat(
-                LlmChatCompletionRequest {
-                    provider_id: selected_model.provider_id,
-                    model_id: selected_model.model_id,
-                    system_prompt: String::new(),
-                    messages,
-                },
-                &mut llm_sink,
-            )?;
+        // user model list, OAuth tokens, …) live in the app's shared credential
+        // vault, keyed by provider, and are pushed to the adapter on spawn.
+        let vault = FileCredentialVault::new(auth_store_path(database));
+        SubprocessChatGateway::new(
+            entry.program.clone(),
+            selected_model.provider_id.clone(),
+            vault,
+        )
+        .complete_chat(
+            LlmChatCompletionRequest {
+                provider_id: selected_model.provider_id,
+                model_id: selected_model.model_id,
+                system_prompt: String::new(),
+                messages,
+            },
+            &mut llm_sink,
+        )?;
 
         let event =
             database.complete_chat_run(&run.run_id, &run.chat.id, &run.assistant_message.id)?;
@@ -163,6 +170,17 @@ fn plugins_store_path(database: &Database) -> PathBuf {
         .parent()
         .map(|path| path.join("plugins"))
         .unwrap_or_else(|| PathBuf::from("plugins"))
+}
+
+/// Root of the app's shared credential vault (sibling of the database). Adapter
+/// settings and secrets are stored here, keyed by provider — the same vault the
+/// auth subsystem uses.
+fn auth_store_path(database: &Database) -> PathBuf {
+    database
+        .path()
+        .parent()
+        .map(|path| path.join("auth"))
+        .unwrap_or_else(|| PathBuf::from("auth"))
 }
 
 #[cfg(test)]

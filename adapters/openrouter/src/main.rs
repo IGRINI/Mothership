@@ -2,9 +2,10 @@
 //!
 //! Speaks the Mothership adapter protocol over stdio and the provider's
 //! OpenAI-compatible HTTP API. Its API key and user-defined model list arrive
-//! via `set_settings` (the host pushes them from the adapter's settings.json on
-//! each spawn). Chat is streamed from `/chat/completions` (SSE) back to the host
-//! as deltas — the core never learns it is plain HTTP underneath.
+//! via `set_settings` (the host pushes them from the app's shared credential
+//! vault, keyed by provider, on each spawn). Chat is streamed from
+//! `/chat/completions` (SSE) back to the host as deltas — the core never learns
+//! it is plain HTTP underneath.
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -19,7 +20,8 @@ const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 struct Settings {
     api_key: String,
     base_url: String,
-    /// Comma-separated model ids the user added.
+    /// The user's model-id list. A `string_list` setting, stored as items joined
+    /// by `\n` (the host's list editor); also tolerates commas, just in case.
     models: String,
 }
 
@@ -70,8 +72,8 @@ fn main() -> anyhow::Result<()> {
                         },
                         SettingsField {
                             key: "models".to_string(),
-                            label: "Models (comma-separated)".to_string(),
-                            kind: SettingsFieldKind::Text,
+                            label: "Models".to_string(),
+                            kind: SettingsFieldKind::StringList,
                             required: false,
                         },
                     ],
@@ -98,6 +100,8 @@ fn main() -> anyhow::Result<()> {
                     },
                 },
             )?,
+            // Api-key auth: no interactive flow, just ack.
+            Request::Authenticate { id } => emit(&mut stdout, &Outbound::Ack { id })?,
             Request::GetModels { id } => emit(
                 &mut stdout,
                 &Outbound::Models {
@@ -130,9 +134,10 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// User model list: "a, b, c" -> models, first one recommended.
+/// User model list (one id per line, commas also accepted) -> models, first one
+/// recommended.
 fn parse_models(spec: &str) -> Vec<Model> {
-    spec.split(',')
+    spec.split(['\n', ','])
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .enumerate()

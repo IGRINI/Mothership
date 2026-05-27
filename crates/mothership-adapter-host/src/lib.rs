@@ -27,6 +27,7 @@ pub struct Adapter {
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
     next_id: u64,
+    store_secret_sink: Option<Box<dyn FnMut(BTreeMap<String, String>) + Send>>,
 }
 
 impl Adapter {
@@ -44,7 +45,27 @@ impl Adapter {
             stdin,
             reader: BufReader::new(stdout),
             next_id: 1,
+            store_secret_sink: None,
         })
+    }
+
+    /// Registers a handler invoked whenever the adapter pushes a `StoreSecret`
+    /// side-channel message (e.g. an OAuth token it just obtained or refreshed).
+    /// The host wires this to persist the values in the shared credential vault.
+    /// It is handled transparently inside [`recv`](Self::recv), so it can fire at
+    /// any point during a request/response exchange — including mid-chat.
+    pub fn set_store_secret_handler(
+        &mut self,
+        handler: impl FnMut(BTreeMap<String, String>) + Send + 'static,
+    ) {
+        self.store_secret_sink = Some(Box::new(handler));
+    }
+
+    /// The OS process id of the spawned adapter. Lets the host supervise it
+    /// externally — e.g. cancel a long-running `authenticate` flow by killing
+    /// the process (generic across adapters; nothing provider-specific).
+    pub fn process_id(&self) -> u32 {
+        self.child.id()
     }
 
     fn next_id(&mut self) -> u64 {
@@ -61,12 +82,26 @@ impl Adapter {
         Ok(())
     }
 
+    /// Reads the next protocol message. `StoreSecret` is consumed transparently
+    /// (forwarded to the registered handler) and never surfaces to callers, so
+    /// the adapter can persist credentials at any moment without disturbing the
+    /// request/response flow.
     fn recv(&mut self) -> Result<Outbound> {
-        let mut line = String::new();
-        if self.reader.read_line(&mut line)? == 0 {
-            bail!("adapter closed its output stream");
+        loop {
+            let mut line = String::new();
+            if self.reader.read_line(&mut line)? == 0 {
+                bail!("adapter closed its output stream");
+            }
+            let message: Outbound =
+                serde_json::from_str(line.trim()).context("decode adapter message")?;
+            if let Outbound::StoreSecret { values } = message {
+                if let Some(sink) = self.store_secret_sink.as_mut() {
+                    sink(values);
+                }
+                continue;
+            }
+            return Ok(message);
         }
-        serde_json::from_str(line.trim()).context("decode adapter message")
     }
 
     /// Handshake: confirm the adapter is alive and speaks the protocol.
@@ -138,6 +173,22 @@ impl Adapter {
         }
     }
 
+    /// Asks the adapter to run its own auth flow now (e.g. browser OAuth) and
+    /// returns once it acks completion. The adapter persists any resulting
+    /// credential via `StoreSecret`, which `recv` forwards to the registered
+    /// handler transparently — so wire `set_store_secret_handler` first.
+    pub fn authenticate(&mut self) -> Result<()> {
+        let id = self.next_id();
+        self.send(&Request::Authenticate { id })?;
+        match self.recv()? {
+            Outbound::Ack { id: got } if got == id => Ok(()),
+            Outbound::Error { id: got, message } if got == id => {
+                bail!("adapter authenticate failed: {message}")
+            }
+            other => bail!("unexpected reply to authenticate: {other:?}"),
+        }
+    }
+
     /// Runs a chat turn, invoking `on_delta` for each streamed chunk and
     /// returning the full concatenated text once the adapter signals `Done`.
     pub fn chat(
@@ -180,34 +231,27 @@ impl Drop for Adapter {
 }
 
 /// On-disk adapter manifest: `<plugins-dir>/<name>/adapter.json`. `program` is
-/// the adapter executable, resolved relative to the manifest's folder.
+/// the adapter executable and `icon` an optional image file, both resolved
+/// relative to the manifest's folder.
 #[derive(Debug, Clone, Deserialize)]
 struct ManifestFile {
     provider_id: String,
     provider_label: String,
     program: String,
+    #[serde(default)]
+    icon: Option<String>,
 }
 
-/// A discovered adapter: its identity, the executable that implements it, and
-/// the folder it lives in (where its `settings.json` is read from).
+/// A discovered adapter: its identity, the executable that implements it, and an
+/// optional icon file (the adapter ships its own branding). Settings (including
+/// secrets) live in the app's shared credential vault, keyed by `provider_id`,
+/// not next to the adapter on disk.
 #[derive(Debug, Clone)]
 pub struct AdapterEntry {
     pub provider_id: String,
     pub provider_label: String,
     pub program: PathBuf,
-    pub dir: PathBuf,
-}
-
-impl AdapterEntry {
-    /// Loads `<dir>/settings.json` (a flat `string -> string` map) that the host
-    /// pushes to the adapter on each spawn. A missing or invalid file yields no
-    /// settings. Secrets live here too (YOLO/full-trust mode).
-    pub fn load_settings(&self) -> BTreeMap<String, String> {
-        std::fs::read_to_string(self.dir.join("settings.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
-    }
+    pub icon: Option<PathBuf>,
 }
 
 /// Adapters discovered under a plugins directory, keyed by provider id. Lets the
@@ -236,7 +280,7 @@ impl AdapterRegistry {
                     provider_id: manifest.provider_id,
                     provider_label: manifest.provider_label,
                     program: folder.join(&manifest.program),
-                    dir: folder,
+                    icon: manifest.icon.as_ref().map(|icon| folder.join(icon)),
                 });
             }
         }

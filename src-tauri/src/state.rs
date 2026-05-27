@@ -1,20 +1,22 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
 };
 
 use mothership_core::Database;
 
 pub struct AppState {
     database: Database,
-    oauth_listener_active: Arc<AtomicBool>,
+    /// In-flight `authenticate` flows, by provider id -> adapter process id, so
+    /// the UI can cancel one (or leaving Settings can) by terminating it.
+    auth_processes: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl AppState {
     pub fn new(database: Database) -> Self {
         Self {
             database,
-            oauth_listener_active: Arc::new(AtomicBool::new(false)),
+            auth_processes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -22,17 +24,20 @@ impl AppState {
         &self.database
     }
 
-    pub fn try_begin_oauth_listener(&self) -> bool {
-        self.oauth_listener_active
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+    /// Records the process id of an in-flight `authenticate` for `provider_id`.
+    pub fn set_auth_process(&self, provider_id: &str, pid: u32) {
+        if let Ok(mut map) = self.auth_processes.lock() {
+            map.insert(provider_id.to_string(), pid);
+        }
     }
 
-    pub fn finish_oauth_listener(&self) {
-        self.oauth_listener_active.store(false, Ordering::SeqCst);
-    }
-
-    pub fn oauth_listener_active(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.oauth_listener_active)
+    /// Removes and returns the in-flight `authenticate` pid for `provider_id`.
+    /// Returns `None` if there isn't one (or another caller already took it —
+    /// which is how the authenticate command learns it was cancelled).
+    pub fn take_auth_process(&self, provider_id: &str) -> Option<u32> {
+        self.auth_processes
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(provider_id))
     }
 }

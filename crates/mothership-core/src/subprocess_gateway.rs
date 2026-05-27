@@ -5,12 +5,12 @@
 //! This is how the core chats through any process-based provider — a normal HTTP
 //! adapter or one that drives an external CLI — without knowing which it is.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use mothership_adapter_host::protocol::ChatMessage;
 use mothership_adapter_host::Adapter;
 
+use crate::auth::FileCredentialVault;
 use crate::llm::{
     LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest, LlmChatRole,
     LlmTransportKind,
@@ -20,25 +20,28 @@ use crate::{MothershipError, Result};
 /// Chats with a provider implemented as a subprocess adapter. Each call spawns a
 /// fresh adapter process, runs one turn, and drops it (the process is killed on
 /// drop). Pooling / resident instances can come later if startup cost matters.
+///
+/// Settings — including secrets like API keys and OAuth tokens — live in the
+/// app's shared credential `vault`, keyed by `provider_id`. The host loads them
+/// and pushes them to the adapter via `set_settings` on each spawn, and persists
+/// anything the adapter hands back (an OAuth token it minted/refreshed) into the
+/// same shared vault. Nothing secret is stored next to the adapter on disk.
 pub struct SubprocessChatGateway {
     program: PathBuf,
-    settings: BTreeMap<String, String>,
+    provider_id: String,
+    vault: FileCredentialVault,
 }
 
 impl SubprocessChatGateway {
-    pub fn new(program: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        program: impl Into<PathBuf>,
+        provider_id: impl Into<String>,
+        vault: FileCredentialVault,
+    ) -> Self {
         Self {
             program: program.into(),
-            settings: BTreeMap::new(),
-        }
-    }
-
-    /// Same, but with the settings the host pushes to the adapter (api key, base
-    /// url, user model list, …) right after initialization.
-    pub fn with_settings(program: impl Into<PathBuf>, settings: BTreeMap<String, String>) -> Self {
-        Self {
-            program: program.into(),
-            settings,
+            provider_id: provider_id.into(),
+            vault,
         }
     }
 }
@@ -52,11 +55,30 @@ impl LlmChatCompletionGateway for SubprocessChatGateway {
         let mut adapter = Adapter::spawn(&self.program).map_err(|error| {
             MothershipError::InvalidRequest(format!("failed to start adapter: {error}"))
         })?;
+
+        // Persist anything the adapter pushes back (e.g. an OAuth token it just
+        // minted or refreshed) into the SAME shared vault, merged so the keys it
+        // didn't send survive. Wired before any exchange so it can fire anytime.
+        let vault = self.vault.clone();
+        let provider_id = self.provider_id.clone();
+        adapter.set_store_secret_handler(move |values| {
+            if let Err(error) = vault.merge_adapter_settings(&provider_id, values) {
+                eprintln!("failed to persist adapter secret for {provider_id}: {error}");
+            }
+        });
+
         adapter.initialize().map_err(|error| {
             MothershipError::InvalidRequest(format!("adapter initialize failed: {error}"))
         })?;
-        if !self.settings.is_empty() {
-            adapter.set_settings(self.settings.clone()).map_err(|error| {
+
+        let settings = self
+            .vault
+            .load_adapter_settings(&self.provider_id)
+            .map_err(|error| {
+                MothershipError::InvalidRequest(format!("load adapter settings failed: {error}"))
+            })?;
+        if !settings.is_empty() {
+            adapter.set_settings(settings).map_err(|error| {
                 MothershipError::InvalidRequest(format!("adapter set_settings failed: {error}"))
             })?;
         }

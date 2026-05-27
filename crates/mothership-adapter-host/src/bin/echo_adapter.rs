@@ -4,6 +4,7 @@
 //! adapters do the same dance but call an HTTP/WS/SSE provider or spawn a CLI
 //! (e.g. claude-code) in place of the echo.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 
 use mothership_adapter_host::protocol::{
@@ -68,7 +69,21 @@ fn main() -> anyhow::Result<()> {
                     ],
                 },
             )?,
-            Request::SetSettings { id, .. } => emit(&mut stdout, &Outbound::Ack { id })?,
+            Request::SetSettings { id, values } => {
+                // Test hook for the reverse secret channel: if asked, push a
+                // secret back to the host *before* acking. The host consumes the
+                // `StoreSecret` transparently inside `recv`, so the ack still
+                // lands as the reply to this request.
+                if let Some(secret) = values.get("echo_store_secret") {
+                    emit(
+                        &mut stdout,
+                        &Outbound::StoreSecret {
+                            values: BTreeMap::from([("persisted".to_string(), secret.clone())]),
+                        },
+                    )?;
+                }
+                emit(&mut stdout, &Outbound::Ack { id })?;
+            }
             Request::GetAuthSchema { id } => emit(
                 &mut stdout,
                 &Outbound::AuthSchema {
@@ -78,6 +93,8 @@ fn main() -> anyhow::Result<()> {
                     },
                 },
             )?,
+            // Api-key auth has no interactive flow; just ack.
+            Request::Authenticate { id } => emit(&mut stdout, &Outbound::Ack { id })?,
             Request::ChatStart { id, messages, .. } => {
                 let last = messages
                     .last()

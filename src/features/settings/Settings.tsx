@@ -1,74 +1,55 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import {
-  Check,
   ChevronLeft,
   Cpu,
-  ExternalLink,
+  LogIn,
+  LogOut,
   Plug,
+  Plus,
   RefreshCw,
   Shield,
-  Unplug,
+  X,
 } from "lucide-solid";
-import { listen } from "@tauri-apps/api/event";
-import { openUrl } from "@tauri-apps/plugin-opener";
 
 import {
   AdapterSettingsView,
-  AuthSession,
   ConnectorProviderSummary,
   ConnectorSettingsSnapshot,
-  completeProviderAuth,
-  disconnectProviderConnection,
+  authenticateAdapter,
+  cancelAuthenticateAdapter,
   getConnectorSettings,
+  logoutAdapter,
   saveAdapterSettings,
   setSelectedModel,
-  startProviderOAuthLogin,
 } from "../../shared/api/mothership";
 
 export function Settings(props: { onBack: () => void }) {
   const [settings, setSettings] = createSignal<ConnectorSettingsSnapshot>();
-  const [pendingSession, setPendingSession] = createSignal<AuthSession>();
-  const [callbackUrl, setCallbackUrl] = createSignal("");
-  const [connectingProviderId, setConnectingProviderId] =
-    createSignal<string>();
   const [error, setError] = createSignal("");
   const [status, setStatus] = createSignal("");
   const [isLoading, setIsLoading] = createSignal(true);
-
-  let unlistenAuthCompleted: (() => void) | undefined;
-  let unlistenAuthFailed: (() => void) | undefined;
+  const [authorizingId, setAuthorizingId] = createSignal<string>();
 
   onMount(() => {
     void reloadSettings();
-
-    if (!isTauriRuntime()) {
-      return;
-    }
-
-    void listen("connector-auth-completed", () => {
-      setPendingSession(undefined);
-      setConnectingProviderId(undefined);
-      setStatus("Connector authorized.");
-      void reloadSettings();
-    }).then((unlisten) => {
-      unlistenAuthCompleted = unlisten;
-    });
-
-    void listen<string>("connector-auth-failed", (event) => {
-      setPendingSession(undefined);
-      setConnectingProviderId(undefined);
-      setStatus("");
-      setError(event.payload);
-      void reloadSettings();
-    }).then((unlisten) => {
-      unlistenAuthFailed = unlisten;
-    });
   });
 
+  // Leaving Settings while an authorization is in flight cancels it (kills the
+  // adapter process), so an abandoned browser flow doesn't linger.
   onCleanup(() => {
-    unlistenAuthCompleted?.();
-    unlistenAuthFailed?.();
+    const inFlight = authorizingId();
+    if (inFlight) {
+      void cancelAuthenticateAdapter(inFlight);
+    }
   });
+
+  function goBack() {
+    const inFlight = authorizingId();
+    if (inFlight) {
+      void cancelAuthenticateAdapter(inFlight);
+    }
+    props.onBack();
+  }
 
   async function reloadSettings() {
     setIsLoading(true);
@@ -80,77 +61,6 @@ export function Settings(props: { onBack: () => void }) {
       setError(errorMessage(caughtError));
     } finally {
       setIsLoading(false);
-    }
-  }
-
-  async function connect(provider: ConnectorProviderSummary) {
-    if (connectingProviderId() || pendingSession()) {
-      setStatus("Authorization is already in progress.");
-      return;
-    }
-
-    const method = provider.authMethods[0];
-    if (!method) {
-      setError("This connector has no auth method yet.");
-      return;
-    }
-
-    setConnectingProviderId(provider.id);
-    setError("");
-    setStatus("Waiting for browser authorization...");
-
-    try {
-      const session = await startProviderOAuthLogin(provider.id, method.id);
-      setPendingSession(session);
-
-      const authorizationUrl = session.nextAction.authorizationUrl;
-      if (authorizationUrl) {
-        try {
-          await openAuthUrl(authorizationUrl);
-        } catch (caughtError) {
-          setError(
-            `Authorization started, but browser open failed: ${errorMessage(caughtError)}`,
-          );
-        }
-      }
-
-      void pollUntilConnected(provider.id);
-    } catch (caughtError) {
-      setConnectingProviderId(undefined);
-      setStatus("");
-      setError(errorMessage(caughtError));
-    }
-  }
-
-  async function completeManualCallback() {
-    const session = pendingSession();
-    if (!session || !callbackUrl().trim()) {
-      return;
-    }
-
-    setError("");
-    setStatus("Completing authorization...");
-
-    try {
-      setSettings(await completeProviderAuth(session.id, callbackUrl().trim()));
-      setPendingSession(undefined);
-      setConnectingProviderId(undefined);
-      setCallbackUrl("");
-      setStatus("Connector authorized.");
-    } catch (caughtError) {
-      setStatus("");
-      setError(errorMessage(caughtError));
-    }
-  }
-
-  async function disconnect(connectionId: string) {
-    setError("");
-
-    try {
-      setSettings(await disconnectProviderConnection(connectionId));
-      setStatus("Connector disconnected.");
-    } catch (caughtError) {
-      setError(errorMessage(caughtError));
     }
   }
 
@@ -179,41 +89,68 @@ export function Settings(props: { onBack: () => void }) {
     }
   }
 
-  async function pollUntilConnected(providerId: string) {
-    const deadline = Date.now() + 300_000;
-
-    while (Date.now() < deadline) {
-      await delay(1_000);
-      const next = await getConnectorSettings();
-      setSettings(next);
-      const provider = next.providers.find((item) => item.id === providerId);
-      if (
-        provider?.connections.some(
-          (connection) => connection.status === "active",
-        )
-      ) {
-        setStatus("Connector authorized.");
-        setPendingSession(undefined);
-        setConnectingProviderId(undefined);
-        return;
-      }
+  async function authorize(providerId: string) {
+    if (authorizingId()) {
+      return;
     }
+    setError("");
+    setStatus("Authorizing — finish the flow in your browser...");
+    setAuthorizingId(providerId);
 
-    setConnectingProviderId(undefined);
-    setPendingSession(undefined);
-    setStatus("Browser authorization is still pending.");
+    try {
+      const snapshot = await authenticateAdapter(providerId);
+      setSettings(snapshot);
+      // The command returns cleanly whether the flow completed or was cancelled;
+      // the snapshot tells us which.
+      const provider = snapshot.providers.find((item) => item.id === providerId);
+      setStatus(provider?.authenticated ? "Authorized." : "Authorization cancelled.");
+    } catch (caughtError) {
+      setStatus("");
+      setError(errorMessage(caughtError));
+    } finally {
+      setAuthorizingId(undefined);
+    }
+  }
+
+  async function cancelAuthorize(providerId: string) {
+    setError("");
+    setStatus("Cancelling authorization...");
+    try {
+      // Terminates the adapter process; the in-flight authorize() above then
+      // resolves and refreshes the snapshot.
+      await cancelAuthenticateAdapter(providerId);
+    } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    }
+  }
+
+  async function logout(providerId: string) {
+    if (authorizingId()) {
+      return;
+    }
+    setError("");
+    setAuthorizingId(providerId);
+
+    try {
+      setSettings(await logoutAdapter(providerId));
+      setStatus("Logged out.");
+    } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    } finally {
+      setAuthorizingId(undefined);
+    }
   }
 
   return (
     <main class="settings-shell">
       <header class="settings-header" data-tauri-drag-region>
-        <button class="settings-back" type="button" onClick={props.onBack}>
+        <button class="settings-back" type="button" onClick={goBack}>
           <ChevronLeft size={17} />
           Back
         </button>
         <div>
           <h1>Settings</h1>
-          <span>Connectors, authorization, and model routing</span>
+          <span>Connectors and model routing</span>
         </div>
         <button
           class="icon-button icon-button--ghost"
@@ -231,8 +168,8 @@ export function Settings(props: { onBack: () => void }) {
             <div>
               <h2>Connectors</h2>
               <p>
-                Provider auth stays in Core. UI receives only safe connection
-                metadata.
+                Each provider is a runtime-loaded adapter that authorizes
+                itself. Secrets it stores live in the app's shared vault.
               </p>
             </div>
             <span class="settings-pill">
@@ -245,65 +182,39 @@ export function Settings(props: { onBack: () => void }) {
             when={!isLoading()}
             fallback={<div class="settings-empty">Loading settings...</div>}
           >
-            <div class="connector-grid">
-              <For each={settings()?.providers ?? []}>
-                {(provider) => (
-                  <ConnectorCard
-                    isConnecting={connectingProviderId() === provider.id}
-                    provider={provider}
-                    selectedModelId={settings()?.selectedModel.modelId}
-                    onConnect={() => void connect(provider)}
-                    onDisconnect={(connectionId) =>
-                      void disconnect(connectionId)
-                    }
-                    onSelectModel={(modelId) =>
-                      void selectModel(provider.id, modelId)
-                    }
-                    onSaveSettings={(values) =>
-                      void saveAdapter(provider.id, values)
-                    }
-                  />
-                )}
-              </For>
-            </div>
+            <Show
+              when={(settings()?.providers ?? []).length > 0}
+              fallback={
+                <div class="settings-empty">
+                  No connectors installed. Drop an adapter into the app's
+                  plugins folder (or run <code>npm run adapters:install</code>)
+                  and hit Refresh.
+                </div>
+              }
+            >
+              <div class="connector-grid">
+                <For each={settings()?.providers ?? []}>
+                  {(provider) => (
+                    <ConnectorCard
+                      provider={provider}
+                      selectedModelId={settings()?.selectedModel.modelId}
+                      busy={authorizingId() === provider.id}
+                      onAuthorize={() => void authorize(provider.id)}
+                      onCancelAuthorize={() => void cancelAuthorize(provider.id)}
+                      onLogout={() => void logout(provider.id)}
+                      onSelectModel={(modelId) =>
+                        void selectModel(provider.id, modelId)
+                      }
+                      onSaveSettings={(values) =>
+                        void saveAdapter(provider.id, values)
+                      }
+                    />
+                  )}
+                </For>
+              </div>
+            </Show>
           </Show>
         </section>
-
-        <Show when={pendingSession()}>
-          {(session) => (
-            <section class="settings-section settings-section--auth">
-              <div class="settings-section__header">
-                <div>
-                  <h2>OAuth Callback</h2>
-                  <p>
-                    Automatic callback listener is running on 127.0.0.1:1455.
-                  </p>
-                </div>
-                <span class="settings-pill">{session().status}</span>
-              </div>
-              <div class="callback-box">
-                <p>
-                  If the browser cannot return to Mothership automatically,
-                  paste the full callback URL here.
-                </p>
-                <textarea
-                  rows={3}
-                  value={callbackUrl()}
-                  placeholder="http://localhost:1455/auth/callback?code=...&state=..."
-                  onInput={(event) => setCallbackUrl(event.currentTarget.value)}
-                />
-                <button
-                  class="settings-primary-button"
-                  type="button"
-                  disabled={!callbackUrl().trim()}
-                  onClick={() => void completeManualCallback()}
-                >
-                  Complete Authorization
-                </button>
-              </div>
-            </section>
-          )}
-        </Show>
 
         <Show when={error()}>
           <div class="settings-alert settings-alert--error" role="alert">
@@ -319,93 +230,71 @@ export function Settings(props: { onBack: () => void }) {
 }
 
 function ConnectorCard(props: {
-  isConnecting: boolean;
-  onConnect: () => void;
-  onDisconnect: (connectionId: string) => void;
+  busy: boolean;
+  onAuthorize: () => void;
+  onCancelAuthorize: () => void;
+  onLogout: () => void;
   onSelectModel: (modelId: string) => void;
   onSaveSettings: (values: Record<string, string>) => void;
   provider: ConnectorProviderSummary;
   selectedModelId?: string;
 }) {
   const provider = () => props.provider;
-  const activeConnection = () =>
-    provider().connections.find((connection) => connection.status === "active");
+  const needsAuthorize = () =>
+    provider().authKind === "oauth_internal" ||
+    provider().authKind === "external_process";
 
   return (
     <article class="connector-card">
       <div class="connector-card__header">
         <span class="connector-icon">
-          <Plug size={18} />
+          <Show when={provider().icon} fallback={<Plug size={18} />}>
+            {(icon) => (
+              <img src={icon()} alt="" class="connector-icon__img" />
+            )}
+          </Show>
         </span>
         <div>
           <h3>{provider().label}</h3>
-          <span>{connectorStatusLabel(provider().status)}</span>
         </div>
-        <Show
-          when={activeConnection()}
-          fallback={
-            <button
-              class="settings-primary-button"
-              type="button"
-              disabled={
-                provider().authMethods.length === 0 || props.isConnecting
-              }
-              onClick={props.onConnect}
-            >
+        <Show when={needsAuthorize()}>
+          <Show
+            when={props.busy}
+            fallback={
               <Show
-                when={!props.isConnecting}
+                when={provider().authenticated}
                 fallback={
-                  <span class="spinner spinner--inline" aria-hidden="true" />
+                  <button
+                    class="settings-primary-button"
+                    type="button"
+                    onClick={props.onAuthorize}
+                  >
+                    <LogIn size={15} />
+                    Authorize
+                  </button>
                 }
               >
-                <ExternalLink size={15} />
+                <button
+                  class="settings-secondary-button"
+                  type="button"
+                  onClick={props.onLogout}
+                >
+                  <LogOut size={15} />
+                  Log out
+                </button>
               </Show>
-              {props.isConnecting ? "Waiting..." : "Connect"}
-            </button>
-          }
-        >
-          {(connection) => (
+            }
+          >
             <button
               class="settings-secondary-button"
               type="button"
-              onClick={() => props.onDisconnect(connection().id)}
+              onClick={props.onCancelAuthorize}
             >
-              <Unplug size={15} />
-              Disconnect
+              <X size={15} />
+              Cancel
             </button>
-          )}
+          </Show>
         </Show>
-      </div>
-
-      <Show when={activeConnection()}>
-        {(connection) => (
-          <div class="connection-summary">
-            <Check size={15} />
-            <span>
-              <strong>
-                {connection().accountLabel ?? "Connected account"}
-              </strong>
-              <small>
-                {connection().accountEmail ?? connection().authMethodId}
-              </small>
-            </span>
-          </div>
-        )}
-      </Show>
-
-      <div class="connector-card__block">
-        <h4>Auth methods</h4>
-        <For
-          each={provider().authMethods}
-          fallback={<p class="muted-line">No auth adapter implemented yet.</p>}
-        >
-          {(method) => (
-            <div class="auth-method-row">
-              <span>{method.kind}</span>
-              <strong>{method.label}</strong>
-            </div>
-          )}
-        </For>
       </div>
 
       <div class="connector-card__block">
@@ -413,7 +302,13 @@ function ConnectorCard(props: {
         <div class="model-list">
           <For
             each={provider().models}
-            fallback={<p class="muted-line">No models loaded.</p>}
+            fallback={
+              <p class="muted-line">
+                {needsAuthorize()
+                  ? "No models loaded — authorize to fetch them."
+                  : "No models loaded."}
+              </p>
+            }
           >
             {(model) => (
               <label
@@ -443,10 +338,12 @@ function ConnectorCard(props: {
 
       <Show when={props.provider.adapterSettings}>
         {(settings) => (
-          <AdapterSettingsForm
-            view={settings()}
-            onSave={props.onSaveSettings}
-          />
+          <Show when={settings().fields.length > 0}>
+            <AdapterSettingsForm
+              view={settings()}
+              onSave={props.onSaveSettings}
+            />
+          </Show>
         )}
       </Show>
     </article>
@@ -457,91 +354,157 @@ function AdapterSettingsForm(props: {
   view: AdapterSettingsView;
   onSave: (values: Record<string, string>) => void;
 }) {
-  const [values, setValues] = createSignal<Record<string, string>>({
-    ...props.view.values,
-  });
-  const setField = (key: string, value: string) =>
-    setValues((current) => ({ ...current, [key]: value }));
+  // Scalar fields (text/secret/bool) live in one record; list fields are edited
+  // as string arrays and joined with "\n" on save.
+  const scalarInit: Record<string, string> = {};
+  const listInit: Record<string, string[]> = {};
+  for (const field of props.view.fields) {
+    if (field.kind === "string_list") {
+      listInit[field.key] = (props.view.values[field.key] ?? "")
+        .split(/[\n,]/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+    } else {
+      scalarInit[field.key] = props.view.values[field.key] ?? "";
+    }
+  }
+
+  const [scalars, setScalars] = createSignal<Record<string, string>>(scalarInit);
+  const [lists, setLists] = createSignal<Record<string, string[]>>(listInit);
+
+  const setScalar = (key: string, value: string) =>
+    setScalars((current) => ({ ...current, [key]: value }));
+  const setListItem = (key: string, index: number, value: string) =>
+    setLists((current) => {
+      const next = [...(current[key] ?? [])];
+      next[index] = value;
+      return { ...current, [key]: next };
+    });
+  const addListItem = (key: string) =>
+    setLists((current) => ({ ...current, [key]: [...(current[key] ?? []), ""] }));
+  const removeListItem = (key: string, index: number) =>
+    setLists((current) => ({
+      ...current,
+      [key]: (current[key] ?? []).filter((_, i) => i !== index),
+    }));
+
+  function submit() {
+    const out: Record<string, string> = { ...scalars() };
+    for (const field of props.view.fields) {
+      if (field.kind === "string_list") {
+        out[field.key] = (lists()[field.key] ?? [])
+          .map((item) => item.trim())
+          .filter(Boolean)
+          .join("\n");
+      }
+    }
+    props.onSave(out);
+  }
 
   return (
     <div class="connector-card__block">
       <h4>Settings</h4>
       <div class="adapter-settings">
-        <For
-          each={props.view.fields}
-          fallback={<p class="muted-line">No settings.</p>}
-        >
+        <For each={props.view.fields}>
           {(field) => (
-            <label class="adapter-setting">
-              <span>
-                {field.label}
-                {field.required ? " *" : ""}
-              </span>
-              <Show
-                when={field.kind === "bool"}
-                fallback={
-                  <input
-                    type={field.kind === "secret" ? "password" : "text"}
-                    value={values()[field.key] ?? ""}
-                    onInput={(event) =>
-                      setField(field.key, event.currentTarget.value)
-                    }
-                  />
-                }
-              >
-                <input
-                  type="checkbox"
-                  checked={values()[field.key] === "true"}
-                  onChange={(event) =>
-                    setField(
-                      field.key,
-                      event.currentTarget.checked ? "true" : "false",
-                    )
+            <Show
+              when={field.kind === "string_list"}
+              fallback={
+                <Show
+                  when={field.kind === "bool"}
+                  fallback={
+                    <label class="adapter-setting">
+                      <span>
+                        {field.label}
+                        {field.required ? " *" : ""}
+                      </span>
+                      <input
+                        type={field.kind === "secret" ? "password" : "text"}
+                        value={scalars()[field.key] ?? ""}
+                        onInput={(event) =>
+                          setScalar(field.key, event.currentTarget.value)
+                        }
+                      />
+                    </label>
                   }
-                />
-              </Show>
-            </label>
+                >
+                  <label class="adapter-setting adapter-setting--bool">
+                    <input
+                      type="checkbox"
+                      checked={scalars()[field.key] === "true"}
+                      onChange={(event) =>
+                        setScalar(
+                          field.key,
+                          event.currentTarget.checked ? "true" : "false",
+                        )
+                      }
+                    />
+                    <span>
+                      {field.label}
+                      {field.required ? " *" : ""}
+                    </span>
+                  </label>
+                </Show>
+              }
+            >
+              <div class="adapter-setting">
+                <span>
+                  {field.label}
+                  {field.required ? " *" : ""}
+                </span>
+                <div class="adapter-list">
+                  <For
+                    each={lists()[field.key] ?? []}
+                    fallback={<p class="muted-line">None yet.</p>}
+                  >
+                    {(item, index) => (
+                      <div class="adapter-list__row">
+                        <input
+                          type="text"
+                          value={item}
+                          placeholder="provider/model-id"
+                          onInput={(event) =>
+                            setListItem(
+                              field.key,
+                              index(),
+                              event.currentTarget.value,
+                            )
+                          }
+                        />
+                        <button
+                          class="adapter-list__remove"
+                          type="button"
+                          aria-label="Remove"
+                          onClick={() => removeListItem(field.key, index())}
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
+                    )}
+                  </For>
+                  <button
+                    class="adapter-list__add"
+                    type="button"
+                    onClick={() => addListItem(field.key)}
+                  >
+                    <Plus size={14} />
+                    Add model
+                  </button>
+                </div>
+              </div>
+            </Show>
           )}
         </For>
         <button
           class="settings-primary-button"
           type="button"
-          onClick={() => props.onSave(values())}
+          onClick={submit}
         >
           Save settings
         </button>
       </div>
     </div>
   );
-}
-
-async function openAuthUrl(url: string) {
-  if (isTauriRuntime()) {
-    await openUrl(url);
-    return;
-  }
-
-  window.open(url, "_blank", "noopener,noreferrer");
-}
-
-function isTauriRuntime() {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
-
-function connectorStatusLabel(status: string) {
-  if (status === "connected") {
-    return "Connected";
-  }
-
-  if (status === "not_available") {
-    return "Adapter pending";
-  }
-
-  return "Not connected";
-}
-
-function delay(ms: number) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function errorMessage(error: unknown) {

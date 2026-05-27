@@ -1,5 +1,6 @@
 {
   "provider_id": "codex",
   "provider_label": "Codex",
-  "program": "codex-adapter.exe"
+  "program": "codex-adapter.exe",
+  "icon": "icon.svg"
 }

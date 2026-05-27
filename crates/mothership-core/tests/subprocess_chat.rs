@@ -3,11 +3,24 @@
 //! adapter from `mothership-adapter-host`.
 
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use mothership_core::auth::FileCredentialVault;
 use mothership_core::{
     LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest, LlmChatMessage,
     LlmChatRole, LlmTransportKind, SubprocessChatGateway,
 };
+
+/// A `FileCredentialVault` rooted at a unique temp directory, so each test gets
+/// an isolated shared-credential store.
+fn temp_vault(name: &str) -> FileCredentialVault {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("mothership_vault_{name}_{stamp}"));
+    FileCredentialVault::new(root)
+}
 
 #[derive(Default)]
 struct RecordingSink {
@@ -49,7 +62,7 @@ fn streams_chat_through_subprocess_adapter() {
         return;
     }
 
-    let gateway = SubprocessChatGateway::new(path);
+    let gateway = SubprocessChatGateway::new(path, "echo", temp_vault("stream"));
     let mut sink = RecordingSink::default();
 
     let full = gateway
@@ -84,7 +97,13 @@ fn pushes_settings_before_streaming() {
         ("api_key".to_string(), "secret-value".to_string()),
         ("endpoint".to_string(), "https://example".to_string()),
     ]);
-    let gateway = SubprocessChatGateway::with_settings(path, settings);
+    // Seed the shared vault; the gateway loads these and pushes them to the
+    // adapter via set_settings on spawn — secrets never live next to the adapter.
+    let vault = temp_vault("settings");
+    vault
+        .save_adapter_settings("echo", &settings)
+        .expect("seed adapter settings");
+    let gateway = SubprocessChatGateway::new(path, "echo", vault);
     let mut sink = RecordingSink::default();
 
     let full = gateway

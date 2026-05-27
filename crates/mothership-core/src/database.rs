@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -7,12 +6,11 @@ use std::{
 
 use rusqlite::{params, types::Type, Connection, OptionalExtension};
 
-use crate::llm::{LlmModelCatalogCache, LlmModelCatalogRepository};
 use crate::{
     id::generate_id, ActivityEvent, ChatConversation, ChatMessage, ChatMessageRole,
     ChatMessageStatus, ChatRunEvent, ChatRunEventKind, ChatThreadSummary, DashboardMetric,
-    DashboardSnapshot, LlmChatMessage, LlmChatRole, LlmModel, MothershipError, Result,
-    SelectedLlmModel, SendChatMessageResult, SidecarStatus, WorkspaceItem,
+    DashboardSnapshot, LlmChatMessage, LlmChatRole, MothershipError, Result, SelectedLlmModel,
+    SendChatMessageResult, SidecarStatus, WorkspaceItem,
 };
 
 const WORKSPACE_LIMIT: i64 = 2_500;
@@ -529,45 +527,6 @@ impl Database {
         })
     }
 
-    pub fn list_llm_models(&self) -> Result<Vec<LlmModel>> {
-        let connection = self.connect()?;
-        let registry = crate::llm::default_llm_registry();
-        let bundled = registry.list_bundled_models();
-        let provider_ids = bundled
-            .iter()
-            .map(|model| model.provider_id.clone())
-            .collect::<BTreeSet<_>>();
-        let mut models = Vec::with_capacity(bundled.len());
-
-        for provider_id in provider_ids {
-            let model_management = registry
-                .settings_schema(&provider_id)
-                .map(|schema| schema.model_management.kind)
-                .unwrap_or(crate::llm::ConnectorModelManagementKind::FixedCatalog);
-
-            match model_management {
-                crate::llm::ConnectorModelManagementKind::RemoteCatalog => {
-                    if let Some(cache) = select_llm_model_catalog_cache(&connection, &provider_id)?
-                        .filter(|cache| cache.is_fresh() && !cache.models.is_empty())
-                    {
-                        models.extend(cache.models);
-                    }
-                }
-                crate::llm::ConnectorModelManagementKind::FixedCatalog
-                | crate::llm::ConnectorModelManagementKind::EditableList => {
-                    models.extend(
-                        bundled
-                            .iter()
-                            .filter(|model| model.provider_id == provider_id)
-                            .cloned(),
-                    );
-                }
-            }
-        }
-
-        Ok(models)
-    }
-
     pub fn selected_llm_model(&self) -> Result<SelectedLlmModel> {
         let connection = self.connect()?;
         selected_llm_model(&connection)
@@ -631,50 +590,6 @@ impl Database {
     }
 }
 
-impl LlmModelCatalogRepository for Database {
-    fn load_llm_model_catalog_cache(
-        &self,
-        provider_id: &str,
-    ) -> Result<Option<LlmModelCatalogCache>> {
-        validate_identifier("provider_id", provider_id)?;
-
-        let connection = self.connect()?;
-        select_llm_model_catalog_cache(&connection, provider_id)
-    }
-
-    fn save_llm_model_catalog_cache(&self, cache: &LlmModelCatalogCache) -> Result<()> {
-        validate_identifier("provider_id", &cache.provider_id)?;
-
-        let connection = self.connect()?;
-        connection.execute(
-            "
-            INSERT INTO llm_model_catalog_cache (
-                provider_id,
-                models_json,
-                etag,
-                fetched_at,
-                expires_at
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5)
-            ON CONFLICT(provider_id) DO UPDATE SET
-                models_json = excluded.models_json,
-                etag = excluded.etag,
-                fetched_at = excluded.fetched_at,
-                expires_at = excluded.expires_at
-            ",
-            params![
-                cache.provider_id,
-                serde_json::to_string(&cache.models)?,
-                cache.etag.as_deref(),
-                cache.fetched_at,
-                cache.expires_at,
-            ],
-        )?;
-
-        Ok(())
-    }
-}
-
 fn migrate(connection: &Connection) -> Result<()> {
     connection.execute_batch(
         "
@@ -705,59 +620,6 @@ fn migrate(connection: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_activity_events_occurred_at
             ON activity_events (occurred_at DESC);
-
-        CREATE TABLE IF NOT EXISTS auth_sessions (
-            id TEXT PRIMARY KEY,
-            provider_id TEXT NOT NULL,
-            auth_method_id TEXT NOT NULL,
-            mode TEXT NOT NULL,
-            status TEXT NOT NULL,
-            authorization_url TEXT,
-            user_code TEXT,
-            verification_uri TEXT,
-            message TEXT,
-            expires_at TEXT,
-            provider_metadata_json TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_auth_sessions_provider_status
-            ON auth_sessions (provider_id, status);
-
-        CREATE TABLE IF NOT EXISTS provider_connections (
-            id TEXT PRIMARY KEY,
-            provider_id TEXT NOT NULL,
-            auth_method_id TEXT NOT NULL,
-            status TEXT NOT NULL,
-            account_label TEXT,
-            account_email TEXT,
-            scopes_json TEXT NOT NULL,
-            capabilities_json TEXT NOT NULL,
-            credential_record_id TEXT NOT NULL,
-            vault_handle TEXT NOT NULL,
-            expires_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_provider_connections_provider_status
-            ON provider_connections (provider_id, status);
-
-        CREATE TABLE IF NOT EXISTS credential_records (
-            id TEXT PRIMARY KEY,
-            connection_id TEXT NOT NULL,
-            credential_kind TEXT NOT NULL,
-            vault_handle TEXT NOT NULL,
-            expires_at TEXT,
-            fingerprint_hash TEXT,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_credential_records_connection
-            ON credential_records (connection_id);
 
         CREATE TABLE IF NOT EXISTS chats (
             id TEXT PRIMARY KEY,
@@ -790,14 +652,6 @@ fn migrate(connection: &Connection) -> Result<()> {
             provider_id TEXT NOT NULL,
             model_id TEXT NOT NULL,
             updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS llm_model_catalog_cache (
-            provider_id TEXT PRIMARY KEY,
-            models_json TEXT NOT NULL,
-            etag TEXT,
-            fetched_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
         );
         ",
     )?;
@@ -1062,48 +916,6 @@ fn selected_llm_model(connection: &Connection) -> Result<SelectedLlmModel> {
         provider_id: "openai".to_string(),
         model_id: String::new(),
         updated_at: current_timestamp(),
-    }))
-}
-
-fn select_llm_model_catalog_cache(
-    connection: &Connection,
-    provider_id: &str,
-) -> Result<Option<LlmModelCatalogCache>> {
-    let raw = connection
-        .query_row(
-            "
-            SELECT provider_id, models_json, etag, fetched_at, expires_at
-            FROM llm_model_catalog_cache
-            WHERE provider_id = ?1
-            ",
-            params![provider_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            },
-        )
-        .optional()?;
-
-    let Some((provider_id, models_json, etag, fetched_at, expires_at)) = raw else {
-        return Ok(None);
-    };
-
-    let models = match serde_json::from_str(&models_json) {
-        Ok(models) => models,
-        Err(_) => return Ok(None),
-    };
-
-    Ok(Some(LlmModelCatalogCache {
-        provider_id,
-        models,
-        etag,
-        fetched_at,
-        expires_at,
     }))
 }
 
@@ -1380,16 +1192,6 @@ mod tests {
         let restored = reopened.selected_llm_model().expect("selected model");
         assert_eq!(restored.provider_id, "some-adapter");
         assert_eq!(restored.model_id, "some-model");
-
-        let _ = fs::remove_file(database_path);
-    }
-
-    #[test]
-    fn builtin_model_list_is_empty() {
-        let database_path = temp_database_path("remote_catalog_models_are_empty_without_cache");
-        let database = Database::open(database_path.clone()).expect("open database");
-
-        assert!(database.list_llm_models().expect("list models").is_empty());
 
         let _ = fs::remove_file(database_path);
     }

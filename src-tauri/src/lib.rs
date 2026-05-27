@@ -27,19 +27,18 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::append_activity_event,
-            commands::complete_provider_auth,
+            commands::authenticate_adapter,
+            commands::cancel_authenticate_adapter,
             commands::create_chat,
-            commands::disconnect_provider_connection,
             commands::get_chat,
             commands::get_connector_settings,
             commands::get_dashboard_snapshot,
             commands::list_chats,
+            commands::logout_adapter,
             commands::run_sidecar_status,
             commands::save_adapter_settings,
             commands::send_chat_message,
             commands::set_selected_model,
-            commands::start_provider_auth,
-            commands::start_provider_oauth_login,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

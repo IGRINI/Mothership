@@ -57,3 +57,40 @@ fn echo_adapter_round_trip() {
     // Streamed word-by-word, not delivered in one shot.
     assert!(deltas.len() >= 3, "expected streamed deltas, got {deltas:?}");
 }
+
+/// The adapter->host `StoreSecret` side channel: the adapter can push a secret
+/// at any point and the host consumes it transparently inside `recv`, invoking
+/// the registered handler, without disturbing the in-flight request/response.
+#[test]
+fn store_secret_is_forwarded_to_handler() {
+    use std::sync::{Arc, Mutex};
+
+    let exe = env!("CARGO_BIN_EXE_echo_adapter");
+    let mut adapter = Adapter::spawn(Path::new(exe)).expect("spawn echo adapter");
+
+    let captured = Arc::new(Mutex::new(Vec::<BTreeMap<String, String>>::new()));
+    let sink = Arc::clone(&captured);
+    adapter.set_store_secret_handler(move |values| {
+        sink.lock().expect("lock").push(values);
+    });
+
+    adapter.initialize().expect("initialize");
+
+    // The echo adapter emits a `StoreSecret` *before* acking when this key is
+    // present, so the ack still resolves `set_settings` while the secret is
+    // routed to the handler.
+    adapter
+        .set_settings(BTreeMap::from([(
+            "echo_store_secret".to_string(),
+            "token-xyz".to_string(),
+        )]))
+        .expect("set settings");
+
+    let captured = captured.lock().expect("lock");
+    assert_eq!(
+        captured.len(),
+        1,
+        "expected exactly one StoreSecret, got {captured:?}"
+    );
+    assert_eq!(captured[0].get("persisted"), Some(&"token-xyz".to_string()));
+}

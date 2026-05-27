@@ -1,24 +1,11 @@
-mod domain;
-mod mock;
-mod oauth;
-mod ports;
-mod repository;
-mod service;
+//! The app's shared credential store.
+//!
+//! Providers are runtime-loaded subprocess adapters that authorize themselves;
+//! the core owns nothing provider-specific. The one auth-related thing it does
+//! own is a single shared vault where adapter settings and secrets live, keyed
+//! by provider — the host loads them on spawn and adapters push fresh tokens
+//! back into it. See [`FileCredentialVault`].
+
 mod vault;
 
-pub use domain::{
-    AuthMethod, AuthMethodId, AuthMethodKind, AuthMode, AuthNextAction, AuthSession, AuthSessionId,
-    AuthSessionStatus, CompleteAuthRequest, ConnectionStatus, CredentialKind, CredentialRecord,
-    CredentialRecordId, CredentialRef, CredentialStatus, ProviderConnection, ProviderConnectionId,
-    ProviderDescriptor, ProviderId, SecretMaterial, SecretPayload, StartAuthRequest, VaultHandle,
-};
-pub use mock::MockProviderAuthAdapter;
-pub use oauth::{generate_pkce_pair, generate_state, pkce_challenge_s256, PkcePair};
-pub use ports::{
-    AdapterAuthCompletion, AdapterRevokeAuthResult, AdapterStartAuthInput, AdapterStartAuthResult,
-    CompleteAuthAdapterInput, CredentialVault, ProviderAuthAdapter, ProviderAuthAdapterRegistry,
-    ProviderAuthRepository, RevokeAuthAdapterInput, StaticProviderAuthAdapterRegistry,
-    StoreCredentialRequest,
-};
-pub use service::ProviderAuthService;
-pub use vault::{FileCredentialVault, InMemoryCredentialVault};
+pub use vault::FileCredentialVault;

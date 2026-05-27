@@ -1,28 +1,16 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{BufRead, BufReader, Write},
-    net::TcpListener,
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
 };
 
 use mothership_core::{
-    auth::{
-        AuthMethod, AuthSession, CompleteAuthRequest, FileCredentialVault, ProviderAuthService,
-        ProviderConnection, ProviderConnectionId, ProviderDescriptor, StartAuthRequest,
-        StaticProviderAuthAdapterRegistry,
-    },
-    ChatConversation, ChatRunEvent, ChatRunEventSink, ChatRunService, ChatThreadSummary,
-    DashboardSnapshot, SendChatMessageResult, SidecarStatus,
+    auth::FileCredentialVault, ChatConversation, ChatRunEvent, ChatRunEventSink, ChatRunService,
+    ChatThreadSummary, DashboardSnapshot, SendChatMessageResult, SidecarStatus,
 };
 use serde::Serialize;
-use serde_json::json;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::{sidecar, state::AppState};
-
-const OAUTH_LISTENER_CANCELLED: &str = "OAuth listener cancelled";
 
 #[tauri::command]
 pub fn get_dashboard_snapshot(state: State<'_, AppState>) -> Result<DashboardSnapshot, String> {
@@ -129,133 +117,114 @@ pub fn save_adapter_settings(
 ) -> Result<ConnectorSettingsSnapshot, String> {
     let database = state.database();
     let registry = mothership_adapter_host::AdapterRegistry::scan(&plugins_store_path(database));
-    let entry = registry
-        .find(&provider_id)
-        .ok_or_else(|| format!("unknown adapter: {provider_id}"))?;
-    let json = serde_json::to_string_pretty(&values).map_err(|error| error.to_string())?;
-    std::fs::write(entry.dir.join("settings.json"), json).map_err(|error| error.to_string())?;
+    if registry.find(&provider_id).is_none() {
+        return Err(format!("unknown adapter: {provider_id}"));
+    }
+    // Persist into the app's SHARED credential vault, keyed by provider — never
+    // next to the adapter on disk. Merge so secrets the form doesn't carry (e.g.
+    // an OAuth token the adapter stored itself) survive the save.
+    let vault = FileCredentialVault::new(auth_store_path(database));
+    vault
+        .merge_adapter_settings(&provider_id, values)
+        .map_err(to_command_error)?;
     connector_settings_snapshot(database).map_err(to_command_error)
 }
 
+/// Runs an adapter's own auth flow (e.g. Codex browser OAuth) on demand, driven
+/// by the "Authorize" button. The adapter owns the flow end-to-end; the host
+/// only spawns it, seeds any stored settings, wires the secret sink so the
+/// resulting token lands in the shared vault, and waits for completion. Blocks
+/// until the adapter acks (the user finishes the browser flow) or errors.
 #[tauri::command]
-pub fn start_provider_auth(
+pub fn authenticate_adapter(
     state: State<'_, AppState>,
     provider_id: String,
-    auth_method_id: String,
-) -> Result<AuthSession, String> {
-    with_auth_service(state.database(), |auth| {
-        auth.start_auth(StartAuthRequest {
-            provider_id: provider_id.into(),
-            auth_method_id: auth_method_id.into(),
-        })
-    })
-    .map_err(to_command_error)
-}
-
-#[tauri::command]
-pub fn complete_provider_auth(
-    state: State<'_, AppState>,
-    session_id: String,
-    callback_url: String,
 ) -> Result<ConnectorSettingsSnapshot, String> {
-    with_auth_service(state.database(), |auth| {
-        auth.complete_auth(CompleteAuthRequest {
-            session_id: session_id.into(),
-            payload: json!({ "callbackUrl": callback_url }),
-        })
-    })
-    .map_err(to_command_error)?;
+    let database = state.database();
+    let registry = mothership_adapter_host::AdapterRegistry::scan(&plugins_store_path(database));
+    let entry = registry
+        .find(&provider_id)
+        .ok_or_else(|| format!("unknown adapter: {provider_id}"))?;
 
-    state.finish_oauth_listener();
-    connector_settings_snapshot(state.database()).map_err(to_command_error)
-}
+    let vault = FileCredentialVault::new(auth_store_path(database));
+    let mut adapter =
+        mothership_adapter_host::Adapter::spawn(&entry.program).map_err(|e| e.to_string())?;
 
-#[tauri::command]
-pub fn disconnect_provider_connection(
-    state: State<'_, AppState>,
-    connection_id: String,
-) -> Result<ConnectorSettingsSnapshot, String> {
-    with_auth_service(state.database(), |auth| {
-        auth.disconnect(&ProviderConnectionId::from(connection_id))
-    })
-    .map_err(to_command_error)?;
-
-    connector_settings_snapshot(state.database()).map_err(to_command_error)
-}
-
-#[tauri::command]
-pub fn start_provider_oauth_login(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    provider_id: String,
-    auth_method_id: String,
-) -> Result<AuthSession, String> {
-    if !state.try_begin_oauth_listener() {
-        return Err(
-            "OAuth authorization is already in progress. Finish the current browser flow first."
-                .to_string(),
-        );
-    }
-
-    let listener = match TcpListener::bind("127.0.0.1:1455") {
-        Ok(listener) => listener,
-        Err(error) => {
-            state.finish_oauth_listener();
-            return Err(format!("failed to bind OAuth callback listener: {error}"));
+    let sink_vault = vault.clone();
+    let sink_provider = provider_id.clone();
+    adapter.set_store_secret_handler(move |values| {
+        if let Err(error) = sink_vault.merge_adapter_settings(&sink_provider, values) {
+            eprintln!("failed to persist adapter secret for {sink_provider}: {error}");
         }
-    };
-
-    if let Err(error) = listener.set_nonblocking(true) {
-        state.finish_oauth_listener();
-        return Err(format!(
-            "failed to configure OAuth callback listener: {error}"
-        ));
-    }
-
-    let session = match with_auth_service(state.database(), |auth| {
-        auth.start_auth(StartAuthRequest {
-            provider_id: provider_id.into(),
-            auth_method_id: auth_method_id.into(),
-        })
-    }) {
-        Ok(session) => session,
-        Err(error) => {
-            state.finish_oauth_listener();
-            return Err(to_command_error(error));
-        }
-    };
-
-    let database = state.database().clone();
-    let session_id = session.id.clone();
-    let app_handle = app.clone();
-    let listener_active = state.oauth_listener_active();
-    let wait_active = state.oauth_listener_active();
-    std::thread::spawn(move || {
-        let result = wait_for_oauth_callback(listener, &wait_active).and_then(|callback_url| {
-            with_auth_service(&database, |auth| {
-                auth.complete_auth(CompleteAuthRequest {
-                    session_id,
-                    payload: json!({ "callbackUrl": callback_url }),
-                })
-            })
-            .map_err(|error| error.to_string())
-        });
-
-        match result {
-            Ok(connection) => {
-                let _ =
-                    app_handle.emit("connector-auth-completed", connection_summary(&connection));
-            }
-            Err(error) if error == OAUTH_LISTENER_CANCELLED => {}
-            Err(error) => {
-                let _ = app_handle.emit("connector-auth-failed", error);
-            }
-        }
-
-        listener_active.store(false, Ordering::SeqCst);
     });
 
-    Ok(session)
+    adapter.initialize().map_err(|e| e.to_string())?;
+    let settings = vault
+        .load_adapter_settings(&provider_id)
+        .map_err(to_command_error)?;
+    if !settings.is_empty() {
+        adapter.set_settings(settings).map_err(|e| e.to_string())?;
+    }
+
+    // Register the process so `cancel_authenticate_adapter` (or leaving Settings)
+    // can terminate this flow. `authenticate` blocks until the user finishes the
+    // browser flow, cancels, or the adapter's own timeout fires.
+    state.set_auth_process(&provider_id, adapter.process_id());
+    let result = adapter.authenticate();
+    // If our registration is already gone, a cancel took it and killed us — treat
+    // that as a clean (not error) outcome.
+    let cancelled = state.take_auth_process(&provider_id).is_none();
+    drop(adapter);
+
+    match result {
+        Ok(()) => connector_settings_snapshot(database).map_err(to_command_error),
+        Err(_) if cancelled => connector_settings_snapshot(database).map_err(to_command_error),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Cancels an in-flight `authenticate` for `provider_id` by terminating the
+/// adapter process (generic — works for any adapter's auth flow). Used by the
+/// "Cancel" button and when the user leaves Settings mid-authorization.
+#[tauri::command]
+pub fn cancel_authenticate_adapter(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<ConnectorSettingsSnapshot, String> {
+    if let Some(pid) = state.take_auth_process(&provider_id) {
+        kill_process(pid);
+    }
+    connector_settings_snapshot(state.database()).map_err(to_command_error)
+}
+
+/// Best-effort terminate a child process by id (a spawned adapter). The host can
+/// always kill an adapter — crash isolation is a core part of the contract.
+fn kill_process(pid: u32) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .output();
+    #[cfg(unix)]
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output();
+}
+
+/// Logs an adapter out by forgetting its stored credential in the shared vault.
+/// The host owns the credential store, so this is a host-side action — the
+/// adapter re-authenticates from scratch next time. (Remote token revocation,
+/// where a provider supports it, would later be an adapter-driven step.)
+#[tauri::command]
+pub fn logout_adapter(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<ConnectorSettingsSnapshot, String> {
+    let database = state.database();
+    let vault = FileCredentialVault::new(auth_store_path(database));
+    vault
+        .delete_adapter_settings(&provider_id)
+        .map_err(to_command_error)?;
+    connector_settings_snapshot(database).map_err(to_command_error)
 }
 
 #[tauri::command]
@@ -283,12 +252,18 @@ pub struct ConnectorSettingsSnapshot {
 struct ConnectorProviderSummary {
     id: String,
     label: String,
-    status: String,
+    /// The adapter's own icon as a data URI, if it ships one (declared in its
+    /// manifest). The core just renders whatever the plugin provides.
+    icon: Option<String>,
     settings_schema: mothership_core::ConnectorSettingsSchema,
-    auth_methods: Vec<ConnectorAuthMethodSummary>,
-    connections: Vec<ConnectorConnectionSummary>,
     models: Vec<mothership_core::LlmModel>,
     selected_model_id: Option<String>,
+    /// The adapter's auth scheme: `none` / `api_key` / `oauth_internal` /
+    /// `external_process`. Drives whether the UI shows an "Authorize" button.
+    auth_kind: String,
+    /// Whether the adapter currently has a stored credential — toggles the UI
+    /// between "Authorize" and "Log out".
+    authenticated: bool,
     /// Present for subprocess adapters: the settings fields they declare plus
     /// their current values, so the UI can render and save a config form.
     adapter_settings: Option<AdapterSettingsView>,
@@ -310,70 +285,33 @@ struct AdapterSettingsFieldView {
     required: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ConnectorAuthMethodSummary {
-    id: String,
-    kind: String,
-    label: String,
-    description: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ConnectorConnectionSummary {
-    id: String,
-    provider_id: String,
-    auth_method_id: String,
-    status: String,
-    account_label: Option<String>,
-    account_email: Option<String>,
-    expires_at: Option<String>,
-    updated_at: String,
-}
-
 fn connector_settings_snapshot(
     database: &mothership_core::Database,
 ) -> mothership_core::Result<ConnectorSettingsSnapshot> {
-    let providers = with_auth_service(database, |auth| {
-        let providers = auth.list_providers();
-        let connections = auth.list_connections()?;
-        Ok((providers, connections))
-    })?;
-    let models = available_llm_models_for_connections(database, &providers.1)?;
+    let models = available_llm_models(database)?;
     let selected_model = database.selected_llm_model()?;
     let adapter_settings = adapter_settings_views(database);
+    let provider_labels = adapter_provider_labels(database);
+    let provider_icons = adapter_provider_icons(database);
 
     Ok(ConnectorSettingsSnapshot {
         providers: connector_providers(
-            providers.0,
-            providers.1,
             models,
             &selected_model,
             &adapter_settings,
+            &provider_labels,
+            &provider_icons,
         ),
         selected_model,
     })
 }
 
+/// Models available to the UI. Every provider is a runtime-loaded adapter, so
+/// the list is exactly what the installed adapters advertise.
 fn available_llm_models(
     database: &mothership_core::Database,
 ) -> mothership_core::Result<Vec<mothership_core::LlmModel>> {
-    let connections = with_auth_service(database, |auth| auth.list_connections())?;
-    available_llm_models_for_connections(database, &connections)
-}
-
-fn available_llm_models_for_connections(
-    database: &mothership_core::Database,
-    connections: &[ProviderConnection],
-) -> mothership_core::Result<Vec<mothership_core::LlmModel>> {
-    let vault = FileCredentialVault::new(auth_store_path(database));
-    let llm_registry = mothership_core::default_llm_registry();
-    let model_catalog =
-        mothership_core::LlmModelCatalogService::new(database, &vault, &llm_registry);
-    let mut models = model_catalog.list_models(connections)?;
-    models.extend(plugin_models(database));
-    Ok(models)
+    Ok(plugin_models(database))
 }
 
 /// Loads provider-adapter plugins from the app's plugins directory and returns
@@ -382,9 +320,10 @@ fn available_llm_models_for_connections(
 /// plugin must never break the built-in model list.
 fn plugin_models(database: &mothership_core::Database) -> Vec<mothership_core::LlmModel> {
     let registry = mothership_adapter_host::AdapterRegistry::scan(&plugins_store_path(database));
+    let vault = FileCredentialVault::new(auth_store_path(database));
     let mut models = Vec::new();
     for entry in registry.entries() {
-        match adapter_models(entry) {
+        match adapter_models(entry, &vault) {
             Ok(list) => models.extend(list),
             Err(error) => eprintln!("skipping adapter {}: {error}", entry.provider_id),
         }
@@ -394,14 +333,19 @@ fn plugin_models(database: &mothership_core::Database) -> Vec<mothership_core::L
 
 /// Spawns an adapter just long enough to read its advertised models. Each call
 /// starts and drops a child process; model listing is infrequent so this is
-/// fine for now (a resident registry can come later).
+/// fine for now (a resident registry can come later). Settings (which can drive
+/// the model list, e.g. OpenRouter's user-defined list) come from the shared
+/// vault, keyed by provider.
 fn adapter_models(
     entry: &mothership_adapter_host::AdapterEntry,
+    vault: &FileCredentialVault,
 ) -> std::result::Result<Vec<mothership_core::LlmModel>, String> {
     let mut adapter = mothership_adapter_host::Adapter::spawn(&entry.program)
         .map_err(|error| error.to_string())?;
     adapter.initialize().map_err(|error| error.to_string())?;
-    let settings = entry.load_settings();
+    let settings = vault
+        .load_adapter_settings(&entry.provider_id)
+        .map_err(|error| error.to_string())?;
     if !settings.is_empty() {
         adapter
             .set_settings(settings)
@@ -423,17 +367,27 @@ fn adapter_models(
         .collect())
 }
 
-/// Spawns each installed adapter once to read the settings fields it declares,
-/// pairing them with the values currently saved in its settings.json. Used by
-/// the UI to render a per-adapter config form.
+/// Per-adapter UI info gathered from one spawn: the settings form (declared
+/// fields + current values from the vault), the adapter's auth scheme, and
+/// whether it currently has a stored credential (drives Authorize vs Log out).
+struct AdapterInfo {
+    view: AdapterSettingsView,
+    auth_kind: String,
+    authenticated: bool,
+}
+
+/// Spawns each installed adapter once to read the settings fields it declares
+/// (paired with current vault values) and its auth scheme. Used by the UI to
+/// render the per-adapter config form and decide whether to show "Authorize".
 fn adapter_settings_views(
     database: &mothership_core::Database,
-) -> BTreeMap<String, AdapterSettingsView> {
+) -> BTreeMap<String, AdapterInfo> {
     let registry = mothership_adapter_host::AdapterRegistry::scan(&plugins_store_path(database));
+    let vault = FileCredentialVault::new(auth_store_path(database));
     let mut views = BTreeMap::new();
     for entry in registry.entries() {
-        if let Some(view) = adapter_settings_view(entry) {
-            views.insert(entry.provider_id.clone(), view);
+        if let Some(info) = adapter_settings_view(entry, &vault) {
+            views.insert(entry.provider_id.clone(), info);
         }
     }
     views
@@ -441,13 +395,31 @@ fn adapter_settings_views(
 
 fn adapter_settings_view(
     entry: &mothership_adapter_host::AdapterEntry,
-) -> Option<AdapterSettingsView> {
-    use mothership_adapter_host::protocol::SettingsFieldKind;
+    vault: &FileCredentialVault,
+) -> Option<AdapterInfo> {
+    use mothership_adapter_host::protocol::{AuthKind, SettingsFieldKind};
 
     let mut adapter = mothership_adapter_host::Adapter::spawn(&entry.program).ok()?;
     adapter.initialize().ok()?;
     let fields = adapter.settings_schema().ok()?;
-    Some(AdapterSettingsView {
+    let auth_kind = match adapter.auth_schema().ok()? {
+        AuthKind::None => "none",
+        AuthKind::ApiKey { .. } => "api_key",
+        AuthKind::OauthInternal => "oauth_internal",
+        AuthKind::ExternalProcess => "external_process",
+    }
+    .to_string();
+
+    let values = vault
+        .load_adapter_settings(&entry.provider_id)
+        .unwrap_or_default();
+    // The host owns the credential store, so it knows the auth STATUS: an
+    // oauth/external adapter is "logged in" iff something is stored for it.
+    // (Api-key adapters don't show an Authorize/Log-out button, so it's moot.)
+    let authenticated =
+        matches!(auth_kind.as_str(), "oauth_internal" | "external_process") && !values.is_empty();
+
+    let view = AdapterSettingsView {
         fields: fields
             .into_iter()
             .map(|field| AdapterSettingsFieldView {
@@ -457,12 +429,19 @@ fn adapter_settings_view(
                     SettingsFieldKind::Text => "text",
                     SettingsFieldKind::Secret => "secret",
                     SettingsFieldKind::Bool => "bool",
+                    SettingsFieldKind::StringList => "string_list",
                 }
                 .to_string(),
                 required: field.required,
             })
             .collect(),
-        values: entry.load_settings(),
+        values,
+    };
+
+    Some(AdapterInfo {
+        view,
+        auth_kind,
+        authenticated,
     })
 }
 
@@ -472,6 +451,52 @@ fn plugins_store_path(database: &mothership_core::Database) -> PathBuf {
         .parent()
         .map(|path| path.join("plugins"))
         .unwrap_or_else(|| PathBuf::from("plugins"))
+}
+
+/// Maps each installed adapter's `provider_id` to its human label from the
+/// manifest — cheap (no process spawn), so the UI can name a connector even
+/// before any of its models have loaded.
+fn adapter_provider_labels(
+    database: &mothership_core::Database,
+) -> BTreeMap<String, String> {
+    mothership_adapter_host::AdapterRegistry::scan(&plugins_store_path(database))
+        .entries()
+        .iter()
+        .map(|entry| (entry.provider_id.clone(), entry.provider_label.clone()))
+        .collect()
+}
+
+/// Maps each installed adapter's `provider_id` to its icon as a data URI, if it
+/// ships one. The adapter declares the icon file in its manifest; the host just
+/// reads + inlines it so the webview can render it without disk access.
+fn adapter_provider_icons(
+    database: &mothership_core::Database,
+) -> BTreeMap<String, String> {
+    mothership_adapter_host::AdapterRegistry::scan(&plugins_store_path(database))
+        .entries()
+        .iter()
+        .filter_map(|entry| {
+            let uri = icon_data_uri(entry.icon.as_deref()?)?;
+            Some((entry.provider_id.clone(), uri))
+        })
+        .collect()
+}
+
+/// Reads an icon file and encodes it as a `data:` URI (base64). Returns `None`
+/// if the file is missing or the extension isn't a known image type.
+fn icon_data_uri(path: &std::path::Path) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let mime = match path.extension().and_then(|ext| ext.to_str())?.to_lowercase().as_str() {
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => return None,
+    };
+    let bytes = std::fs::read(path).ok()?;
+    Some(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
 
 /// Thin event adapter: forwards Core's chat-run events to the desktop UI.
@@ -490,91 +515,57 @@ impl ChatRunEventSink for TauriChatRunSink {
 }
 
 fn connector_providers(
-    auth_providers: Vec<ProviderDescriptor>,
-    connections: Vec<ProviderConnection>,
     models: Vec<mothership_core::LlmModel>,
     selected_model: &mothership_core::SelectedLlmModel,
-    adapter_settings: &BTreeMap<String, AdapterSettingsView>,
+    adapter_info: &BTreeMap<String, AdapterInfo>,
+    provider_labels: &BTreeMap<String, String>,
+    provider_icons: &BTreeMap<String, String>,
 ) -> Vec<ConnectorProviderSummary> {
-    let llm_registry = mothership_core::default_llm_registry();
+    // Providers are exactly the installed adapters: those advertising models and
+    // those exposing a settings form. (A freshly installed adapter shows up via
+    // its settings form before it has any usable models.)
     let mut provider_ids = BTreeSet::new();
-    for provider in &auth_providers {
-        provider_ids.insert(provider.id.as_str().to_string());
-    }
     for model in &models {
         provider_ids.insert(model.provider_id.clone());
     }
-    for connection in &connections {
-        provider_ids.insert(connection.provider_id.as_str().to_string());
+    for provider_id in adapter_info.keys() {
+        provider_ids.insert(provider_id.clone());
     }
-
-    let auth_by_provider: BTreeMap<String, ProviderDescriptor> = auth_providers
-        .into_iter()
-        .map(|provider| (provider.id.as_str().to_string(), provider))
-        .collect();
 
     provider_ids
         .into_iter()
         .map(|provider_id| {
-            let auth_provider = auth_by_provider.get(&provider_id);
-            let settings_schema = llm_registry
-                .settings_schema(&provider_id)
-                .unwrap_or_else(default_connector_settings_schema);
             let provider_models = models
                 .iter()
                 .filter(|model| model.provider_id == provider_id)
                 .cloned()
                 .collect::<Vec<_>>();
-            let provider_connections = connections
-                .iter()
-                .filter(|connection| connection.provider_id.as_str() == provider_id)
-                .map(connection_summary)
-                .collect::<Vec<_>>();
-            let has_active_connection = provider_connections
-                .iter()
-                .any(|connection| connection.status == "active");
+            // Prefer the adapter's declared label (available even before any
+            // models load), then a model's label, then the bare id.
+            let label = provider_labels
+                .get(&provider_id)
+                .cloned()
+                .or_else(|| provider_models.first().map(|model| model.provider_label.clone()))
+                .unwrap_or_else(|| provider_id.clone());
             let selected_model_id = (selected_model.provider_id == provider_id)
                 .then(|| selected_model.model_id.clone());
-            let adapter_settings_view = adapter_settings.get(&provider_id).cloned();
+            let info = adapter_info.get(&provider_id);
+            let auth_kind = info
+                .map(|info| info.auth_kind.clone())
+                .unwrap_or_else(|| "none".to_string());
+            let authenticated = info.map(|info| info.authenticated).unwrap_or(false);
+            let adapter_settings_view = info.map(|info| info.view.clone());
+            let icon = provider_icons.get(&provider_id).cloned();
 
             ConnectorProviderSummary {
-                id: provider_id.clone(),
-                label: auth_provider
-                    .map(|provider| provider.label.clone())
-                    .or_else(|| {
-                        llm_registry
-                            .provider_label(&provider_id)
-                            .map(ToOwned::to_owned)
-                    })
-                    .or_else(|| {
-                        provider_models
-                            .first()
-                            .map(|model| model.provider_label.clone())
-                    })
-                    .unwrap_or(provider_id),
-                settings_schema,
-                status: if has_active_connection {
-                    "connected".to_string()
-                } else if auth_provider
-                    .map(|provider| !provider.methods.is_empty())
-                    .unwrap_or(false)
-                {
-                    "not_connected".to_string()
-                } else {
-                    "not_available".to_string()
-                },
-                auth_methods: auth_provider
-                    .map(|provider| {
-                        provider
-                            .methods
-                            .iter()
-                            .map(auth_method_summary)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default(),
-                connections: provider_connections,
+                id: provider_id,
+                label,
+                icon,
+                settings_schema: default_connector_settings_schema(),
                 models: provider_models,
                 selected_model_id,
+                auth_kind,
+                authenticated,
                 adapter_settings: adapter_settings_view,
             }
         })
@@ -593,278 +584,10 @@ fn default_connector_settings_schema() -> mothership_core::ConnectorSettingsSche
     }
 }
 
-fn auth_method_summary(method: &AuthMethod) -> ConnectorAuthMethodSummary {
-    ConnectorAuthMethodSummary {
-        id: method.id.as_str().to_string(),
-        kind: serde_json::to_value(&method.kind)
-            .ok()
-            .and_then(|value| value.as_str().map(ToOwned::to_owned))
-            .unwrap_or_else(|| "unknown".to_string()),
-        label: method.label.clone(),
-        description: method.description.clone(),
-    }
-}
-
-fn connection_summary(connection: &ProviderConnection) -> ConnectorConnectionSummary {
-    ConnectorConnectionSummary {
-        id: connection.id.as_str().to_string(),
-        provider_id: connection.provider_id.as_str().to_string(),
-        auth_method_id: connection.auth_method_id.as_str().to_string(),
-        status: serde_json::to_value(&connection.status)
-            .ok()
-            .and_then(|value| value.as_str().map(ToOwned::to_owned))
-            .unwrap_or_else(|| "unknown".to_string()),
-        account_label: connection.account_label.clone(),
-        account_email: connection.account_email.clone(),
-        expires_at: connection.expires_at.clone(),
-        updated_at: connection.updated_at.clone(),
-    }
-}
-
-fn with_auth_service<T>(
-    database: &mothership_core::Database,
-    run: impl FnOnce(&ProviderAuthService<'_>) -> mothership_core::Result<T>,
-) -> mothership_core::Result<T> {
-    let vault = FileCredentialVault::new(auth_store_path(database));
-    let registry = StaticProviderAuthAdapterRegistry::with_mock_adapter();
-    let service = ProviderAuthService::new(database, &vault, &registry);
-    run(&service)
-}
-
 fn auth_store_path(database: &mothership_core::Database) -> PathBuf {
     database
         .path()
         .parent()
         .map(|path| path.join("auth"))
         .unwrap_or_else(|| PathBuf::from("auth"))
-}
-
-fn wait_for_oauth_callback(listener: TcpListener, active: &AtomicBool) -> Result<String, String> {
-    let deadline = Instant::now() + Duration::from_secs(300);
-
-    loop {
-        if !active.load(Ordering::SeqCst) {
-            return Err(OAUTH_LISTENER_CANCELLED.to_string());
-        }
-
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let mut reader =
-                    BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
-                let mut request_line = String::new();
-                reader
-                    .read_line(&mut request_line)
-                    .map_err(|error| error.to_string())?;
-                let path = request_line
-                    .split_whitespace()
-                    .nth(1)
-                    .ok_or_else(|| "invalid OAuth callback request".to_string())?;
-                let callback_url = format!(
-                    "{}{}",
-                    "http://localhost:1455/auth/callback",
-                    path.strip_prefix("/auth/callback").unwrap_or_default()
-                );
-                let body = oauth_callback_success_page();
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncache-control: no-store\r\ncontent-security-policy: default-src 'none'; style-src 'unsafe-inline'\r\ncontent-length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                )
-                .map_err(|error| error.to_string())?;
-                return Ok(callback_url);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err("OAuth callback timed out".to_string());
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-}
-
-fn oauth_callback_success_page() -> &'static str {
-    r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Mothership Authorization</title>
-  <style>
-    :root {
-      color-scheme: dark;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #050a10;
-      color: #eaf1f8;
-    }
-
-    * {
-      box-sizing: border-box;
-    }
-
-    html,
-    body {
-      width: 100%;
-      min-height: 100%;
-      margin: 0;
-    }
-
-    body {
-      display: grid;
-      min-height: 100vh;
-      place-items: center;
-      padding: 24px;
-      background:
-        radial-gradient(circle at 50% -20%, rgb(33 108 227 / 22%), transparent 42%),
-        linear-gradient(180deg, #07101a 0%, #050a10 100%);
-    }
-
-    main {
-      width: min(520px, 100%);
-      border: 1px solid #213143;
-      border-radius: 12px;
-      padding: 28px;
-      background: #09131f;
-      box-shadow:
-        0 24px 80px rgb(0 0 0 / 42%),
-        0 0 0 1px rgb(35 124 255 / 10%);
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 26px;
-    }
-
-    .mark {
-      position: relative;
-      display: grid;
-      width: 42px;
-      height: 42px;
-      place-items: center;
-      border: 1px solid #285080;
-      border-radius: 10px;
-      background: linear-gradient(145deg, #0b2540, #0e66ff);
-      box-shadow: 0 12px 34px rgb(13 99 255 / 28%);
-    }
-
-    .mark::before,
-    .mark::after {
-      position: absolute;
-      border: 2px solid rgb(255 255 255 / 86%);
-      content: "";
-    }
-
-    .mark::before {
-      width: 20px;
-      height: 20px;
-      border-radius: 999px;
-    }
-
-    .mark::after {
-      width: 7px;
-      height: 7px;
-      border-top: 0;
-      border-left: 0;
-      transform: translate(10px, 10px);
-    }
-
-    .brand strong {
-      color: #f5f8fc;
-      font-size: 18px;
-      font-weight: 800;
-      letter-spacing: 0;
-    }
-
-    .brand span {
-      display: block;
-      margin-top: 2px;
-      color: #7f8d9d;
-      font-size: 13px;
-      font-weight: 650;
-    }
-
-    .status {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      border: 1px solid #1d5a39;
-      border-radius: 999px;
-      padding: 7px 11px;
-      background: #0c2118;
-      color: #7df2a4;
-      font-size: 13px;
-      font-weight: 800;
-    }
-
-    .status::before {
-      width: 8px;
-      height: 8px;
-      border-radius: 999px;
-      background: #41d981;
-      box-shadow: 0 0 0 4px rgb(65 217 129 / 14%);
-      content: "";
-    }
-
-    h1 {
-      margin: 18px 0 10px;
-      color: #f3f7fb;
-      font-size: clamp(28px, 7vw, 42px);
-      line-height: 1.06;
-      letter-spacing: 0;
-    }
-
-    p {
-      margin: 0;
-      color: #9caaba;
-      font-size: 15px;
-      line-height: 1.6;
-    }
-
-    .footer {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-top: 28px;
-      border-top: 1px solid #1b2a3a;
-      padding-top: 16px;
-      color: #708092;
-      font-size: 12px;
-      font-weight: 700;
-    }
-
-    .pill {
-      border: 1px solid #27394b;
-      border-radius: 999px;
-      padding: 5px 9px;
-      background: #101b27;
-      color: #b9c7d6;
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <div class="brand">
-      <div class="mark" aria-hidden="true"></div>
-      <div>
-        <strong>Mothership</strong>
-        <span>Local provider authorization</span>
-      </div>
-    </div>
-
-    <div class="status">Authorization received</div>
-    <h1>You are connected.</h1>
-    <p>Mothership has received the OAuth callback and is finishing the secure local connection. You can close this browser window and return to the desktop app.</p>
-
-    <div class="footer">
-      <span>Credentials stay on this device</span>
-      <span class="pill">OAuth callback complete</span>
-    </div>
-  </main>
-</body>
-</html>"#
 }

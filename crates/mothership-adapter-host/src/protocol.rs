@@ -23,6 +23,11 @@ pub enum Request {
         values: BTreeMap<String, String>,
     },
     GetAuthSchema { id: u64 },
+    /// Ask the adapter to run its own auth flow now (e.g. browser OAuth) and
+    /// persist the result via [`Outbound::StoreSecret`]. Drives the UI's
+    /// per-adapter "Authorize" action for `oauth_internal` / `external_process`
+    /// schemes. Adapters with no interactive auth (api-key) just ack.
+    Authenticate { id: u64 },
     ChatStart {
         id: u64,
         model: String,
@@ -66,6 +71,12 @@ pub enum Outbound {
     Error {
         id: u64,
         message: String,
+    },
+    /// Adapter -> host side channel: persist these secret values in the app's
+    /// shared credential store (e.g. an OAuth token the adapter just obtained or
+    /// refreshed). Not tied to a request id.
+    StoreSecret {
+        values: BTreeMap<String, String>,
     },
 }
 
@@ -111,6 +122,9 @@ pub enum SettingsFieldKind {
     Text,
     Secret,
     Bool,
+    /// An editable list of strings (e.g. a user-defined model-id list). The host
+    /// renders add/remove rows; the value is stored as the items joined by `\n`.
+    StringList,
 }
 
 /// The adapter's auth scheme. Secret values (API keys) are persisted by the host

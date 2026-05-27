@@ -17,3 +17,6 @@ base64.workspace = true
 getrandom.workspace = true
 url.workspace = true
 anyhow.workspace = true
+# Opens the OAuth URL in the default browser via the OS handler (ShellExecute on
+# Windows, open/xdg-open elsewhere) — no fragile shelling out to `cmd`.
+open = "5"
