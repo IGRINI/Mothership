@@ -2308,6 +2308,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "mothership-adapter-protocol",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

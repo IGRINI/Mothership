@@ -17,6 +17,8 @@
 
 pub use mothership_adapter_protocol as protocol;
 
+pub mod sse;
+
 use std::collections::BTreeMap;
 
 use anyhow::Result;
