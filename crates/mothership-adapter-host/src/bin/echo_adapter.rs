@@ -9,6 +9,7 @@ use std::io::{BufRead, Write};
 
 use mothership_adapter_host::protocol::{
     AuthKind, Model, ModelManagement, Outbound, Request, SettingsField, SettingsFieldKind,
+    PROTOCOL_VERSION,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -28,7 +29,13 @@ fn main() -> anyhow::Result<()> {
         }
 
         match serde_json::from_str::<Request>(trimmed)? {
-            Request::Initialize { id } => emit(&mut stdout, &Outbound::Ack { id })?,
+            Request::Initialize { id, .. } => emit(
+                &mut stdout,
+                &Outbound::Initialized {
+                    id,
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            )?,
             Request::GetIdentity { id } => emit(
                 &mut stdout,
                 &Outbound::Identity {
@@ -109,6 +116,7 @@ fn main() -> anyhow::Result<()> {
                 emit(&mut stdout, &Outbound::Done { id })?;
             }
             Request::ChatCancel { id } => emit(&mut stdout, &Outbound::Done { id })?,
+            Request::Logout { id } => emit(&mut stdout, &Outbound::Ack { id })?,
         }
     }
 

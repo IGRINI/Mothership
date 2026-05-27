@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 
 use mothership_adapter_host::protocol::{
     AuthKind, ChatMessage, Model, ModelManagement, Outbound, Request, SettingsField,
-    SettingsFieldKind,
+    SettingsFieldKind, PROTOCOL_VERSION,
 };
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -44,7 +44,13 @@ fn main() -> anyhow::Result<()> {
         }
 
         match serde_json::from_str::<Request>(trimmed)? {
-            Request::Initialize { id } => emit(&mut stdout, &Outbound::Ack { id })?,
+            Request::Initialize { id, .. } => emit(
+                &mut stdout,
+                &Outbound::Initialized {
+                    id,
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            )?,
             Request::GetIdentity { id } => emit(
                 &mut stdout,
                 &Outbound::Identity {
@@ -128,6 +134,9 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             Request::ChatCancel { id } => emit(&mut stdout, &Outbound::Done { id })?,
+            // No server-side revoke for a user-supplied API key — the host just
+            // forgets it. Ack so logout completes.
+            Request::Logout { id } => emit(&mut stdout, &Outbound::Ack { id })?,
         }
     }
 

@@ -104,13 +104,30 @@ impl Adapter {
         }
     }
 
-    /// Handshake: confirm the adapter is alive and speaks the protocol.
+    /// Handshake: confirm the adapter is alive and speaks a compatible protocol
+    /// version. Refuses (rather than mis-parsing) an adapter on a different
+    /// version, including an older one that still replies with a bare `Ack`.
     pub fn initialize(&mut self) -> Result<()> {
         let id = self.next_id();
-        self.send(&Request::Initialize { id })?;
+        self.send(&Request::Initialize {
+            id,
+            protocol_version: protocol::PROTOCOL_VERSION,
+        })?;
         match self.recv()? {
-            Outbound::Ack { id: got } if got == id => Ok(()),
-            other => bail!("unexpected reply to initialize: {other:?}"),
+            Outbound::Initialized {
+                id: got,
+                protocol_version,
+            } if got == id => {
+                if protocol_version == protocol::PROTOCOL_VERSION {
+                    Ok(())
+                } else {
+                    bail!(
+                        "adapter protocol version {protocol_version} is incompatible with host version {}",
+                        protocol::PROTOCOL_VERSION
+                    )
+                }
+            }
+            other => bail!("unexpected reply to initialize (adapter may be too old): {other:?}"),
         }
     }
 
@@ -186,6 +203,18 @@ impl Adapter {
                 bail!("adapter authenticate failed: {message}")
             }
             other => bail!("unexpected reply to authenticate: {other:?}"),
+        }
+    }
+
+    /// Asks the adapter to revoke / clean up its current auth before the host
+    /// forgets the credential. Best-effort on the adapter side; the host still
+    /// proceeds with local logout regardless.
+    pub fn logout(&mut self) -> Result<()> {
+        let id = self.next_id();
+        self.send(&Request::Logout { id })?;
+        match self.recv()? {
+            Outbound::Ack { id: got } if got == id => Ok(()),
+            other => bail!("unexpected reply to logout: {other:?}"),
         }
     }
 

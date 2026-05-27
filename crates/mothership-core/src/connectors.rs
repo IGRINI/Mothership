@@ -159,10 +159,27 @@ impl<'a> ConnectorService<'a> {
         self.snapshot()
     }
 
-    /// Logs an adapter out by forgetting its stored credential in the shared
-    /// vault; it re-authenticates from scratch next time.
+    /// Logs an adapter out. Best-effort: first asks the adapter to revoke its
+    /// credential server-side (e.g. Codex OAuth token revoke), then forgets it in
+    /// the shared vault. A revoke failure never blocks local logout.
     pub fn logout(&self, provider_id: &str) -> Result<ConnectorSettingsSnapshot> {
-        self.vault().delete_adapter_settings(provider_id)?;
+        let vault = self.vault();
+        let registry = AdapterRegistry::scan(&self.plugins_dir());
+        if let Some(entry) = registry.find(provider_id) {
+            if let Ok(settings) = vault.load_adapter_settings(provider_id) {
+                if !settings.is_empty() {
+                    if let Ok(mut adapter) = Adapter::spawn(&entry.program) {
+                        if adapter.initialize().is_ok() {
+                            // Seed the adapter with the stored credential so it can
+                            // revoke it, then ask it to log out. All best-effort.
+                            let _ = adapter.set_settings(settings);
+                            let _ = adapter.logout();
+                        }
+                    }
+                }
+            }
+        }
+        vault.delete_adapter_settings(provider_id)?;
         self.snapshot()
     }
 

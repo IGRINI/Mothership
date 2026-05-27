@@ -10,11 +10,23 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// Wire-protocol version between host and adapter. The host sends it on
+/// `initialize` and refuses an adapter that reports a different version, rather
+/// than mis-parsing a contract it doesn't understand. Bump on any incompatible
+/// change to `Request`/`Outbound`.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Host -> adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum Request {
-    Initialize { id: u64 },
+    Initialize {
+        id: u64,
+        /// The host's protocol version. Defaulted so a frame from an older host
+        /// (without the field) still parses.
+        #[serde(default)]
+        protocol_version: u32,
+    },
     GetIdentity { id: u64 },
     GetModels { id: u64 },
     GetSettingsSchema { id: u64 },
@@ -34,6 +46,11 @@ pub enum Request {
         messages: Vec<ChatMessage>,
     },
     ChatCancel { id: u64 },
+    /// Ask the adapter to revoke / clean up its current auth (e.g. revoke an
+    /// OAuth token server-side) before the host forgets the stored credential.
+    /// Best-effort: the adapter acks even if revoke fails. Adapters with nothing
+    /// to revoke (api-key) just ack.
+    Logout { id: u64 },
 }
 
 /// Adapter -> host.
@@ -42,6 +59,12 @@ pub enum Request {
 pub enum Outbound {
     Ack {
         id: u64,
+    },
+    /// Reply to `initialize`: confirms the adapter is alive and reports the
+    /// protocol version it implements, so the host can refuse a mismatch.
+    Initialized {
+        id: u64,
+        protocol_version: u32,
     },
     Identity {
         id: u64,

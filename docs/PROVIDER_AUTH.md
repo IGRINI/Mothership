@@ -76,20 +76,23 @@ provider API           (HTTP / WS / SSE / внешний CLI)
 Host → adapter (`Request`, поле `method`):
 
 ```text
-initialize            рукопожатие
+initialize            { protocol_version }  рукопожатие + версия протокола
 get_identity          provider_id + человекочитаемый label
 get_models            список моделей + режим управления списком
 get_settings_schema   поля настроек для UI
-set_settings          { values }  текущие значения настроек (host шлёт на каждом спавне)
+set_settings          { values }  текущие значения настроек (host шлёт при изменении)
 get_auth_schema       схема авторизации
+authenticate          запустить свой auth-flow (например browser OAuth) сейчас
 chat_start            { model, messages }  один ход чата
 chat_cancel           отмена
+logout                ревокнуть/почистить свой credential перед забыванием в vault
 ```
 
 Adapter → host (`Outbound`, поле `type`):
 
 ```text
-ack             подтверждение initialize/set_settings
+initialized     { protocol_version }  ответ на initialize: версия адаптера
+ack             подтверждение set_settings/authenticate/logout
 identity        { provider_id, provider_label }
 models          { management, models }
 settings_schema { fields }
@@ -100,13 +103,19 @@ error           { message }
 store_secret    { values }   side channel: сохранить секреты в общий vault (без id)
 ```
 
+Версионирование: `PROTOCOL_VERSION` в `protocol.rs`. Host шлёт свою версию на
+`initialize`, адаптер отвечает `initialized` со своей; при несовпадении host
+отказывается работать с адаптером (а не молча мис-парсит контракт). Bump major
+при любом несовместимом изменении.
+
 Режим управления моделями (`ModelManagement`): `fixed` (встроенный список),
 `server` (берётся с сервера провайдера, например Codex), `user_defined`
 (пользователь ведёт список сам, UI показывает «+», например OpenRouter).
 
 Поле настроек (`SettingsField`): `{ key, label, kind, required }`, где `kind` —
-`text`, `secret` или `bool`. UI рендерит форму по schema и возвращает значения
-через `set_settings`.
+`text`, `secret`, `bool` или `string_list` (редактируемый список строк с +/−;
+хранится как элементы, склеенные через `\n`). UI рендерит форму по schema и
+возвращает значения через `set_settings`.
 
 Схема авторизации (`AuthKind`):
 
@@ -265,7 +274,10 @@ credential открывает браузер для логина.
   `set_settings` под ключом `credential`, а адаптер возвращает выпущенный/
   обновлённый токен через `StoreSecret` в общий vault.
 
-Disconnect/revoke в адаптере пока не реализован.
+Logout/revoke: на `logout` адаптер делает best-effort server-side revoke токена
+(`POST https://auth.openai.com/oauth/revoke`, предпочитая refresh-токен; форма
+запроса как в upstream `auth/revoke.rs`), затем host забывает credential в vault.
+Ошибка revoke не блокирует logout.
 
 ### OpenRouter (`adapters/openrouter`)
 
@@ -273,7 +285,7 @@ OpenAI-совместимый HTTP-провайдер.
 
 - provider id: `openrouter`; auth schema: `api_key`;
 - настройки: `api_key` (secret, required), `base_url` (text, optional, default
-  `https://openrouter.ai/api/v1`), `models` (text, optional, comma-separated);
+  `https://openrouter.ai/api/v1`), `models` (string_list, optional — список с +/−);
 - модели: `ModelManagement::UserDefined` — список из поля `models`, первый
   помечается recommended;
 - chat: SSE `POST {base}/chat/completions` с `Authorization: Bearer <api_key>`,

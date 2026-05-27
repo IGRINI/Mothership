@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use mothership_adapter_host::protocol::{
-    AuthKind, ChatMessage, Model, ModelManagement, Outbound, Request,
+    AuthKind, ChatMessage, Model, ModelManagement, Outbound, Request, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -35,6 +35,7 @@ const CALLBACK_ADDR: &str = "127.0.0.1:1455";
 const SCOPE: &str = "openid profile email offline_access";
 const MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
 const RESPONSES_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+const REVOKE_ENDPOINT: &str = "https://auth.openai.com/oauth/revoke";
 const CLIENT_VERSION: &str = "0.133.0";
 const REFRESH_MARGIN_MS: u64 = 60_000;
 /// Fallback system prompt: the Codex backend rejects a request with no
@@ -74,7 +75,13 @@ fn main() -> anyhow::Result<()> {
         }
 
         match serde_json::from_str::<Request>(trimmed)? {
-            Request::Initialize { id } => emit(&mut stdout, &Outbound::Ack { id })?,
+            Request::Initialize { id, .. } => emit(
+                &mut stdout,
+                &Outbound::Initialized {
+                    id,
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            )?,
             Request::GetIdentity { id } => emit(
                 &mut stdout,
                 &Outbound::Identity {
@@ -136,6 +143,16 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             Request::ChatCancel { id } => emit(&mut stdout, &Outbound::Done { id })?,
+            // Best-effort server-side revoke before the host forgets the token,
+            // then drop our in-memory copy. Always ack (logout must not fail on a
+            // revoke error).
+            Request::Logout { id } => {
+                if let Some(cred) = credential.as_ref() {
+                    revoke_credential(&client, cred);
+                }
+                credential = None;
+                emit(&mut stdout, &Outbound::Ack { id })?;
+            }
         }
     }
 
@@ -284,6 +301,47 @@ fn run_oauth(client: &reqwest::blocking::Client) -> anyhow::Result<CodexCredenti
             .map(|e| now_millis().saturating_add(e.saturating_mul(1000)).to_string()),
         account_id,
     })
+}
+
+#[derive(Debug, Serialize)]
+struct RevokeTokenRequest<'a> {
+    token: &'a str,
+    token_type_hint: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_id: Option<&'static str>,
+}
+
+/// Best-effort OAuth token revoke (mirrors the Codex CLI's logout-with-revoke):
+/// prefer the refresh token, fall back to the access token, and never propagate
+/// failure — logout proceeds regardless. Endpoint + request shape match upstream
+/// `auth/revoke.rs`.
+fn revoke_credential(client: &reqwest::blocking::Client, credential: &CodexCredential) {
+    let refresh = credential.refresh_token.trim();
+    let access = credential.access_token.trim();
+    let (token, token_type_hint, client_id) = if !refresh.is_empty() {
+        (refresh, "refresh_token", Some(CLIENT_ID))
+    } else if !access.is_empty() {
+        (access, "access_token", None)
+    } else {
+        return;
+    };
+
+    let request = RevokeTokenRequest {
+        token,
+        token_type_hint,
+        client_id,
+    };
+    match client
+        .post(REVOKE_ENDPOINT)
+        .timeout(std::time::Duration::from_secs(10))
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+    {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => eprintln!("codex-adapter: token revoke rejected: {}", response.status()),
+        Err(error) => eprintln!("codex-adapter: token revoke failed: {error}"),
+    }
 }
 
 fn post_token(
