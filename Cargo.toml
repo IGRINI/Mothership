@@ -6,6 +6,7 @@ members = [
   "crates/mothership-adapter-protocol",
   "crates/mothership-adapter-sdk",
   "crates/mothership-core",
+  "crates/mothership-openai-responses",
   "crates/process-sandbox",
   "src-sidecar",
   "src-tauri",

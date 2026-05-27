@@ -1,0 +1,18 @@
+[package]
+name = "mothership-openai-responses"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# OpenAI Responses-family transport: request shapes, structured stream-event
+# parsing, and the WS-primary -> SSE -> HTTP-JSON fallback chain. Reusable by any
+# Responses-family adapter (Codex now; future OpenAI/Azure). NOT used by
+# /chat/completions providers (e.g. OpenRouter). Built on the adapter SDK
+# transports; never depends on the app core.
+[dependencies]
+mothership-adapter-sdk = { path = "../mothership-adapter-sdk" }
+anyhow.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true }
+url.workspace = true

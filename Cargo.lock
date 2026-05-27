@@ -2351,6 +2351,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mothership-openai-responses"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mothership-adapter-sdk",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "mothership-sidecar"
 version = "0.1.0"
 dependencies = [
