@@ -949,6 +949,105 @@ kbd,
   font-size: 13px;
 }
 
+/* A failed run renders as a dedicated error card in the message stream, not as
+   an agent bubble. */
+.message-row--error {
+  justify-content: stretch;
+}
+
+.message-row--error .message-row__content {
+  max-width: none;
+  width: 100%;
+}
+
+.chat-error-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  border: 1px solid #783131;
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: #2a1114;
+}
+
+.chat-error-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #ff9b9b;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.chat-error-card__summary {
+  margin: 0;
+  color: #f3c6c6;
+  font-size: 13.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-error-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-error-card__retry,
+.chat-error-card__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 7px;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.chat-error-card__retry {
+  background: #7a2a2a;
+  border-color: #9c3a3a;
+  color: #ffe2e2;
+}
+
+.chat-error-card__retry:hover:not(:disabled) {
+  background: #8f3232;
+}
+
+.chat-error-card__retry:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.chat-error-card__toggle {
+  background: transparent;
+  border-color: #5e2a2a;
+  color: #e0a8a8;
+}
+
+.chat-error-card__toggle:hover {
+  background: rgb(255 255 255 / 5%);
+}
+
+.chat-error-card__raw {
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  max-height: 220px;
+  background: #1a0c0e;
+  border: 1px solid #5e2a2a;
+  border-radius: 8px;
+  color: #e7b9b9;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .checklist-item {
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr);

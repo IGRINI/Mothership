@@ -81,6 +81,9 @@ pub enum CoreRequest {
     CreateChat,
     GetChat { chat_id: String, limit: Option<i64> },
     SendChatMessage { chat_id: Option<String>, content: String },
+    /// Re-run the last failed assistant message in a chat (rolled back in place,
+    /// no duplicate exchange). Like `SendChatMessage`, it streams `Event::ChatRun`s.
+    RetryChatMessage { chat_id: String },
     ConnectorSettings,
     SetSelectedModel { provider_id: String, model_id: String },
     SaveAdapterSettings { provider_id: String, values: BTreeMap<String, String> },

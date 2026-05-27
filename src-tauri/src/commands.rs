@@ -105,6 +105,19 @@ pub async fn send_chat_message(
 }
 
 #[tauri::command]
+pub async fn retry_chat_message(
+    state: State<'_, AppState>,
+    chat_id: String,
+) -> Result<SendChatMessageResult, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::RetryChatMessage { chat_id })
+        .await?;
+    expect_variant!(response, CoreResponse::ChatMessageStarted)
+}
+
+#[tauri::command]
 pub async fn get_connector_settings(
     state: State<'_, AppState>,
 ) -> Result<ConnectorSettingsSnapshot, String> {

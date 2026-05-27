@@ -316,6 +316,71 @@ impl Database {
         })
     }
 
+    /// Rolls the last (failed) assistant message in a chat back to a fresh
+    /// pending state in place and returns a run handle to re-drive it — reusing
+    /// the existing user message instead of creating a duplicate exchange.
+    /// Errors if there's nothing to retry (no failed assistant message).
+    pub fn begin_retry_run(&self, chat_id: &str) -> Result<SendChatMessageResult> {
+        validate_identifier("chat_id", chat_id)?;
+        let mut connection = self.connect()?;
+        let selected_model = selected_llm_model(&connection)?;
+        if selected_model.model_id.trim().is_empty() {
+            return Err(MothershipError::InvalidRequest(
+                "no LLM model selected; connect a provider and choose a model first".to_string(),
+            ));
+        }
+
+        let tx = connection.transaction()?;
+        let chat = select_chat_summary(&tx, chat_id)?;
+
+        let assistant_message = select_last_message_by_role(&tx, chat_id, "assistant")?
+            .ok_or_else(|| {
+                MothershipError::InvalidRequest("no assistant message to retry".to_string())
+            })?;
+        if assistant_message.status != ChatMessageStatus::Failed {
+            return Err(MothershipError::InvalidRequest(
+                "the latest run did not fail; nothing to retry".to_string(),
+            ));
+        }
+        let user_message = select_last_message_by_role(&tx, chat_id, "user")?.ok_or_else(|| {
+            MothershipError::InvalidRequest("no user message to retry".to_string())
+        })?;
+
+        tx.execute(
+            "
+            UPDATE chat_messages
+            SET content = '', status = ?2
+            WHERE id = ?1 AND chat_id = ?3
+            ",
+            params![
+                assistant_message.id,
+                chat_status_to_db(ChatMessageStatus::Sending),
+                chat_id
+            ],
+        )?;
+
+        let now = current_timestamp();
+        tx.execute(
+            "UPDATE chats SET updated_at = ?2 WHERE id = ?1",
+            params![chat_id, now],
+        )?;
+        tx.commit()?;
+
+        Ok(SendChatMessageResult {
+            run_id: generate_id("chat_run")?,
+            chat: ChatThreadSummary {
+                updated_at: now,
+                ..chat
+            },
+            user_message,
+            assistant_message: ChatMessage {
+                content: String::new(),
+                status: ChatMessageStatus::Sending,
+                ..assistant_message
+            },
+        })
+    }
+
     pub fn llm_chat_context(
         &self,
         chat_id: &str,
@@ -855,24 +920,35 @@ fn select_chat_message_by_id(connection: &Connection, message_id: &str) -> Resul
             WHERE id = ?1
             ",
             params![message_id],
-            |row| {
-                let role_value: String = row.get(3)?;
-                let status_value: String = row.get(5)?;
-                Ok(ChatMessage {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    position: row.get(2)?,
-                    role: chat_role_from_db(&role_value)?,
-                    content: row.get(4)?,
-                    status: chat_status_from_db(&status_value)?,
-                    created_at: row.get(6)?,
-                })
-            },
+            chat_message_from_row,
         )
         .optional()?
         .ok_or_else(|| {
             MothershipError::InvalidRequest(format!("chat message not found: {message_id}"))
         })
+}
+
+/// The most recent message of `role` in a chat (highest rowid), if any. Used by
+/// retry to find the prompt and the failed assistant message to re-run.
+fn select_last_message_by_role(
+    connection: &Connection,
+    chat_id: &str,
+    role: &str,
+) -> Result<Option<ChatMessage>> {
+    connection
+        .query_row(
+            "
+            SELECT id, chat_id, rowid, role, content, status, created_at
+            FROM chat_messages
+            WHERE chat_id = ?1 AND role = ?2
+            ORDER BY rowid DESC
+            LIMIT 1
+            ",
+            params![chat_id, role],
+            chat_message_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn update_chat_after_assistant(
@@ -1121,6 +1197,38 @@ mod tests {
             .get_chat(&result.chat.id, 200)
             .expect("restore conversation");
         assert_eq!(restored.messages.len(), 2);
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn retry_resets_failed_assistant_in_place() {
+        let database_path = temp_database_path("retry_resets_failed_assistant_in_place");
+        let database = Database::open(database_path.clone()).expect("open database");
+        database
+            .set_selected_llm_model("openai", "test-model")
+            .expect("select model");
+
+        let run = database.begin_chat_run(None, "Retry me").expect("begin run");
+        database
+            .fail_chat_run(&run.run_id, &run.chat.id, &run.assistant_message.id, "boom")
+            .expect("fail run");
+
+        let retry = database.begin_retry_run(&run.chat.id).expect("begin retry");
+        // Same assistant message, rolled back to a fresh pending state.
+        assert_eq!(retry.assistant_message.id, run.assistant_message.id);
+        assert_eq!(retry.assistant_message.status, ChatMessageStatus::Sending);
+        assert!(retry.assistant_message.content.is_empty());
+        // The original prompt is reused, not duplicated.
+        assert_eq!(retry.user_message.content, "Retry me");
+        let conversation = database.get_chat(&run.chat.id, 200).expect("get chat");
+        assert_eq!(conversation.messages.len(), 2);
+
+        // Nothing to retry while the run is pending again.
+        let error = database
+            .begin_retry_run(&run.chat.id)
+            .expect_err("no failed run to retry");
+        assert!(matches!(error, MothershipError::InvalidRequest(_)));
 
         let _ = fs::remove_file(database_path);
     }

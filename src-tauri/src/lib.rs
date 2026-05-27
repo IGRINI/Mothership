@@ -37,6 +37,7 @@ pub fn run() {
             commands::get_dashboard_snapshot,
             commands::list_chats,
             commands::logout_adapter,
+            commands::retry_chat_message,
             commands::run_sidecar_status,
             commands::save_adapter_settings,
             commands::send_chat_message,

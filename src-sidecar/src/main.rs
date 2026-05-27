@@ -23,6 +23,7 @@ use mothership_core::ipc::{
 };
 use mothership_core::{
     AuthProcessRegistry, ChatRunEvent, ChatRunEventSink, ChatRunService, ConnectorService, Database,
+    SendChatMessageResult,
 };
 
 /// Frames queued for the writer thread, which alone owns stdout.
@@ -142,8 +143,16 @@ fn handle_request(
     outbox: Outbox,
     auth_registry: Arc<AuthProcessRegistry>,
 ) {
-    if let CoreRequest::SendChatMessage { chat_id, content } = request {
-        run_chat_message(id, chat_id, content, database, outbox);
+    // Streaming requests answer immediately with the persisted placeholder, then
+    // stream the run; handle them before the uniform request/response path.
+    if let CoreRequest::SendChatMessage { chat_id, content } = &request {
+        let started = database.begin_chat_run(chat_id.as_deref(), content);
+        run_chat_message(id, started, database, outbox);
+        return;
+    }
+    if let CoreRequest::RetryChatMessage { chat_id } = &request {
+        let started = database.begin_retry_run(chat_id);
+        run_chat_message(id, started, database, outbox);
         return;
     }
 
@@ -198,21 +207,23 @@ fn compute(
             CoreResponse::ConnectorSettings(ConnectorService::new(database).logout(&provider_id)?)
         }
         CoreRequest::SidecarStatus => CoreResponse::SidecarStatus(database.sidecar_status()?),
-        // Streaming case handled in `handle_request` before reaching here.
-        CoreRequest::SendChatMessage { .. } => unreachable!("handled as a streaming request"),
+        // Streaming cases handled in `handle_request` before reaching here.
+        CoreRequest::SendChatMessage { .. } | CoreRequest::RetryChatMessage { .. } => {
+            unreachable!("handled as a streaming request")
+        }
     })
 }
 
-/// The streaming path: persist the user message + assistant placeholder, answer
-/// the request with that, then drive the completion, forwarding every run event.
+/// The streaming path: given the begun run (a fresh send or a retry), answer the
+/// request with the persisted placeholder, then drive the completion, forwarding
+/// every run event. A failure to even begin the run is a terminal error reply.
 fn run_chat_message(
     id: u64,
-    chat_id: Option<String>,
-    content: String,
+    started: mothership_core::Result<SendChatMessageResult>,
     database: Database,
     outbox: Outbox,
 ) {
-    match database.begin_chat_run(chat_id.as_deref(), &content) {
+    match started {
         Ok(started) => {
             let _ = outbox.send(ServerFrame::Response {
                 id,

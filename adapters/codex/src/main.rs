@@ -37,6 +37,10 @@ const MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
 const RESPONSES_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const CLIENT_VERSION: &str = "0.133.0";
 const REFRESH_MARGIN_MS: u64 = 60_000;
+/// Fallback system prompt: the Codex backend rejects a request with no
+/// `instructions`, so we send this when the core supplies no system message.
+const DEFAULT_INSTRUCTIONS: &str =
+    "You are Codex, a precise and helpful software engineering assistant.";
 /// Settings key under which the host stores/loads the whole credential JSON in
 /// the shared vault (pushed via `set_settings`, persisted via `StoreSecret`).
 const CREDENTIAL_SETTINGS_KEY: &str = "credential";
@@ -450,8 +454,27 @@ fn chat(
 ) -> anyhow::Result<()> {
     let (access_token, account_id) = ensure_token(client, credential, out)?;
 
+    // The Codex /responses endpoint requires a non-empty `instructions` (the
+    // system prompt) — without it the server returns 400 "Instructions are
+    // required". System messages feed it; absent any, fall back to a default so
+    // a provider-agnostic core (which may send no system prompt) still works.
+    let instructions = messages
+        .iter()
+        .filter(|message| message.role == "system")
+        .map(|message| message.content.trim())
+        .filter(|content| !content.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let instructions = if instructions.is_empty() {
+        DEFAULT_INSTRUCTIONS.to_string()
+    } else {
+        instructions
+    };
+
+    // Everything that isn't a system message is conversation input.
     let input: Vec<serde_json::Value> = messages
         .iter()
+        .filter(|message| message.role != "system")
         .filter(|message| !message.content.trim().is_empty())
         .map(|message| {
             let kind = if message.role == "assistant" {
@@ -465,6 +488,7 @@ fn chat(
 
     let body = json!({
         "model": model,
+        "instructions": instructions,
         "input": input,
         "stream": true,
         "store": false,

@@ -1,5 +1,6 @@
 import { createSignal, JSX, onCleanup, onMount, Show } from "solid-js";
 import {
+  AlertTriangle,
   ChevronDown,
   Circle,
   Clock,
@@ -9,6 +10,7 @@ import {
   MoreVertical,
   Paperclip,
   Plus,
+  RefreshCw,
   Search,
   Send,
   Terminal,
@@ -24,6 +26,7 @@ import {
   getChat,
   getConnectorSettings,
   listChats,
+  retryChatMessage,
   sendChatMessage,
   setSelectedModel,
 } from "../../shared/api/mothership";
@@ -180,6 +183,24 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     }
   }
 
+  async function handleRetry() {
+    const chatId = activeChatId();
+    if (!chatId || isChatRunning()) {
+      return;
+    }
+    setError("");
+
+    try {
+      const result = await retryChatMessage(chatId);
+      setChats((current) => bumpChat(current, result.chat));
+      setMessages((current) =>
+        mergeMessages(current, [result.userMessage, result.assistantMessage]),
+      );
+    } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    }
+  }
+
   async function loadConnectorSettings() {
     try {
       setConnectorSettings(await getConnectorSettings());
@@ -223,10 +244,9 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     if (event.message) {
       setMessages((current) => mergeMessages(current, [event.message!]));
     }
-
-    if (event.kind === "failed" && event.error) {
-      setError(event.error);
-    }
+    // A failed run is rendered inline as an error card on the failed assistant
+    // message (see MessageRow), not as a bubble or the bottom error bar — the
+    // bar is reserved for app-level errors (load / send / auth).
   }
 
   return (
@@ -249,6 +269,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         messages={messages()}
         runTransports={runTransports()}
         onDraftChange={setDraft}
+        onRetry={handleRetry}
         onSelectModel={handleSelectModel}
         onSendMessage={handleSendMessage}
       />
@@ -360,6 +381,7 @@ function ConversationPane(props: {
   messages: ChatMessage[];
   runTransports: Record<string, string>;
   onDraftChange: (value: string) => void;
+  onRetry: () => void;
   onSelectModel: (providerId: string, modelId: string) => void;
   onSendMessage: () => void;
 }) {
@@ -408,6 +430,8 @@ function ConversationPane(props: {
           <MessageRow
             message={message}
             transport={props.runTransports[message.id]}
+            isBusy={props.isSending}
+            onRetry={props.onRetry}
           />
         )}
       </VirtualList>
@@ -558,9 +582,16 @@ function InspectorPane(props: {
   );
 }
 
-function MessageRow(props: { message: ChatMessage; transport?: string }) {
+function MessageRow(props: {
+  message: ChatMessage;
+  transport?: string;
+  isBusy?: boolean;
+  onRetry?: () => void;
+}) {
   const message = () => props.message;
   const isUser = () => message().role === "user";
+  const isFailed = () =>
+    message().role === "assistant" && message().status === "failed";
   const body = () =>
     message().content ||
     (message().status === "sending"
@@ -568,36 +599,93 @@ function MessageRow(props: { message: ChatMessage; transport?: string }) {
       : "No content.");
 
   // Messenger layout: user on the right in a colored bubble, agent on the left
-  // with an avatar. Both render Markdown (GFM) via solid-markdown (component
-  // output, not innerHTML, so it is XSS-safe). Kept scroll-cheap: no per-message
-  // SVG buttons, no blurred shadows; rows already use content-visibility.
+  // with an avatar. A failed run is not an agent message — it renders as a
+  // dedicated red error card (human summary + raw details + retry) instead.
+  // Both render Markdown (GFM) via solid-markdown (component output, not
+  // innerHTML, so it is XSS-safe). Kept scroll-cheap.
   return (
-    <article
-      classList={{
-        "message-row": true,
-        "message-row--user": isUser(),
-        "message-row--assistant": !isUser(),
-      }}
-    >
-      <Show when={!isUser()}>
-        <Avatar role="assistant" />
-      </Show>
-      <div class="message-row__content">
-        <Show when={!isUser()}>
-          <div class="message-meta">
-            <strong>Mothership</strong>
-            <span>{formatMessageTime(message().createdAt)}</span>
+    <Show
+      when={isFailed()}
+      fallback={
+        <article
+          classList={{
+            "message-row": true,
+            "message-row--user": isUser(),
+            "message-row--assistant": !isUser(),
+          }}
+        >
+          <Show when={!isUser()}>
+            <Avatar role="assistant" />
+          </Show>
+          <div class="message-row__content">
+            <Show when={!isUser()}>
+              <div class="message-meta">
+                <strong>Mothership</strong>
+                <span>{formatMessageTime(message().createdAt)}</span>
+              </div>
+            </Show>
+            <div class="message-md">
+              <SolidMarkdown
+                renderingStrategy="reconcile"
+                remarkPlugins={[remarkGfm]}
+                children={body()}
+              />
+            </div>
           </div>
-        </Show>
-        <div class="message-md">
-          <SolidMarkdown
-            renderingStrategy="reconcile"
-            remarkPlugins={[remarkGfm]}
-            children={body()}
-          />
-        </div>
+        </article>
+      }
+    >
+      <article class="message-row message-row--error">
+        <ErrorCard
+          error={message().content}
+          disabled={Boolean(props.isBusy)}
+          onRetry={props.onRetry}
+        />
+      </article>
+    </Show>
+  );
+}
+
+function ErrorCard(props: {
+  error: string;
+  disabled: boolean;
+  onRetry?: () => void;
+}) {
+  const [showDetails, setShowDetails] = createSignal(false);
+
+  return (
+    <div class="chat-error-card" role="alert">
+      <div class="chat-error-card__head">
+        <AlertTriangle size={16} />
+        <strong>Couldn't get a response</strong>
       </div>
-    </article>
+      <p class="chat-error-card__summary">{humanizeError(props.error)}</p>
+      <div class="chat-error-card__actions">
+        <Show when={props.onRetry}>
+          <button
+            class="chat-error-card__retry"
+            type="button"
+            disabled={props.disabled}
+            onClick={() => props.onRetry?.()}
+          >
+            <RefreshCw size={14} />
+            Retry
+          </button>
+        </Show>
+        <button
+          class="chat-error-card__toggle"
+          type="button"
+          aria-expanded={showDetails()}
+          onClick={() => setShowDetails((value) => !value)}
+        >
+          {showDetails() ? "Hide details" : "Details"}
+          <ChevronDown size={13} />
+        </button>
+      </div>
+      <Show when={showDetails()}>
+        <pre class="chat-error-card__raw">{props.error}</pre>
+      </Show>
+    </div>
   );
 }
 
@@ -867,6 +955,44 @@ function unixTimestampToDate(timestamp: string) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Turns a raw run error into a one-line human summary: strips our internal
+ * wrapper prefixes and, if the provider returned a JSON body, surfaces its
+ * detail/message. The full original string is still shown under "Details".
+ */
+function humanizeError(raw: string): string {
+  let message = (raw ?? "").trim();
+
+  for (const prefix of [
+    "invalid request:",
+    "adapter chat failed:",
+    "adapter chat error:",
+  ]) {
+    if (message.toLowerCase().startsWith(prefix)) {
+      message = message.slice(prefix.length).trim();
+    }
+  }
+
+  const jsonStart = message.indexOf("{");
+  if (jsonStart !== -1) {
+    try {
+      const parsed = JSON.parse(message.slice(jsonStart));
+      const detail =
+        parsed?.detail ??
+        parsed?.message ??
+        parsed?.error?.message ??
+        (typeof parsed?.error === "string" ? parsed.error : undefined);
+      if (typeof detail === "string" && detail.trim()) {
+        return detail.trim();
+      }
+    } catch {
+      // Not JSON — fall through to the cleaned string.
+    }
+  }
+
+  return message || "The model provider could not complete this request.";
 }
 
 function isTauriRuntime() {

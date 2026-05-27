@@ -247,6 +247,21 @@ export function sendChatMessage(
   });
 }
 
+/**
+ * Re-runs the last failed assistant message in a chat. The failed message is
+ * rolled back in place (no duplicate exchange) and re-streamed, so the caller
+ * just merges the returned messages back in and listens for run events.
+ */
+export function retryChatMessage(
+  chatId: string,
+): Promise<SendChatMessageResult> {
+  if (!isTauriRuntime()) {
+    return Promise.reject(new Error("Retry requires the desktop app."));
+  }
+
+  return invoke<SendChatMessageResult>("retry_chat_message", { chatId });
+}
+
 export function getConnectorSettings(): Promise<ConnectorSettingsSnapshot> {
   if (!isTauriRuntime()) {
     return Promise.resolve(
