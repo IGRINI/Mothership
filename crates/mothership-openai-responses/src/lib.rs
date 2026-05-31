@@ -103,7 +103,6 @@ struct PartialToolCall {
 #[derive(Debug, Default)]
 struct RoundOutput {
     tool_calls: Vec<RawToolCall>,
-    continuation_items: Vec<Value>,
 }
 
 /// Endpoint config for a Responses backend.
@@ -220,7 +219,6 @@ async fn chat_with_optional_tools(
             bail!("model requested a tool call, but no tool dispatcher is configured");
         };
 
-        input.extend(round.continuation_items);
         for call in round.tool_calls {
             let output = dispatcher.dispatch(tool_call_for_dispatch(&call)).await?;
             input.push(function_call_input_item(&call));
@@ -323,20 +321,13 @@ async fn chat_ws(
     let body = build_request_from_input(model, instructions, input, true, tools);
     session.send_text(body.to_string()).await?;
     let mut accumulator = ToolCallAccumulator::default();
-    let mut continuation_items = Vec::new();
     loop {
         match session.next_text(WS_READ_IDLE_TIMEOUT).await? {
             Some(frame) => {
                 let Some(value) = parse_frame(&frame) else {
                     continue;
                 };
-                match handle_stream_event(
-                    &value,
-                    &mut accumulator,
-                    &mut continuation_items,
-                    committed,
-                    on_delta,
-                )? {
+                match handle_stream_event(&value, &mut accumulator, committed, on_delta)? {
                     Event::OutputText(text) => {
                         *committed = true;
                         on_delta(&text);
@@ -344,7 +335,6 @@ async fn chat_ws(
                     Event::Completed => {
                         return Ok(RoundOutput {
                             tool_calls: accumulator.finish(),
-                            continuation_items,
                         })
                     }
                     Event::Failed(message) => bail!("{message}"),
@@ -355,7 +345,6 @@ async fn chat_ws(
                 if *committed {
                     return Ok(RoundOutput {
                         tool_calls: accumulator.finish(),
-                        continuation_items,
                     });
                 }
                 bail!("websocket closed before any response");
@@ -378,7 +367,6 @@ async fn chat_sse(
     let body = build_request_from_input(model, instructions, input, true, tools);
     let response = http::post_stream(client, &endpoint.https_url, auth_headers, &body).await?;
     let mut accumulator = ToolCallAccumulator::default();
-    let mut continuation_items = Vec::new();
     sse::read_sse(response, SSE_IDLE_TIMEOUT, |payload| {
         if payload == "[DONE]" {
             return Ok(false);
@@ -386,13 +374,7 @@ async fn chat_sse(
         let Ok(value) = serde_json::from_str::<Value>(payload) else {
             return Ok(true);
         };
-        match handle_stream_event(
-            &value,
-            &mut accumulator,
-            &mut continuation_items,
-            committed,
-            on_delta,
-        )? {
+        match handle_stream_event(&value, &mut accumulator, committed, on_delta)? {
             Event::OutputText(text) => {
                 *committed = true;
                 on_delta(&text);
@@ -406,7 +388,6 @@ async fn chat_sse(
     .await?;
     Ok(RoundOutput {
         tool_calls: accumulator.finish(),
-        continuation_items,
     })
 }
 
@@ -435,10 +416,7 @@ async fn chat_json(
         bail!("empty response from provider");
     }
     on_delta(&text);
-    Ok(RoundOutput {
-        tool_calls,
-        continuation_items: extract_reasoning_items(&value),
-    })
+    Ok(RoundOutput { tool_calls })
 }
 
 /// Build the Responses request body. System messages feed `instructions`
@@ -498,7 +476,6 @@ fn build_request_from_input(
 fn handle_stream_event(
     value: &Value,
     accumulator: &mut ToolCallAccumulator,
-    continuation_items: &mut Vec<Value>,
     committed: &mut bool,
     _on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> Result<Event> {
@@ -541,7 +518,6 @@ fn handle_stream_event(
                         *committed = true;
                         accumulator.merge_item(item, output_index(value));
                     }
-                    Some("reasoning") => continuation_items.push(item.clone()),
                     _ => {}
                 }
             }
@@ -792,17 +768,6 @@ fn extract_tool_calls(value: &Value) -> Vec<RawToolCall> {
         .collect()
 }
 
-fn extract_reasoning_items(value: &Value) -> Vec<Value> {
-    value
-        .get("output")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
-        .cloned()
-        .collect()
-}
-
 /// Derive the `wss://` URL from an `https://` (or `http://`) responses URL.
 fn to_ws_url(https_url: &str) -> Result<String> {
     let mut parsed = url::Url::parse(https_url)?;
@@ -864,7 +829,6 @@ mod tests {
     #[test]
     fn accumulates_streaming_function_call_arguments() {
         let mut accumulator = ToolCallAccumulator::default();
-        let mut continuation = Vec::new();
         let mut committed = false;
         let mut on_delta = |_text: &str| {};
 
@@ -881,7 +845,6 @@ mod tests {
                 }
             }),
             &mut accumulator,
-            &mut continuation,
             &mut committed,
             &mut on_delta,
         )
@@ -894,7 +857,6 @@ mod tests {
                 "delta": "{\"program\":\"git\"}"
             }),
             &mut accumulator,
-            &mut continuation,
             &mut committed,
             &mut on_delta,
         )

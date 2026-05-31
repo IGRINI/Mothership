@@ -403,6 +403,26 @@ fn handle_request(
         );
         return;
     }
+    if let CoreRequest::EditChatUserMessage {
+        chat_id,
+        message_id,
+        content,
+    } = &request
+    {
+        let started = database.begin_edited_chat_run(chat_id, message_id, content);
+        run_chat_message(
+            id,
+            started,
+            database,
+            outbox,
+            provider_manager,
+            tool_supervisor,
+            tool_registry,
+            async_runtime,
+            chat_registry,
+        );
+        return;
+    }
     if let CoreRequest::RetryChatMessage { chat_id } = &request {
         let started = database.begin_retry_run(chat_id);
         run_chat_message(
@@ -483,6 +503,12 @@ fn compute(
         CoreRequest::CreateChat => response(CoreResponse::Chat(database.create_chat()?)),
         CoreRequest::GetChat { chat_id, limit } => response(CoreResponse::Chat(
             database.get_chat(&chat_id, limit.unwrap_or(200))?,
+        )),
+        CoreRequest::BranchChatFromMessage {
+            chat_id,
+            message_id,
+        } => response(CoreResponse::Chat(
+            database.branch_chat_from_message(&chat_id, &message_id)?,
         )),
         CoreRequest::CancelChatRun { run_id } => {
             if let Some(provider_id) = chat_registry.cancel(&run_id) {
@@ -567,6 +593,7 @@ fn compute(
         }
         // Streaming cases handled in `handle_request` before reaching here.
         CoreRequest::SendChatMessage { .. }
+        | CoreRequest::EditChatUserMessage { .. }
         | CoreRequest::RetryChatMessage { .. }
         | CoreRequest::RunToolCommand { .. } => {
             unreachable!("handled as a streaming request")
@@ -617,6 +644,9 @@ fn run_tool_command(
 
     let sink: Arc<dyn ToolExecutionEventSink> = Arc::new(ProtocolToolExecutionSink {
         outbox: outbox.clone(),
+        database: None,
+        chat_id: None,
+        message_id: None,
     });
     async_runtime.spawn(async move {
         let result = tool_supervisor
@@ -727,6 +757,9 @@ fn run_chat_message(
             });
             let tool_sink: Arc<dyn ToolExecutionEventSink> = Arc::new(ProtocolToolExecutionSink {
                 outbox: outbox.clone(),
+                database: Some(database.clone()),
+                chat_id: Some(started.chat.id.clone()),
+                message_id: Some(started.assistant_message.id.clone()),
             });
             let tool_handler: Arc<dyn LlmToolCallHandler> =
                 Arc::new(tool_runtime::SidecarLlmToolHandler::new(
@@ -764,10 +797,19 @@ impl ChatRunEventSink for ProtocolChatRunSink {
 
 struct ProtocolToolExecutionSink {
     outbox: Outbox,
+    database: Option<Database>,
+    chat_id: Option<String>,
+    message_id: Option<String>,
 }
 
 impl ToolExecutionEventSink for ProtocolToolExecutionSink {
     fn emit(&self, event: ToolExecutionEvent) {
+        if let (Some(database), Some(chat_id), Some(message_id)) =
+            (&self.database, &self.chat_id, &self.message_id)
+        {
+            let _ = database.record_chat_tool_execution_event(chat_id, message_id, &event);
+        }
+
         let _ = self.outbox.send(ServerFrame::Event {
             event: CoreEvent::ToolExecution(event),
         });

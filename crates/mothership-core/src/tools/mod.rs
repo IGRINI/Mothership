@@ -29,6 +29,6 @@ pub use supervisor::ToolSupervisor;
 pub use types::{
     NoopToolExecutionEventSink, ToolApprovalAnswer, ToolCommand, ToolExecutionAccepted,
     ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionEventKind,
-    ToolExecutionEventSink, ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus,
-    ToolOutputPolicy, ToolOutputStream,
+    ToolExecutionEventSink, ToolExecutionRecord, ToolExecutionRequest, ToolExecutionResult,
+    ToolExecutionStatus, ToolOutputPolicy, ToolOutputStream,
 };

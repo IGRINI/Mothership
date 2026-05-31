@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -35,6 +36,7 @@ impl ProcessSandboxToolAdapter {
 #[async_trait::async_trait]
 impl ToolProcessSandbox for ProcessSandboxToolAdapter {
     async fn spawn(&self, spec: ToolProcessSpec) -> Result<Box<dyn SpawnedToolProcess>> {
+        let spec = platform_process_spec(spec);
         let process = self
             .inner
             .spawn(process_sandbox::ToolSpec {
@@ -49,6 +51,70 @@ impl ToolProcessSandbox for ProcessSandboxToolAdapter {
 
         Ok(Box::new(SpawnedProcessAdapter { inner: process }))
     }
+}
+
+#[cfg(windows)]
+fn platform_process_spec(spec: ToolProcessSpec) -> ToolProcessSpec {
+    let program = spec
+        .program
+        .to_string_lossy()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let args = spec
+        .args
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+
+    match program.as_str() {
+        "pwd" => powershell_spec(
+            spec,
+            "Get-Location | Select-Object -ExpandProperty Path",
+            Vec::new(),
+        ),
+        "ls" | "dir" => powershell_spec(
+            spec,
+            "if ($args.Count -eq 0) { Get-ChildItem -Force } else { Get-ChildItem -Force -LiteralPath $args }",
+            args,
+        ),
+        "cat" | "type" => powershell_spec(
+            spec,
+            "if ($args.Count -eq 0) { Write-Error 'file path is required'; exit 2 } Get-Content -Raw -LiteralPath $args",
+            args,
+        ),
+        "grep" => powershell_spec(
+            spec,
+            "if ($args.Count -lt 1) { Write-Error 'pattern is required'; exit 2 } $pattern = $args[0]; $paths = if ($args.Count -gt 1) { $args[1..($args.Count - 1)] } else { @('.') }; Select-String -Pattern $pattern -Path $paths",
+            args,
+        ),
+        _ => spec,
+    }
+}
+
+#[cfg(not(windows))]
+fn platform_process_spec(spec: ToolProcessSpec) -> ToolProcessSpec {
+    spec
+}
+
+#[cfg(windows)]
+fn powershell_spec(
+    mut spec: ToolProcessSpec,
+    script: &str,
+    script_args: Vec<String>,
+) -> ToolProcessSpec {
+    let mut args = vec![
+        OsString::from("-NoProfile"),
+        OsString::from("-NonInteractive"),
+        OsString::from("-Command"),
+        OsString::from(script),
+    ];
+    args.extend(script_args.into_iter().map(OsString::from));
+    spec.program = OsString::from("powershell.exe");
+    spec.args = args;
+    spec
 }
 
 pub struct SidecarLlmToolHandler {
@@ -280,5 +346,31 @@ impl SpawnedToolProcess for SpawnedProcessAdapter {
             .kill_tree()
             .await
             .map_err(|error| MothershipError::Runtime(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pwd_uses_powershell_builtin() {
+        let spec = platform_process_spec(ToolProcessSpec {
+            program: OsString::from("pwd"),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout: Some(Duration::from_secs(1)),
+        });
+
+        assert_eq!(spec.program, OsString::from("powershell.exe"));
+        assert!(spec
+            .args
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("Get-Location")));
     }
 }

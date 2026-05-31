@@ -95,6 +95,19 @@ pub enum CoreRequest {
         chat_id: Option<String>,
         content: String,
     },
+    /// Edit an existing user message, remove everything after it in that chat,
+    /// and start a fresh assistant run from the edited prompt.
+    EditChatUserMessage {
+        chat_id: String,
+        message_id: String,
+        content: String,
+    },
+    /// Create a new chat by copying the visible conversation history through
+    /// the selected assistant message.
+    BranchChatFromMessage {
+        chat_id: String,
+        message_id: String,
+    },
     /// Re-run the last failed assistant message in a chat (rolled back in place,
     /// no duplicate exchange). Like `SendChatMessage`, it streams `Event::ChatRun`s.
     RetryChatMessage {

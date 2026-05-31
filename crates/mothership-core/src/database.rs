@@ -1,16 +1,18 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{params, types::Type, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, types::Type, Connection, OptionalExtension};
 
 use crate::{
     id::generate_id, ActivityEvent, ChatConversation, ChatMessage, ChatMessageRole,
     ChatMessageStatus, ChatRunEvent, ChatRunEventKind, ChatThreadSummary, DashboardMetric,
     DashboardSnapshot, LlmChatMessage, LlmChatRole, MothershipError, Result, SelectedLlmModel,
-    SendChatMessageResult, SidecarStatus, WorkspaceItem,
+    SendChatMessageResult, SidecarStatus, ToolCommand, ToolExecutionEvent, ToolExecutionEventKind,
+    ToolExecutionRecord, ToolExecutionResult, ToolOutputStream, WorkspaceItem,
 };
 
 const WORKSPACE_LIMIT: i64 = 2_500;
@@ -18,6 +20,7 @@ const EVENT_LIMIT: i64 = 5_000;
 const CHAT_LIST_LIMIT: i64 = 100;
 const CHAT_MESSAGE_LIMIT: i64 = 200;
 const CHAT_MESSAGE_MAX_BYTES: usize = 20_000;
+const TOOL_OUTPUT_DISPLAY_MAX_BYTES: usize = 12_000;
 const DEFAULT_MODEL_SCOPE: &str = "default";
 
 #[derive(Debug, Clone)]
@@ -151,6 +154,7 @@ impl Database {
         Ok(ChatConversation {
             chat,
             messages: Vec::new(),
+            tool_executions: Vec::new(),
         })
     }
 
@@ -164,8 +168,69 @@ impl Database {
             chat_id,
             normalize_limit(limit, CHAT_MESSAGE_LIMIT),
         )?;
+        let message_ids = messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+        let tool_executions = select_chat_tool_executions(&connection, chat_id, &message_ids)?;
 
-        Ok(ChatConversation { chat, messages })
+        Ok(ChatConversation {
+            chat,
+            messages,
+            tool_executions,
+        })
+    }
+
+    pub fn record_chat_tool_execution_event(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        event: &ToolExecutionEvent,
+    ) -> Result<()> {
+        validate_identifier("chat_id", chat_id)?;
+        validate_identifier("message_id", message_id)?;
+        validate_identifier("tool_call_id", &event.tool_call_id)?;
+
+        let connection = self.connect()?;
+        let occurred_at = current_timestamp();
+        let command_json = json_string(&event.command)?;
+        let result_json = json_string(&event.result)?;
+
+        connection.execute(
+            "
+            INSERT INTO chat_tool_events (
+                chat_id,
+                message_id,
+                tool_call_id,
+                run_id,
+                project_id,
+                command_json,
+                kind,
+                stream,
+                chunk,
+                message,
+                result_json,
+                occurred_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ",
+            params![
+                chat_id,
+                message_id,
+                event.tool_call_id.as_str(),
+                event.run_id.as_deref(),
+                event.project_id.as_deref(),
+                command_json,
+                tool_event_kind_to_db(event.kind),
+                event.stream.map(tool_output_stream_to_db),
+                event.chunk.as_deref(),
+                event.message.as_deref(),
+                result_json,
+                occurred_at
+            ],
+        )?;
+
+        Ok(())
     }
 
     pub fn send_chat_message(
@@ -321,6 +386,197 @@ impl Database {
         })
     }
 
+    /// Edits a completed user message, deletes all later messages in the same
+    /// chat, and creates a fresh assistant placeholder after the edited prompt.
+    pub fn begin_edited_chat_run(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        content: &str,
+    ) -> Result<SendChatMessageResult> {
+        validate_identifier("chat_id", chat_id)?;
+        validate_identifier("message_id", message_id)?;
+        let content = validate_chat_message_content(content)?;
+        let mut connection = self.connect()?;
+        let selected_model = selected_llm_model(&connection)?;
+        if selected_model.model_id.trim().is_empty() {
+            return Err(MothershipError::InvalidRequest(
+                "no LLM model selected; connect a provider and choose a model first".to_string(),
+            ));
+        }
+
+        let tx = connection.transaction()?;
+        let chat = select_chat_summary(&tx, chat_id)?;
+        let original_user_message = select_chat_message_by_id(&tx, message_id)?;
+        if original_user_message.chat_id != chat_id {
+            return Err(MothershipError::InvalidRequest(
+                "message does not belong to the selected chat".to_string(),
+            ));
+        }
+        if original_user_message.role != ChatMessageRole::User {
+            return Err(MothershipError::InvalidRequest(
+                "only user messages can be edited and re-sent".to_string(),
+            ));
+        }
+        if original_user_message.status != ChatMessageStatus::Complete {
+            return Err(MothershipError::InvalidRequest(
+                "only completed user messages can be edited".to_string(),
+            ));
+        }
+
+        let messages_before_target =
+            count_chat_messages_before(&tx, chat_id, original_user_message.position)?;
+        tx.execute(
+            "DELETE FROM chat_messages WHERE chat_id = ?1 AND rowid > ?2",
+            params![chat_id, original_user_message.position],
+        )?;
+
+        let now = current_timestamp();
+        tx.execute(
+            "
+            UPDATE chat_messages
+            SET content = ?1,
+                status = ?2,
+                created_at = ?3,
+                provider_id = NULL,
+                model_id = NULL
+            WHERE id = ?4 AND chat_id = ?5
+            ",
+            params![
+                content,
+                chat_status_to_db(ChatMessageStatus::Complete),
+                now,
+                message_id,
+                chat_id
+            ],
+        )?;
+
+        let user_message = ChatMessage {
+            content: content.to_string(),
+            status: ChatMessageStatus::Complete,
+            created_at: now.clone(),
+            provider_id: None,
+            model_id: None,
+            ..original_user_message
+        };
+        let mut assistant_message = ChatMessage {
+            id: generate_id("chat_message")?,
+            chat_id: chat_id.to_string(),
+            position: 0,
+            role: ChatMessageRole::Assistant,
+            content: String::new(),
+            status: ChatMessageStatus::Sending,
+            created_at: now.clone(),
+            provider_id: Some(selected_model.provider_id.clone()),
+            model_id: Some(selected_model.model_id.clone()),
+        };
+        assistant_message.position = insert_chat_message(&tx, &assistant_message)?;
+
+        let message_count = count_chat_messages(&tx, chat_id)?;
+        let title = if messages_before_target == 0 {
+            derive_chat_title(content)
+        } else {
+            chat.title
+        };
+        let updated_chat = ChatThreadSummary {
+            id: chat.id,
+            title,
+            preview: derive_chat_preview(content),
+            message_count,
+            created_at: chat.created_at,
+            updated_at: now,
+        };
+        update_chat_summary(&tx, &updated_chat)?;
+        tx.commit()?;
+
+        Ok(SendChatMessageResult {
+            run_id: generate_id("chat_run")?,
+            chat: updated_chat,
+            user_message,
+            assistant_message,
+        })
+    }
+
+    /// Creates a new chat whose messages are copied from `chat_id` through the
+    /// selected assistant message, inclusive. The copied chat is independent:
+    /// message ids and copied tool-call ids are regenerated.
+    pub fn branch_chat_from_message(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<ChatConversation> {
+        validate_identifier("chat_id", chat_id)?;
+        validate_identifier("message_id", message_id)?;
+
+        let mut connection = self.connect()?;
+        let tx = connection.transaction()?;
+        let source_chat = select_chat_summary(&tx, chat_id)?;
+        let branch_point = select_chat_message_by_id(&tx, message_id)?;
+        if branch_point.chat_id != chat_id {
+            return Err(MothershipError::InvalidRequest(
+                "message does not belong to the selected chat".to_string(),
+            ));
+        }
+        if branch_point.role != ChatMessageRole::Assistant {
+            return Err(MothershipError::InvalidRequest(
+                "chat branches can only start from assistant messages".to_string(),
+            ));
+        }
+        if branch_point.status == ChatMessageStatus::Sending {
+            return Err(MothershipError::InvalidRequest(
+                "cannot branch from a message that is still streaming".to_string(),
+            ));
+        }
+
+        let source_messages =
+            select_chat_messages_through_position(&tx, chat_id, branch_point.position)?;
+        if source_messages.is_empty() {
+            return Err(MothershipError::InvalidRequest(
+                "no chat messages to copy".to_string(),
+            ));
+        }
+
+        let now = current_timestamp();
+        let chat = ChatThreadSummary {
+            id: generate_id("chat")?,
+            title: branch_chat_title(&source_chat.title),
+            preview: derive_chat_preview(&branch_point.content),
+            message_count: source_messages.len() as i64,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        insert_chat_summary(&tx, &chat)?;
+
+        let mut copied_messages = Vec::with_capacity(source_messages.len());
+        let mut message_id_map = HashMap::with_capacity(source_messages.len());
+        for source_message in source_messages {
+            let source_message_id = source_message.id.clone();
+            let mut copied_message = ChatMessage {
+                id: generate_id("chat_message")?,
+                chat_id: chat.id.clone(),
+                position: 0,
+                ..source_message
+            };
+            message_id_map.insert(source_message_id, copied_message.id.clone());
+            copied_message.position = insert_chat_message(&tx, &copied_message)?;
+            copied_messages.push(copied_message);
+        }
+
+        copy_chat_tool_events(&tx, chat_id, &chat.id, &message_id_map)?;
+        let copied_message_ids = copied_messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+        let tool_executions = select_chat_tool_executions(&tx, &chat.id, &copied_message_ids)?;
+        tx.commit()?;
+
+        Ok(ChatConversation {
+            chat,
+            messages: copied_messages,
+            tool_executions,
+        })
+    }
+
     /// Rolls the last (failed) assistant message in a chat back to a fresh
     /// pending state in place and returns a run handle to re-drive it — reusing
     /// the existing user message instead of creating a duplicate exchange.
@@ -364,6 +620,10 @@ impl Database {
                 selected_model.provider_id,
                 selected_model.model_id
             ],
+        )?;
+        tx.execute(
+            "DELETE FROM chat_tool_events WHERE message_id = ?1",
+            params![assistant_message.id],
         )?;
 
         let now = current_timestamp();
@@ -768,6 +1028,30 @@ fn migrate(connection: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_chat_messages_chat
             ON chat_messages (chat_id);
 
+        CREATE TABLE IF NOT EXISTS chat_tool_events (
+            id INTEGER PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            tool_call_id TEXT NOT NULL,
+            run_id TEXT,
+            project_id TEXT,
+            command_json TEXT,
+            kind TEXT NOT NULL,
+            stream TEXT,
+            chunk TEXT,
+            message TEXT,
+            result_json TEXT,
+            occurred_at TEXT NOT NULL,
+            FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE,
+            FOREIGN KEY(message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chat_tool_events_chat
+            ON chat_tool_events (chat_id, id);
+
+        CREATE INDEX IF NOT EXISTS idx_chat_tool_events_message
+            ON chat_tool_events (message_id, id);
+
         CREATE TABLE IF NOT EXISTS llm_model_preferences (
             scope TEXT PRIMARY KEY,
             provider_id TEXT NOT NULL,
@@ -806,6 +1090,10 @@ fn migrate(connection: &Connection) -> Result<()> {
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
         params![6_i64, current_timestamp()],
+    )?;
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+        params![7_i64, current_timestamp()],
     )?;
 
     Ok(())
@@ -956,6 +1244,69 @@ fn select_chat_summary(connection: &Connection, chat_id: &str) -> Result<ChatThr
         .ok_or_else(|| MothershipError::InvalidRequest(format!("chat not found: {chat_id}")))
 }
 
+fn insert_chat_summary(connection: &Connection, chat: &ChatThreadSummary) -> Result<()> {
+    connection.execute(
+        "
+        INSERT INTO chats (id, title, preview, message_count, archived, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
+        ",
+        params![
+            chat.id,
+            chat.title,
+            chat.preview,
+            chat.message_count,
+            chat.created_at,
+            chat.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_chat_summary(connection: &Connection, chat: &ChatThreadSummary) -> Result<()> {
+    connection.execute(
+        "
+        UPDATE chats
+        SET title = ?2,
+            preview = ?3,
+            message_count = ?4,
+            updated_at = ?5
+        WHERE id = ?1
+        ",
+        params![
+            chat.id,
+            chat.title,
+            chat.preview,
+            chat.message_count,
+            chat.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn count_chat_messages(connection: &Connection, chat_id: &str) -> Result<i64> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM chat_messages WHERE chat_id = ?1",
+            params![chat_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn count_chat_messages_before(
+    connection: &Connection,
+    chat_id: &str,
+    position: i64,
+) -> Result<i64> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM chat_messages WHERE chat_id = ?1 AND rowid < ?2",
+            params![chat_id, position],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
 fn select_chat_messages(
     connection: &Connection,
     chat_id: &str,
@@ -979,6 +1330,280 @@ fn select_chat_messages(
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+fn select_chat_messages_through_position(
+    connection: &Connection,
+    chat_id: &str,
+    through_position: i64,
+) -> Result<Vec<ChatMessage>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id, chat_id, rowid, role, content, status, created_at, provider_id, model_id
+        FROM chat_messages
+        WHERE chat_id = ?1 AND rowid <= ?2
+        ORDER BY rowid ASC
+        ",
+    )?;
+
+    let rows = statement.query_map(params![chat_id, through_position], chat_message_from_row)?;
+
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn select_chat_tool_executions(
+    connection: &Connection,
+    chat_id: &str,
+    message_ids: &[&str],
+) -> Result<Vec<ToolExecutionRecord>> {
+    if message_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = std::iter::repeat("?")
+        .take(message_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "
+        SELECT id, message_id, tool_call_id, run_id, project_id, command_json, kind, stream, chunk, message, result_json, occurred_at
+        FROM chat_tool_events
+        WHERE chat_id = ?
+          AND message_id IN ({placeholders})
+        ORDER BY id ASC
+        "
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let params = std::iter::once(chat_id)
+        .chain(message_ids.iter().copied())
+        .collect::<Vec<_>>();
+    let rows = statement.query_map(params_from_iter(params), chat_tool_event_row_from_row)?;
+
+    let mut records = Vec::<ToolExecutionRecord>::new();
+    let mut index_by_tool_call_id = HashMap::<String, usize>::new();
+    for row in rows {
+        let row = row?;
+        let record_index = match index_by_tool_call_id.get(&row.tool_call_id) {
+            Some(index) => *index,
+            None => {
+                let index = records.len();
+                index_by_tool_call_id.insert(row.tool_call_id.clone(), index);
+                records.push(ToolExecutionRecord {
+                    tool_call_id: row.tool_call_id.clone(),
+                    run_id: row.run_id.clone(),
+                    chat_id: chat_id.to_string(),
+                    message_id: row.message_id.clone(),
+                    project_id: row.project_id.clone(),
+                    command: row.command.clone(),
+                    kind: row.kind,
+                    message: row.message.clone(),
+                    output: String::new(),
+                    result: row.result.clone(),
+                    created_at: row.occurred_at.clone(),
+                    updated_at: row.occurred_at.clone(),
+                });
+                index
+            }
+        };
+
+        apply_tool_event_row(&mut records[record_index], row);
+    }
+
+    Ok(records)
+}
+
+fn copy_chat_tool_events(
+    connection: &Connection,
+    source_chat_id: &str,
+    target_chat_id: &str,
+    message_id_map: &HashMap<String, String>,
+) -> Result<()> {
+    if message_id_map.is_empty() {
+        return Ok(());
+    }
+
+    let source_message_ids = message_id_map
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let placeholders = std::iter::repeat("?")
+        .take(source_message_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "
+        SELECT message_id, tool_call_id, project_id, command_json, kind, stream, chunk, message, result_json, occurred_at
+        FROM chat_tool_events
+        WHERE chat_id = ?
+          AND message_id IN ({placeholders})
+        ORDER BY id ASC
+        "
+    );
+
+    struct EventCopyRow {
+        message_id: String,
+        tool_call_id: String,
+        project_id: Option<String>,
+        command_json: Option<String>,
+        kind: String,
+        stream: Option<String>,
+        chunk: Option<String>,
+        message: Option<String>,
+        result_json: Option<String>,
+        occurred_at: String,
+    }
+
+    let rows = {
+        let mut statement = connection.prepare(&sql)?;
+        let params = std::iter::once(source_chat_id)
+            .chain(source_message_ids.iter().copied())
+            .collect::<Vec<_>>();
+        let rows = statement.query_map(params_from_iter(params), |row| {
+            Ok(EventCopyRow {
+                message_id: row.get(0)?,
+                tool_call_id: row.get(1)?,
+                project_id: row.get(2)?,
+                command_json: row.get(3)?,
+                kind: row.get(4)?,
+                stream: row.get(5)?,
+                chunk: row.get(6)?,
+                message: row.get(7)?,
+                result_json: row.get(8)?,
+                occurred_at: row.get(9)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let mut tool_call_id_map = HashMap::<String, String>::new();
+    for row in rows {
+        let Some(target_message_id) = message_id_map.get(&row.message_id) else {
+            continue;
+        };
+        let target_tool_call_id = match tool_call_id_map.get(&row.tool_call_id) {
+            Some(id) => id.clone(),
+            None => {
+                let id = generate_id("tool_call")?;
+                tool_call_id_map.insert(row.tool_call_id.clone(), id.clone());
+                id
+            }
+        };
+
+        connection.execute(
+            "
+            INSERT INTO chat_tool_events (
+                chat_id,
+                message_id,
+                tool_call_id,
+                run_id,
+                project_id,
+                command_json,
+                kind,
+                stream,
+                chunk,
+                message,
+                result_json,
+                occurred_at
+            )
+            VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ",
+            params![
+                target_chat_id,
+                target_message_id,
+                target_tool_call_id,
+                row.project_id,
+                row.command_json,
+                row.kind,
+                row.stream,
+                row.chunk,
+                row.message,
+                row.result_json,
+                row.occurred_at
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ChatToolEventRow {
+    message_id: String,
+    tool_call_id: String,
+    run_id: Option<String>,
+    project_id: Option<String>,
+    command: Option<ToolCommand>,
+    kind: ToolExecutionEventKind,
+    stream: Option<ToolOutputStream>,
+    chunk: Option<String>,
+    message: Option<String>,
+    result: Option<ToolExecutionResult>,
+    occurred_at: String,
+}
+
+fn chat_tool_event_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatToolEventRow> {
+    let command_json: Option<String> = row.get(5)?;
+    let result_json: Option<String> = row.get(10)?;
+    Ok(ChatToolEventRow {
+        message_id: row.get(1)?,
+        tool_call_id: row.get(2)?,
+        run_id: row.get(3)?,
+        project_id: row.get(4)?,
+        command: json_value(command_json, 5)?,
+        kind: tool_event_kind_from_db(&row.get::<_, String>(6)?, 6)?,
+        stream: match row.get::<_, Option<String>>(7)? {
+            Some(stream) => Some(tool_output_stream_from_db(&stream, 7)?),
+            None => None,
+        },
+        chunk: row.get(8)?,
+        message: row.get(9)?,
+        result: json_value(result_json, 10)?,
+        occurred_at: row.get(11)?,
+    })
+}
+
+fn apply_tool_event_row(record: &mut ToolExecutionRecord, row: ChatToolEventRow) {
+    record.kind = row.kind;
+    record.updated_at = row.occurred_at;
+
+    if row.run_id.is_some() {
+        record.run_id = row.run_id;
+    }
+    if row.project_id.is_some() {
+        record.project_id = row.project_id;
+    }
+    if row.command.is_some() {
+        record.command = row.command;
+    }
+    if row.message.is_some() {
+        record.message = row.message;
+    }
+    if row.result.is_some() {
+        record.result = row.result;
+    }
+    if let Some(chunk) = row.chunk {
+        append_tool_output(&mut record.output, row.stream, &chunk);
+    }
+}
+
+fn append_tool_output(output: &mut String, stream: Option<ToolOutputStream>, chunk: &str) {
+    if stream == Some(ToolOutputStream::Stderr) {
+        output.push_str("[stderr] ");
+    }
+    output.push_str(chunk);
+
+    if output.len() > TOOL_OUTPUT_DISPLAY_MAX_BYTES {
+        let keep_from = output
+            .char_indices()
+            .map(|(index, _)| index)
+            .find(|index| output.len() - *index <= TOOL_OUTPUT_DISPLAY_MAX_BYTES)
+            .unwrap_or(output.len());
+        let tail = output[keep_from..].to_string();
+        output.clear();
+        output.push_str("... output trimmed ...\n");
+        output.push_str(&tail);
+    }
 }
 
 fn insert_chat_message(connection: &Connection, message: &ChatMessage) -> Result<i64> {
@@ -1160,6 +1785,85 @@ fn chat_status_from_db(value: &str) -> rusqlite::Result<ChatMessageStatus> {
     }
 }
 
+fn tool_event_kind_to_db(kind: ToolExecutionEventKind) -> &'static str {
+    match kind {
+        ToolExecutionEventKind::Queued => "queued",
+        ToolExecutionEventKind::PermissionRequested => "permission_requested",
+        ToolExecutionEventKind::PermissionDenied => "permission_denied",
+        ToolExecutionEventKind::WaitingForResource => "waiting_for_resource",
+        ToolExecutionEventKind::Started => "started",
+        ToolExecutionEventKind::Output => "output",
+        ToolExecutionEventKind::Completed => "completed",
+        ToolExecutionEventKind::Failed => "failed",
+        ToolExecutionEventKind::Cancelled => "cancelled",
+        ToolExecutionEventKind::TimedOut => "timed_out",
+    }
+}
+
+fn tool_event_kind_from_db(value: &str, column: usize) -> rusqlite::Result<ToolExecutionEventKind> {
+    match value {
+        "queued" => Ok(ToolExecutionEventKind::Queued),
+        "permission_requested" => Ok(ToolExecutionEventKind::PermissionRequested),
+        "permission_denied" => Ok(ToolExecutionEventKind::PermissionDenied),
+        "waiting_for_resource" => Ok(ToolExecutionEventKind::WaitingForResource),
+        "started" => Ok(ToolExecutionEventKind::Started),
+        "output" => Ok(ToolExecutionEventKind::Output),
+        "completed" => Ok(ToolExecutionEventKind::Completed),
+        "failed" => Ok(ToolExecutionEventKind::Failed),
+        "cancelled" => Ok(ToolExecutionEventKind::Cancelled),
+        "timed_out" => Ok(ToolExecutionEventKind::TimedOut),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            Box::new(MothershipError::InvalidRequest(format!(
+                "unsupported tool event kind: {value}"
+            ))),
+        )),
+    }
+}
+
+fn tool_output_stream_to_db(stream: ToolOutputStream) -> &'static str {
+    match stream {
+        ToolOutputStream::Stdout => "stdout",
+        ToolOutputStream::Stderr => "stderr",
+    }
+}
+
+fn tool_output_stream_from_db(value: &str, column: usize) -> rusqlite::Result<ToolOutputStream> {
+    match value {
+        "stdout" => Ok(ToolOutputStream::Stdout),
+        "stderr" => Ok(ToolOutputStream::Stderr),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            Box::new(MothershipError::InvalidRequest(format!(
+                "unsupported tool output stream: {value}"
+            ))),
+        )),
+    }
+}
+
+fn json_string<T: serde::Serialize>(value: &Option<T>) -> Result<Option<String>> {
+    value
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn json_value<T: serde::de::DeserializeOwned>(
+    value: Option<String>,
+    column: usize,
+) -> rusqlite::Result<Option<T>> {
+    value
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+            })
+        })
+        .transpose()
+}
+
 fn validate_identifier(name: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         return Err(MothershipError::InvalidRequest(format!(
@@ -1202,6 +1906,15 @@ fn derive_chat_title(content: &str) -> String {
     }
 
     truncate_chars(&title, 64)
+}
+
+fn branch_chat_title(source_title: &str) -> String {
+    let title = compact_whitespace(source_title);
+    if title.is_empty() || title == "New chat" {
+        return "New chat branch".to_string();
+    }
+
+    truncate_chars(&format!("{title} branch"), 64)
 }
 
 fn derive_chat_preview(content: &str) -> String {
@@ -1258,6 +1971,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::ToolExecutionStatus;
 
     #[test]
     fn chat_message_creates_persistent_conversation() {
@@ -1308,6 +2022,23 @@ mod tests {
             .begin_chat_run(None, "Retry me")
             .expect("begin run");
         database
+            .record_chat_tool_execution_event(
+                &run.chat.id,
+                &run.assistant_message.id,
+                &ToolExecutionEvent {
+                    tool_call_id: "tool_retry_1".to_string(),
+                    run_id: Some(run.run_id.clone()),
+                    project_id: None,
+                    command: Some(ToolCommand::new("pwd", std::iter::empty::<&str>())),
+                    kind: ToolExecutionEventKind::Queued,
+                    stream: None,
+                    chunk: None,
+                    message: None,
+                    result: None,
+                },
+            )
+            .expect("record tool event");
+        database
             .fail_chat_run(&run.run_id, &run.chat.id, &run.assistant_message.id, "boom")
             .expect("fail run");
 
@@ -1320,12 +2051,273 @@ mod tests {
         assert_eq!(retry.user_message.content, "Retry me");
         let conversation = database.get_chat(&run.chat.id, 200).expect("get chat");
         assert_eq!(conversation.messages.len(), 2);
+        assert!(conversation.tool_executions.is_empty());
 
         // Nothing to retry while the run is pending again.
         let error = database
             .begin_retry_run(&run.chat.id)
             .expect_err("no failed run to retry");
         assert!(matches!(error, MothershipError::InvalidRequest(_)));
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn chat_tool_events_are_restored_with_conversation() {
+        let database_path = temp_database_path("chat_tool_events_are_restored");
+        let database = Database::open(database_path.clone()).expect("open database");
+        database
+            .set_selected_llm_model("openai", "test-model")
+            .expect("select model");
+        let run = database
+            .begin_chat_run(None, "Show the current folder")
+            .expect("begin run");
+        let command = ToolCommand::new("powershell", ["-Command", "Get-Location"]);
+
+        database
+            .record_chat_tool_execution_event(
+                &run.chat.id,
+                &run.assistant_message.id,
+                &ToolExecutionEvent {
+                    tool_call_id: "tool_history_1".to_string(),
+                    run_id: Some(run.run_id.clone()),
+                    project_id: Some("project_1".to_string()),
+                    command: Some(command.clone()),
+                    kind: ToolExecutionEventKind::Queued,
+                    stream: None,
+                    chunk: None,
+                    message: None,
+                    result: None,
+                },
+            )
+            .expect("record queued");
+        database
+            .record_chat_tool_execution_event(
+                &run.chat.id,
+                &run.assistant_message.id,
+                &ToolExecutionEvent {
+                    tool_call_id: "tool_history_1".to_string(),
+                    run_id: Some(run.run_id.clone()),
+                    project_id: Some("project_1".to_string()),
+                    command: None,
+                    kind: ToolExecutionEventKind::Output,
+                    stream: Some(ToolOutputStream::Stdout),
+                    chunk: Some("E:\\Mothership\n".to_string()),
+                    message: None,
+                    result: None,
+                },
+            )
+            .expect("record output");
+        database
+            .record_chat_tool_execution_event(
+                &run.chat.id,
+                &run.assistant_message.id,
+                &ToolExecutionEvent {
+                    tool_call_id: "tool_history_1".to_string(),
+                    run_id: Some(run.run_id.clone()),
+                    project_id: Some("project_1".to_string()),
+                    command: None,
+                    kind: ToolExecutionEventKind::Completed,
+                    stream: None,
+                    chunk: None,
+                    message: None,
+                    result: Some(ToolExecutionResult {
+                        tool_call_id: "tool_history_1".to_string(),
+                        status: ToolExecutionStatus::Completed,
+                        exit_code: Some(0),
+                        stdout_preview: "E:\\Mothership\n".to_string(),
+                        stderr_preview: String::new(),
+                        stdout_tail: "E:\\Mothership\n".to_string(),
+                        stderr_tail: String::new(),
+                        stdout_bytes: 14,
+                        stderr_bytes: 0,
+                        truncated_for_display: false,
+                        truncated_for_agent: false,
+                        log_ref: None,
+                        message: None,
+                    }),
+                },
+            )
+            .expect("record completed");
+
+        drop(database);
+
+        let reopened = Database::open(database_path.clone()).expect("reopen database");
+        let conversation = reopened
+            .get_chat(&run.chat.id, 200)
+            .expect("restore conversation");
+
+        assert_eq!(conversation.tool_executions.len(), 1);
+        let tool = &conversation.tool_executions[0];
+        assert_eq!(tool.tool_call_id, "tool_history_1");
+        assert_eq!(tool.message_id, run.assistant_message.id);
+        assert_eq!(tool.command, Some(command));
+        assert_eq!(tool.kind, ToolExecutionEventKind::Completed);
+        assert_eq!(
+            tool.result.as_ref().map(|result| result.exit_code),
+            Some(Some(0))
+        );
+        assert!(tool.output.contains("E:\\Mothership"));
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn editing_user_message_truncates_later_history_and_starts_run() {
+        let database_path = temp_database_path("editing_user_message_truncates_history");
+        let database = Database::open(database_path.clone()).expect("open database");
+        database
+            .set_selected_llm_model("openai", "test-model")
+            .expect("select model");
+
+        let first = database
+            .begin_chat_run(None, "Original prompt")
+            .expect("begin first run");
+        database
+            .append_chat_run_delta(
+                &first.run_id,
+                &first.chat.id,
+                &first.assistant_message.id,
+                "Original answer",
+            )
+            .expect("append first answer");
+        database
+            .complete_chat_run(&first.run_id, &first.chat.id, &first.assistant_message.id)
+            .expect("complete first run");
+
+        let second = database
+            .begin_chat_run(Some(&first.chat.id), "Follow-up prompt")
+            .expect("begin second run");
+        database
+            .record_chat_tool_execution_event(
+                &second.chat.id,
+                &second.assistant_message.id,
+                &ToolExecutionEvent {
+                    tool_call_id: "tool_deleted_after_edit".to_string(),
+                    run_id: Some(second.run_id.clone()),
+                    project_id: None,
+                    command: Some(ToolCommand::new("pwd", std::iter::empty::<&str>())),
+                    kind: ToolExecutionEventKind::Queued,
+                    stream: None,
+                    chunk: None,
+                    message: None,
+                    result: None,
+                },
+            )
+            .expect("record deleted tool event");
+        database
+            .append_chat_run_delta(
+                &second.run_id,
+                &second.chat.id,
+                &second.assistant_message.id,
+                "Follow-up answer",
+            )
+            .expect("append second answer");
+        database
+            .complete_chat_run(
+                &second.run_id,
+                &second.chat.id,
+                &second.assistant_message.id,
+            )
+            .expect("complete second run");
+
+        let edited = database
+            .begin_edited_chat_run(&first.chat.id, &first.user_message.id, "Edited prompt")
+            .expect("begin edited run");
+
+        assert_eq!(edited.user_message.id, first.user_message.id);
+        assert_eq!(edited.user_message.content, "Edited prompt");
+        assert_ne!(edited.assistant_message.id, first.assistant_message.id);
+        assert_eq!(edited.assistant_message.status, ChatMessageStatus::Sending);
+        assert_eq!(edited.chat.message_count, 2);
+
+        let conversation = database.get_chat(&first.chat.id, 200).expect("get chat");
+        assert_eq!(conversation.messages.len(), 2);
+        assert_eq!(conversation.messages[0].content, "Edited prompt");
+        assert_eq!(conversation.messages[1].id, edited.assistant_message.id);
+        assert!(conversation.tool_executions.is_empty());
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn branch_chat_copies_history_through_assistant_message() {
+        let database_path = temp_database_path("branch_chat_copies_history");
+        let database = Database::open(database_path.clone()).expect("open database");
+        database
+            .set_selected_llm_model("openai", "test-model")
+            .expect("select model");
+
+        let first = database
+            .begin_chat_run(None, "First prompt")
+            .expect("begin first run");
+        database
+            .append_chat_run_delta(
+                &first.run_id,
+                &first.chat.id,
+                &first.assistant_message.id,
+                "First answer",
+            )
+            .expect("append first answer");
+        database
+            .complete_chat_run(&first.run_id, &first.chat.id, &first.assistant_message.id)
+            .expect("complete first run");
+
+        let second = database
+            .begin_chat_run(Some(&first.chat.id), "Second prompt")
+            .expect("begin second run");
+        database
+            .record_chat_tool_execution_event(
+                &second.chat.id,
+                &second.assistant_message.id,
+                &ToolExecutionEvent {
+                    tool_call_id: "tool_branch_source".to_string(),
+                    run_id: Some(second.run_id.clone()),
+                    project_id: Some("project_1".to_string()),
+                    command: Some(ToolCommand::new("pwd", std::iter::empty::<&str>())),
+                    kind: ToolExecutionEventKind::Queued,
+                    stream: None,
+                    chunk: None,
+                    message: None,
+                    result: None,
+                },
+            )
+            .expect("record source tool event");
+        database
+            .append_chat_run_delta(
+                &second.run_id,
+                &second.chat.id,
+                &second.assistant_message.id,
+                "Second answer",
+            )
+            .expect("append second answer");
+        database
+            .complete_chat_run(
+                &second.run_id,
+                &second.chat.id,
+                &second.assistant_message.id,
+            )
+            .expect("complete second run");
+
+        let branch = database
+            .branch_chat_from_message(&first.chat.id, &second.assistant_message.id)
+            .expect("branch chat");
+
+        assert_ne!(branch.chat.id, first.chat.id);
+        assert_eq!(branch.chat.message_count, 4);
+        assert_eq!(branch.messages.len(), 4);
+        assert_eq!(branch.messages[0].content, "First prompt");
+        assert_eq!(branch.messages[1].content, "First answer");
+        assert_eq!(branch.messages[2].content, "Second prompt");
+        assert_eq!(branch.messages[3].content, "Second answer");
+        assert_ne!(branch.messages[3].id, second.assistant_message.id);
+        assert_eq!(branch.tool_executions.len(), 1);
+        assert_ne!(branch.tool_executions[0].tool_call_id, "tool_branch_source");
+        assert_eq!(branch.tool_executions[0].message_id, branch.messages[3].id);
+        assert_eq!(branch.tool_executions[0].run_id, None);
+
+        let source = database.get_chat(&first.chat.id, 200).expect("get source");
+        assert_eq!(source.messages.len(), 4);
 
         let _ = fs::remove_file(database_path);
     }

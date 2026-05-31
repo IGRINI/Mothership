@@ -107,6 +107,42 @@ pub async fn send_chat_message(
 }
 
 #[tauri::command]
+pub async fn edit_chat_user_message(
+    state: State<'_, AppState>,
+    chat_id: String,
+    message_id: String,
+    content: String,
+) -> Result<SendChatMessageResult, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::EditChatUserMessage {
+            chat_id,
+            message_id,
+            content,
+        })
+        .await?;
+    expect_variant!(response, CoreResponse::ChatMessageStarted)
+}
+
+#[tauri::command]
+pub async fn branch_chat_from_message(
+    state: State<'_, AppState>,
+    chat_id: String,
+    message_id: String,
+) -> Result<ChatConversation, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::BranchChatFromMessage {
+            chat_id,
+            message_id,
+        })
+        .await?;
+    expect_variant!(response, CoreResponse::Chat)
+}
+
+#[tauri::command]
 pub async fn retry_chat_message(
     state: State<'_, AppState>,
     chat_id: String,

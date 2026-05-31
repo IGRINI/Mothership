@@ -10,6 +10,7 @@ import {
   GitBranch,
   MoreVertical,
   Paperclip,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
@@ -29,11 +30,14 @@ import {
   ToolCommand,
   ToolExecutionEvent,
   ToolExecutionEventKind,
+  ToolExecutionRecord,
   ToolExecutionResult,
   approveToolExecution,
+  branchChatFromMessage,
   cancelChatRun,
   cancelToolExecution,
   createChat,
+  editChatUserMessage,
   getChat,
   getConnectorSettings,
   listChats,
@@ -84,9 +88,19 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   const [isLoadingChats, setIsLoadingChats] = createSignal(true);
   const [isLoadingMessages, setIsLoadingMessages] = createSignal(false);
   const [isSending, setIsSending] = createSignal(false);
+  const [editingMessageId, setEditingMessageId] = createSignal<string>();
+  const [editingDraft, setEditingDraft] = createSignal("");
+  const [isSubmittingEdit, setIsSubmittingEdit] = createSignal(false);
+  const [branchingChatId, setBranchingChatId] = createSignal<string>();
   const [activeRunIds, setActiveRunIds] = createSignal<Record<string, string>>(
     {},
   );
+  const [runMessageIds, setRunMessageIds] = createSignal<Record<string, string>>(
+    {},
+  );
+  const [expandedInlineTools, setExpandedInlineTools] = createSignal<
+    Record<string, boolean>
+  >({});
   const [toolExecutions, setToolExecutions] = createSignal<
     Record<string, ToolExecutionView>
   >({});
@@ -180,6 +194,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
       const conversation = await getChat(chatId, 200);
       setChats((current) => mergeChatInPlace(current, conversation.chat));
       setMessages(normalizeMessages(conversation.messages));
+      hydrateToolExecutions(conversation.toolExecutions ?? []);
     } catch (caughtError) {
       setError(errorMessage(caughtError));
     } finally {
@@ -202,7 +217,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
 
   async function handleSendMessage() {
     const content = draft().trim();
-    if (!content || isSending() || isChatRunning()) {
+    if (!content || isSending() || isSubmittingEdit() || isChatRunning()) {
       return;
     }
 
@@ -218,6 +233,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         ...current,
         [result.chat.id]: result.runId,
       }));
+      rememberRunMessage(result.runId, result.assistantMessage.id);
       setChats((current) => bumpChat(current, result.chat));
       setActiveChatId(result.chat.id);
       setMessages((current) => {
@@ -229,6 +245,127 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
       setError(errorMessage(caughtError));
     } finally {
       setIsSending(false);
+    }
+  }
+
+  function handleStartEdit(message: ChatMessage) {
+    if (message.role !== "user" || message.status !== "complete" || isChatRunning()) {
+      return;
+    }
+
+    setEditingMessageId(message.id);
+    setEditingDraft(message.content);
+    setError("");
+  }
+
+  function handleCancelEdit() {
+    setEditingMessageId(undefined);
+    setEditingDraft("");
+  }
+
+  async function handleSubmitEdit(messageId: string) {
+    const chatId = activeChatId();
+    const content = editingDraft().trim();
+    const targetMessage = messages().find((message) => message.id === messageId);
+    if (
+      !chatId ||
+      !targetMessage ||
+      !content ||
+      isSubmittingEdit() ||
+      isSending() ||
+      isChatRunning()
+    ) {
+      return;
+    }
+
+    const removedMessageIds = messages()
+      .filter((message) => message.position > targetMessage.position)
+      .map((message) => message.id);
+
+    setIsSubmittingEdit(true);
+    setError("");
+
+    try {
+      const result = await editChatUserMessage(chatId, messageId, content);
+      setActiveRunIds((current) => ({
+        ...current,
+        [result.chat.id]: result.runId,
+      }));
+      clearToolExecutionsForMessageIds(removedMessageIds);
+      rememberRunMessage(result.runId, result.assistantMessage.id);
+      setChats((current) => bumpChat(current, result.chat));
+      setMessages((current) =>
+        mergeMessages(
+          current.filter(
+            (message) =>
+              message.chatId === result.chat.id &&
+              message.position < result.userMessage.position,
+          ),
+          [result.userMessage, result.assistantMessage],
+        ),
+      );
+      setEditingMessageId(undefined);
+      setEditingDraft("");
+    } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    } finally {
+      setIsSubmittingEdit(false);
+    }
+  }
+
+  async function handleBranchMessage(message: ChatMessage) {
+    const sourceChatId = activeChatId();
+    if (
+      !sourceChatId ||
+      message.role !== "assistant" ||
+      message.status === "sending" ||
+      isChatRunning() ||
+      branchingChatId()
+    ) {
+      return;
+    }
+
+    const sourceMessages = messages();
+    const sourceChat = activeChat();
+    const tempChatId = `branching-${message.id}`;
+    const now = currentUnixTimestamp();
+    const tempChat: ChatThreadSummary = {
+      id: tempChatId,
+      title: sourceChat ? `${sourceChat.title} branch` : "Creating branch",
+      preview: "Copying chat history...",
+      messageCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    setBranchingChatId(tempChatId);
+    setEditingMessageId(undefined);
+    setEditingDraft("");
+    setError("");
+    setChats((current) => bumpChat(current, tempChat));
+    setActiveChatId(tempChatId);
+    setMessages([]);
+    setIsLoadingMessages(true);
+
+    try {
+      const conversation = await branchChatFromMessage(sourceChatId, message.id);
+      setChats((current) =>
+        bumpChat(
+          current.filter((chat) => chat.id !== tempChatId),
+          conversation.chat,
+        ),
+      );
+      setActiveChatId(conversation.chat.id);
+      setMessages(normalizeMessages(conversation.messages));
+      hydrateToolExecutions(conversation.toolExecutions ?? []);
+    } catch (caughtError) {
+      setChats((current) => current.filter((chat) => chat.id !== tempChatId));
+      setActiveChatId(sourceChatId);
+      setMessages(sourceMessages);
+      setError(errorMessage(caughtError));
+    } finally {
+      setBranchingChatId(undefined);
+      setIsLoadingMessages(false);
     }
   }
 
@@ -245,6 +382,8 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         ...current,
         [result.chat.id]: result.runId,
       }));
+      clearMessageToolExecutions(result.assistantMessage.id);
+      rememberRunMessage(result.runId, result.assistantMessage.id);
       setChats((current) => bumpChat(current, result.chat));
       setMessages((current) =>
         mergeMessages(current, [result.userMessage, result.assistantMessage]),
@@ -312,6 +451,8 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   }
 
   function applyChatRunEvent(event: ChatRunEvent) {
+    rememberRunMessage(event.runId, event.messageId);
+
     if (event.kind === "started") {
       setActiveRunIds((current) => ({
         ...current,
@@ -366,9 +507,84 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     // bar is reserved for app-level errors (load / send / auth).
   }
 
+  function rememberRunMessage(runId: string, messageId: string) {
+    if (runMessageIds()[runId] === messageId) {
+      return;
+    }
+
+    setRunMessageIds((current) => ({
+      ...current,
+      [runId]: messageId,
+    }));
+    setToolExecutions((current) =>
+      attachMessageIdToToolExecutions(current, runId, messageId),
+    );
+  }
+
+  function hydrateToolExecutions(records: ToolExecutionRecord[]) {
+    if (records.length === 0) {
+      return;
+    }
+
+    setRunMessageIds((current) => {
+      const next = { ...current };
+      for (const record of records) {
+        if (record.runId) {
+          next[record.runId] = record.messageId;
+        }
+      }
+      return next;
+    });
+    setToolExecutions((current) => ({
+      ...current,
+      ...Object.fromEntries(
+        records.map((record) => [
+          record.toolCallId,
+          toolExecutionViewFromRecord(record),
+        ]),
+      ),
+    }));
+  }
+
+  function clearMessageToolExecutions(messageId: string) {
+    clearToolExecutionsForMessageIds([messageId]);
+  }
+
+  function clearToolExecutionsForMessageIds(messageIds: string[]) {
+    if (messageIds.length === 0) {
+      return;
+    }
+
+    const removedMessageIds = new Set(messageIds);
+    const toolCallIds = Object.values(toolExecutions())
+      .filter((tool) => tool.messageId && removedMessageIds.has(tool.messageId))
+      .map((tool) => tool.toolCallId);
+    if (toolCallIds.length === 0) {
+      return;
+    }
+
+    const removed = new Set(toolCallIds);
+    setToolExecutions((current) =>
+      Object.fromEntries(
+        Object.entries(current).filter(
+          ([toolCallId]) => !removed.has(toolCallId),
+        ),
+      ),
+    );
+    setExpandedInlineTools((current) =>
+      Object.fromEntries(
+        Object.entries(current).filter(
+          ([toolCallId]) => !removed.has(toolCallId),
+        ),
+      ),
+    );
+  }
+
   function applyToolExecutionEvent(event: ToolExecutionEvent) {
     setToolExecutions((current) => {
       const previous = current[event.toolCallId];
+      const now = Date.now();
+      const runId = event.runId ?? previous?.runId;
       const output =
         event.kind === "output" && event.chunk
           ? appendToolOutput(previous?.output ?? "", event.stream, event.chunk)
@@ -378,14 +594,18 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         ...current,
         [event.toolCallId]: {
           toolCallId: event.toolCallId,
-          runId: event.runId ?? previous?.runId,
+          runId,
+          messageId:
+            previous?.messageId ?? (runId ? runMessageIds()[runId] : undefined),
+          chatId: previous?.chatId,
           projectId: event.projectId ?? previous?.projectId,
           command: event.command ?? previous?.command,
           kind: event.kind,
           message: event.message ?? previous?.message,
           output,
           result: event.result ?? previous?.result,
-          updatedAt: Date.now(),
+          createdAt: previous?.createdAt ?? now,
+          updatedAt: now,
         },
       };
     });
@@ -395,6 +615,35 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     Object.values(toolExecutions())
       .sort((left, right) => right.updatedAt - left.updatedAt)
       .slice(0, 50);
+
+  const inlineToolExecutionsByMessageId = () => {
+    const messageIds = runMessageIds();
+    const grouped: Record<string, ToolExecutionView[]> = {};
+
+    for (const tool of Object.values(toolExecutions())) {
+      const messageId =
+        tool.messageId ?? (tool.runId ? messageIds[tool.runId] : undefined);
+      if (!messageId) {
+        continue;
+      }
+
+      grouped[messageId] ??= [];
+      grouped[messageId].push(tool);
+    }
+
+    for (const tools of Object.values(grouped)) {
+      tools.sort(compareToolExecutions);
+    }
+
+    return grouped;
+  };
+
+  function handleToggleInlineTool(toolCallId: string) {
+    setExpandedInlineTools((current) => ({
+      ...current,
+      [toolCallId]: !current[toolCallId],
+    }));
+  }
 
   return (
     <main class="workspace-shell">
@@ -411,16 +660,31 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         connectorSettings={connectorSettings()}
         draft={draft()}
         error={error()}
-        isLoading={isLoadingMessages()}
-        isSending={isSending() || isChatRunning()}
+        editingDraft={editingDraft()}
+        editingMessageId={editingMessageId()}
+        isLoading={
+          isLoadingMessages() || (isLoadingChats() && messages().length === 0)
+        }
+        isSending={isSending() || isSubmittingEdit() || isChatRunning()}
         messages={messages()}
         runTransports={runTransports()}
+        toolExecutionsByMessageId={inlineToolExecutionsByMessageId()}
+        expandedInlineTools={expandedInlineTools()}
         activeRunId={activeRunId()}
+        onApproveTool={handleApproveTool}
         onCancelRun={handleCancelRun}
+        onCancelTool={handleCancelTool}
+        onBranchMessage={(message) => void handleBranchMessage(message)}
+        onCancelEdit={handleCancelEdit}
+        onDenyTool={handleDenyTool}
         onDraftChange={setDraft}
+        onEditDraftChange={setEditingDraft}
         onRetry={handleRetry}
         onSelectModel={handleSelectModel}
         onSendMessage={handleSendMessage}
+        onStartEdit={handleStartEdit}
+        onSubmitEdit={(messageId) => void handleSubmitEdit(messageId)}
+        onToggleInlineTool={handleToggleInlineTool}
       />
       <InspectorPane
         activeChat={activeChat()}
@@ -529,17 +793,33 @@ function ConversationPane(props: {
   activeRunId?: string;
   connectorSettings?: ConnectorSettingsSnapshot;
   draft: string;
+  editingDraft: string;
+  editingMessageId?: string;
   error: string;
   isLoading: boolean;
   isSending: boolean;
   messages: ChatMessage[];
   runTransports: Record<string, string>;
+  toolExecutionsByMessageId: Record<string, ToolExecutionView[]>;
+  expandedInlineTools: Record<string, boolean>;
+  onApproveTool: (toolCallId: string) => void;
+  onBranchMessage: (message: ChatMessage) => void;
+  onCancelEdit: () => void;
   onCancelRun: () => void;
+  onCancelTool: (toolCallId: string) => void;
+  onDenyTool: (toolCallId: string) => void;
   onDraftChange: (value: string) => void;
+  onEditDraftChange: (value: string) => void;
   onRetry: () => void;
   onSelectModel: (providerId: string, modelId: string) => void;
   onSendMessage: () => void;
+  onStartEdit: (message: ChatMessage) => void;
+  onSubmitEdit: (messageId: string) => void;
+  onToggleInlineTool: (toolCallId: string) => void;
 }) {
+  const timelineItems = () =>
+    buildConversationTimeline(props.messages, props.toolExecutionsByMessageId);
+
   return (
     <section class="conversation-pane" aria-label="Active chat">
       <header class="conversation-header">
@@ -572,23 +852,51 @@ function ConversationPane(props: {
         empty={
           <ConversationState error={props.error} isLoading={props.isLoading} />
         }
-        estimateSize={(message) =>
-          Math.max(120, Math.min(420, 92 + message.content.length * 0.4))
-        }
-        getItemKey={(message) => message.id}
-        items={props.messages}
+        estimateSize={(item) => estimateTimelineItemSize(item, props.expandedInlineTools)}
+        getItemKey={(item) => item.id}
+        items={timelineItems()}
         overscan={4}
         scrollKey={props.activeChat?.id}
         stickToEnd
       >
-        {(message) => (
-          <MessageRow
-            message={message}
-            transport={props.runTransports[message.id]}
-            isBusy={props.isSending}
-            onRetry={props.onRetry}
-            settings={props.connectorSettings}
-          />
+        {(item) => (
+          <Show
+            when={item.kind === "tool"}
+            fallback={
+              <MessageRow
+                message={(item as MessageTimelineItem).message}
+                transport={
+                  props.runTransports[(item as MessageTimelineItem).message.id]
+                }
+                editingDraft={props.editingDraft}
+                isEditing={
+                  props.editingMessageId ===
+                  (item as MessageTimelineItem).message.id
+                }
+                isBusy={props.isSending}
+                onBranchMessage={props.onBranchMessage}
+                onCancelEdit={props.onCancelEdit}
+                onEditDraftChange={props.onEditDraftChange}
+                onRetry={props.onRetry}
+                settings={props.connectorSettings}
+                onStartEdit={props.onStartEdit}
+                onSubmitEdit={props.onSubmitEdit}
+              />
+            }
+          >
+            <TimelineToolRow
+              expanded={Boolean(
+                props.expandedInlineTools[
+                  (item as ToolTimelineItem).tool.toolCallId
+                ],
+              )}
+              tool={(item as ToolTimelineItem).tool}
+              onApproveTool={props.onApproveTool}
+              onCancelTool={props.onCancelTool}
+              onDenyTool={props.onDenyTool}
+              onToggleTool={props.onToggleInlineTool}
+            />
+          </Show>
         )}
       </VirtualList>
 
@@ -620,7 +928,13 @@ function ConversationState(props: { error: string; isLoading: boolean }) {
   }
 
   if (props.isLoading) {
-    return <div class="conversation-state">Loading messages...</div>;
+    return (
+      <div class="conversation-state conversation-state--loading">
+        <div class="message-skeleton message-skeleton--assistant" />
+        <div class="message-skeleton message-skeleton--user" />
+        <div class="message-skeleton message-skeleton--assistant message-skeleton--short" />
+      </div>
+    );
   }
 
   return (
@@ -850,9 +1164,16 @@ function ToolCallRow(props: {
 function MessageRow(props: {
   message: ChatMessage;
   transport?: string;
+  editingDraft: string;
+  isEditing: boolean;
   isBusy?: boolean;
+  onBranchMessage: (message: ChatMessage) => void;
+  onCancelEdit: () => void;
+  onEditDraftChange: (value: string) => void;
   onRetry?: () => void;
   settings?: ConnectorSettingsSnapshot;
+  onStartEdit: (message: ChatMessage) => void;
+  onSubmitEdit: (messageId: string) => void;
 }) {
   const message = () => props.message;
   const isUser = () => message().role === "user";
@@ -894,25 +1215,253 @@ function MessageRow(props: {
                 <span>{formatMessageTime(message().createdAt)}</span>
               </div>
             </Show>
-            <div class="message-md">
-              <SolidMarkdown
-                renderingStrategy="reconcile"
-                remarkPlugins={[remarkGfm]}
-                children={body()}
+            <Show
+              when={props.isEditing}
+              fallback={
+                <>
+                  <div class="message-md">
+                    <SolidMarkdown
+                      renderingStrategy="reconcile"
+                      remarkPlugins={[remarkGfm]}
+                      children={body()}
+                    />
+                  </div>
+                  <MessageActions
+                    disabled={Boolean(props.isBusy)}
+                    isUser={isUser()}
+                    message={message()}
+                    onBranch={props.onBranchMessage}
+                    onEdit={props.onStartEdit}
+                  />
+                </>
+              }
+            >
+              <MessageEditor
+                disabled={Boolean(props.isBusy)}
+                messageId={message().id}
+                value={props.editingDraft}
+                onCancel={props.onCancelEdit}
+                onChange={props.onEditDraftChange}
+                onSubmit={props.onSubmitEdit}
               />
-            </div>
+            </Show>
           </div>
         </article>
       }
     >
       <article class="message-row message-row--error">
-        <ErrorCard
-          error={message().content}
-          disabled={Boolean(props.isBusy)}
-          onRetry={props.onRetry}
-        />
+        <div class="message-row__content message-row__content--error">
+          <ErrorCard
+            error={message().content}
+            disabled={Boolean(props.isBusy)}
+            onRetry={props.onRetry}
+          />
+        </div>
       </article>
     </Show>
+  );
+}
+
+function MessageActions(props: {
+  disabled: boolean;
+  isUser: boolean;
+  message: ChatMessage;
+  onBranch: (message: ChatMessage) => void;
+  onEdit: (message: ChatMessage) => void;
+}) {
+  return (
+    <div class="message-actions">
+      <Show when={props.isUser}>
+        <button
+          class="message-action-button"
+          type="button"
+          title="Edit message"
+          disabled={props.disabled || props.message.status !== "complete"}
+          onClick={() => props.onEdit(props.message)}
+        >
+          <Pencil size={14} />
+        </button>
+      </Show>
+      <Show when={!props.isUser}>
+        <button
+          class="message-action-button"
+          type="button"
+          title="Branch from this response"
+          disabled={props.disabled || props.message.status === "sending"}
+          onClick={() => props.onBranch(props.message)}
+        >
+          <GitBranch size={14} />
+        </button>
+      </Show>
+    </div>
+  );
+}
+
+function MessageEditor(props: {
+  disabled: boolean;
+  messageId: string;
+  value: string;
+  onCancel: () => void;
+  onChange: (value: string) => void;
+  onSubmit: (messageId: string) => void;
+}) {
+  const canSubmit = () => props.value.trim().length > 0 && !props.disabled;
+  let textareaRef: HTMLTextAreaElement | undefined;
+
+  onMount(() => {
+    textareaRef?.focus();
+    textareaRef?.setSelectionRange(textareaRef.value.length, textareaRef.value.length);
+  });
+
+  return (
+    <form
+      class="message-editor"
+      onSubmit={(event) => {
+        event.preventDefault();
+        props.onSubmit(props.messageId);
+      }}
+    >
+      <textarea
+        ref={textareaRef}
+        rows={3}
+        value={props.value}
+        disabled={props.disabled}
+        onInput={(event) => props.onChange(event.currentTarget.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+            event.preventDefault();
+            props.onSubmit(props.messageId);
+          }
+          if (event.key === "Escape") {
+            event.preventDefault();
+            props.onCancel();
+          }
+        }}
+      />
+      <div class="message-editor__actions">
+        <button
+          class="message-editor__button"
+          type="submit"
+          title="Send edited message"
+          disabled={!canSubmit()}
+        >
+          <Send size={14} />
+        </button>
+        <button
+          class="message-editor__button"
+          type="button"
+          title="Cancel edit"
+          disabled={props.disabled}
+          onClick={props.onCancel}
+        >
+          <X size={14} />
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function TimelineToolRow(props: {
+  expanded: boolean;
+  tool: ToolExecutionView;
+  onApproveTool: (toolCallId: string) => void;
+  onCancelTool: (toolCallId: string) => void;
+  onDenyTool: (toolCallId: string) => void;
+  onToggleTool: (toolCallId: string) => void;
+}) {
+  return (
+    <article class="message-row message-row--tool">
+      <div class="message-row__avatar-spacer" aria-hidden="true" />
+      <div class="message-row__content message-row__content--tool">
+        <InlineToolCall
+          expanded={props.expanded}
+          tool={props.tool}
+          onApprove={() => props.onApproveTool(props.tool.toolCallId)}
+          onCancel={() => props.onCancelTool(props.tool.toolCallId)}
+          onDeny={() => props.onDenyTool(props.tool.toolCallId)}
+          onToggle={() => props.onToggleTool(props.tool.toolCallId)}
+        />
+      </div>
+    </article>
+  );
+}
+
+function InlineToolCall(props: {
+  expanded: boolean;
+  tool: ToolExecutionView;
+  onApprove: () => void;
+  onCancel: () => void;
+  onDeny: () => void;
+  onToggle: () => void;
+}) {
+  const command = () => formatToolCommand(props.tool.command);
+  const output = () => formatToolOutput(props.tool);
+  const canApprove = () => props.tool.kind === "permission_requested";
+  const canCancel = () =>
+    !canApprove() && !isTerminalToolKind(props.tool.kind);
+
+  return (
+    <div
+      classList={{
+        "inline-tool-call": true,
+        "inline-tool-call--open": props.expanded,
+      }}
+    >
+      <button
+        class="inline-tool-call__summary"
+        type="button"
+        aria-expanded={props.expanded}
+        onClick={props.onToggle}
+      >
+        <ChevronDown
+          size={14}
+          classList={{
+            "inline-tool-call__chevron": true,
+            "inline-tool-call__chevron--open": props.expanded,
+          }}
+        />
+        <Terminal size={15} />
+        <span class="inline-tool-call__title" title={command()}>
+          {formatToolHeadline(props.tool.command)}
+        </span>
+        <span class={`tool-status tool-status--${toolTone(props.tool.kind)}`}>
+          {toolStatusLabel(props.tool.kind)}
+        </span>
+      </button>
+
+      <Show when={props.expanded}>
+        <div class="inline-tool-call__body">
+          <div class="inline-tool-call__label">{toolCommandLabel(props.tool.command)}</div>
+          <pre class="inline-tool-call__command">$ {command()}</pre>
+          <Show when={props.tool.message}>
+            <p class="inline-tool-call__message">{props.tool.message}</p>
+          </Show>
+          <Show when={output()}>
+            <pre class="inline-tool-call__output">{output()}</pre>
+          </Show>
+          <Show when={canApprove() || canCancel()}>
+            <div class="inline-tool-call__actions">
+              <Show when={canApprove()}>
+                <button type="button" onClick={props.onApprove}>
+                  <Check size={14} />
+                  Approve
+                </button>
+                <button type="button" onClick={props.onDeny}>
+                  <X size={14} />
+                  Deny
+                </button>
+              </Show>
+              <Show when={canCancel()}>
+                <button type="button" onClick={props.onCancel}>
+                  <Square size={12} />
+                  Cancel
+                </button>
+              </Show>
+            </div>
+          </Show>
+        </div>
+      </Show>
+    </div>
   );
 }
 
@@ -921,8 +1470,6 @@ function ErrorCard(props: {
   disabled: boolean;
   onRetry?: () => void;
 }) {
-  const [showDetails, setShowDetails] = createSignal(false);
-
   return (
     <div class="chat-error-card" role="alert">
       <div class="chat-error-card__head">
@@ -942,19 +1489,14 @@ function ErrorCard(props: {
             Retry
           </button>
         </Show>
-        <button
-          class="chat-error-card__toggle"
-          type="button"
-          aria-expanded={showDetails()}
-          onClick={() => setShowDetails((value) => !value)}
-        >
-          {showDetails() ? "Hide details" : "Details"}
-          <ChevronDown size={13} />
-        </button>
+        <details class="chat-error-card__details">
+          <summary>
+            Details
+            <ChevronDown size={13} />
+          </summary>
+          <pre class="chat-error-card__raw">{props.error}</pre>
+        </details>
       </div>
-      <Show when={showDetails()}>
-        <pre class="chat-error-card__raw">{props.error}</pre>
-      </Show>
     </div>
   );
 }
@@ -1189,6 +1731,97 @@ function appendMessageDelta(
   return changed ? next : current;
 }
 
+function attachMessageIdToToolExecutions(
+  current: Record<string, ToolExecutionView>,
+  runId: string,
+  messageId: string,
+): Record<string, ToolExecutionView> {
+  let changed = false;
+  const next: Record<string, ToolExecutionView> = {};
+
+  for (const [toolCallId, tool] of Object.entries(current)) {
+    if (tool.runId === runId && tool.messageId !== messageId) {
+      changed = true;
+      next[toolCallId] = { ...tool, messageId };
+    } else {
+      next[toolCallId] = tool;
+    }
+  }
+
+  return changed ? next : current;
+}
+
+function toolExecutionViewFromRecord(
+  record: ToolExecutionRecord,
+): ToolExecutionView {
+  return {
+    toolCallId: record.toolCallId,
+    runId: record.runId,
+    chatId: record.chatId,
+    messageId: record.messageId,
+    projectId: record.projectId,
+    command: record.command,
+    kind: record.kind,
+    message: record.message,
+    output: record.output,
+    result: record.result,
+    createdAt: timestampToMillis(record.createdAt),
+    updatedAt: timestampToMillis(record.updatedAt),
+  };
+}
+
+function compareToolExecutions(
+  left: ToolExecutionView,
+  right: ToolExecutionView,
+) {
+  if (left.createdAt !== right.createdAt) {
+    return left.createdAt - right.createdAt;
+  }
+
+  return left.toolCallId.localeCompare(right.toolCallId);
+}
+
+function buildConversationTimeline(
+  messages: ChatMessage[],
+  toolExecutionsByMessageId: Record<string, ToolExecutionView[]>,
+): ConversationTimelineItem[] {
+  const items: ConversationTimelineItem[] = [];
+
+  for (const message of messages) {
+    const tools = toolExecutionsByMessageId[message.id] ?? [];
+    if (message.role === "assistant" && tools.length > 0) {
+      for (const tool of tools) {
+        items.push({
+          id: `tool:${tool.toolCallId}`,
+          kind: "tool",
+          messageId: message.id,
+          tool,
+        });
+      }
+    }
+
+    items.push({
+      id: `message:${message.id}`,
+      kind: "message",
+      message,
+    });
+  }
+
+  return items;
+}
+
+function estimateTimelineItemSize(
+  item: ConversationTimelineItem,
+  expandedTools: Record<string, boolean>,
+) {
+  if (item.kind === "tool") {
+    return expandedTools[item.tool.toolCallId] ? 340 : 56;
+  }
+
+  const message = item.message;
+  return Math.max(120, Math.min(520, 100 + message.content.length * 0.4));
+}
+
 function normalizeMessages(messages: ChatMessage[]) {
   return mergeMessages([], messages);
 }
@@ -1264,6 +1897,15 @@ function unixTimestampToDate(timestamp: string) {
   return new Date(
     Number.isFinite(numericTimestamp) ? numericTimestamp * 1000 : Date.now(),
   );
+}
+
+function timestampToMillis(timestamp: string) {
+  const numericTimestamp = Number(timestamp);
+  return Number.isFinite(numericTimestamp) ? numericTimestamp * 1000 : Date.now();
+}
+
+function currentUnixTimestamp() {
+  return Math.floor(Date.now() / 1000).toString();
 }
 
 function errorMessage(error: unknown) {
@@ -1345,6 +1987,56 @@ function formatToolCommand(command?: ToolCommand | null) {
   return [command.program, ...(command.args ?? [])].join(" ");
 }
 
+function formatToolHeadline(command?: ToolCommand | null) {
+  if (!command) {
+    return "Used tool";
+  }
+
+  if (isPowerShellCommand(command.program)) {
+    return "Used PowerShell";
+  }
+
+  return `Ran ${command.program}`;
+}
+
+function toolCommandLabel(command?: ToolCommand | null) {
+  if (!command) {
+    return "Command";
+  }
+
+  return isPowerShellCommand(command.program) ? "PowerShell" : "Command";
+}
+
+function isPowerShellCommand(program: string) {
+  const normalized = program.toLowerCase();
+  return (
+    normalized === "powershell" ||
+    normalized === "powershell.exe" ||
+    normalized === "pwsh" ||
+    normalized === "pwsh.exe"
+  );
+}
+
+function formatToolOutput(tool: ToolExecutionView) {
+  if (tool.output) {
+    return tool.output;
+  }
+
+  if (!tool.result) {
+    return "";
+  }
+
+  const chunks = [
+    (tool.result.stdoutPreview || tool.result.stdoutTail || "").trim(),
+    (tool.result.stderrPreview || tool.result.stderrTail || "").trim()
+      ? `[stderr]\n${(tool.result.stderrPreview || tool.result.stderrTail || "").trim()}`
+      : "",
+    tool.result.message?.trim() ?? "",
+  ].filter(Boolean);
+
+  return chunks.join("\n\n");
+}
+
 function isTerminalToolKind(kind: ToolExecutionEventKind) {
   return (
     kind === "completed" ||
@@ -1395,6 +2087,21 @@ function isTauriRuntime() {
 
 type RecentStatus = "active" | "branch" | "clock";
 
+type ConversationTimelineItem = MessageTimelineItem | ToolTimelineItem;
+
+interface MessageTimelineItem {
+  id: string;
+  kind: "message";
+  message: ChatMessage;
+}
+
+interface ToolTimelineItem {
+  id: string;
+  kind: "tool";
+  messageId: string;
+  tool: ToolExecutionView;
+}
+
 interface ProjectItem {
   branch: string;
   id: string;
@@ -1406,11 +2113,14 @@ interface ProjectItem {
 interface ToolExecutionView {
   toolCallId: string;
   runId?: string | null;
+  chatId?: string | null;
+  messageId?: string | null;
   projectId?: string | null;
   command?: ToolCommand | null;
   kind: ToolExecutionEventKind;
   message?: string | null;
   output: string;
   result?: ToolExecutionResult | null;
+  createdAt: number;
   updatedAt: number;
 }

@@ -143,6 +143,23 @@ pub struct ToolExecutionEvent {
     pub result: Option<ToolExecutionResult>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionRecord {
+    pub tool_call_id: String,
+    pub run_id: Option<String>,
+    pub chat_id: String,
+    pub message_id: String,
+    pub project_id: Option<String>,
+    pub command: Option<ToolCommand>,
+    pub kind: ToolExecutionEventKind,
+    pub message: Option<String>,
+    pub output: String,
+    pub result: Option<ToolExecutionResult>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 pub trait ToolExecutionEventSink: Send + Sync {
     fn emit(&self, event: ToolExecutionEvent);
 }

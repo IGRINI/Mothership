@@ -21,6 +21,18 @@ const CHAT_CONTEXT_LIMIT: i64 = 80;
 const CHAT_DELTA_FLUSH_BYTES: usize = 1024;
 const CHAT_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const CHAT_CANCEL_PROCESS_GRACE: Duration = Duration::from_secs(10);
+const BASE_SYSTEM_PROMPT: &str = "You are Mothership's local AI coding assistant.
+Answer in the user's language unless the user asks otherwise.
+Be direct, practical, and precise.
+Use only the conversation context and tool results available in this request.
+Do not claim that you edited files, ran commands, opened applications, or inspected the local machine unless a tool result shows it.
+
+Runtime context:
+- The local host operating system is {host_os}.
+- Tool calls run through Mothership's supervised runtime, not directly inside the model provider.
+- When using run_command, pass the executable as program and command arguments as args. Do not rely on POSIX shell syntax unless you explicitly invoke a shell.
+- Prefer Windows-compatible commands. Simple read-only aliases such as pwd, ls, dir, cat, type, and grep are accepted and normalized by the runtime.
+- If the project folder is not known, say so and ask the user to open or select a project before running project-specific commands.";
 
 #[derive(Default)]
 pub struct ChatRunRegistry {
@@ -237,7 +249,7 @@ impl<'a> ChatRunService<'a> {
             LlmChatCompletionRequest {
                 provider_id: selected_model.provider_id,
                 model_id: selected_model.model_id,
-                system_prompt: String::new(),
+                system_prompt: runtime_system_prompt(),
                 messages,
             },
             &cancellation,
@@ -260,6 +272,10 @@ impl<'a> ChatRunService<'a> {
         llm_sink.emit(event);
         Ok(())
     }
+}
+
+fn runtime_system_prompt() -> String {
+    BASE_SYSTEM_PROMPT.replace("{host_os}", std::env::consts::OS)
 }
 
 pub fn schedule_cancel_fallback(
@@ -487,5 +503,13 @@ mod tests {
         assert!(sink.error_text().contains("no LLM model selected"));
 
         let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn runtime_prompt_includes_host_os_and_tool_context() {
+        let prompt = runtime_system_prompt();
+        assert!(prompt.contains(std::env::consts::OS));
+        assert!(prompt.contains("supervised runtime"));
+        assert!(prompt.contains("run_command"));
     }
 }

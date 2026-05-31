@@ -41,8 +41,9 @@ pub use tools::{
     PendingToolApprovalGate, SpawnedToolProcess, StaticToolApprovalGate, ToolApprovalAnswer,
     ToolApprovalDecision, ToolApprovalGate, ToolCancellationToken, ToolCommand,
     ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
-    ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest,
-    ToolExecutionResult, ToolExecutionStatus, ToolOutputPolicy, ToolOutputStore, ToolOutputStream,
-    ToolPermissionAction, ToolPermissionEvaluation, ToolPermissionPolicy, ToolProcessExit,
-    ToolProcessSandbox, ToolProcessSpec, ToolResourceLimits, ToolSupervisor,
+    ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRecord, ToolExecutionRegistry,
+    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolOutputPolicy,
+    ToolOutputStore, ToolOutputStream, ToolPermissionAction, ToolPermissionEvaluation,
+    ToolPermissionPolicy, ToolProcessExit, ToolProcessSandbox, ToolProcessSpec, ToolResourceLimits,
+    ToolSupervisor,
 };

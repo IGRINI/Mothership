@@ -66,6 +66,7 @@ export interface ChatMessage {
 export interface ChatConversation {
   chat: ChatThreadSummary;
   messages: ChatMessage[];
+  toolExecutions?: ToolExecutionRecord[];
 }
 
 export interface SendChatMessageResult {
@@ -184,6 +185,21 @@ export interface ToolExecutionEvent {
   chunk?: string | null;
   message?: string | null;
   result?: ToolExecutionResult | null;
+}
+
+export interface ToolExecutionRecord {
+  toolCallId: string;
+  runId?: string | null;
+  chatId: string;
+  messageId: string;
+  projectId?: string | null;
+  command?: ToolCommand | null;
+  kind: ToolExecutionEventKind;
+  message?: string | null;
+  output: string;
+  result?: ToolExecutionResult | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface LlmModel {
@@ -374,6 +390,36 @@ export function sendChatMessage(
   return invoke<SendChatMessageResult>("send_chat_message", {
     chatId,
     content,
+  });
+}
+
+export function editChatUserMessage(
+  chatId: string,
+  messageId: string,
+  content: string,
+): Promise<SendChatMessageResult> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve(editPreviewChatUserMessage(chatId, messageId, content));
+  }
+
+  return invoke<SendChatMessageResult>("edit_chat_user_message", {
+    chatId,
+    messageId,
+    content,
+  });
+}
+
+export function branchChatFromMessage(
+  chatId: string,
+  messageId: string,
+): Promise<ChatConversation> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve(branchPreviewChatFromMessage(chatId, messageId));
+  }
+
+  return invoke<ChatConversation>("branch_chat_from_message", {
+    chatId,
+    messageId,
   });
 }
 
@@ -696,6 +742,104 @@ function sendPreviewChatMessage(
     chat: copyChat(chat),
     userMessage: copyMessage(userMessage),
     assistantMessage: copyMessage(assistantMessage),
+  };
+}
+
+function editPreviewChatUserMessage(
+  chatId: string,
+  messageId: string,
+  content: string,
+): SendChatMessageResult {
+  const message = content.trim();
+  if (!message) {
+    throw new Error("chat message cannot be empty");
+  }
+
+  const chat = findPreviewChat(chatId);
+  const messages = getPreviewMessages(chat.id);
+  const messageIndex = messages.findIndex((item) => item.id === messageId);
+  if (messageIndex === -1) {
+    throw new Error(`chat message not found: ${messageId}`);
+  }
+  const target = messages[messageIndex];
+  if (target.role !== "user") {
+    throw new Error("only user messages can be edited");
+  }
+
+  const now = currentTimestamp();
+  const userMessage: ChatMessage = {
+    ...target,
+    content: message,
+    status: "complete",
+    createdAt: now,
+  };
+  const assistantMessage: ChatMessage = {
+    id: `preview-message-${++previewMessageSequence}`,
+    chatId: chat.id,
+    position: userMessage.position + 1,
+    role: "assistant",
+    content:
+      "Preview mode cannot reach the desktop LLM runtime. Run the Tauri app to test provider-backed chat.",
+    status: "complete",
+    createdAt: now,
+    providerId: "codex",
+    modelId: "gpt-5.5",
+  };
+
+  messages.splice(messageIndex, messages.length - messageIndex, userMessage, assistantMessage);
+  chat.title = messageIndex === 0 ? derivePreviewTitle(message) : chat.title;
+  chat.preview = derivePreviewPreview(message);
+  chat.messageCount = messages.length;
+  chat.updatedAt = now;
+  previewChats = [
+    chat,
+    ...getPreviewChats().filter((item) => item.id !== chat.id),
+  ];
+
+  return {
+    runId: `preview-run-${previewMessageSequence}`,
+    chat: copyChat(chat),
+    userMessage: copyMessage(userMessage),
+    assistantMessage: copyMessage(assistantMessage),
+  };
+}
+
+function branchPreviewChatFromMessage(
+  chatId: string,
+  messageId: string,
+): ChatConversation {
+  const sourceChat = findPreviewChat(chatId);
+  const sourceMessages = getPreviewMessages(sourceChat.id);
+  const messageIndex = sourceMessages.findIndex((item) => item.id === messageId);
+  if (messageIndex === -1) {
+    throw new Error(`chat message not found: ${messageId}`);
+  }
+  if (sourceMessages[messageIndex].role !== "assistant") {
+    throw new Error("chat branches can only start from assistant messages");
+  }
+
+  const now = currentTimestamp();
+  const chat: ChatThreadSummary = {
+    id: `preview-chat-${++previewChatSequence}`,
+    title: truncatePreview(`${sourceChat.title} branch`, 64),
+    preview: derivePreviewPreview(sourceMessages[messageIndex].content),
+    messageCount: messageIndex + 1,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const messages = sourceMessages.slice(0, messageIndex + 1).map((message) => ({
+    ...copyMessage(message),
+    id: `preview-message-${++previewMessageSequence}`,
+    chatId: chat.id,
+  }));
+
+  previewChats = [chat, ...getPreviewChats()];
+  previewMessages.set(chat.id, messages);
+
+  return {
+    chat: copyChat(chat),
+    messages: messages.map(copyMessage),
+    toolExecutions: [],
   };
 }
 

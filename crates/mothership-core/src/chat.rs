@@ -5,6 +5,8 @@ use std::sync::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::tools::ToolExecutionRecord;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatThreadSummary {
@@ -56,6 +58,8 @@ pub enum ChatMessageStatus {
 pub struct ChatConversation {
     pub chat: ChatThreadSummary,
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub tool_executions: Vec<ToolExecutionRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
