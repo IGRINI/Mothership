@@ -12,9 +12,8 @@ import { createEffect, For, JSX, Show, onCleanup } from "solid-js";
 //   to the bottom. Restoration runs as a short multi-frame "pin" so it holds the
 //   target while messages/markdown/avatars finish laying out (their height grows
 //   asynchronously and would otherwise leave a single-shot restore near the top).
-// - With `stickToEnd`: appended rows and streaming height growth stick to the
-//   bottom only while the user is already at the bottom. A normal user scroll up
-//   disables following until they return to the bottom.
+// - With `stickToEnd`: a new message in the current key sticks to the bottom only
+//   when you are already near the bottom (never yanks you up while reading history).
 export interface VirtualListProps<TItem> {
   ariaLabel: string;
   class?: string;
@@ -29,7 +28,7 @@ export interface VirtualListProps<TItem> {
 }
 
 const SCROLL_STORE_KEY = "mothership:chat-scroll-positions";
-const FOLLOW_END_THRESHOLD_PX = 48;
+const STICK_THRESHOLD_PX = 200;
 const AT_BOTTOM_PX = 48;
 const RESTORE_PIN_FRAMES = 12;
 
@@ -69,11 +68,8 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
   let scrollElement: HTMLDivElement | undefined;
   const positions = loadScrollPositions();
   let restoring = false;
-  let followEnd = true;
   let persistTimer: number | undefined;
   let pinRaf = 0;
-  let followRaf = 0;
-  let resizeObserver: ResizeObserver | undefined;
   let restoredForKey: string | undefined;
   let lastCount = 0;
 
@@ -94,48 +90,22 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
     // Save only genuine user scrolls of the current, settled key: skip while
     // restoring, skip other keys, and skip when there is nothing scrollable (the
     // transient state right after a chat switch) so we never record a bogus 0.
-    if (!element || restoring) return;
-
-    const distance = distanceFromEnd(element);
-    followEnd = distance <= FOLLOW_END_THRESHOLD_PX;
-
-    if (!key || key !== restoredForKey) return;
+    if (!key || !element || restoring || key !== restoredForKey) return;
     if (element.scrollHeight <= element.clientHeight + 4) return;
-    positions[key] = {
-      top: element.scrollTop,
-      atBottom: distance <= AT_BOTTOM_PX,
-    };
+    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+    positions[key] = { top: element.scrollTop, atBottom: distance < AT_BOTTOM_PX };
     persistSoon();
-  };
-
-  const attachContentElement = (element: HTMLDivElement) => {
-    resizeObserver?.disconnect();
-
-    if (typeof ResizeObserver === "undefined") {
-      return;
-    }
-
-    resizeObserver = new ResizeObserver(() => {
-      const scrollParent = scrollElement;
-      if (!scrollParent || !props.stickToEnd || restoring || !followEnd) {
-        return;
-      }
-
-      requestScrollToEnd(scrollParent);
-    });
-    resizeObserver.observe(element);
   };
 
   // Hold the target position across several frames so it survives async layout
   // growth (markdown/avatars) and the content swap when switching chats.
   const pinTo = (element: HTMLDivElement, target: ScrollPos | null) => {
     cancelAnimationFrame(pinRaf);
-    followEnd = !target || target.atBottom;
     restoring = true;
     let frame = 0;
     const step = () => {
       if (!target || target.atBottom) {
-        scrollToEnd(element);
+        element.scrollTop = element.scrollHeight;
       } else {
         element.scrollTop = target.top;
       }
@@ -149,17 +119,13 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
     pinRaf = requestAnimationFrame(step);
   };
 
-  const requestScrollToEnd = (element: HTMLDivElement) => {
-    cancelAnimationFrame(followRaf);
-    scrollToEnd(element);
-    followRaf = requestAnimationFrame(() => {
-      scrollToEnd(element);
-    });
-  };
-
-  const stickIfFollowingEnd = (element: HTMLDivElement) => {
-    if (followEnd) {
-      requestScrollToEnd(element);
+  const stickIfNearBottom = (element: HTMLDivElement) => {
+    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+    if (distance < STICK_THRESHOLD_PX) {
+      element.scrollTop = element.scrollHeight;
+      requestAnimationFrame(() => {
+        element.scrollTop = element.scrollHeight;
+      });
     }
   };
 
@@ -182,7 +148,7 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
       }
 
       if (props.stickToEnd && count > lastCount && !restoring) {
-        requestAnimationFrame(() => stickIfFollowingEnd(element));
+        requestAnimationFrame(() => stickIfNearBottom(element));
       }
       lastCount = count;
       return;
@@ -190,16 +156,14 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
 
     // Unkeyed (e.g. sidebar lists): optional stick-to-end only.
     if (props.stickToEnd && count > lastCount && count > 0) {
-      requestAnimationFrame(() => stickIfFollowingEnd(element));
+      requestAnimationFrame(() => stickIfNearBottom(element));
     }
     lastCount = count;
   });
 
   onCleanup(() => {
     cancelAnimationFrame(pinRaf);
-    cancelAnimationFrame(followRaf);
     clearTimeout(persistTimer);
-    resizeObserver?.disconnect();
   });
 
   return (
@@ -211,24 +175,14 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
       onScroll={handleScroll}
     >
       <Show when={props.items.length > 0} fallback={props.empty}>
-        <div ref={attachContentElement} class="virtual-list__content">
-          <For each={props.items}>
-            {(item, index) => (
-              <div class="virtual-list__row" role="listitem">
-                {props.children(item, index())}
-              </div>
-            )}
-          </For>
-        </div>
+        <For each={props.items}>
+          {(item, index) => (
+            <div class="virtual-list__row" role="listitem">
+              {props.children(item, index())}
+            </div>
+          )}
+        </For>
       </Show>
     </div>
   );
-}
-
-function distanceFromEnd(element: HTMLElement) {
-  return Math.max(0, element.scrollHeight - element.scrollTop - element.clientHeight);
-}
-
-function scrollToEnd(element: HTMLElement) {
-  element.scrollTop = element.scrollHeight;
 }
