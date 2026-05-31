@@ -36,6 +36,7 @@ pub const WS_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const WS_SESSION_IDLE: Duration = Duration::from_secs(60);
 /// Overall bound on the non-streaming JSON fallback.
 pub const JSON_TIMEOUT: Duration = Duration::from_secs(180);
+const MAX_TOOL_ROUNDS: usize = 8;
 
 /// Which transport produced the answer (so the caller can disable a WS tier that
 /// keeps falling back).
@@ -58,6 +59,51 @@ enum Event {
     Failed(String),
     /// Anything else (created, in-progress, item added, …).
     Other,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolOutput {
+    pub output: String,
+}
+
+#[async_trait::async_trait]
+pub trait ToolDispatcher: Send + Sync {
+    async fn dispatch(&self, call: ToolCall) -> Result<ToolOutput>;
+}
+
+#[derive(Debug, Clone)]
+struct RawToolCall {
+    item_id: Option<String>,
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Default)]
+struct ToolCallAccumulator {
+    calls: Vec<PartialToolCall>,
+}
+
+#[derive(Debug, Default)]
+struct PartialToolCall {
+    item_id: Option<String>,
+    output_index: usize,
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+#[derive(Debug, Default)]
+struct RoundOutput {
+    tool_calls: Vec<RawToolCall>,
+    continuation_items: Vec<Value>,
 }
 
 /// Endpoint config for a Responses backend.
@@ -94,12 +140,129 @@ pub async fn chat(
     ws: Option<&mut WsSession>,
     on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> Result<Transport> {
+    chat_with_optional_tools(
+        client,
+        endpoint,
+        auth_headers,
+        model,
+        instructions,
+        messages,
+        ws,
+        on_delta,
+        &[],
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn chat_with_tools(
+    client: &reqwest::Client,
+    endpoint: &Endpoint,
+    auth_headers: &[(String, String)],
+    model: &str,
+    instructions: &str,
+    messages: &[ChatMessage],
+    ws: Option<&mut WsSession>,
+    on_delta: &mut (dyn FnMut(&str) + Send),
+    tools: &[Value],
+    dispatcher: &dyn ToolDispatcher,
+) -> Result<Transport> {
+    chat_with_optional_tools(
+        client,
+        endpoint,
+        auth_headers,
+        model,
+        instructions,
+        messages,
+        ws,
+        on_delta,
+        tools,
+        Some(dispatcher),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn chat_with_optional_tools(
+    client: &reqwest::Client,
+    endpoint: &Endpoint,
+    auth_headers: &[(String, String)],
+    model: &str,
+    instructions: &str,
+    messages: &[ChatMessage],
+    mut ws: Option<&mut WsSession>,
+    on_delta: &mut (dyn FnMut(&str) + Send),
+    tools: &[Value],
+    dispatcher: Option<&dyn ToolDispatcher>,
+) -> Result<Transport> {
+    let mut input = build_input(messages);
+
+    for _ in 0..MAX_TOOL_ROUNDS {
+        let (transport, round) = chat_round(
+            client,
+            endpoint,
+            auth_headers,
+            model,
+            instructions,
+            &input,
+            ws.as_deref_mut(),
+            on_delta,
+            tools,
+        )
+        .await?;
+
+        if round.tool_calls.is_empty() {
+            return Ok(transport);
+        }
+
+        let Some(dispatcher) = dispatcher else {
+            bail!("model requested a tool call, but no tool dispatcher is configured");
+        };
+
+        input.extend(round.continuation_items);
+        for call in round.tool_calls {
+            let output = dispatcher.dispatch(tool_call_for_dispatch(&call)).await?;
+            input.push(function_call_input_item(&call));
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call.call_id,
+                "output": output.output,
+            }));
+        }
+    }
+
+    bail!("responses tool loop exceeded {MAX_TOOL_ROUNDS} rounds")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn chat_round(
+    client: &reqwest::Client,
+    endpoint: &Endpoint,
+    auth_headers: &[(String, String)],
+    model: &str,
+    instructions: &str,
+    input: &[Value],
+    ws: Option<&mut WsSession>,
+    on_delta: &mut (dyn FnMut(&str) + Send),
+    tools: &[Value],
+) -> Result<(Transport, RoundOutput)> {
     let mut committed = false;
 
     // 1. WebSocket (primary), when enabled.
     if let Some(session) = ws {
-        match chat_ws(session, model, instructions, messages, &mut committed, on_delta).await {
-            Ok(()) => return Ok(Transport::WebSocket),
+        match chat_ws(
+            session,
+            model,
+            instructions,
+            input,
+            tools,
+            &mut committed,
+            on_delta,
+        )
+        .await
+        {
+            Ok(round) => return Ok((Transport::WebSocket, round)),
             Err(error) => {
                 if committed {
                     return Err(error); // already streaming answer — do not re-run
@@ -111,8 +274,20 @@ pub async fn chat(
     }
 
     // 2. HTTP-SSE.
-    match chat_sse(client, endpoint, auth_headers, model, instructions, messages, &mut committed, on_delta).await {
-        Ok(()) => return Ok(Transport::Sse),
+    match chat_sse(
+        client,
+        endpoint,
+        auth_headers,
+        model,
+        instructions,
+        input,
+        tools,
+        &mut committed,
+        on_delta,
+    )
+    .await
+    {
+        Ok(round) => return Ok((Transport::Sse, round)),
         Err(error) => {
             if committed {
                 return Err(error);
@@ -122,39 +297,66 @@ pub async fn chat(
     }
 
     // 3. Non-streaming HTTP-JSON (last resort; only reached pre-commit).
-    chat_json(client, endpoint, auth_headers, model, instructions, messages, on_delta).await?;
-    Ok(Transport::Json)
+    let round = chat_json(
+        client,
+        endpoint,
+        auth_headers,
+        model,
+        instructions,
+        input,
+        tools,
+        on_delta,
+    )
+    .await?;
+    Ok((Transport::Json, round))
 }
 
 async fn chat_ws(
     session: &mut WsSession,
     model: &str,
     instructions: &str,
-    messages: &[ChatMessage],
+    input: &[Value],
+    tools: &[Value],
     committed: &mut bool,
     on_delta: &mut (dyn FnMut(&str) + Send),
-) -> Result<()> {
-    let body = build_request(model, instructions, messages, true);
+) -> Result<RoundOutput> {
+    let body = build_request_from_input(model, instructions, input, true, tools);
     session.send_text(body.to_string()).await?;
+    let mut accumulator = ToolCallAccumulator::default();
+    let mut continuation_items = Vec::new();
     loop {
         match session.next_text(WS_READ_IDLE_TIMEOUT).await? {
             Some(frame) => {
                 let Some(value) = parse_frame(&frame) else {
                     continue;
                 };
-                match classify(&value) {
+                match handle_stream_event(
+                    &value,
+                    &mut accumulator,
+                    &mut continuation_items,
+                    committed,
+                    on_delta,
+                )? {
                     Event::OutputText(text) => {
                         *committed = true;
                         on_delta(&text);
                     }
-                    Event::Completed => return Ok(()),
+                    Event::Completed => {
+                        return Ok(RoundOutput {
+                            tool_calls: accumulator.finish(),
+                            continuation_items,
+                        })
+                    }
                     Event::Failed(message) => bail!("{message}"),
                     Event::Reasoning | Event::Other => {}
                 }
             }
             None => {
                 if *committed {
-                    return Ok(());
+                    return Ok(RoundOutput {
+                        tool_calls: accumulator.finish(),
+                        continuation_items,
+                    });
                 }
                 bail!("websocket closed before any response");
             }
@@ -168,12 +370,15 @@ async fn chat_sse(
     auth_headers: &[(String, String)],
     model: &str,
     instructions: &str,
-    messages: &[ChatMessage],
+    input: &[Value],
+    tools: &[Value],
     committed: &mut bool,
     on_delta: &mut (dyn FnMut(&str) + Send),
-) -> Result<()> {
-    let body = build_request(model, instructions, messages, true);
+) -> Result<RoundOutput> {
+    let body = build_request_from_input(model, instructions, input, true, tools);
     let response = http::post_stream(client, &endpoint.https_url, auth_headers, &body).await?;
+    let mut accumulator = ToolCallAccumulator::default();
+    let mut continuation_items = Vec::new();
     sse::read_sse(response, SSE_IDLE_TIMEOUT, |payload| {
         if payload == "[DONE]" {
             return Ok(false);
@@ -181,7 +386,13 @@ async fn chat_sse(
         let Ok(value) = serde_json::from_str::<Value>(payload) else {
             return Ok(true);
         };
-        match classify(&value) {
+        match handle_stream_event(
+            &value,
+            &mut accumulator,
+            &mut continuation_items,
+            committed,
+            on_delta,
+        )? {
             Event::OutputText(text) => {
                 *committed = true;
                 on_delta(&text);
@@ -192,7 +403,11 @@ async fn chat_sse(
             Event::Reasoning | Event::Other => Ok(true),
         }
     })
-    .await
+    .await?;
+    Ok(RoundOutput {
+        tool_calls: accumulator.finish(),
+        continuation_items,
+    })
 }
 
 async fn chat_json(
@@ -201,10 +416,11 @@ async fn chat_json(
     auth_headers: &[(String, String)],
     model: &str,
     instructions: &str,
-    messages: &[ChatMessage],
+    input: &[Value],
+    tools: &[Value],
     on_delta: &mut (dyn FnMut(&str) + Send),
-) -> Result<()> {
-    let body = build_request(model, instructions, messages, false);
+) -> Result<RoundOutput> {
+    let body = build_request_from_input(model, instructions, input, false, tools);
     let value = http::post_json(
         client,
         &endpoint.https_url,
@@ -214,11 +430,15 @@ async fn chat_json(
     )
     .await?;
     let text = extract_output_text(&value);
-    if text.is_empty() {
+    let tool_calls = extract_tool_calls(&value);
+    if text.is_empty() && tool_calls.is_empty() {
         bail!("empty response from provider");
     }
     on_delta(&text);
-    Ok(())
+    Ok(RoundOutput {
+        tool_calls,
+        continuation_items: extract_reasoning_items(&value),
+    })
 }
 
 /// Build the Responses request body. System messages feed `instructions`
@@ -229,7 +449,11 @@ pub fn build_request(
     messages: &[ChatMessage],
     stream: bool,
 ) -> Value {
-    let input: Vec<Value> = messages
+    build_request_from_input(model, instructions, &build_input(messages), stream, &[])
+}
+
+fn build_input(messages: &[ChatMessage]) -> Vec<Value> {
+    messages
         .iter()
         .filter(|message| message.role != "system")
         .filter(|message| !message.content.trim().is_empty())
@@ -244,15 +468,212 @@ pub fn build_request(
                 "content": [{ "type": kind, "text": message.content }],
             })
         })
-        .collect();
+        .collect()
+}
 
-    json!({
+fn build_request_from_input(
+    model: &str,
+    instructions: &str,
+    input: &[Value],
+    stream: bool,
+    tools: &[Value],
+) -> Value {
+    let mut body = json!({
         "model": model,
         "instructions": instructions,
         "input": input,
         "stream": stream,
         "store": false,
-    })
+    });
+    if !tools.is_empty() {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("tools".to_string(), Value::Array(tools.to_vec()));
+            object.insert("tool_choice".to_string(), Value::String("auto".to_string()));
+            object.insert("parallel_tool_calls".to_string(), Value::Bool(true));
+        }
+    }
+    body
+}
+
+fn handle_stream_event(
+    value: &Value,
+    accumulator: &mut ToolCallAccumulator,
+    continuation_items: &mut Vec<Value>,
+    committed: &mut bool,
+    _on_delta: &mut (dyn FnMut(&str) + Send),
+) -> Result<Event> {
+    let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+    match event_type {
+        "response.output_item.added" => {
+            if let Some(item) = value.get("item") {
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    *committed = true;
+                    accumulator.merge_item(item, output_index(value));
+                }
+            }
+            Ok(Event::Other)
+        }
+        "response.function_call_arguments.delta" => {
+            *committed = true;
+            accumulator.merge_arguments_delta(
+                output_index(value),
+                value.get("item_id").and_then(Value::as_str),
+                value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
+            Ok(Event::Other)
+        }
+        "response.function_call_arguments.done" => {
+            *committed = true;
+            if let Some(item) = value.get("item") {
+                accumulator.merge_item(item, output_index(value));
+            } else {
+                accumulator.merge_top_level_done(value);
+            }
+            Ok(Event::Other)
+        }
+        "response.output_item.done" => {
+            if let Some(item) = value.get("item") {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("function_call") => {
+                        *committed = true;
+                        accumulator.merge_item(item, output_index(value));
+                    }
+                    Some("reasoning") => continuation_items.push(item.clone()),
+                    _ => {}
+                }
+            }
+            Ok(Event::Other)
+        }
+        _ => Ok(classify(value)),
+    }
+}
+
+fn output_index(value: &Value) -> usize {
+    value
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .map(|index| index as usize)
+        .unwrap_or(0)
+}
+
+impl ToolCallAccumulator {
+    fn merge_item(&mut self, item: &Value, output_index: usize) {
+        let call = self.find_or_create(output_index, item.get("id").and_then(Value::as_str));
+        if let Some(id) = item.get("id").and_then(Value::as_str) {
+            if !id.is_empty() {
+                call.item_id = Some(id.to_string());
+            }
+        }
+        if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+            if !call_id.is_empty() {
+                call.call_id = Some(call_id.to_string());
+            }
+        }
+        if let Some(name) = item.get("name").and_then(Value::as_str) {
+            if !name.is_empty() {
+                call.name = Some(name.to_string());
+            }
+        }
+        if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
+            call.arguments = arguments.to_string();
+        }
+    }
+
+    fn merge_top_level_done(&mut self, value: &Value) {
+        let call = self.find_or_create(
+            output_index(value),
+            value.get("item_id").and_then(Value::as_str),
+        );
+        if let Some(arguments) = value.get("arguments").and_then(Value::as_str) {
+            call.arguments = arguments.to_string();
+        }
+        if let Some(call_id) = value.get("call_id").and_then(Value::as_str) {
+            call.call_id = Some(call_id.to_string());
+        }
+        if let Some(name) = value.get("name").and_then(Value::as_str) {
+            call.name = Some(name.to_string());
+        }
+    }
+
+    fn merge_arguments_delta(&mut self, output_index: usize, item_id: Option<&str>, delta: &str) {
+        let call = self.find_or_create(output_index, item_id);
+        call.arguments.push_str(delta);
+    }
+
+    fn finish(mut self) -> Vec<RawToolCall> {
+        self.calls.sort_by_key(|call| call.output_index);
+        self.calls
+            .into_iter()
+            .filter_map(|call| {
+                let name = call.name?;
+                if name.trim().is_empty() {
+                    return None;
+                }
+                Some(RawToolCall {
+                    item_id: call.item_id,
+                    call_id: call
+                        .call_id
+                        .unwrap_or_else(|| format!("responses_call_{}", call.output_index)),
+                    name,
+                    arguments: call.arguments,
+                })
+            })
+            .collect()
+    }
+
+    fn find_or_create(
+        &mut self,
+        output_index: usize,
+        item_id: Option<&str>,
+    ) -> &mut PartialToolCall {
+        if let Some(item_id) = item_id {
+            if let Some(position) = self
+                .calls
+                .iter()
+                .position(|call| call.item_id.as_deref() == Some(item_id))
+            {
+                return &mut self.calls[position];
+            }
+        }
+        if let Some(position) = self
+            .calls
+            .iter()
+            .position(|call| call.output_index == output_index)
+        {
+            return &mut self.calls[position];
+        }
+        self.calls.push(PartialToolCall {
+            output_index,
+            item_id: item_id.map(ToOwned::to_owned),
+            ..PartialToolCall::default()
+        });
+        self.calls.last_mut().expect("tool call just inserted")
+    }
+}
+
+fn tool_call_for_dispatch(call: &RawToolCall) -> ToolCall {
+    ToolCall {
+        call_id: call.call_id.clone(),
+        name: call.name.clone(),
+        arguments: serde_json::from_str(&call.arguments)
+            .unwrap_or_else(|_| json!({ "rawArguments": call.arguments.clone() })),
+    }
+}
+
+fn function_call_input_item(call: &RawToolCall) -> Value {
+    let mut item = json!({
+        "type": "function_call",
+        "call_id": call.call_id.as_str(),
+        "name": call.name.as_str(),
+        "arguments": call.arguments.as_str(),
+    });
+    if let (Some(object), Some(item_id)) = (item.as_object_mut(), call.item_id.as_deref()) {
+        object.insert("id".to_string(), Value::String(item_id.to_string()));
+    }
+    item
 }
 
 /// Parse a Responses event by its `type` — the structured parsing that keeps
@@ -299,7 +720,10 @@ fn classify(value: &Value) -> Event {
 /// the JSON event. Returns `None` for non-JSON / control frames.
 fn parse_frame(frame: &str) -> Option<Value> {
     let trimmed = frame.trim();
-    let payload = trimmed.strip_prefix("data:").map(str::trim).unwrap_or(trimmed);
+    let payload = trimmed
+        .strip_prefix("data:")
+        .map(str::trim)
+        .unwrap_or(trimmed);
     if payload.is_empty() || payload == "[DONE]" {
         return None;
     }
@@ -332,6 +756,53 @@ fn extract_output_text(value: &Value) -> String {
     text
 }
 
+fn extract_tool_calls(value: &Value) -> Vec<RawToolCall> {
+    value
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                return None;
+            }
+            let name = item.get("name").and_then(Value::as_str)?.to_string();
+            if name.trim().is_empty() {
+                return None;
+            }
+            Some(RawToolCall {
+                item_id: item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                call_id: item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("responses_call_{index}")),
+                name,
+                arguments: item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+fn extract_reasoning_items(value: &Value) -> Vec<Value> {
+    value
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+        .cloned()
+        .collect()
+}
+
 /// Derive the `wss://` URL from an `https://` (or `http://`) responses URL.
 fn to_ws_url(https_url: &str) -> Result<String> {
     let mut parsed = url::Url::parse(https_url)?;
@@ -354,7 +825,8 @@ mod tests {
     fn classifies_output_vs_reasoning() {
         let out = classify(&json!({"type":"response.output_text.delta","delta":"hi"}));
         assert!(matches!(out, Event::OutputText(t) if t == "hi"));
-        let reasoning = classify(&json!({"type":"response.reasoning_summary_text.delta","delta":"think"}));
+        let reasoning =
+            classify(&json!({"type":"response.reasoning_summary_text.delta","delta":"think"}));
         assert!(matches!(reasoning, Event::Reasoning));
     }
 
@@ -370,7 +842,8 @@ mod tests {
 
     #[test]
     fn derives_wss_url() {
-        let endpoint = Endpoint::from_https("https://chatgpt.com/backend-api/codex/responses").unwrap();
+        let endpoint =
+            Endpoint::from_https("https://chatgpt.com/backend-api/codex/responses").unwrap();
         assert_eq!(
             endpoint.wss_url,
             "wss://chatgpt.com/backend-api/codex/responses"
@@ -386,6 +859,71 @@ mod tests {
             }]
         });
         assert_eq!(extract_output_text(&body), "hello world");
+    }
+
+    #[test]
+    fn accumulates_streaming_function_call_arguments() {
+        let mut accumulator = ToolCallAccumulator::default();
+        let mut continuation = Vec::new();
+        let mut committed = false;
+        let mut on_delta = |_text: &str| {};
+
+        handle_stream_event(
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "run_command",
+                    "arguments": ""
+                }
+            }),
+            &mut accumulator,
+            &mut continuation,
+            &mut committed,
+            &mut on_delta,
+        )
+        .unwrap();
+        handle_stream_event(
+            &json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "item_id": "fc_1",
+                "delta": "{\"program\":\"git\"}"
+            }),
+            &mut accumulator,
+            &mut continuation,
+            &mut committed,
+            &mut on_delta,
+        )
+        .unwrap();
+
+        let calls = accumulator.finish();
+        assert!(committed);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].call_id, "call_1");
+        assert_eq!(calls[0].name, "run_command");
+        assert_eq!(calls[0].arguments, "{\"program\":\"git\"}");
+    }
+
+    #[test]
+    fn extracts_non_streaming_function_call() {
+        let body = json!({
+            "output": [{
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "run_command",
+                "arguments": "{\"program\":\"git\"}"
+            }]
+        });
+
+        let calls = extract_tool_calls(&body);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].call_id, "call_1");
+        assert_eq!(calls[0].name, "run_command");
     }
 
     #[test]

@@ -25,7 +25,9 @@ use crate::connectors::{
 };
 use crate::{
     ChatConversation, ChatRunCancellationResult, ChatRunEvent, ChatThreadSummary,
-    DashboardSnapshot, MothershipError, SendChatMessageResult, SidecarStatus,
+    DashboardSnapshot, MothershipError, SendChatMessageResult, SidecarStatus, ToolApprovalAnswer,
+    ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
+    ToolExecutionRequest,
 };
 
 /// Bump the major when a change isn't backward compatible. The host refuses a
@@ -101,6 +103,17 @@ pub enum CoreRequest {
     CancelChatRun {
         run_id: String,
     },
+    RunToolCommand {
+        request: ToolExecutionRequest,
+    },
+    ApproveToolExecution {
+        tool_call_id: String,
+        approved: bool,
+        reason: Option<String>,
+    },
+    CancelToolExecution {
+        tool_call_id: String,
+    },
     ConnectorSettings,
     SetSelectedModel {
         provider_id: String,
@@ -144,6 +157,9 @@ pub enum CoreResponse {
     /// placeholder. The streamed completion follows as `Event::ChatRun`s.
     ChatMessageStarted(SendChatMessageResult),
     ChatRunCancellation(ChatRunCancellationResult),
+    ToolExecutionAccepted(ToolExecutionAccepted),
+    ToolApproval(ToolApprovalAnswer),
+    ToolExecutionCancellation(ToolExecutionCancellationResult),
     ConnectorSettings(ConnectorSettingsSnapshot),
     SidecarStatus(SidecarStatus),
 }
@@ -158,6 +174,7 @@ pub enum CoreResponse {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum CoreEvent {
     ChatRun(ChatRunEvent),
+    ToolExecution(ToolExecutionEvent),
     ConnectorSettings(ConnectorSettingsEvent),
     #[serde(other)]
     Unknown,

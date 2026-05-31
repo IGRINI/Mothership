@@ -22,16 +22,16 @@ pub mod http;
 pub mod sse;
 pub mod ws;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 /// How often the runtime nudges the adapter's [`ProviderAdapter::on_idle`] while
 /// no request is in flight, so it can release idle resources (e.g. close a
@@ -40,8 +40,10 @@ const IDLE_TICK: Duration = Duration::from_secs(5);
 
 use protocol::{
     AuthKind, ChatMessage, Model, ModelManagement, Outbound, Request, SettingsField,
-    PROTOCOL_VERSION,
+    ToolCallResult, PROTOCOL_VERSION,
 };
+
+type PendingToolResults = Arc<Mutex<HashMap<String, oneshot::Sender<ToolCallResult>>>>;
 
 /// What a provider plugin implements. The SDK runtime calls these in response to
 /// host requests; all stdio framing/dispatch lives in [`run`]. Methods take
@@ -196,11 +198,14 @@ impl Context {
     }
 }
 
-/// Emits streamed chat deltas for the in-flight `chat_start` request.
+/// Emits streamed chat deltas and tool-call requests for the in-flight
+/// `chat_start` request.
+#[derive(Clone)]
 pub struct ChatSink {
     id: u64,
     outbox: mpsc::UnboundedSender<Outbound>,
     cancellation: CancellationToken,
+    pending_tool_results: PendingToolResults,
 }
 
 impl ChatSink {
@@ -229,6 +234,62 @@ impl ChatSink {
     /// `ChatSink` borrow.
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    /// Ask the host to execute a tool call requested by the model and wait for
+    /// the result. Multiple cloned sinks may call this concurrently; the SDK
+    /// routes each [`Request::ToolResult`] back by `tool_call_id`.
+    pub async fn request_tool(
+        &self,
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> Result<ToolCallResult> {
+        if self.is_cancelled() {
+            anyhow::bail!("chat cancelled before tool call was sent");
+        }
+
+        let tool_call_id = tool_call_id.into();
+        if tool_call_id.trim().is_empty() {
+            anyhow::bail!("tool_call_id cannot be empty");
+        }
+        let name = name.into();
+        if name.trim().is_empty() {
+            anyhow::bail!("tool name cannot be empty");
+        }
+
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut pending = self.pending_tool_results.lock().unwrap();
+            if pending.insert(tool_call_id.clone(), sender).is_some() {
+                anyhow::bail!("duplicate active tool_call_id: {tool_call_id}");
+            }
+        }
+
+        let sent = self.outbox.send(Outbound::ToolCall {
+            id: self.id,
+            tool_call_id: tool_call_id.clone(),
+            name,
+            arguments,
+        });
+        if sent.is_err() {
+            self.pending_tool_results
+                .lock()
+                .unwrap()
+                .remove(&tool_call_id);
+            anyhow::bail!("host connection closed before tool call could be sent");
+        }
+
+        tokio::select! {
+            result = receiver => result.context("tool result channel closed before host responded"),
+            _ = self.cancelled() => {
+                self.pending_tool_results
+                    .lock()
+                    .unwrap()
+                    .remove(&tool_call_id);
+                anyhow::bail!("chat cancelled while waiting for tool result");
+            }
+        }
     }
 }
 
@@ -300,6 +361,7 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
                     }
                 }
                 Request::ChatCancel { id } => send(&outbox, Outbound::Done { id }),
+                Request::ToolResult { .. } => {}
                 request => dispatch(&mut adapter, &ctx, &outbox, request).await,
             }
             continue;
@@ -329,6 +391,7 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
                         }
                     }
                     Request::ChatCancel { id } => send(&outbox, Outbound::Done { id }),
+                    Request::ToolResult { .. } => {}
                     request => dispatch(&mut adapter, &ctx, &outbox, request).await,
                 }
             }
@@ -356,11 +419,13 @@ async fn run_chat_turn<A: ProviderAdapter>(
     messages: Vec<ChatMessage>,
 ) -> bool {
     let cancellation = CancellationToken::new();
+    let pending_tool_results = PendingToolResults::default();
     let chat_ctx = ctx.with_cancellation(cancellation.clone());
     let mut sink = ChatSink {
         id,
         outbox: outbox.clone(),
         cancellation: cancellation.clone(),
+        pending_tool_results: Arc::clone(&pending_tool_results),
     };
     let chat = adapter.chat(&model, messages, &chat_ctx, &mut sink);
     tokio::pin!(chat);
@@ -383,6 +448,11 @@ async fn run_chat_turn<A: ProviderAdapter>(
                     continue;
                 };
                 match request {
+                    Request::ToolResult {
+                        tool_call_id,
+                        result,
+                        ..
+                    } => resolve_tool_result(&pending_tool_results, tool_call_id, result),
                     Request::ChatCancel { id: cancel_id } => {
                         cancellation.cancel();
                         if cancel_id != id {
@@ -479,12 +549,14 @@ async fn dispatch<A: ProviderAdapter>(
                 id,
                 outbox: outbox.clone(),
                 cancellation,
+                pending_tool_results: PendingToolResults::default(),
             };
             match adapter.chat(&model, messages, &chat_ctx, &mut sink).await {
                 Ok(()) => send(outbox, Outbound::Done { id }),
                 Err(error) => send_error(outbox, id, error),
             }
         }
+        Request::ToolResult { .. } => {}
         Request::ChatCancel { id } => send(outbox, Outbound::Done { id }),
         Request::Logout { id } => match adapter.logout(ctx).await {
             Ok(()) => send(outbox, Outbound::Ack { id }),
@@ -502,6 +574,19 @@ fn send_error(outbox: &mpsc::UnboundedSender<Outbound>, id: u64, error: anyhow::
         id,
         message: format!("{error:#}"),
     });
+}
+
+fn resolve_tool_result(
+    pending_tool_results: &PendingToolResults,
+    tool_call_id: String,
+    result: ToolCallResult,
+) {
+    let sender = pending_tool_results.lock().unwrap().remove(&tool_call_id);
+    if let Some(sender) = sender {
+        let _ = sender.send(result);
+    } else {
+        eprintln!("adapter-sdk: ignoring tool_result for inactive tool call {tool_call_id}");
+    }
 }
 
 #[cfg(test)]
@@ -592,6 +677,7 @@ mod tests {
             id: 7,
             outbox,
             cancellation: cancellation.clone(),
+            pending_tool_results: PendingToolResults::default(),
         };
 
         sink.delta("before");
@@ -603,5 +689,51 @@ mod tests {
             Ok(Outbound::Delta { id: 7, text }) if text == "before"
         ));
         assert!(frames.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_sink_routes_tool_result_by_call_id() {
+        let (outbox, mut frames) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        let sink = ChatSink {
+            id: 11,
+            outbox,
+            cancellation,
+            pending_tool_results: PendingToolResults::default(),
+        };
+
+        let pending = Arc::clone(&sink.pending_tool_results);
+        let request = tokio::spawn(async move {
+            sink.request_tool(
+                "call_1",
+                "run_command",
+                serde_json::json!({ "program": "git", "args": ["status"] }),
+            )
+            .await
+        });
+
+        let frame = frames.recv().await.expect("tool call frame");
+        assert!(matches!(
+            frame,
+            Outbound::ToolCall {
+                id: 11,
+                tool_call_id,
+                name,
+                ..
+            } if tool_call_id == "call_1" && name == "run_command"
+        ));
+
+        resolve_tool_result(
+            &pending,
+            "call_1".to_string(),
+            ToolCallResult {
+                ok: true,
+                content: "done".to_string(),
+            },
+        );
+
+        let result = request.await.expect("tool task").expect("tool result");
+        assert!(result.ok);
+        assert_eq!(result.content, "done");
     }
 }

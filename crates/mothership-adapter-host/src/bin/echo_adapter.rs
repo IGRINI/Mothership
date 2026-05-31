@@ -108,14 +108,18 @@ fn main() -> anyhow::Result<()> {
                     .map(|message| message.content.clone())
                     .unwrap_or_default();
                 for word in last.split_whitespace() {
-                    emit(&mut stdout, &Outbound::Delta {
-                        id,
-                        text: format!("{word} "),
-                    })?;
+                    emit(
+                        &mut stdout,
+                        &Outbound::Delta {
+                            id,
+                            text: format!("{word} "),
+                        },
+                    )?;
                 }
                 emit(&mut stdout, &Outbound::Done { id })?;
             }
             Request::ChatCancel { id } => emit(&mut stdout, &Outbound::Done { id })?,
+            Request::ToolResult { .. } => {}
             Request::Logout { id } => emit(&mut stdout, &Outbound::Ack { id })?,
         }
     }

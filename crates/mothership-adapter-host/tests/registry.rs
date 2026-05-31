@@ -14,6 +14,7 @@ fn scans_and_finds_adapter_manifest() {
     let dir = std::env::temp_dir().join(format!("mship_adapters_{stamp}"));
     let adapter_dir = dir.join("echo");
     fs::create_dir_all(&adapter_dir).expect("create adapter dir");
+    fs::write(adapter_dir.join("echo_adapter.exe"), b"test").expect("write adapter exe");
     fs::write(
         adapter_dir.join("adapter.json"),
         r#"{"provider_id":"echo","provider_label":"Echo Provider","program":"echo_adapter.exe"}"#,

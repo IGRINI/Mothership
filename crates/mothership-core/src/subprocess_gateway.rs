@@ -8,14 +8,14 @@
 
 use std::sync::Arc;
 
-use mothership_adapter_host::protocol::ChatMessage;
-use mothership_adapter_host::AdapterEntry;
+use mothership_adapter_host::protocol::{ChatMessage, ToolCallResult};
+use mothership_adapter_host::{AdapterEntry, ToolCallHandler, ToolCallRequest};
 
 use crate::adapter_pool::AdapterPool;
 use crate::auth::FileCredentialVault;
 use crate::llm::{
     LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest, LlmChatRole,
-    LlmTransportKind,
+    LlmToolCallHandler, LlmToolCallRequest, LlmTransportKind,
 };
 use crate::{ChatCancellationToken, MothershipError, Result};
 
@@ -28,11 +28,29 @@ pub struct SubprocessChatGateway {
     pool: Arc<AdapterPool>,
     entry: AdapterEntry,
     vault: FileCredentialVault,
+    run_id: Option<String>,
+    tool_handler: Option<Arc<dyn LlmToolCallHandler>>,
 }
 
 impl SubprocessChatGateway {
     pub fn new(pool: Arc<AdapterPool>, entry: AdapterEntry, vault: FileCredentialVault) -> Self {
-        Self { pool, entry, vault }
+        Self {
+            pool,
+            entry,
+            vault,
+            run_id: None,
+            tool_handler: None,
+        }
+    }
+
+    pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self
+    }
+
+    pub fn with_tool_handler(mut self, handler: Arc<dyn LlmToolCallHandler>) -> Self {
+        self.tool_handler = Some(handler);
+        self
     }
 }
 
@@ -67,17 +85,59 @@ impl LlmChatCompletionGateway for SubprocessChatGateway {
 
         let model_id = request.model_id;
         let cancellation = cancellation.clone();
+        let run_id = self.run_id.clone();
+        let tool_handler = self.tool_handler.as_ref().map(|handler| {
+            Arc::new(SubprocessToolCallHandler {
+                inner: Arc::clone(handler),
+                run_id,
+                cancellation: cancellation.clone(),
+            }) as Arc<dyn ToolCallHandler>
+        });
         self.pool
             .with(&self.entry, &self.vault, |adapter| {
-                adapter.chat_cancellable(
-                    &model_id,
-                    messages,
-                    move || cancellation.is_cancelled(),
-                    |delta| sink.delta(delta),
-                )
+                if let Some(tool_handler) = tool_handler {
+                    adapter.chat_cancellable_with_tools(
+                        &model_id,
+                        messages,
+                        move || cancellation.is_cancelled(),
+                        |delta| sink.delta(delta),
+                        tool_handler,
+                    )
+                } else {
+                    adapter.chat_cancellable(
+                        &model_id,
+                        messages,
+                        move || cancellation.is_cancelled(),
+                        |delta| sink.delta(delta),
+                    )
+                }
             })
             .map_err(|error| {
                 MothershipError::InvalidRequest(format!("adapter chat failed: {error}"))
             })
+    }
+}
+
+struct SubprocessToolCallHandler {
+    inner: Arc<dyn LlmToolCallHandler>,
+    run_id: Option<String>,
+    cancellation: ChatCancellationToken,
+}
+
+impl ToolCallHandler for SubprocessToolCallHandler {
+    fn handle_tool_call(&self, request: ToolCallRequest) -> ToolCallResult {
+        let result = self.inner.handle_tool_call(
+            LlmToolCallRequest {
+                run_id: self.run_id.clone(),
+                tool_call_id: request.tool_call_id,
+                name: request.name,
+                arguments: request.arguments,
+            },
+            &self.cancellation,
+        );
+        ToolCallResult {
+            ok: result.ok,
+            content: result.content,
+        }
     }
 }

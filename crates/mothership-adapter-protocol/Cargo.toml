@@ -8,3 +8,4 @@ license.workspace = true
 # out-of-tree adapter. Pure data definitions — no transport, no runtime.
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true

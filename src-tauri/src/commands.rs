@@ -12,6 +12,8 @@ use mothership_core::ipc::{CoreRequest, CoreResponse};
 use mothership_core::{
     AdapterSettingPatchValue, ChatConversation, ChatRunCancellationResult, ChatThreadSummary,
     ConnectorSettingsSnapshot, DashboardSnapshot, SendChatMessageResult, SidecarStatus,
+    ToolApprovalAnswer, ToolExecutionAccepted, ToolExecutionCancellationResult,
+    ToolExecutionRequest,
 };
 use tauri::State;
 
@@ -128,6 +130,51 @@ pub async fn cancel_chat_run(
         .request(CoreRequest::CancelChatRun { run_id })
         .await?;
     expect_variant!(response, CoreResponse::ChatRunCancellation)
+}
+
+#[tauri::command]
+pub async fn run_tool_command(
+    state: State<'_, AppState>,
+    request: ToolExecutionRequest,
+) -> Result<ToolExecutionAccepted, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::RunToolCommand { request })
+        .await?;
+    expect_variant!(response, CoreResponse::ToolExecutionAccepted)
+}
+
+#[tauri::command]
+pub async fn approve_tool_execution(
+    state: State<'_, AppState>,
+    tool_call_id: String,
+    approved: bool,
+    reason: Option<String>,
+) -> Result<ToolApprovalAnswer, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::ApproveToolExecution {
+            tool_call_id,
+            approved,
+            reason,
+        })
+        .await?;
+    expect_variant!(response, CoreResponse::ToolApproval)
+}
+
+#[tauri::command]
+pub async fn cancel_tool_execution(
+    state: State<'_, AppState>,
+    tool_call_id: String,
+) -> Result<ToolExecutionCancellationResult, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::CancelToolExecution { tool_call_id })
+        .await?;
+    expect_variant!(response, CoreResponse::ToolExecutionCancellation)
 }
 
 #[tauri::command]

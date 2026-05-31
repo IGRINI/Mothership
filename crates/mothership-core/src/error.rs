@@ -14,6 +14,9 @@ pub enum MothershipError {
 
     #[error("credential vault error: {0}")]
     CredentialVault(String),
+
+    #[error("runtime error: {0}")]
+    Runtime(String),
 }
 
 pub type Result<T> = std::result::Result<T, MothershipError>;

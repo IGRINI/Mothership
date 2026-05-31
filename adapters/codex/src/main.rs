@@ -43,6 +43,7 @@ const MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Settings key under which the host stores/loads the whole credential JSON.
 const CREDENTIAL_SETTINGS_KEY: &str = "credential";
+const RUN_COMMAND_TOOL_NAME: &str = "run_command";
 
 /// Fallback system prompt when the core sends no system message (the Codex
 /// backend requires non-empty `instructions`).
@@ -224,9 +225,11 @@ impl ProviderAdapter for CodexAdapter {
 
         let cancellation = sink.cancellation_token();
         let mut on_delta = |text: &str| sink.delta(text);
+        let tool_dispatcher = CodexToolDispatcher { sink: sink.clone() };
+        let tools = [run_command_tool_schema()];
         let ws_arg = if had_ws { self.ws.as_mut() } else { None };
         let transport = tokio::select! {
-            result = responses::chat(
+            result = responses::chat_with_tools(
                 &self.client,
                 &self.endpoint,
                 &headers,
@@ -235,6 +238,8 @@ impl ProviderAdapter for CodexAdapter {
                 &messages,
                 ws_arg,
                 &mut on_delta,
+                &tools,
+                &tool_dispatcher,
             ) => result?,
             _ = cancellation.cancelled() => {
                 if let Some(session) = self.ws.as_mut() {
@@ -267,6 +272,61 @@ impl ProviderAdapter for CodexAdapter {
             session.close_if_idle().await;
         }
     }
+}
+
+struct CodexToolDispatcher {
+    sink: mothership_adapter_sdk::ChatSink,
+}
+
+#[async_trait::async_trait]
+impl responses::ToolDispatcher for CodexToolDispatcher {
+    async fn dispatch(&self, call: responses::ToolCall) -> Result<responses::ToolOutput> {
+        let result = self
+            .sink
+            .request_tool(call.call_id, call.name, call.arguments)
+            .await?;
+        let output = if result.ok {
+            result.content
+        } else {
+            format!("tool_error:\n{}", result.content)
+        };
+        Ok(responses::ToolOutput { output })
+    }
+}
+
+fn run_command_tool_schema() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "name": RUN_COMMAND_TOOL_NAME,
+        "description": "Run a local command through Mothership's supervised tool runtime. Use it for project inspection, tests, builds, git operations, and other development tasks. The app may ask the user for approval before execution.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "program": {
+                    "type": "string",
+                    "description": "Executable to run, for example git, npm, cargo, powershell, or python."
+                },
+                "args": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Command arguments without shell quoting."
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Absolute working directory for the command. Omit only when the current project directory is not known."
+                },
+                "timeoutMs": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "maximum": 1800000,
+                    "description": "Optional timeout in milliseconds."
+                }
+            },
+            "required": ["program"],
+            "additionalProperties": false
+        },
+        "strict": false
+    })
 }
 
 // ---- credential + auth ----------------------------------------------------

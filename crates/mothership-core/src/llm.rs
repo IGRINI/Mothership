@@ -8,6 +8,7 @@
 //! (see [`crate::SubprocessChatGateway`]); the core holds no provider code.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::ChatCancellationToken;
 
@@ -102,6 +103,30 @@ pub trait LlmChatCompletionEventSink {
     fn transport_selected(&mut self, transport: LlmTransportKind);
 
     fn delta(&mut self, delta: &str);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmToolCallRequest {
+    pub run_id: Option<String>,
+    pub tool_call_id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmToolCallResult {
+    pub ok: bool,
+    pub content: String,
+}
+
+pub trait LlmToolCallHandler: Send + Sync {
+    fn handle_tool_call(
+        &self,
+        request: LlmToolCallRequest,
+        cancellation: &ChatCancellationToken,
+    ) -> LlmToolCallResult;
 }
 
 pub trait LlmChatCompletionGateway: Send + Sync {

@@ -29,9 +29,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::append_activity_event,
+            commands::approve_tool_execution,
             commands::authenticate_adapter,
             commands::cancel_authenticate_adapter,
             commands::cancel_chat_run,
+            commands::cancel_tool_execution,
             commands::create_chat,
             commands::get_chat,
             commands::get_connector_settings,
@@ -39,6 +41,7 @@ pub fn run() {
             commands::list_chats,
             commands::logout_adapter,
             commands::retry_chat_message,
+            commands::run_tool_command,
             commands::run_sidecar_status,
             commands::save_adapter_settings,
             commands::send_chat_message,

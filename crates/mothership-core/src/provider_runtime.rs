@@ -5,7 +5,10 @@ use mothership_adapter_host::AdapterEntry;
 
 use crate::adapter_pool::AdapterPool;
 use crate::auth::FileCredentialVault;
-use crate::llm::{LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest};
+use crate::llm::{
+    LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest,
+    LlmToolCallHandler,
+};
 use crate::subprocess_gateway::SubprocessChatGateway;
 use crate::{ChatCancellationToken, Result};
 
@@ -51,14 +54,22 @@ impl ProviderRuntimeManager {
         &self,
         entry: AdapterEntry,
         vault: FileCredentialVault,
+        run_id: Option<String>,
+        tool_handler: Option<Arc<dyn LlmToolCallHandler>>,
         request: LlmChatCompletionRequest,
         cancellation: &ChatCancellationToken,
         sink: &mut dyn LlmChatCompletionEventSink,
     ) -> Result<String> {
         let provider_id = request.provider_id.clone();
         let _guard = self.start_run(&provider_id);
-        let result = SubprocessChatGateway::new(Arc::clone(&self.pool), entry, vault)
-            .complete_chat(request, cancellation, sink);
+        let mut gateway = SubprocessChatGateway::new(Arc::clone(&self.pool), entry, vault);
+        if let Some(run_id) = run_id {
+            gateway = gateway.with_run_id(run_id);
+        }
+        if let Some(tool_handler) = tool_handler {
+            gateway = gateway.with_tool_handler(tool_handler);
+        }
+        let result = gateway.complete_chat(request, cancellation, sink);
 
         if cancellation.is_cancelled() {
             self.record_cancelled(&provider_id);
@@ -73,10 +84,7 @@ impl ProviderRuntimeManager {
 
     fn start_run(&self, provider_id: &str) -> ProviderRunGuard<'_> {
         let mut providers = self.providers.lock().unwrap();
-        providers
-            .entry(provider_id.to_string())
-            .or_default()
-            .active += 1;
+        providers.entry(provider_id.to_string()).or_default().active += 1;
         ProviderRunGuard {
             manager: self,
             provider_id: provider_id.to_string(),

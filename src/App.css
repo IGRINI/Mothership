@@ -1818,11 +1818,11 @@ kbd,
 .tool-call-row {
   display: grid;
   grid-template-columns: 20px minmax(0, 1fr) auto;
-  align-items: center;
+  align-items: start;
   min-height: 62px;
   gap: 12px;
   border-bottom: 1px solid #1d2b3b;
-  padding: 0 14px;
+  padding: 11px 14px;
 }
 
 .tool-call-row > svg,
@@ -1831,16 +1831,95 @@ kbd,
   color: #c6d2df;
 }
 
+.tool-call-row__body {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.tool-call-row__body strong,
+.tool-call-row__body small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-call-row__body strong {
+  color: #edf4fb;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.tool-call-row__body small {
+  color: #8d9bab;
+  font-size: 11.5px;
+}
+
+.tool-call-row__output {
+  max-height: 84px;
+  margin: 2px 0 0;
+  overflow: auto;
+  border: 1px solid #1d2b3b;
+  border-radius: 6px;
+  padding: 7px;
+  background: #07101a;
+  color: #9fb0c2;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tool-call-row__actions {
+  display: flex;
+  gap: 6px;
+}
+
+.tool-call-row__actions button {
+  display: inline-grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border: 1px solid #27394b;
+  border-radius: 7px;
+  background: #101b27;
+  color: #cfd9e4;
+}
+
+.tool-call-row__actions button:hover {
+  border-color: #3b5874;
+  background: #142335;
+}
+
 .tool-status {
   color: #9aa8b7;
   font-size: 12px;
 }
 
-.tool-status--done {
+.tool-status--done,
+.tool-status--running,
+.tool-status--pending,
+.tool-status--error {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+}
+
+.tool-status--done {
   color: #4add86;
+}
+
+.tool-status--running {
+  color: #7db2ff;
+}
+
+.tool-status--pending {
+  color: #e4aa43;
+}
+
+.tool-status--error {
+  color: #ff9b9b;
 }
 
 .artifact-list {

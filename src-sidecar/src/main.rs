@@ -20,14 +20,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::thread;
 
+mod tool_runtime;
+
 use mothership_core::ipc::{
     ClientFrame, CoreError, CoreEvent, CoreRequest, CoreResponse, ServerFrame, PROTOCOL_VERSION,
 };
 use mothership_core::{
     schedule_cancel_fallback, trusted_built_in_adapter_sha256, AdapterPool, AuthProcessRegistry,
     ChatRunCancellationResult, ChatRunEvent, ChatRunEventSink, ChatRunRegistry, ChatRunService,
-    ConnectorManager, ConnectorSettingsEvent, ConnectorSettingsEventKind, Database,
-    ProviderRuntimeManager, SendChatMessageResult,
+    ConnectorManager, ConnectorSettingsEvent, ConnectorSettingsEventKind,
+    ConservativeCommandPermissionPolicy, Database, FileToolOutputStore, LlmToolCallHandler,
+    PendingToolApprovalGate, ProviderRuntimeManager, SendChatMessageResult, ToolApprovalAnswer,
+    ToolApprovalDecision, ToolCancellationToken, ToolExecutionAccepted,
+    ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionEventKind,
+    ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest, ToolExecutionResult,
+    ToolExecutionStatus, ToolResourceLimits, ToolSupervisor,
 };
 use sha2::{Digest, Sha256};
 
@@ -124,6 +131,30 @@ fn serve() -> anyhow::Result<()> {
     let pool = Arc::new(AdapterPool::new());
     let connector_manager = Arc::new(ConnectorManager::new(database.clone(), Arc::clone(&pool)));
     let provider_manager = Arc::new(ProviderRuntimeManager::new(Arc::clone(&pool)));
+    let async_runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("mothership-tool-runtime")
+            .build()?,
+    );
+    let tool_approvals = PendingToolApprovalGate::new();
+    let tool_supervisor = Arc::new(
+        ToolSupervisor::new(
+            Arc::new(tool_runtime::ProcessSandboxToolAdapter::new(
+                process_sandbox::platform_sandbox(),
+            )),
+            db_path.parent().map(|parent| {
+                Arc::new(FileToolOutputStore::new(parent.join("tool-logs")))
+                    as Arc<dyn mothership_core::ToolOutputStore>
+            }),
+            ToolResourceLimits::default(),
+        )
+        .with_policy(
+            Arc::new(ConservativeCommandPermissionPolicy),
+            Arc::clone(&tool_approvals) as Arc<dyn mothership_core::ToolApprovalGate>,
+        ),
+    );
+    let tool_registry = Arc::new(ToolExecutionRegistry::new());
     let chat_registry = Arc::new(ChatRunRegistry::new());
     let _ = outbox.send(ServerFrame::Ready);
     start_connector_refresh(
@@ -154,6 +185,10 @@ fn serve() -> anyhow::Result<()> {
                 let auth_registry = Arc::clone(&auth_registry);
                 let connector_manager = Arc::clone(&connector_manager);
                 let provider_manager = Arc::clone(&provider_manager);
+                let tool_supervisor = Arc::clone(&tool_supervisor);
+                let tool_approvals = Arc::clone(&tool_approvals);
+                let tool_registry = Arc::clone(&tool_registry);
+                let async_runtime = Arc::clone(&async_runtime);
                 let chat_registry = Arc::clone(&chat_registry);
                 thread::spawn(move || {
                     handle_request(
@@ -164,6 +199,10 @@ fn serve() -> anyhow::Result<()> {
                         auth_registry,
                         connector_manager,
                         provider_manager,
+                        tool_supervisor,
+                        tool_approvals,
+                        tool_registry,
+                        async_runtime,
                         chat_registry,
                     )
                 });
@@ -341,18 +380,53 @@ fn handle_request(
     auth_registry: Arc<AuthProcessRegistry>,
     connector_manager: Arc<ConnectorManager>,
     provider_manager: Arc<ProviderRuntimeManager>,
+    tool_supervisor: Arc<ToolSupervisor>,
+    tool_approvals: Arc<PendingToolApprovalGate>,
+    tool_registry: Arc<ToolExecutionRegistry>,
+    async_runtime: Arc<tokio::runtime::Runtime>,
     chat_registry: Arc<ChatRunRegistry>,
 ) {
     // Streaming requests answer immediately with the persisted placeholder, then
     // stream the run; handle them before the uniform request/response path.
     if let CoreRequest::SendChatMessage { chat_id, content } = &request {
         let started = database.begin_chat_run(chat_id.as_deref(), content);
-        run_chat_message(id, started, database, outbox, provider_manager, chat_registry);
+        run_chat_message(
+            id,
+            started,
+            database,
+            outbox,
+            provider_manager,
+            tool_supervisor,
+            tool_registry,
+            async_runtime,
+            chat_registry,
+        );
         return;
     }
     if let CoreRequest::RetryChatMessage { chat_id } = &request {
         let started = database.begin_retry_run(chat_id);
-        run_chat_message(id, started, database, outbox, provider_manager, chat_registry);
+        run_chat_message(
+            id,
+            started,
+            database,
+            outbox,
+            provider_manager,
+            tool_supervisor,
+            tool_registry,
+            async_runtime,
+            chat_registry,
+        );
+        return;
+    }
+    if let CoreRequest::RunToolCommand { request } = request {
+        run_tool_command(
+            id,
+            request,
+            outbox,
+            tool_supervisor,
+            tool_registry,
+            async_runtime,
+        );
         return;
     }
 
@@ -362,6 +436,8 @@ fn handle_request(
         &auth_registry,
         &connector_manager,
         &provider_manager,
+        &tool_approvals,
+        &tool_registry,
         &chat_registry,
     );
     let _ = match result {
@@ -391,6 +467,8 @@ fn compute(
     auth_registry: &AuthProcessRegistry,
     connector_manager: &Arc<ConnectorManager>,
     provider_manager: &Arc<ProviderRuntimeManager>,
+    tool_approvals: &Arc<PendingToolApprovalGate>,
+    tool_registry: &Arc<ToolExecutionRegistry>,
     chat_registry: &Arc<ChatRunRegistry>,
 ) -> Result<RequestOutcome, CoreError> {
     Ok(match request {
@@ -419,6 +497,33 @@ fn compute(
                 ChatRunCancellationResult {
                     run_id,
                     accepted: true,
+                },
+            ))
+        }
+        CoreRequest::ApproveToolExecution {
+            tool_call_id,
+            approved,
+            reason,
+        } => {
+            let decision = if approved {
+                ToolApprovalDecision::Approved
+            } else {
+                ToolApprovalDecision::Denied {
+                    reason: reason.unwrap_or_else(|| "denied by user".to_string()),
+                }
+            };
+            let accepted = tool_approvals.decide(&tool_call_id, decision);
+            response(CoreResponse::ToolApproval(ToolApprovalAnswer {
+                tool_call_id,
+                accepted,
+            }))
+        }
+        CoreRequest::CancelToolExecution { tool_call_id } => {
+            let accepted = tool_registry.cancel(&tool_call_id);
+            response(CoreResponse::ToolExecutionCancellation(
+                ToolExecutionCancellationResult {
+                    tool_call_id,
+                    accepted,
                 },
             ))
         }
@@ -461,10 +566,92 @@ fn compute(
             response(CoreResponse::SidecarStatus(database.sidecar_status()?))
         }
         // Streaming cases handled in `handle_request` before reaching here.
-        CoreRequest::SendChatMessage { .. } | CoreRequest::RetryChatMessage { .. } => {
+        CoreRequest::SendChatMessage { .. }
+        | CoreRequest::RetryChatMessage { .. }
+        | CoreRequest::RunToolCommand { .. } => {
             unreachable!("handled as a streaming request")
         }
     })
+}
+
+fn run_tool_command(
+    id: u64,
+    request: ToolExecutionRequest,
+    outbox: Outbox,
+    tool_supervisor: Arc<ToolSupervisor>,
+    tool_registry: Arc<ToolExecutionRegistry>,
+    async_runtime: Arc<tokio::runtime::Runtime>,
+) {
+    if request.tool_call_id.trim().is_empty() {
+        let _ = outbox.send(ServerFrame::Error {
+            id,
+            error: CoreError::new("invalid_request", "tool_call_id cannot be empty", false),
+        });
+        return;
+    }
+
+    let cancellation = ToolCancellationToken::default();
+    if !tool_registry.register(&request.tool_call_id, cancellation.clone()) {
+        let _ = outbox.send(ServerFrame::Error {
+            id,
+            error: CoreError::new(
+                "invalid_request",
+                format!("tool call already active: {}", request.tool_call_id),
+                false,
+            ),
+        });
+        return;
+    }
+
+    let tool_call_id = request.tool_call_id.clone();
+    let response_result = outbox.send(ServerFrame::Response {
+        id,
+        result: CoreResponse::ToolExecutionAccepted(ToolExecutionAccepted {
+            tool_call_id: tool_call_id.clone(),
+        }),
+    });
+    if response_result.is_err() {
+        tool_registry.finish(&tool_call_id);
+        return;
+    }
+
+    let sink: Arc<dyn ToolExecutionEventSink> = Arc::new(ProtocolToolExecutionSink {
+        outbox: outbox.clone(),
+    });
+    async_runtime.spawn(async move {
+        let result = tool_supervisor
+            .run_command(request.clone(), cancellation, Arc::clone(&sink))
+            .await;
+        if let Err(error) = result {
+            let failed = ToolExecutionResult {
+                tool_call_id: request.tool_call_id.clone(),
+                status: ToolExecutionStatus::Failed,
+                exit_code: None,
+                stdout_preview: String::new(),
+                stderr_preview: String::new(),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+                truncated_for_display: false,
+                truncated_for_agent: false,
+                log_ref: None,
+                message: Some(error.to_string()),
+            };
+            sink.emit(ToolExecutionEvent {
+                tool_call_id: request.tool_call_id.clone(),
+                run_id: request.run_id.clone(),
+                project_id: request.project_id.clone(),
+                command: Some(request.command.clone()),
+                kind: ToolExecutionEventKind::Failed,
+                stream: None,
+                chunk: None,
+                message: Some(error.to_string()),
+                result: Some(failed),
+            });
+        }
+        tool_registry.finish(&request.tool_call_id);
+    });
 }
 
 fn response(response: CoreResponse) -> RequestOutcome {
@@ -527,6 +714,9 @@ fn run_chat_message(
     database: Database,
     outbox: Outbox,
     provider_manager: Arc<ProviderRuntimeManager>,
+    tool_supervisor: Arc<ToolSupervisor>,
+    tool_registry: Arc<ToolExecutionRegistry>,
+    async_runtime: Arc<tokio::runtime::Runtime>,
     chat_registry: Arc<ChatRunRegistry>,
 ) {
     match started {
@@ -535,8 +725,20 @@ fn run_chat_message(
                 id,
                 result: CoreResponse::ChatMessageStarted(started.clone()),
             });
+            let tool_sink: Arc<dyn ToolExecutionEventSink> = Arc::new(ProtocolToolExecutionSink {
+                outbox: outbox.clone(),
+            });
+            let tool_handler: Arc<dyn LlmToolCallHandler> =
+                Arc::new(tool_runtime::SidecarLlmToolHandler::new(
+                    tool_supervisor,
+                    tool_registry,
+                    async_runtime,
+                    tool_sink,
+                ));
             let mut sink = ProtocolChatRunSink { outbox };
-            ChatRunService::new(&database, provider_manager).run(&started, chat_registry, &mut sink);
+            ChatRunService::new(&database, provider_manager)
+                .with_tool_handler(tool_handler)
+                .run(&started, chat_registry, &mut sink);
         }
         Err(error) => {
             let _ = outbox.send(ServerFrame::Error {
@@ -556,6 +758,18 @@ impl ChatRunEventSink for ProtocolChatRunSink {
     fn emit(&mut self, event: ChatRunEvent) {
         let _ = self.outbox.send(ServerFrame::Event {
             event: CoreEvent::ChatRun(event),
+        });
+    }
+}
+
+struct ProtocolToolExecutionSink {
+    outbox: Outbox,
+}
+
+impl ToolExecutionEventSink for ProtocolToolExecutionSink {
+    fn emit(&self, event: ToolExecutionEvent) {
+        let _ = self.outbox.send(ServerFrame::Event {
+            event: CoreEvent::ToolExecution(event),
         });
     }
 }

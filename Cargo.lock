@@ -2303,6 +2303,7 @@ name = "mothership-adapter-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2341,6 +2342,7 @@ name = "mothership-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "getrandom 0.2.17",
  "mothership-adapter-host",
@@ -2350,6 +2352,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
+ "tokio",
  "tungstenite",
  "url",
 ]
@@ -2359,6 +2362,7 @@ name = "mothership-openai-responses"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "mothership-adapter-sdk",
  "reqwest",
  "serde_json",
@@ -2371,9 +2375,13 @@ name = "mothership-sidecar"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "mothership-core",
+ "process-sandbox",
+ "serde",
  "serde_json",
  "sha2",
+ "tokio",
 ]
 
 [[package]]

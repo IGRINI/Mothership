@@ -29,13 +29,37 @@ use sha2::{Digest, Sha256};
 // `mothership_adapter_host::protocol::*` paths keep working unchanged.
 pub use mothership_adapter_protocol as protocol;
 
-use protocol::{AuthKind, ChatMessage, Model, ModelManagement, Outbound, Request, SettingsField};
+use protocol::{
+    AuthKind, ChatMessage, Model, ModelManagement, Outbound, Request, SettingsField, ToolCallResult,
+};
 
 /// Handler the host registers to persist secrets an adapter pushes via the
 /// `StoreSecret` side channel (e.g. a freshly minted/refreshed OAuth token).
 type StoreSecretSink = Box<dyn FnMut(BTreeMap<String, String>) + Send>;
 
 const CHAT_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone)]
+pub struct ToolCallRequest {
+    pub tool_call_id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+pub trait ToolCallHandler: Send + Sync {
+    fn handle_tool_call(&self, request: ToolCallRequest) -> ToolCallResult;
+}
+
+struct RejectingToolCallHandler;
+
+impl ToolCallHandler for RejectingToolCallHandler {
+    fn handle_tool_call(&self, request: ToolCallRequest) -> ToolCallResult {
+        ToolCallResult {
+            ok: false,
+            content: format!("tool calls are not enabled for `{}`", request.name),
+        }
+    }
+}
 
 /// A spawned adapter process and the stdio pipes to talk to it.
 pub struct Adapter {
@@ -252,6 +276,27 @@ impl Adapter {
         is_cancelled: impl Fn() -> bool + Send + 'static,
         mut on_delta: impl FnMut(&str),
     ) -> Result<String> {
+        self.chat_cancellable_with_tools(
+            model,
+            messages,
+            is_cancelled,
+            |delta| on_delta(delta),
+            Arc::new(RejectingToolCallHandler),
+        )
+    }
+
+    /// Runs a chat turn and handles model-requested tool calls through the
+    /// supplied host-side handler. Each tool call is executed on a separate
+    /// worker thread and its result is sent back to the adapter, so multiple
+    /// pending tool calls do not block the adapter event reader.
+    pub fn chat_cancellable_with_tools(
+        &mut self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        is_cancelled: impl Fn() -> bool + Send + 'static,
+        mut on_delta: impl FnMut(&str),
+        tool_handler: Arc<dyn ToolCallHandler>,
+    ) -> Result<String> {
         let id = self.next_id();
         self.send(&Request::ChatStart {
             id,
@@ -278,6 +323,31 @@ impl Adapter {
                 Ok(Outbound::Delta { id: got, text }) if got == id => {
                     full.push_str(&text);
                     on_delta(&text);
+                }
+                Ok(Outbound::ToolCall {
+                    id: got,
+                    tool_call_id,
+                    name,
+                    arguments,
+                }) if got == id => {
+                    let request_id = self.next_id();
+                    let stdin = Arc::clone(&self.stdin);
+                    let handler = Arc::clone(&tool_handler);
+                    thread::spawn(move || {
+                        let result = handler.handle_tool_call(ToolCallRequest {
+                            tool_call_id: tool_call_id.clone(),
+                            name,
+                            arguments,
+                        });
+                        let _ = write_request(
+                            &stdin,
+                            &Request::ToolResult {
+                                id: request_id,
+                                tool_call_id,
+                                result,
+                            },
+                        );
+                    });
                 }
                 Ok(Outbound::Done { id: got }) if got == id => break Ok(full),
                 Ok(Outbound::Error { id: got, message }) if got == id => {

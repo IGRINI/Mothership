@@ -12,7 +12,7 @@ use crate::connectors::{
     ensure_adapter_capability, find_trusted_adapter_entry, CAPABILITY_LLM_CHAT,
 };
 use crate::llm::{
-    LlmChatCompletionEventSink, LlmChatCompletionRequest, LlmTransportKind,
+    LlmChatCompletionEventSink, LlmChatCompletionRequest, LlmToolCallHandler, LlmTransportKind,
 };
 use crate::provider_runtime::ProviderRuntimeManager;
 use crate::{Database, MothershipError, Result};
@@ -106,6 +106,7 @@ impl ChatRunRegistry {
 pub struct ChatRunService<'a> {
     database: &'a Database,
     providers: Arc<ProviderRuntimeManager>,
+    tool_handler: Option<Arc<dyn LlmToolCallHandler>>,
 }
 
 impl<'a> ChatRunService<'a> {
@@ -113,7 +114,13 @@ impl<'a> ChatRunService<'a> {
         Self {
             database,
             providers,
+            tool_handler: None,
         }
+    }
+
+    pub fn with_tool_handler(mut self, handler: Arc<dyn LlmToolCallHandler>) -> Self {
+        self.tool_handler = Some(handler);
+        self
     }
 
     /// Runs the chat completion for `run` to completion, emitting `Started`,
@@ -180,7 +187,8 @@ impl<'a> ChatRunService<'a> {
 
         // Every provider is a subprocess adapter. Find the one that owns this
         // model; the adapter handles its own transport and auth.
-        let entry = find_trusted_adapter_entry(&plugins_store_path(database), &selected_model.provider_id)?;
+        let entry =
+            find_trusted_adapter_entry(&plugins_store_path(database), &selected_model.provider_id)?;
         ensure_adapter_capability(&entry, CAPABILITY_LLM_CHAT, "run chat")
             .map_err(MothershipError::InvalidRequest)?;
 
@@ -224,6 +232,8 @@ impl<'a> ChatRunService<'a> {
         let result = self.providers.complete_subprocess_chat(
             entry,
             vault,
+            Some(run.run_id.clone()),
+            self.tool_handler.clone(),
             LlmChatCompletionRequest {
                 provider_id: selected_model.provider_id,
                 model_id: selected_model.model_id,

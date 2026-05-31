@@ -100,6 +100,92 @@ export interface ChatRunEvent {
   error?: string | null;
 }
 
+export interface ToolCommand {
+  program: string;
+  args: string[];
+  env?: Record<string, string>;
+}
+
+export interface ToolOutputPolicy {
+  memoryPreviewBytes: number;
+  uiStreamBytesPerSec: number;
+  agentTailBytes: number;
+  spillToFile: boolean;
+}
+
+export interface ToolExecutionRequest {
+  toolCallId: string;
+  runId?: string | null;
+  projectId?: string | null;
+  cwd?: string | null;
+  command: ToolCommand;
+  timeoutMs?: number | null;
+  outputPolicy?: ToolOutputPolicy;
+}
+
+export interface ToolExecutionAccepted {
+  toolCallId: string;
+}
+
+export interface ToolExecutionCancellationResult {
+  toolCallId: string;
+  accepted: boolean;
+}
+
+export interface ToolApprovalAnswer {
+  toolCallId: string;
+  accepted: boolean;
+}
+
+export type ToolOutputStream = "stdout" | "stderr";
+
+export type ToolExecutionStatus =
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "timed_out"
+  | "permission_denied";
+
+export interface ToolExecutionResult {
+  toolCallId: string;
+  status: ToolExecutionStatus;
+  exitCode?: number | null;
+  stdoutPreview: string;
+  stderrPreview: string;
+  stdoutTail: string;
+  stderrTail: string;
+  stdoutBytes: number;
+  stderrBytes: number;
+  truncatedForDisplay: boolean;
+  truncatedForAgent: boolean;
+  logRef?: string | null;
+  message?: string | null;
+}
+
+export type ToolExecutionEventKind =
+  | "queued"
+  | "permission_requested"
+  | "permission_denied"
+  | "waiting_for_resource"
+  | "started"
+  | "output"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "timed_out";
+
+export interface ToolExecutionEvent {
+  toolCallId: string;
+  runId?: string | null;
+  projectId?: string | null;
+  command?: ToolCommand | null;
+  kind: ToolExecutionEventKind;
+  stream?: ToolOutputStream | null;
+  chunk?: string | null;
+  message?: string | null;
+  result?: ToolExecutionResult | null;
+}
+
 export interface LlmModel {
   providerId: string;
   providerLabel: string;
@@ -314,6 +400,44 @@ export function cancelChatRun(
   }
 
   return invoke<ChatRunCancellationResult>("cancel_chat_run", { runId });
+}
+
+export function runToolCommand(
+  request: ToolExecutionRequest,
+): Promise<ToolExecutionAccepted> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve({ toolCallId: request.toolCallId });
+  }
+
+  return invoke<ToolExecutionAccepted>("run_tool_command", { request });
+}
+
+export function approveToolExecution(
+  toolCallId: string,
+  approved: boolean,
+  reason?: string,
+): Promise<ToolApprovalAnswer> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve({ toolCallId, accepted: true });
+  }
+
+  return invoke<ToolApprovalAnswer>("approve_tool_execution", {
+    toolCallId,
+    approved,
+    reason,
+  });
+}
+
+export function cancelToolExecution(
+  toolCallId: string,
+): Promise<ToolExecutionCancellationResult> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve({ toolCallId, accepted: true });
+  }
+
+  return invoke<ToolExecutionCancellationResult>("cancel_tool_execution", {
+    toolCallId,
+  });
 }
 
 export function getConnectorSettings(): Promise<ConnectorSettingsSnapshot> {

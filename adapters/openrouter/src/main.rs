@@ -9,9 +9,10 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use mothership_adapter_sdk::protocol::{
-    AuthKind, ChatMessage, Model, ModelManagement, SettingsField, SettingsFieldKind,
+    AuthKind, ChatMessage, Model, ModelManagement, SettingsField, SettingsFieldKind, ToolCallResult,
 };
 use mothership_adapter_sdk::{Context, ProviderAdapter};
+use serde_json::{json, Value};
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -20,6 +21,8 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SSE_BUFFER_BYTES: usize = 8192;
 const MAX_SSE_LINE_BYTES: usize = 256 * 1024;
 const MAX_ERROR_BODY_CHARS: usize = 300;
+const MAX_TOOL_ROUNDS: usize = 8;
+const RUN_COMMAND_TOOL_NAME: &str = "run_command";
 
 #[derive(Default)]
 struct OpenRouterSettings {
@@ -85,7 +88,10 @@ impl ProviderAdapter for OpenRouterAdapter {
     }
 
     async fn models(&mut self, _ctx: &Context) -> anyhow::Result<(ModelManagement, Vec<Model>)> {
-        Ok((ModelManagement::UserDefined, parse_models(&self.settings.models)))
+        Ok((
+            ModelManagement::UserDefined,
+            parse_models(&self.settings.models),
+        ))
     }
 
     async fn chat(
@@ -128,24 +134,53 @@ async fn stream_chat(
         settings.base_url.trim()
     };
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+    let mut conversation = messages
+        .iter()
+        .map(|message| json!({ "role": message.role, "content": message.content }))
+        .collect::<Vec<_>>();
 
-    let body = serde_json::json!({
+    for _ in 0..MAX_TOOL_ROUNDS {
+        let tool_calls =
+            stream_chat_once(client, settings, &url, model, &conversation, sink).await?;
+        if tool_calls.is_empty() {
+            return Ok(());
+        }
+
+        let tool_results = execute_tool_calls(tool_calls.clone(), sink).await?;
+        conversation.push(assistant_tool_call_message(&tool_calls));
+        for (tool_call, result) in tool_results {
+            conversation.push(tool_result_message(&tool_call, result));
+        }
+    }
+
+    anyhow::bail!("OpenRouter tool loop exceeded {MAX_TOOL_ROUNDS} rounds")
+}
+
+async fn stream_chat_once(
+    client: &reqwest::Client,
+    settings: &OpenRouterSettings,
+    url: &str,
+    model: &str,
+    messages: &[Value],
+    sink: &mut mothership_adapter_sdk::ChatSink,
+) -> anyhow::Result<Vec<PendingToolCall>> {
+    let body = json!({
         "model": model,
-        "messages": messages
-            .iter()
-            .map(|message| serde_json::json!({ "role": message.role, "content": message.content }))
-            .collect::<Vec<_>>(),
+        "messages": messages,
         "stream": true,
+        "tools": [run_command_tool_schema()],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
     });
 
     let request = client
-        .post(&url)
+        .post(url)
         .bearer_auth(settings.api_key.trim())
         .json(&body)
         .send();
     let response = tokio::select! {
         result = request => result.context("send OpenRouter chat request")?,
-        _ = sink.cancelled() => return Ok(()),
+        _ = sink.cancelled() => return Ok(Vec::new()),
     };
 
     if !response.status().is_success() {
@@ -179,8 +214,9 @@ async fn read_error_body(response: reqwest::Response) -> String {
 async fn read_sse_stream(
     mut response: reqwest::Response,
     sink: &mut mothership_adapter_sdk::ChatSink,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<PendingToolCall>> {
     let mut pending = Vec::with_capacity(SSE_BUFFER_BYTES);
+    let mut tool_calls = Vec::<StreamingToolCall>::new();
 
     loop {
         let chunk = tokio::select! {
@@ -194,10 +230,10 @@ async fn read_sse_stream(
                     })?
                     .context("read OpenRouter SSE stream")?
             }
-            _ = sink.cancelled() => return Ok(()),
+            _ = sink.cancelled() => return Ok(Vec::new()),
         };
         let Some(chunk) = chunk else {
-            return Ok(());
+            return Ok(finish_tool_calls(tool_calls));
         };
         if chunk.is_empty() {
             continue;
@@ -213,8 +249,8 @@ async fn read_sse_stream(
             let mut line = pending.drain(..=newline_index).collect::<Vec<_>>();
             trim_line_ending(&mut line);
             let line = std::str::from_utf8(&line).context("decode OpenRouter SSE line as UTF-8")?;
-            if handle_sse_line(line, sink)? {
-                return Ok(());
+            if handle_sse_line(line, sink, &mut tool_calls)? {
+                return Ok(finish_tool_calls(tool_calls));
             }
         }
         if pending.len() > MAX_SSE_LINE_BYTES {
@@ -226,7 +262,11 @@ async fn read_sse_stream(
     }
 }
 
-fn handle_sse_line(line: &str, sink: &mothership_adapter_sdk::ChatSink) -> anyhow::Result<bool> {
+fn handle_sse_line(
+    line: &str,
+    sink: &mothership_adapter_sdk::ChatSink,
+    tool_calls: &mut Vec<StreamingToolCall>,
+) -> anyhow::Result<bool> {
     let Some(data) = line.trim().strip_prefix("data:") else {
         return Ok(false);
     };
@@ -234,14 +274,192 @@ fn handle_sse_line(line: &str, sink: &mothership_adapter_sdk::ChatSink) -> anyho
     if data == "[DONE]" {
         return Ok(true);
     }
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
-        if let Some(delta) = value["choices"][0]["delta"]["content"].as_str() {
-            if !delta.is_empty() {
-                sink.delta(delta);
+    if let Ok(value) = serde_json::from_str::<Value>(data) {
+        let delta = &value["choices"][0]["delta"];
+        if let Some(text) = delta["content"].as_str() {
+            if !text.is_empty() {
+                sink.delta(text);
+            }
+        }
+        if let Some(calls) = delta["tool_calls"].as_array() {
+            for call in calls {
+                merge_tool_call_delta(tool_calls, call);
             }
         }
     }
     Ok(false)
+}
+
+#[derive(Debug, Clone)]
+struct PendingToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StreamingToolCall {
+    index: usize,
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+fn merge_tool_call_delta(tool_calls: &mut Vec<StreamingToolCall>, call: &Value) {
+    let index = call
+        .get("index")
+        .and_then(Value::as_u64)
+        .map(|index| index as usize)
+        .unwrap_or(tool_calls.len());
+
+    let position = tool_calls
+        .iter()
+        .position(|existing| existing.index == index)
+        .unwrap_or_else(|| {
+            tool_calls.push(StreamingToolCall {
+                index,
+                ..StreamingToolCall::default()
+            });
+            tool_calls.len() - 1
+        });
+    let pending = &mut tool_calls[position];
+
+    if let Some(id) = call.get("id").and_then(Value::as_str) {
+        if !id.is_empty() {
+            pending.id = Some(id.to_string());
+        }
+    }
+    if let Some(function) = call.get("function") {
+        if let Some(name) = function.get("name").and_then(Value::as_str) {
+            if !name.is_empty() {
+                let current = pending.name.get_or_insert_with(String::new);
+                current.push_str(name);
+            }
+        }
+        if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+            pending.arguments.push_str(arguments);
+        }
+    }
+}
+
+fn finish_tool_calls(tool_calls: Vec<StreamingToolCall>) -> Vec<PendingToolCall> {
+    tool_calls
+        .into_iter()
+        .filter_map(|call| {
+            let name = call.name?;
+            if name.trim().is_empty() {
+                return None;
+            }
+            Some(PendingToolCall {
+                id: call
+                    .id
+                    .unwrap_or_else(|| format!("openrouter_tool_call_{}", call.index)),
+                name,
+                arguments: call.arguments,
+            })
+        })
+        .collect()
+}
+
+async fn execute_tool_calls(
+    tool_calls: Vec<PendingToolCall>,
+    sink: &mothership_adapter_sdk::ChatSink,
+) -> anyhow::Result<Vec<(PendingToolCall, ToolCallResult)>> {
+    let mut tasks = Vec::with_capacity(tool_calls.len());
+    for tool_call in tool_calls {
+        let sink = sink.clone();
+        tasks.push(tokio::spawn(async move {
+            let arguments = parse_tool_arguments(&tool_call.arguments);
+            let result = sink
+                .request_tool(tool_call.id.clone(), tool_call.name.clone(), arguments)
+                .await;
+            (tool_call, result)
+        }));
+    }
+
+    let mut results = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let (tool_call, result) = task.await.context("join OpenRouter tool call task")?;
+        results.push((tool_call, result?));
+    }
+    Ok(results)
+}
+
+fn parse_tool_arguments(arguments: &str) -> Value {
+    if arguments.trim().is_empty() {
+        return json!({});
+    }
+    serde_json::from_str(arguments).unwrap_or_else(|_| json!({ "rawArguments": arguments }))
+}
+
+fn assistant_tool_call_message(tool_calls: &[PendingToolCall]) -> Value {
+    json!({
+        "role": "assistant",
+        "content": null,
+        "tool_calls": tool_calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    },
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn tool_result_message(tool_call: &PendingToolCall, result: ToolCallResult) -> Value {
+    let content = if result.ok {
+        result.content
+    } else {
+        format!("tool_error:\n{}", result.content)
+    };
+    json!({
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "content": content,
+    })
+}
+
+fn run_command_tool_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": RUN_COMMAND_TOOL_NAME,
+            "description": "Run a local command through Mothership's supervised tool runtime. Use it for project inspection, tests, builds, git operations, and other development tasks. The app may ask the user for approval before execution.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "program": {
+                        "type": "string",
+                        "description": "Executable to run, for example git, npm, cargo, powershell, or python."
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Command arguments without shell quoting."
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Absolute working directory for the command. Omit only when the current project directory is not known."
+                    },
+                    "timeoutMs": {
+                        "type": "integer",
+                        "minimum": 1000,
+                        "maximum": 1800000,
+                        "description": "Optional timeout in milliseconds."
+                    }
+                },
+                "required": ["program"],
+                "additionalProperties": false
+            },
+            "strict": false
+        }
+    })
 }
 
 fn trim_line_ending(line: &mut Vec<u8>) {

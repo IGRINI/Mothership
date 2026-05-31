@@ -1,6 +1,7 @@
 import { createSignal, JSX, onCleanup, onMount, Show } from "solid-js";
 import {
   AlertTriangle,
+  Check,
   ChevronDown,
   Circle,
   Clock,
@@ -15,6 +16,7 @@ import {
   Send,
   Square,
   Terminal,
+  X,
 } from "lucide-solid";
 import { listen } from "@tauri-apps/api/event";
 
@@ -24,7 +26,13 @@ import {
   ChatThreadSummary,
   ConnectorSettingsEvent,
   ConnectorSettingsSnapshot,
+  ToolCommand,
+  ToolExecutionEvent,
+  ToolExecutionEventKind,
+  ToolExecutionResult,
+  approveToolExecution,
   cancelChatRun,
+  cancelToolExecution,
   createChat,
   getChat,
   getConnectorSettings,
@@ -79,8 +87,12 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   const [activeRunIds, setActiveRunIds] = createSignal<Record<string, string>>(
     {},
   );
+  const [toolExecutions, setToolExecutions] = createSignal<
+    Record<string, ToolExecutionView>
+  >({});
   let unlistenChatRun: (() => void) | undefined;
   let unlistenConnectorSettings: (() => void) | undefined;
+  let unlistenToolExecution: (() => void) | undefined;
 
   const activeChat = () =>
     chats().find((chat) => chat.id === activeChatId()) ?? null;
@@ -119,6 +131,16 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         }
       });
 
+      void listen<ToolExecutionEvent>("tool-execution-event", (event) => {
+        applyToolExecutionEvent(event.payload);
+      }).then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          unlistenToolExecution = unlisten;
+        }
+      });
+
       onCleanup(() => {
         disposed = true;
       });
@@ -128,6 +150,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   onCleanup(() => {
     unlistenChatRun?.();
     unlistenConnectorSettings?.();
+    unlistenToolExecution?.();
   });
 
   async function loadChats() {
@@ -261,6 +284,33 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     }
   }
 
+  async function handleApproveTool(toolCallId: string) {
+    setError("");
+    try {
+      await approveToolExecution(toolCallId, true);
+    } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    }
+  }
+
+  async function handleDenyTool(toolCallId: string) {
+    setError("");
+    try {
+      await approveToolExecution(toolCallId, false, "Denied by user");
+    } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    }
+  }
+
+  async function handleCancelTool(toolCallId: string) {
+    setError("");
+    try {
+      await cancelToolExecution(toolCallId);
+    } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    }
+  }
+
   function applyChatRunEvent(event: ChatRunEvent) {
     if (event.kind === "started") {
       setActiveRunIds((current) => ({
@@ -316,6 +366,36 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     // bar is reserved for app-level errors (load / send / auth).
   }
 
+  function applyToolExecutionEvent(event: ToolExecutionEvent) {
+    setToolExecutions((current) => {
+      const previous = current[event.toolCallId];
+      const output =
+        event.kind === "output" && event.chunk
+          ? appendToolOutput(previous?.output ?? "", event.stream, event.chunk)
+          : previous?.output ?? "";
+
+      return {
+        ...current,
+        [event.toolCallId]: {
+          toolCallId: event.toolCallId,
+          runId: event.runId ?? previous?.runId,
+          projectId: event.projectId ?? previous?.projectId,
+          command: event.command ?? previous?.command,
+          kind: event.kind,
+          message: event.message ?? previous?.message,
+          output,
+          result: event.result ?? previous?.result,
+          updatedAt: Date.now(),
+        },
+      };
+    });
+  }
+
+  const visibleToolExecutions = () =>
+    Object.values(toolExecutions())
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .slice(0, 50);
+
   return (
     <main class="workspace-shell">
       <Sidebar
@@ -345,6 +425,10 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
       <InspectorPane
         activeChat={activeChat()}
         messageCount={messages().length}
+        toolExecutions={visibleToolExecutions()}
+        onApproveTool={handleApproveTool}
+        onCancelTool={handleCancelTool}
+        onDenyTool={handleDenyTool}
       />
     </main>
   );
@@ -625,7 +709,14 @@ function parseModelOptionValue(value: string): [string, string] {
 function InspectorPane(props: {
   activeChat: ChatThreadSummary | null;
   messageCount: number;
+  toolExecutions: ToolExecutionView[];
+  onApproveTool: (toolCallId: string) => void;
+  onCancelTool: (toolCallId: string) => void;
+  onDenyTool: (toolCallId: string) => void;
 }) {
+  const activeTools = () =>
+    props.toolExecutions.filter((tool) => !isTerminalToolKind(tool.kind)).length;
+
   return (
     <aside class="inspector-pane" aria-label="Run inspector">
       <div class="inspector-tabs" role="tablist" aria-label="Inspector tabs">
@@ -643,7 +734,7 @@ function InspectorPane(props: {
           action={
             <span class="live-pill">
               <Circle size={8} />
-              Idle
+              {activeTools() > 0 ? "Tools" : "Idle"}
             </span>
           }
         >
@@ -652,7 +743,11 @@ function InspectorPane(props: {
               <Terminal size={16} />
               <strong>No active run</strong>
             </div>
-            <span>Chat persistence is enabled</span>
+            <span>
+              {activeTools() > 0
+                ? `${activeTools()} tool job${activeTools() === 1 ? "" : "s"} active`
+                : "Chat persistence is enabled"}
+            </span>
             <div class="progress-track">
               <div class="progress-track__fill" style={{ width: "0%" }} />
             </div>
@@ -667,11 +762,25 @@ function InspectorPane(props: {
           title="Tool Calls"
           action={
             <button class="count-button" type="button">
-              0 <ChevronDown size={13} />
+              {props.toolExecutions.length} <ChevronDown size={13} />
             </button>
           }
         >
-          <div class="panel-empty">Tool calls will appear here.</div>
+          <Show
+            when={props.toolExecutions.length > 0}
+            fallback={<div class="panel-empty">Tool calls will appear here.</div>}
+          >
+            <div class="tool-call-list">
+              {props.toolExecutions.map((tool) => (
+                <ToolCallRow
+                  tool={tool}
+                  onApprove={() => props.onApproveTool(tool.toolCallId)}
+                  onCancel={() => props.onCancelTool(tool.toolCallId)}
+                  onDeny={() => props.onDenyTool(tool.toolCallId)}
+                />
+              ))}
+            </div>
+          </Show>
         </InspectorSection>
 
         <InspectorSection
@@ -690,6 +799,51 @@ function InspectorPane(props: {
         </InspectorSection>
       </div>
     </aside>
+  );
+}
+
+function ToolCallRow(props: {
+  tool: ToolExecutionView;
+  onApprove: () => void;
+  onCancel: () => void;
+  onDeny: () => void;
+}) {
+  const command = () => formatToolCommand(props.tool.command);
+  const canApprove = () => props.tool.kind === "permission_requested";
+  const canCancel = () =>
+    !canApprove() && !isTerminalToolKind(props.tool.kind);
+
+  return (
+    <div class="tool-call-row">
+      <Terminal size={16} />
+      <div class="tool-call-row__body">
+        <strong title={command()}>{command()}</strong>
+        <span class={`tool-status tool-status--${toolTone(props.tool.kind)}`}>
+          {toolStatusLabel(props.tool.kind)}
+        </span>
+        <Show when={props.tool.message}>
+          <small>{props.tool.message}</small>
+        </Show>
+        <Show when={props.tool.output}>
+          <pre class="tool-call-row__output">{props.tool.output}</pre>
+        </Show>
+      </div>
+      <div class="tool-call-row__actions">
+        <Show when={canApprove()}>
+          <button type="button" title="Approve tool" onClick={props.onApprove}>
+            <Check size={14} />
+          </button>
+          <button type="button" title="Deny tool" onClick={props.onDeny}>
+            <X size={14} />
+          </button>
+        </Show>
+        <Show when={canCancel()}>
+          <button type="button" title="Cancel tool" onClick={props.onCancel}>
+            <Square size={12} />
+          </button>
+        </Show>
+      </div>
+    </div>
   );
 }
 
@@ -1173,6 +1327,68 @@ function humanizeError(raw: string): string {
   return message || "The model provider could not complete this request.";
 }
 
+function appendToolOutput(
+  current: string,
+  stream: "stdout" | "stderr" | null | undefined,
+  chunk: string,
+) {
+  const prefix = stream === "stderr" ? "[stderr] " : "";
+  const next = `${current}${prefix}${chunk}`;
+  const max = 12_000;
+  return next.length > max ? `... output trimmed ...\n${next.slice(-max)}` : next;
+}
+
+function formatToolCommand(command?: ToolCommand | null) {
+  if (!command) {
+    return "tool command";
+  }
+  return [command.program, ...(command.args ?? [])].join(" ");
+}
+
+function isTerminalToolKind(kind: ToolExecutionEventKind) {
+  return (
+    kind === "completed" ||
+    kind === "failed" ||
+    kind === "cancelled" ||
+    kind === "timed_out" ||
+    kind === "permission_denied"
+  );
+}
+
+function toolStatusLabel(kind: ToolExecutionEventKind) {
+  const labels: Record<ToolExecutionEventKind, string> = {
+    queued: "Queued",
+    permission_requested: "Needs approval",
+    permission_denied: "Denied",
+    waiting_for_resource: "Waiting",
+    started: "Running",
+    output: "Running",
+    completed: "Completed",
+    failed: "Failed",
+    cancelled: "Cancelled",
+    timed_out: "Timed out",
+  };
+  return labels[kind];
+}
+
+function toolTone(kind: ToolExecutionEventKind) {
+  if (kind === "completed") {
+    return "done";
+  }
+  if (
+    kind === "failed" ||
+    kind === "permission_denied" ||
+    kind === "timed_out" ||
+    kind === "cancelled"
+  ) {
+    return "error";
+  }
+  if (kind === "permission_requested" || kind === "waiting_for_resource") {
+    return "pending";
+  }
+  return "running";
+}
+
 function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -1185,4 +1401,16 @@ interface ProjectItem {
   name: string;
   path: string;
   tone: "blue" | "green" | "yellow";
+}
+
+interface ToolExecutionView {
+  toolCallId: string;
+  runId?: string | null;
+  projectId?: string | null;
+  command?: ToolCommand | null;
+  kind: ToolExecutionEventKind;
+  message?: string | null;
+  output: string;
+  result?: ToolExecutionResult | null;
+  updatedAt: number;
 }

@@ -14,12 +14,13 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Wire-protocol version between host and adapter. The host sends it on
 /// `initialize` and refuses an adapter that reports a different version, rather
 /// than mis-parsing a contract it doesn't understand. Bump on any incompatible
 /// change to `Request`/`Outbound`.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Host -> adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,30 +33,52 @@ pub enum Request {
         #[serde(default)]
         protocol_version: u32,
     },
-    GetIdentity { id: u64 },
-    GetModels { id: u64 },
-    GetSettingsSchema { id: u64 },
+    GetIdentity {
+        id: u64,
+    },
+    GetModels {
+        id: u64,
+    },
+    GetSettingsSchema {
+        id: u64,
+    },
     SetSettings {
         id: u64,
         values: BTreeMap<String, String>,
     },
-    GetAuthSchema { id: u64 },
+    GetAuthSchema {
+        id: u64,
+    },
     /// Ask the adapter to run its own auth flow now (e.g. browser OAuth) and
     /// persist the result via [`Outbound::StoreSecret`]. Drives the UI's
     /// per-adapter "Authorize" action for `oauth_internal` / `external_process`
     /// schemes. Adapters with no interactive auth (api-key) just ack.
-    Authenticate { id: u64 },
+    Authenticate {
+        id: u64,
+    },
     ChatStart {
         id: u64,
         model: String,
         messages: Vec<ChatMessage>,
     },
-    ChatCancel { id: u64 },
+    /// Return the result for a model-requested tool call. This is a continuation
+    /// frame for an active chat turn and intentionally has no separate adapter
+    /// response; the chat turn itself continues or finishes afterwards.
+    ToolResult {
+        id: u64,
+        tool_call_id: String,
+        result: ToolCallResult,
+    },
+    ChatCancel {
+        id: u64,
+    },
     /// Ask the adapter to revoke / clean up its current auth (e.g. revoke an
     /// OAuth token server-side) before the host forgets the stored credential.
     /// Best-effort: the adapter acks even if revoke fails. Adapters with nothing
     /// to revoke (api-key) just ack.
-    Logout { id: u64 },
+    Logout {
+        id: u64,
+    },
 }
 
 /// Adapter -> host.
@@ -93,6 +116,15 @@ pub enum Outbound {
         id: u64,
         text: String,
     },
+    /// The model asked the adapter to call one of the tools exposed by the host.
+    /// The host executes it through its own tool runtime and replies with
+    /// [`Request::ToolResult`].
+    ToolCall {
+        id: u64,
+        tool_call_id: String,
+        name: String,
+        arguments: Value,
+    },
     Done {
         id: u64,
     },
@@ -111,6 +143,13 @@ pub enum Outbound {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallResult {
+    pub ok: bool,
     pub content: String,
 }
 

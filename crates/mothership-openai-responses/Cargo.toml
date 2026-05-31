@@ -12,6 +12,7 @@ license.workspace = true
 [dependencies]
 mothership-adapter-sdk = { path = "../mothership-adapter-sdk" }
 anyhow.workspace = true
+async-trait.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true }
