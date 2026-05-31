@@ -13,6 +13,7 @@ import {
   RefreshCw,
   Search,
   Send,
+  Square,
   Terminal,
 } from "lucide-solid";
 import { listen } from "@tauri-apps/api/event";
@@ -21,7 +22,9 @@ import {
   ChatRunEvent,
   ChatMessage,
   ChatThreadSummary,
+  ConnectorSettingsEvent,
   ConnectorSettingsSnapshot,
+  cancelChatRun,
   createChat,
   getChat,
   getConnectorSettings,
@@ -73,10 +76,18 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   const [isLoadingChats, setIsLoadingChats] = createSignal(true);
   const [isLoadingMessages, setIsLoadingMessages] = createSignal(false);
   const [isSending, setIsSending] = createSignal(false);
+  const [activeRunIds, setActiveRunIds] = createSignal<Record<string, string>>(
+    {},
+  );
   let unlistenChatRun: (() => void) | undefined;
+  let unlistenConnectorSettings: (() => void) | undefined;
 
   const activeChat = () =>
     chats().find((chat) => chat.id === activeChatId()) ?? null;
+  const activeRunId = () => {
+    const chatId = activeChatId();
+    return chatId ? activeRunIds()[chatId] : undefined;
+  };
   const isChatRunning = () =>
     messages().some(
       (message) => message.role === "assistant" && message.status === "sending",
@@ -98,6 +109,16 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         }
       });
 
+      void listen<ConnectorSettingsEvent>("connector-settings-event", (event) => {
+        setConnectorSettings(event.payload.snapshot);
+      }).then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          unlistenConnectorSettings = unlisten;
+        }
+      });
+
       onCleanup(() => {
         disposed = true;
       });
@@ -106,6 +127,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
 
   onCleanup(() => {
     unlistenChatRun?.();
+    unlistenConnectorSettings?.();
   });
 
   async function loadChats() {
@@ -169,6 +191,10 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     try {
       const result = await sendChatMessage(currentChatId, content);
 
+      setActiveRunIds((current) => ({
+        ...current,
+        [result.chat.id]: result.runId,
+      }));
       setChats((current) => bumpChat(current, result.chat));
       setActiveChatId(result.chat.id);
       setMessages((current) => {
@@ -192,6 +218,10 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
 
     try {
       const result = await retryChatMessage(chatId);
+      setActiveRunIds((current) => ({
+        ...current,
+        [result.chat.id]: result.runId,
+      }));
       setChats((current) => bumpChat(current, result.chat));
       setMessages((current) =>
         mergeMessages(current, [result.userMessage, result.assistantMessage]),
@@ -217,7 +247,28 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     }
   }
 
+  async function handleCancelRun() {
+    const runId = activeRunId();
+    if (!runId) {
+      return;
+    }
+    setError("");
+
+    try {
+      await cancelChatRun(runId);
+    } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    }
+  }
+
   function applyChatRunEvent(event: ChatRunEvent) {
+    if (event.kind === "started") {
+      setActiveRunIds((current) => ({
+        ...current,
+        [event.chatId]: event.runId,
+      }));
+    }
+
     if (event.chat) {
       setChats((current) => bumpChat(current, event.chat!));
     }
@@ -229,10 +280,22 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
       }));
     }
 
-    if (event.kind === "completed" || event.kind === "failed") {
+    if (
+      event.kind === "completed" ||
+      event.kind === "failed" ||
+      event.kind === "cancelled"
+    ) {
       setRunTransports((current) => {
         const next = { ...current };
         delete next[event.messageId];
+        return next;
+      });
+      setActiveRunIds((current) => {
+        if (current[event.chatId] !== event.runId) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[event.chatId];
         return next;
       });
     }
@@ -243,6 +306,10 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
 
     if (event.message) {
       setMessages((current) => mergeMessages(current, [event.message!]));
+    } else if (event.kind === "delta" && event.delta) {
+      setMessages((current) =>
+        appendMessageDelta(current, event.messageId, event.delta!),
+      );
     }
     // A failed run is rendered inline as an error card on the failed assistant
     // message (see MessageRow), not as a bubble or the bottom error bar — the
@@ -268,6 +335,8 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         isSending={isSending() || isChatRunning()}
         messages={messages()}
         runTransports={runTransports()}
+        activeRunId={activeRunId()}
+        onCancelRun={handleCancelRun}
         onDraftChange={setDraft}
         onRetry={handleRetry}
         onSelectModel={handleSelectModel}
@@ -373,6 +442,7 @@ function Sidebar(props: {
 
 function ConversationPane(props: {
   activeChat: ChatThreadSummary | null;
+  activeRunId?: string;
   connectorSettings?: ConnectorSettingsSnapshot;
   draft: string;
   error: string;
@@ -380,6 +450,7 @@ function ConversationPane(props: {
   isSending: boolean;
   messages: ChatMessage[];
   runTransports: Record<string, string>;
+  onCancelRun: () => void;
   onDraftChange: (value: string) => void;
   onRetry: () => void;
   onSelectModel: (providerId: string, modelId: string) => void;
@@ -444,8 +515,10 @@ function ConversationPane(props: {
       </Show>
 
       <Composer
+        activeRunId={props.activeRunId}
         draft={props.draft}
         isSending={props.isSending}
+        onCancelRun={props.onCancelRun}
         onDraftChange={props.onDraftChange}
         onSend={props.onSendMessage}
       />
@@ -481,9 +554,21 @@ function ModelSelector(props: {
 }) {
   const models = () =>
     props.settings?.providers.flatMap((provider) => provider.models) ?? [];
+  const isRefreshing = () =>
+    props.settings?.providers.some(
+      (provider) =>
+        provider.refreshStatus === "pending" ||
+        provider.refreshStatus === "refreshing",
+    ) ?? true;
+  const hasConnectorError = () =>
+    props.settings?.providers.some(
+      (provider) => provider.modelError && provider.models.length === 0,
+    ) ?? false;
   const selectedValue = () => {
     const selected = props.settings?.selectedModel;
-    return selected ? `${selected.providerId}/${selected.modelId}` : "";
+    return selected
+      ? modelOptionValue(selected.providerId, selected.modelId)
+      : "";
   };
 
   return (
@@ -492,7 +577,9 @@ function ModelSelector(props: {
       aria-label="Active model"
       value={selectedValue()}
       onChange={(event) => {
-        const [providerId, modelId] = event.currentTarget.value.split("/");
+        const [providerId, modelId] = parseModelOptionValue(
+          event.currentTarget.value,
+        );
         if (providerId && modelId) {
           props.onSelectModel(providerId, modelId);
         }
@@ -500,16 +587,39 @@ function ModelSelector(props: {
     >
       <Show
         when={models().length > 0}
-        fallback={<option value="">No models connected</option>}
+        fallback={
+          <option value="">
+            {isRefreshing()
+              ? "Loading models..."
+              : hasConnectorError()
+                ? "Connector unavailable"
+                : "No models connected"}
+          </option>
+        }
       >
         {models().map((model) => (
-          <option value={`${model.providerId}/${model.id}`}>
+          <option value={modelOptionValue(model.providerId, model.id)}>
             {model.providerLabel} / {model.label}
           </option>
         ))}
       </Show>
     </select>
   );
+}
+
+function modelOptionValue(providerId: string, modelId: string) {
+  return JSON.stringify([providerId, modelId]);
+}
+
+function parseModelOptionValue(value: string): [string, string] {
+  try {
+    const parsed = JSON.parse(value);
+    return typeof parsed?.[0] === "string" && typeof parsed?.[1] === "string"
+      ? [parsed[0], parsed[1]]
+      : ["", ""];
+  } catch {
+    return ["", ""];
+  }
 }
 
 function InspectorPane(props: {
@@ -598,9 +708,11 @@ function MessageRow(props: {
     resolveAttribution(props.settings, message().providerId, message().modelId);
   const body = () =>
     message().content ||
-    (message().status === "sending"
-      ? thinkingLabel(props.transport)
-      : "No content.");
+    (message().status === "cancelled"
+      ? "Response cancelled."
+      : message().status === "sending"
+        ? thinkingLabel(props.transport)
+        : "No content.");
 
   // Messenger layout: user on the right in a colored bubble, agent on the left
   // with an avatar. A failed run is not an agent message — it renders as a
@@ -694,8 +806,10 @@ function ErrorCard(props: {
 }
 
 function Composer(props: {
+  activeRunId?: string;
   draft: string;
   isSending: boolean;
+  onCancelRun: () => void;
   onDraftChange: (value: string) => void;
   onSend: () => void;
 }) {
@@ -726,14 +840,28 @@ function Composer(props: {
         <button class="icon-button" type="button" title="Attach file">
           <Paperclip size={17} />
         </button>
-        <button
-          class="send-button"
-          disabled={!canSend()}
-          type="submit"
-          title="Send message"
+        <Show
+          when={props.activeRunId}
+          fallback={
+            <button
+              class="send-button"
+              disabled={!canSend()}
+              type="submit"
+              title="Send message"
+            >
+              <Send size={16} />
+            </button>
+          }
         >
-          <Send size={16} />
-        </button>
+          <button
+            class="send-button send-button--stop"
+            type="button"
+            title="Stop response"
+            onClick={props.onCancelRun}
+          >
+            <Square size={13} />
+          </button>
+        </Show>
       </div>
     </form>
   );
@@ -885,6 +1013,26 @@ function mergeMessages(
   }
 
   return Array.from(messagesById.values()).sort(compareMessages);
+}
+
+function appendMessageDelta(
+  current: ChatMessage[],
+  messageId: string,
+  delta: string,
+): ChatMessage[] {
+  let changed = false;
+  const next = current.map((message) => {
+    if (message.id !== messageId) {
+      return message;
+    }
+    changed = true;
+    return {
+      ...message,
+      content: `${message.content}${delta}`,
+    };
+  });
+
+  return changed ? next : current;
 }
 
 function normalizeMessages(messages: ChatMessage[]) {

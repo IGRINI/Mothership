@@ -9,3 +9,4 @@ mothership-adapter-protocol = { path = "../mothership-adapter-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+sha2.workspace = true

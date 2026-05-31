@@ -31,6 +31,7 @@ pub fn run() {
             commands::append_activity_event,
             commands::authenticate_adapter,
             commands::cancel_authenticate_adapter,
+            commands::cancel_chat_run,
             commands::create_chat,
             commands::get_chat,
             commands::get_connector_settings,

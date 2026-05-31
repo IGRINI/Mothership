@@ -20,10 +20,12 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::connectors::ConnectorSettingsSnapshot;
+use crate::connectors::{
+    AdapterSettingPatchValue, ConnectorSettingsEvent, ConnectorSettingsSnapshot,
+};
 use crate::{
-    ChatConversation, ChatRunEvent, ChatThreadSummary, DashboardSnapshot, MothershipError,
-    SendChatMessageResult, SidecarStatus,
+    ChatConversation, ChatRunCancellationResult, ChatRunEvent, ChatThreadSummary,
+    DashboardSnapshot, MothershipError, SendChatMessageResult, SidecarStatus,
 };
 
 /// Bump the major when a change isn't backward compatible. The host refuses a
@@ -76,24 +78,51 @@ pub enum ServerFrame {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum CoreRequest {
     DashboardSnapshot,
-    AppendActivityEvent { message: String },
-    ListChats { limit: Option<i64> },
+    AppendActivityEvent {
+        message: String,
+    },
+    ListChats {
+        limit: Option<i64>,
+    },
     CreateChat,
-    GetChat { chat_id: String, limit: Option<i64> },
-    SendChatMessage { chat_id: Option<String>, content: String },
+    GetChat {
+        chat_id: String,
+        limit: Option<i64>,
+    },
+    SendChatMessage {
+        chat_id: Option<String>,
+        content: String,
+    },
     /// Re-run the last failed assistant message in a chat (rolled back in place,
     /// no duplicate exchange). Like `SendChatMessage`, it streams `Event::ChatRun`s.
-    RetryChatMessage { chat_id: String },
+    RetryChatMessage {
+        chat_id: String,
+    },
+    CancelChatRun {
+        run_id: String,
+    },
     ConnectorSettings,
-    SetSelectedModel { provider_id: String, model_id: String },
-    SaveAdapterSettings { provider_id: String, values: BTreeMap<String, String> },
+    SetSelectedModel {
+        provider_id: String,
+        model_id: String,
+    },
+    SaveAdapterSettings {
+        provider_id: String,
+        values: BTreeMap<String, AdapterSettingPatchValue>,
+    },
     /// Run the adapter's own auth flow (e.g. browser OAuth). Long-running: the
     /// single `Response` lands when the flow finishes or is cancelled.
-    Authenticate { provider_id: String },
+    Authenticate {
+        provider_id: String,
+    },
     /// Cancel an in-flight `Authenticate` for this provider (its domain id).
     /// Idempotent — unknown/finished providers are a no-op.
-    CancelAuthenticate { provider_id: String },
-    Logout { provider_id: String },
+    CancelAuthenticate {
+        provider_id: String,
+    },
+    Logout {
+        provider_id: String,
+    },
     SidecarStatus,
 }
 
@@ -114,6 +143,7 @@ pub enum CoreResponse {
     /// The synchronous half of sending a message: the persisted user + assistant
     /// placeholder. The streamed completion follows as `Event::ChatRun`s.
     ChatMessageStarted(SendChatMessageResult),
+    ChatRunCancellation(ChatRunCancellationResult),
     ConnectorSettings(ConnectorSettingsSnapshot),
     SidecarStatus(SidecarStatus),
 }
@@ -128,6 +158,7 @@ pub enum CoreResponse {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum CoreEvent {
     ChatRun(ChatRunEvent),
+    ConnectorSettings(ConnectorSettingsEvent),
     #[serde(other)]
     Unknown,
 }

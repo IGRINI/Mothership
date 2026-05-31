@@ -284,6 +284,9 @@ fn forward_event(app: &AppHandle, event: CoreEvent) {
         CoreEvent::ChatRun(run_event) => {
             let _ = app.emit("chat-run-event", run_event);
         }
+        CoreEvent::ConnectorSettings(connector_event) => {
+            let _ = app.emit("connector-settings-event", connector_event);
+        }
         CoreEvent::Unknown => {}
     }
 }

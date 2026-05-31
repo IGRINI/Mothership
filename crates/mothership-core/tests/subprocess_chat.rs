@@ -2,6 +2,7 @@
 //! uniform `LlmChatCompletionGateway` interface — driving the sample echo
 //! adapter from `mothership-adapter-host`.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,8 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mothership_adapter_host::AdapterEntry;
 use mothership_core::auth::FileCredentialVault;
 use mothership_core::{
-    AdapterPool, LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest,
-    LlmChatMessage, LlmChatRole, LlmTransportKind, SubprocessChatGateway,
+    AdapterPool, ChatCancellationToken, LlmChatCompletionEventSink, LlmChatCompletionGateway,
+    LlmChatCompletionRequest, LlmChatMessage, LlmChatRole, LlmTransportKind, SubprocessChatGateway,
 };
 
 /// Builds a gateway over a fresh single-process pool pointed at the echo adapter.
@@ -20,6 +21,8 @@ fn echo_gateway(path: PathBuf, vault: FileCredentialVault) -> SubprocessChatGate
         provider_label: "Echo".to_string(),
         program: path,
         icon: None,
+        integrity: None,
+        capabilities: BTreeSet::from(["llm.chat".to_string()]),
     };
     SubprocessChatGateway::new(Arc::new(AdapterPool::new()), entry, vault)
 }
@@ -89,6 +92,7 @@ fn streams_chat_through_subprocess_adapter() {
                     content: "hello brave world".to_string(),
                 }],
             },
+            &ChatCancellationToken::default(),
             &mut sink,
         )
         .expect("chat through subprocess adapter");
@@ -130,6 +134,7 @@ fn pushes_settings_before_streaming() {
                     content: "ping pong".to_string(),
                 }],
             },
+            &ChatCancellationToken::default(),
             &mut sink,
         )
         .expect("chat after settings push");

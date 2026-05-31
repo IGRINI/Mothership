@@ -99,13 +99,21 @@ impl CodexAdapter {
             self.set_credential(Some(fresh));
         }
         self.refresh_if_needed(ctx).await?;
-        let credential = self.credential.as_ref().expect("credential present after ensure");
-        Ok((credential.access_token.clone(), credential.account_id.clone()))
+        let credential = self
+            .credential
+            .as_ref()
+            .expect("credential present after ensure");
+        Ok((
+            credential.access_token.clone(),
+            credential.account_id.clone(),
+        ))
     }
 
     async fn refresh_if_needed(&mut self, ctx: &Context) -> Result<()> {
         let refresh_token = match &self.credential {
-            Some(credential) if is_near_expiry(credential) && !credential.refresh_token.trim().is_empty() => {
+            Some(credential)
+                if is_near_expiry(credential) && !credential.refresh_token.trim().is_empty() =>
+            {
                 credential.refresh_token.clone()
             }
             _ => return Ok(()),
@@ -127,9 +135,11 @@ impl CodexAdapter {
             if let Some(id_token) = tokens.id_token {
                 credential.id_token = Some(id_token);
             }
-            credential.expires_at = tokens
-                .expires_in
-                .map(|seconds| now_millis().saturating_add(seconds.saturating_mul(1000)).to_string());
+            credential.expires_at = tokens.expires_in.map(|seconds| {
+                now_millis()
+                    .saturating_add(seconds.saturating_mul(1000))
+                    .to_string()
+            });
         }
         // Token changed: rebuild the WS with fresh headers and persist.
         self.ws = None;
@@ -151,9 +161,11 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     async fn set_settings(&mut self, values: BTreeMap<String, String>) -> Result<()> {
-        if let Some(raw) = values.get(CREDENTIAL_SETTINGS_KEY) {
-            self.set_credential(serde_json::from_str(raw).ok());
-        }
+        self.set_credential(
+            values
+                .get(CREDENTIAL_SETTINGS_KEY)
+                .and_then(|raw| serde_json::from_str(raw).ok()),
+        );
         Ok(())
     }
 
@@ -165,14 +177,15 @@ impl ProviderAdapter for CodexAdapter {
         }
         // Never trigger OAuth from model listing — only use an existing credential.
         let models = if self.credential.is_some() {
-            let _ = self.refresh_if_needed(ctx).await;
+            self.refresh_if_needed(ctx).await?;
             let (access_token, account_id) = {
                 let credential = self.credential.as_ref().expect("credential present");
-                (credential.access_token.clone(), credential.account_id.clone())
+                (
+                    credential.access_token.clone(),
+                    credential.account_id.clone(),
+                )
             };
-            fetch_models(&self.client, &access_token, account_id.as_deref())
-                .await
-                .unwrap_or_default()
+            fetch_models(&self.client, &access_token, account_id.as_deref()).await?
         } else {
             Vec::new()
         };
@@ -209,19 +222,27 @@ impl ProviderAdapter for CodexAdapter {
             ));
         }
 
+        let cancellation = sink.cancellation_token();
         let mut on_delta = |text: &str| sink.delta(text);
         let ws_arg = if had_ws { self.ws.as_mut() } else { None };
-        let transport = responses::chat(
-            &self.client,
-            &self.endpoint,
-            &headers,
-            model,
-            &instructions,
-            &messages,
-            ws_arg,
-            &mut on_delta,
-        )
-        .await?;
+        let transport = tokio::select! {
+            result = responses::chat(
+                &self.client,
+                &self.endpoint,
+                &headers,
+                model,
+                &instructions,
+                &messages,
+                ws_arg,
+                &mut on_delta,
+            ) => result?,
+            _ = cancellation.cancelled() => {
+                if let Some(session) = self.ws.as_mut() {
+                    session.close().await;
+                }
+                return Ok(());
+            }
+        };
 
         // If WS was enabled but the answer came over a fallback, the WS tier is
         // unavailable on this backend/session — stop paying its connect cost.
@@ -300,7 +321,10 @@ fn resolve_instructions(messages: &[ChatMessage]) -> String {
 }
 
 fn auth_headers(access_token: &str, account_id: Option<&str>) -> Vec<(String, String)> {
-    let mut headers = vec![("Authorization".to_string(), format!("Bearer {access_token}"))];
+    let mut headers = vec![(
+        "Authorization".to_string(),
+        format!("Bearer {access_token}"),
+    )];
     if let Some(account_id) = account_id {
         headers.push(("ChatGPT-Account-Id".to_string(), account_id.to_string()));
     }
@@ -365,9 +389,11 @@ async fn run_oauth(client: &reqwest::Client) -> Result<CodexCredential> {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         id_token: tokens.id_token,
-        expires_at: tokens
-            .expires_in
-            .map(|seconds| now_millis().saturating_add(seconds.saturating_mul(1000)).to_string()),
+        expires_at: tokens.expires_in.map(|seconds| {
+            now_millis()
+                .saturating_add(seconds.saturating_mul(1000))
+                .to_string()
+        }),
         account_id,
     })
 }
@@ -471,7 +497,10 @@ async fn revoke_credential(client: &reqwest::Client, credential: &CodexCredentia
         .await
     {
         Ok(response) if response.status().is_success() => {}
-        Ok(response) => eprintln!("codex-adapter: token revoke rejected: {}", response.status()),
+        Ok(response) => eprintln!(
+            "codex-adapter: token revoke rejected: {}",
+            response.status()
+        ),
         Err(error) => eprintln!("codex-adapter: token revoke failed: {error}"),
     }
 }

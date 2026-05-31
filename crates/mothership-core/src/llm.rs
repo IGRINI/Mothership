@@ -9,6 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ChatCancellationToken;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmModel {
@@ -106,6 +108,7 @@ pub trait LlmChatCompletionGateway: Send + Sync {
     fn complete_chat(
         &self,
         request: LlmChatCompletionRequest,
+        cancellation: &ChatCancellationToken,
         sink: &mut dyn LlmChatCompletionEventSink,
     ) -> Result<String, crate::MothershipError>;
 }

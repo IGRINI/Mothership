@@ -29,8 +29,14 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com"
+    },
     "externalBin": [
-      "binaries/mothership-sidecar"
+      "binaries/mothership-sidecar",
+      "binaries/codex-adapter",
+      "binaries/openrouter-adapter"
     ],
     "icon": [
       "icons/32x32.png",

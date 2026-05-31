@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 
 use mothership_core::ipc::{CoreRequest, CoreResponse};
 use mothership_core::{
-    ChatConversation, ChatThreadSummary, ConnectorSettingsSnapshot, DashboardSnapshot,
-    SendChatMessageResult, SidecarStatus,
+    AdapterSettingPatchValue, ChatConversation, ChatRunCancellationResult, ChatThreadSummary,
+    ConnectorSettingsSnapshot, DashboardSnapshot, SendChatMessageResult, SidecarStatus,
 };
 use tauri::State;
 
@@ -118,6 +118,19 @@ pub async fn retry_chat_message(
 }
 
 #[tauri::command]
+pub async fn cancel_chat_run(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<ChatRunCancellationResult, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::CancelChatRun { run_id })
+        .await?;
+    expect_variant!(response, CoreResponse::ChatRunCancellation)
+}
+
+#[tauri::command]
 pub async fn get_connector_settings(
     state: State<'_, AppState>,
 ) -> Result<ConnectorSettingsSnapshot, String> {
@@ -150,7 +163,7 @@ pub async fn set_selected_model(
 pub async fn save_adapter_settings(
     state: State<'_, AppState>,
     provider_id: String,
-    values: BTreeMap<String, String>,
+    values: BTreeMap<String, AdapterSettingPatchValue>,
 ) -> Result<ConnectorSettingsSnapshot, String> {
     let response = state
         .sidecar()

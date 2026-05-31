@@ -559,6 +559,50 @@ impl Database {
         })
     }
 
+    pub fn cancel_chat_run(
+        &self,
+        run_id: &str,
+        chat_id: &str,
+        assistant_message_id: &str,
+    ) -> Result<ChatRunEvent> {
+        validate_identifier("run_id", run_id)?;
+        validate_identifier("chat_id", chat_id)?;
+        validate_identifier("assistant_message_id", assistant_message_id)?;
+
+        let connection = self.connect()?;
+        connection.execute(
+            "
+            UPDATE chat_messages
+            SET status = ?2
+            WHERE id = ?1 AND chat_id = ?3
+            ",
+            params![
+                assistant_message_id,
+                chat_status_to_db(ChatMessageStatus::Cancelled),
+                chat_id
+            ],
+        )?;
+        let message = select_chat_message_by_id(&connection, assistant_message_id)?;
+        let preview = if message.content.trim().is_empty() {
+            "Response cancelled."
+        } else {
+            &message.content
+        };
+        let chat = update_chat_after_assistant(&connection, chat_id, preview)?;
+
+        Ok(ChatRunEvent {
+            run_id: run_id.to_string(),
+            chat_id: chat_id.to_string(),
+            message_id: assistant_message_id.to_string(),
+            kind: ChatRunEventKind::Cancelled,
+            delta: None,
+            message: Some(message),
+            chat: Some(chat),
+            transport: None,
+            error: None,
+        })
+    }
+
     pub fn fail_chat_run(
         &self,
         run_id: &str,
@@ -1094,6 +1138,7 @@ fn chat_role_from_db(value: &str) -> rusqlite::Result<ChatMessageRole> {
 fn chat_status_to_db(status: ChatMessageStatus) -> &'static str {
     match status {
         ChatMessageStatus::Complete => "complete",
+        ChatMessageStatus::Cancelled => "cancelled",
         ChatMessageStatus::Failed => "failed",
         ChatMessageStatus::Sending => "sending",
     }
@@ -1102,6 +1147,7 @@ fn chat_status_to_db(status: ChatMessageStatus) -> &'static str {
 fn chat_status_from_db(value: &str) -> rusqlite::Result<ChatMessageStatus> {
     match value {
         "complete" => Ok(ChatMessageStatus::Complete),
+        "cancelled" => Ok(ChatMessageStatus::Cancelled),
         "failed" => Ok(ChatMessageStatus::Failed),
         "sending" => Ok(ChatMessageStatus::Sending),
         _ => Err(rusqlite::Error::FromSqlConversionFailure(
@@ -1258,7 +1304,9 @@ mod tests {
             .set_selected_llm_model("openai", "test-model")
             .expect("select model");
 
-        let run = database.begin_chat_run(None, "Retry me").expect("begin run");
+        let run = database
+            .begin_chat_run(None, "Retry me")
+            .expect("begin run");
         database
             .fail_chat_run(&run.run_id, &run.chat.id, &run.assistant_message.id, "boom")
             .expect("fail run");

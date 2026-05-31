@@ -2295,6 +2295,7 @@ dependencies = [
  "mothership-adapter-protocol",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -2372,6 +2373,7 @@ dependencies = [
  "anyhow",
  "mothership-core",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -2719,10 +2721,12 @@ name = "openrouter-adapter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "mothership-adapter-host",
+ "async-trait",
+ "mothership-adapter-sdk",
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

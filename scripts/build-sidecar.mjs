@@ -1,6 +1,7 @@
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 const release = process.argv.includes("--release");
 const profile = release ? "release" : "debug";
@@ -19,33 +20,68 @@ if (!targetTriple) {
   throw new Error("rustc did not return a host target triple");
 }
 
-const cargoArgs = ["build", "-p", "mothership-sidecar"];
-if (release) {
-  cargoArgs.push("--release");
+const sidecarBinary = "mothership-sidecar";
+const adapterBinaries = ["codex-adapter", "openrouter-adapter"];
+const bundledBinaries = [sidecarBinary, ...adapterBinaries];
+
+for (const binary of adapterBinaries) {
+  buildCargoBinary(binary);
 }
 
-execFileSync("cargo", cargoArgs, { cwd: root, stdio: "inherit" });
-
-const source = join(
-  targetDirectory,
-  ...(explicitCargoTarget ? [explicitCargoTarget] : []),
-  profile,
-  `mothership-sidecar${executableExtension}`,
+const adapterHashes = new Map(
+  adapterBinaries.map((binary) => [binary, sha256File(binaryPath(binary))]),
 );
-const destinationDirectory = join(root, "src-tauri", "binaries");
-if (!existsSync(source)) {
-  throw new Error(`expected sidecar binary was not produced: ${source}`);
-}
 
+buildCargoBinary(sidecarBinary, {
+  MOTHERSHIP_BUILTIN_CODEX_ADAPTER_SHA256: adapterHashes.get("codex-adapter"),
+  MOTHERSHIP_BUILTIN_OPENROUTER_ADAPTER_SHA256: adapterHashes.get("openrouter-adapter"),
+});
+
+const destinationDirectory = join(root, "src-tauri", "binaries");
 mkdirSync(destinationDirectory, { recursive: true });
 
-for (const target of sidecarTargetAliases(targetTriple)) {
-  const destination = join(
-    destinationDirectory,
-    `mothership-sidecar-${target}${executableExtension}`,
+for (const binary of bundledBinaries) {
+  const source = binaryPath(binary);
+  if (!existsSync(source)) {
+    throw new Error(`expected bundled binary was not produced: ${source}`);
+  }
+
+  for (const target of sidecarTargetAliases(targetTriple)) {
+    const destination = join(
+      destinationDirectory,
+      `${binary}-${target}${executableExtension}`,
+    );
+    copyFileSync(source, destination);
+    console.log(`bundled binary ready: ${basename(destination)}`);
+  }
+}
+
+function buildCargoBinary(binary, extraEnv = {}) {
+  const cargoArgs = ["build", "-p", binary];
+  if (release) {
+    cargoArgs.push("--release");
+  }
+  execFileSync("cargo", cargoArgs, {
+    cwd: root,
+    env: { ...process.env, ...extraEnv },
+    stdio: "inherit",
+  });
+}
+
+function binaryPath(binary) {
+  return join(
+    targetDirectory,
+    ...(explicitCargoTarget ? [explicitCargoTarget] : []),
+    profile,
+    `${binary}${executableExtension}`,
   );
-  copyFileSync(source, destination);
-  console.log(`sidecar ready: ${basename(destination)}`);
+}
+
+function sha256File(path) {
+  if (!existsSync(path)) {
+    throw new Error(`expected adapter binary was not produced: ${path}`);
+  }
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
 function sidecarTargetAliases(hostTriple) {

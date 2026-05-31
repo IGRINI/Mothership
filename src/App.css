@@ -1295,6 +1295,15 @@ kbd,
   color: #ffffff;
 }
 
+.send-button--stop {
+  color: #ff9c8f;
+}
+
+.send-button--stop:hover:not(:disabled) {
+  background: rgb(255 116 94 / 14%);
+  color: #ffd0c8;
+}
+
 .send-button:disabled {
   cursor: default;
   background: transparent;

@@ -17,7 +17,7 @@ use crate::llm::{
     LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest, LlmChatRole,
     LlmTransportKind,
 };
-use crate::{MothershipError, Result};
+use crate::{ChatCancellationToken, MothershipError, Result};
 
 /// Chats with a provider implemented as a subprocess adapter. The adapter
 /// process is reused across turns via the [`AdapterPool`]; spawning, the
@@ -40,6 +40,7 @@ impl LlmChatCompletionGateway for SubprocessChatGateway {
     fn complete_chat(
         &self,
         request: LlmChatCompletionRequest,
+        cancellation: &ChatCancellationToken,
         sink: &mut dyn LlmChatCompletionEventSink,
     ) -> Result<String> {
         sink.transport_selected(LlmTransportKind::Subprocess);
@@ -65,9 +66,15 @@ impl LlmChatCompletionGateway for SubprocessChatGateway {
         }
 
         let model_id = request.model_id;
+        let cancellation = cancellation.clone();
         self.pool
             .with(&self.entry, &self.vault, |adapter| {
-                adapter.chat(&model_id, messages, |delta| sink.delta(delta))
+                adapter.chat_cancellable(
+                    &model_id,
+                    messages,
+                    move || cancellation.is_cancelled(),
+                    |delta| sink.delta(delta),
+                )
             })
             .map_err(|error| {
                 MothershipError::InvalidRequest(format!("adapter chat failed: {error}"))

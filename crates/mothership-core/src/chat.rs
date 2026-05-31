@@ -1,3 +1,8 @@
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +46,7 @@ pub enum ChatMessageRole {
 #[serde(rename_all = "snake_case")]
 pub enum ChatMessageStatus {
     Complete,
+    Cancelled,
     Failed,
     Sending,
 }
@@ -73,6 +79,13 @@ pub struct ChatRunContext {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ChatRunCancellationResult {
+    pub run_id: String,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChatRunEvent {
     pub run_id: String,
     pub chat_id: String,
@@ -91,8 +104,24 @@ pub enum ChatRunEventKind {
     Started,
     TransportSelected,
     Delta,
+    Cancelled,
     Completed,
     Failed,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChatCancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ChatCancellationToken {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
 }
 
 pub trait ChatRunEventSink: Send {

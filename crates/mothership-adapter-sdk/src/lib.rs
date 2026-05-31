@@ -6,9 +6,10 @@
 //! dispatch, the `initialize` version handshake, the `StoreSecret` side channel,
 //! and error mapping — so adapters stop hand-rolling that plumbing.
 //!
-//! Requests are processed one at a time (the host serializes per provider via
-//! its resident-adapter pool), so an adapter keeps `&mut self` state — including
-//! a long-lived backend connection — across calls without locking.
+//! Requests are processed one at a time except that `chat_cancel` is accepted
+//! while a `chat_start` turn is in flight. The adapter still keeps `&mut self`
+//! state — including a long-lived backend connection — across calls without
+//! locking.
 //!
 //! Transport primitives (HTTP-JSON / HTTP-SSE / WebSocket + fallback + timeouts)
 //! and OAuth helpers will live in this crate too; for now it provides the
@@ -21,12 +22,16 @@ pub mod http;
 pub mod sse;
 pub mod ws;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 /// How often the runtime nudges the adapter's [`ProviderAdapter::on_idle`] while
 /// no request is in flight, so it can release idle resources (e.g. close a
@@ -100,11 +105,57 @@ pub trait ProviderAdapter: Send {
     }
 }
 
+/// Cooperative cancellation signal for an in-flight chat turn.
+#[derive(Clone, Debug)]
+pub struct CancellationToken {
+    inner: Arc<CancellationState>,
+}
+
+#[derive(Debug)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl CancellationToken {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(CancellationState {
+                cancelled: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    fn cancel(&self) {
+        if !self.inner.cancelled.swap(true, Ordering::SeqCst) {
+            self.inner.notify.notify_waiters();
+        }
+    }
+
+    /// Returns true once the host has requested cancellation for this turn.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Resolves when the host requests cancellation for this turn.
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Lets an adapter persist secrets (e.g. a freshly minted/refreshed OAuth token)
 /// into the host's shared vault at any time via the `StoreSecret` side channel.
 #[derive(Clone)]
 pub struct Context {
     outbox: mpsc::UnboundedSender<Outbound>,
+    cancellation: Option<CancellationToken>,
 }
 
 impl Context {
@@ -112,21 +163,72 @@ impl Context {
     pub fn store_secret(&self, values: BTreeMap<String, String>) {
         let _ = self.outbox.send(Outbound::StoreSecret { values });
     }
+
+    /// Returns true when the current chat turn has been cancelled. Non-chat
+    /// request contexts are never cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .map(CancellationToken::is_cancelled)
+            .unwrap_or(false)
+    }
+
+    /// Resolves when the current chat turn is cancelled. For non-chat request
+    /// contexts this waits forever.
+    pub async fn cancelled(&self) {
+        match &self.cancellation {
+            Some(cancellation) => cancellation.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    /// Returns the underlying cancellation token for advanced integrations that
+    /// need to share cancellation with helper tasks.
+    pub fn cancellation_token(&self) -> Option<CancellationToken> {
+        self.cancellation.clone()
+    }
+
+    fn with_cancellation(&self, cancellation: CancellationToken) -> Self {
+        Self {
+            outbox: self.outbox.clone(),
+            cancellation: Some(cancellation),
+        }
+    }
 }
 
 /// Emits streamed chat deltas for the in-flight `chat_start` request.
 pub struct ChatSink {
     id: u64,
     outbox: mpsc::UnboundedSender<Outbound>,
+    cancellation: CancellationToken,
 }
 
 impl ChatSink {
     /// Push a chunk of assistant output to the host.
     pub fn delta(&self, text: impl Into<String>) {
+        if self.is_cancelled() {
+            return;
+        }
         let _ = self.outbox.send(Outbound::Delta {
             id: self.id,
             text: text.into(),
         });
+    }
+
+    /// Returns true once the host has requested cancellation for this turn.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    /// Resolves when the host requests cancellation for this turn.
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+
+    /// Returns a cloneable cancellation token for helper code that cannot hold a
+    /// `ChatSink` borrow.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 }
 
@@ -155,6 +257,7 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
 
     let ctx = Context {
         outbox: outbox.clone(),
+        cancellation: None,
     };
 
     // Read stdin on a dedicated task so the main loop can `select!` an idle timer
@@ -171,19 +274,62 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
         // Dropping requests_tx on stdin EOF closes the channel below.
     });
 
+    let mut pending = VecDeque::new();
+
     loop {
+        if let Some(request) = pending.pop_front() {
+            match request {
+                Request::ChatStart {
+                    id,
+                    model,
+                    messages,
+                } => {
+                    if !run_chat_turn(
+                        &mut adapter,
+                        &ctx,
+                        &outbox,
+                        &mut requests,
+                        &mut pending,
+                        id,
+                        model,
+                        messages,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+                Request::ChatCancel { id } => send(&outbox, Outbound::Done { id }),
+                request => dispatch(&mut adapter, &ctx, &outbox, request).await,
+            }
+            continue;
+        }
+
         tokio::select! {
             line = requests.recv() => {
                 let Some(line) = line else { break }; // stdin closed
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
+                let Some(request) = parse_request(&line) else {
                     continue;
-                }
-                match serde_json::from_str::<Request>(trimmed) {
-                    Ok(request) => dispatch(&mut adapter, &ctx, &outbox, request).await,
-                    Err(error) => {
-                        eprintln!("adapter-sdk: ignoring unparseable request: {error}");
+                };
+                match request {
+                    Request::ChatStart { id, model, messages } => {
+                        if !run_chat_turn(
+                            &mut adapter,
+                            &ctx,
+                            &outbox,
+                            &mut requests,
+                            &mut pending,
+                            id,
+                            model,
+                            messages,
+                        )
+                        .await
+                        {
+                            break;
+                        }
                     }
+                    Request::ChatCancel { id } => send(&outbox, Outbound::Done { id }),
+                    request => dispatch(&mut adapter, &ctx, &outbox, request).await,
                 }
             }
             _ = tokio::time::sleep(IDLE_TICK) => {
@@ -196,6 +342,72 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
     drop(ctx);
     let _ = writer.await;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_chat_turn<A: ProviderAdapter>(
+    adapter: &mut A,
+    ctx: &Context,
+    outbox: &mpsc::UnboundedSender<Outbound>,
+    requests: &mut mpsc::UnboundedReceiver<String>,
+    pending: &mut VecDeque<Request>,
+    id: u64,
+    model: String,
+    messages: Vec<ChatMessage>,
+) -> bool {
+    let cancellation = CancellationToken::new();
+    let chat_ctx = ctx.with_cancellation(cancellation.clone());
+    let mut sink = ChatSink {
+        id,
+        outbox: outbox.clone(),
+        cancellation: cancellation.clone(),
+    };
+    let chat = adapter.chat(&model, messages, &chat_ctx, &mut sink);
+    tokio::pin!(chat);
+
+    loop {
+        tokio::select! {
+            result = &mut chat => {
+                match result {
+                    Ok(()) => send(outbox, Outbound::Done { id }),
+                    Err(error) => send_error(outbox, id, error),
+                }
+                return true;
+            }
+            line = requests.recv() => {
+                let Some(line) = line else {
+                    cancellation.cancel();
+                    return false;
+                };
+                let Some(request) = parse_request(&line) else {
+                    continue;
+                };
+                match request {
+                    Request::ChatCancel { id: cancel_id } => {
+                        cancellation.cancel();
+                        if cancel_id != id {
+                            send(outbox, Outbound::Done { id: cancel_id });
+                        }
+                    }
+                    request => pending.push_back(request),
+                }
+            }
+        }
+    }
+}
+
+fn parse_request(line: &str) -> Option<Request> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<Request>(trimmed) {
+        Ok(request) => Some(request),
+        Err(error) => {
+            eprintln!("adapter-sdk: ignoring unparseable request: {error}");
+            None
+        }
+    }
 }
 
 async fn dispatch<A: ProviderAdapter>(
@@ -256,18 +468,23 @@ async fn dispatch<A: ProviderAdapter>(
             Ok(()) => send(outbox, Outbound::Ack { id }),
             Err(error) => send_error(outbox, id, error),
         },
-        Request::ChatStart { id, model, messages } => {
+        Request::ChatStart {
+            id,
+            model,
+            messages,
+        } => {
+            let cancellation = CancellationToken::new();
+            let chat_ctx = ctx.with_cancellation(cancellation.clone());
             let mut sink = ChatSink {
                 id,
                 outbox: outbox.clone(),
+                cancellation,
             };
-            match adapter.chat(&model, messages, ctx, &mut sink).await {
+            match adapter.chat(&model, messages, &chat_ctx, &mut sink).await {
                 Ok(()) => send(outbox, Outbound::Done { id }),
                 Err(error) => send_error(outbox, id, error),
             }
         }
-        // Sequential processing means a cancel can't arrive mid-turn yet; ack the
-        // turn as finished. Mid-stream cancellation lands with the host stop button.
         Request::ChatCancel { id } => send(outbox, Outbound::Done { id }),
         Request::Logout { id } => match adapter.logout(ctx).await {
             Ok(()) => send(outbox, Outbound::Ack { id }),
@@ -285,4 +502,106 @@ fn send_error(outbox: &mpsc::UnboundedSender<Outbound>, id: u64, error: anyhow::
         id,
         message: format!("{error:#}"),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    struct CancelAwareAdapter {
+        started: Option<oneshot::Sender<()>>,
+        saw_cancel: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderAdapter for CancelAwareAdapter {
+        fn identity(&self) -> (String, String) {
+            ("test".to_string(), "Test".to_string())
+        }
+
+        async fn chat(
+            &mut self,
+            _model: &str,
+            _messages: Vec<ChatMessage>,
+            ctx: &Context,
+            sink: &mut ChatSink,
+        ) -> Result<()> {
+            sink.delta("before");
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+            }
+            ctx.cancelled().await;
+            self.saw_cancel = ctx.is_cancelled() && sink.is_cancelled();
+            sink.delta("after");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_cancel_is_observable_during_active_turn() {
+        let (outbox, mut frames) = mpsc::unbounded_channel();
+        let ctx = Context {
+            outbox: outbox.clone(),
+            cancellation: None,
+        };
+        let (requests_tx, mut requests) = mpsc::unbounded_channel();
+        let mut pending = VecDeque::new();
+        let (started_tx, started_rx) = oneshot::channel();
+        let mut adapter = CancelAwareAdapter {
+            started: Some(started_tx),
+            saw_cancel: false,
+        };
+
+        let run = run_chat_turn(
+            &mut adapter,
+            &ctx,
+            &outbox,
+            &mut requests,
+            &mut pending,
+            42,
+            "test-model".to_string(),
+            Vec::new(),
+        );
+        let cancel = async {
+            started_rx.await.expect("chat starts");
+            let cancel = serde_json::to_string(&Request::ChatCancel { id: 42 }).unwrap();
+            requests_tx.send(cancel).expect("send cancel");
+        };
+
+        let (stdin_open, _) = tokio::join!(run, cancel);
+
+        assert!(stdin_open);
+        assert!(adapter.saw_cancel);
+        assert!(pending.is_empty());
+        let mut emitted = Vec::new();
+        while let Ok(frame) = frames.try_recv() {
+            emitted.push(frame);
+        }
+        assert!(matches!(
+            emitted.as_slice(),
+            [Outbound::Delta { id: 42, text }, Outbound::Done { id: 42 }] if text == "before"
+        ));
+    }
+
+    #[test]
+    fn chat_sink_suppresses_delta_after_cancel() {
+        let (outbox, mut frames) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        let sink = ChatSink {
+            id: 7,
+            outbox,
+            cancellation: cancellation.clone(),
+        };
+
+        sink.delta("before");
+        cancellation.cancel();
+        sink.delta("after");
+
+        assert!(matches!(
+            frames.try_recv(),
+            Ok(Outbound::Delta { id: 7, text }) if text == "before"
+        ));
+        assert!(frames.try_recv().is_err());
+    }
 }

@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-mothership-adapter-host = { path = "../../crates/mothership-adapter-host" }
+mothership-adapter-sdk = { path = "../../crates/mothership-adapter-sdk" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true

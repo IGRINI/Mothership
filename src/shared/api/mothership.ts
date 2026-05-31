@@ -38,7 +38,7 @@ export interface DashboardSnapshot {
 }
 
 export type ChatMessageRole = "assistant" | "user";
-export type ChatMessageStatus = "complete" | "failed" | "sending";
+export type ChatMessageStatus = "complete" | "cancelled" | "failed" | "sending";
 
 export interface ChatThreadSummary {
   id: string;
@@ -75,10 +75,16 @@ export interface SendChatMessageResult {
   assistantMessage: ChatMessage;
 }
 
+export interface ChatRunCancellationResult {
+  runId: string;
+  accepted: boolean;
+}
+
 export type ChatRunEventKind =
   | "started"
   | "transport_selected"
   | "delta"
+  | "cancelled"
   | "completed"
   | "failed";
 
@@ -129,16 +135,34 @@ export interface AdapterSettingsField {
   required: boolean;
 }
 
+export interface SecretSettingState {
+  hasValue: boolean;
+  fingerprint?: string | null;
+  last4?: string | null;
+}
+
 export interface AdapterSettingsView {
   fields: AdapterSettingsField[];
   values: Record<string, string>;
+  secrets: Record<string, SecretSettingState>;
 }
+
+export type AdapterSettingPatchValue =
+  | { action: "set"; value: string }
+  | { action: "clear" }
+  | { action: "unchanged" };
 
 export type AdapterAuthKind =
   | "none"
   | "api_key"
   | "oauth_internal"
   | "external_process";
+
+export type ConnectorRefreshStatus =
+  | "pending"
+  | "refreshing"
+  | "ready"
+  | "failed";
 
 export interface ConnectorProviderSummary {
   id: string;
@@ -147,6 +171,8 @@ export interface ConnectorProviderSummary {
   icon?: string | null;
   settingsSchema: ConnectorSettingsSchema;
   models: LlmModel[];
+  modelError?: string | null;
+  refreshStatus: ConnectorRefreshStatus;
   selectedModelId?: string | null;
   authKind: AdapterAuthKind;
   authenticated: boolean;
@@ -156,6 +182,20 @@ export interface ConnectorProviderSummary {
 export interface ConnectorSettingsSnapshot {
   providers: ConnectorProviderSummary[];
   selectedModel: SelectedLlmModel;
+}
+
+export type ConnectorSettingsEventKind =
+  | "refresh_started"
+  | "provider_updated"
+  | "selected_model_changed"
+  | "adapter_settings_saved"
+  | "authentication_finished"
+  | "authentication_cancelled"
+  | "logged_out";
+
+export interface ConnectorSettingsEvent {
+  kind: ConnectorSettingsEventKind;
+  snapshot: ConnectorSettingsSnapshot;
 }
 
 export function getDashboardSnapshot(): Promise<DashboardSnapshot> {
@@ -266,6 +306,16 @@ export function retryChatMessage(
   return invoke<SendChatMessageResult>("retry_chat_message", { chatId });
 }
 
+export function cancelChatRun(
+  runId: string,
+): Promise<ChatRunCancellationResult> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve({ runId, accepted: true });
+  }
+
+  return invoke<ChatRunCancellationResult>("cancel_chat_run", { runId });
+}
+
 export function getConnectorSettings(): Promise<ConnectorSettingsSnapshot> {
   if (!isTauriRuntime()) {
     return Promise.resolve(
@@ -299,7 +349,7 @@ export function setSelectedModel(
 
 export function saveAdapterSettings(
   providerId: string,
-  values: Record<string, string>,
+  patch: Record<string, AdapterSettingPatchValue>,
 ): Promise<ConnectorSettingsSnapshot> {
   if (!isTauriRuntime()) {
     const snapshot = getPreviewConnectorSettings();
@@ -307,10 +357,10 @@ export function saveAdapterSettings(
       provider.id === providerId && provider.adapterSettings
         ? {
             ...provider,
-            adapterSettings: {
-              ...provider.adapterSettings,
-              values: { ...values },
-            },
+            adapterSettings: applyAdapterSettingsPatch(
+              provider.adapterSettings,
+              patch,
+            ),
           }
         : provider,
     );
@@ -320,7 +370,7 @@ export function saveAdapterSettings(
 
   return invoke<ConnectorSettingsSnapshot>("save_adapter_settings", {
     providerId,
-    values,
+    values: patch,
   });
 }
 
@@ -567,10 +617,11 @@ function getPreviewConnectorSettings() {
           },
         },
         models: previewModels,
+        refreshStatus: "ready",
         selectedModelId: "gpt-5.5",
         authKind: "oauth_internal",
         authenticated: true,
-        adapterSettings: { fields: [], values: {} },
+        adapterSettings: { fields: [], values: {}, secrets: {} },
       },
       {
         id: "openrouter",
@@ -584,6 +635,7 @@ function getPreviewConnectorSettings() {
           },
         },
         models: [],
+        refreshStatus: "ready",
         selectedModelId: null,
         authKind: "api_key",
         authenticated: false,
@@ -609,6 +661,9 @@ function getPreviewConnectorSettings() {
             },
           ],
           values: {},
+          secrets: {
+            api_key: { hasValue: false, fingerprint: null, last4: null },
+          },
         },
       },
     ],
@@ -620,6 +675,63 @@ function getPreviewConnectorSettings() {
   });
 
   return previewConnectorSettings;
+}
+
+function applyAdapterSettingsPatch(
+  view: AdapterSettingsView,
+  patch: Record<string, AdapterSettingPatchValue>,
+): AdapterSettingsView {
+  const values = { ...view.values };
+  const secrets = { ...view.secrets };
+
+  for (const field of view.fields) {
+    const update = patch[field.key];
+    if (!update) {
+      continue;
+    }
+
+    if (field.kind === "secret") {
+      delete values[field.key];
+
+      if (update.action === "set") {
+        secrets[field.key] = previewSecretState(update.value);
+      } else if (update.action === "clear") {
+        secrets[field.key] = {
+          hasValue: false,
+          fingerprint: null,
+          last4: null,
+        };
+      }
+
+      continue;
+    }
+
+    if (update.action === "set") {
+      values[field.key] = update.value;
+    } else if (update.action === "clear") {
+      delete values[field.key];
+    }
+  }
+
+  return { ...view, values, secrets };
+}
+
+function previewSecretState(value: string): SecretSettingState {
+  return {
+    hasValue: true,
+    fingerprint: `preview-${hashSecret(value)}`,
+    last4: value.length > 0 ? value.slice(-4) : null,
+  };
+}
+
+function hashSecret(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 const previewModels: LlmModel[] = [
@@ -723,8 +835,17 @@ function copyConnectorSettings(
               ...field,
             })),
             values: { ...provider.adapterSettings.values },
+            secrets: copySecretSettings(provider.adapterSettings.secrets),
           }
         : provider.adapterSettings,
     })),
   };
+}
+
+function copySecretSettings(
+  secrets: Record<string, SecretSettingState> | undefined,
+): Record<string, SecretSettingState> {
+  return Object.fromEntries(
+    Object.entries(secrets ?? {}).map(([key, state]) => [key, { ...state }]),
+  );
 }

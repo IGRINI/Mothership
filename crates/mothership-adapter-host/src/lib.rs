@@ -9,13 +9,20 @@
 //! A crashing adapter cannot take down the app: it lives in its own process and
 //! its failure surfaces as an error on the next read.
 
-use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 // The protocol now lives in its own crate so the adapter SDK can depend on it
 // without pulling in this host runtime. Re-exported as `protocol` so existing
@@ -28,10 +35,12 @@ use protocol::{AuthKind, ChatMessage, Model, ModelManagement, Outbound, Request,
 /// `StoreSecret` side channel (e.g. a freshly minted/refreshed OAuth token).
 type StoreSecretSink = Box<dyn FnMut(BTreeMap<String, String>) + Send>;
 
+const CHAT_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// A spawned adapter process and the stdio pipes to talk to it.
 pub struct Adapter {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Arc<Mutex<ChildStdin>>,
     reader: BufReader<ChildStdout>,
     next_id: u64,
     store_secret_sink: Option<StoreSecretSink>,
@@ -49,7 +58,7 @@ impl Adapter {
         let stdout = child.stdout.take().context("adapter has no stdout")?;
         Ok(Self {
             child,
-            stdin,
+            stdin: Arc::new(Mutex::new(stdin)),
             reader: BufReader::new(stdout),
             next_id: 1,
             store_secret_sink: None,
@@ -82,11 +91,7 @@ impl Adapter {
     }
 
     fn send(&mut self, request: &Request) -> Result<()> {
-        let line = serde_json::to_string(request).context("encode request")?;
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
-        Ok(())
+        write_request(&self.stdin, request)
     }
 
     /// Reads the next protocol message. `StoreSecret` is consumed transparently
@@ -233,6 +238,20 @@ impl Adapter {
         messages: Vec<ChatMessage>,
         mut on_delta: impl FnMut(&str),
     ) -> Result<String> {
+        self.chat_cancellable(model, messages, || false, |delta| on_delta(delta))
+    }
+
+    /// Runs a chat turn like [`chat`](Self::chat), while also sending a
+    /// best-effort `chat_cancel` frame if `is_cancelled` becomes true. SDK-based
+    /// adapters can use that signal to end the turn cleanly; older adapters
+    /// still rely on the host-side process kill fallback.
+    pub fn chat_cancellable(
+        &mut self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        is_cancelled: impl Fn() -> bool + Send + 'static,
+        mut on_delta: impl FnMut(&str),
+    ) -> Result<String> {
         let id = self.next_id();
         self.send(&Request::ChatStart {
             id,
@@ -240,21 +259,47 @@ impl Adapter {
             messages,
         })?;
 
+        let stdin = Arc::clone(&self.stdin);
+        let finished = Arc::new(AtomicBool::new(false));
+        let watcher_finished = Arc::clone(&finished);
+        let watcher = thread::spawn(move || {
+            while !watcher_finished.load(Ordering::SeqCst) {
+                if is_cancelled() {
+                    let _ = write_request(&stdin, &Request::ChatCancel { id });
+                    return;
+                }
+                thread::sleep(CHAT_CANCEL_POLL_INTERVAL);
+            }
+        });
+
         let mut full = String::new();
-        loop {
-            match self.recv()? {
-                Outbound::Delta { id: got, text } if got == id => {
+        let result = loop {
+            match self.recv() {
+                Ok(Outbound::Delta { id: got, text }) if got == id => {
                     full.push_str(&text);
                     on_delta(&text);
                 }
-                Outbound::Done { id: got } if got == id => return Ok(full),
-                Outbound::Error { id: got, message } if got == id => {
-                    bail!("adapter chat error: {message}")
+                Ok(Outbound::Done { id: got }) if got == id => break Ok(full),
+                Ok(Outbound::Error { id: got, message }) if got == id => {
+                    break Err(anyhow::anyhow!("adapter chat error: {message}"))
                 }
-                other => bail!("unexpected chat event: {other:?}"),
+                Ok(other) => break Err(anyhow::anyhow!("unexpected chat event: {other:?}")),
+                Err(error) => break Err(error),
             }
-        }
+        };
+        finished.store(true, Ordering::SeqCst);
+        let _ = watcher.join();
+        result
     }
+}
+
+fn write_request(stdin: &Arc<Mutex<ChildStdin>>, request: &Request) -> Result<()> {
+    let line = serde_json::to_string(request).context("encode request")?;
+    let mut stdin = stdin.lock().unwrap();
+    stdin.write_all(line.as_bytes())?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()?;
+    Ok(())
 }
 
 impl Drop for Adapter {
@@ -276,6 +321,17 @@ struct ManifestFile {
     program: String,
     #[serde(default)]
     icon: Option<String>,
+    #[serde(default)]
+    integrity: Option<AdapterIntegrity>,
+    #[serde(default)]
+    capabilities: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterIntegrity {
+    pub algorithm: String,
+    pub sha256: String,
 }
 
 /// A discovered adapter: its identity, the executable that implements it, and an
@@ -288,6 +344,50 @@ pub struct AdapterEntry {
     pub provider_label: String,
     pub program: PathBuf,
     pub icon: Option<PathBuf>,
+    pub integrity: Option<AdapterIntegrity>,
+    pub capabilities: BTreeSet<String>,
+}
+
+impl AdapterEntry {
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities.contains(capability)
+    }
+
+    pub fn capabilities(&self) -> &BTreeSet<String> {
+        &self.capabilities
+    }
+
+    /// Computes the executable SHA-256 and verifies the manifest-declared hash
+    /// when one is present. Core calls this immediately before spawning.
+    pub fn verify_program_integrity(&self) -> Result<String> {
+        let actual = file_sha256_hex(&self.program)?;
+        if let Some(integrity) = &self.integrity {
+            if !integrity.algorithm.eq_ignore_ascii_case("sha256") {
+                bail!(
+                    "unsupported integrity algorithm for {}: {}",
+                    self.provider_id,
+                    integrity.algorithm
+                );
+            }
+            if !actual.eq_ignore_ascii_case(integrity.sha256.trim()) {
+                bail!(
+                    "adapter integrity mismatch for {}: expected {}, got {}",
+                    self.provider_id,
+                    integrity.sha256,
+                    actual
+                );
+            }
+        }
+        Ok(actual)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AdapterDiagnostic {
+    pub provider_id: Option<String>,
+    pub provider_label: Option<String>,
+    pub manifest_path: PathBuf,
+    pub message: String,
 }
 
 /// Adapters discovered under a plugins directory, keyed by provider id. Lets the
@@ -295,6 +395,7 @@ pub struct AdapterEntry {
 #[derive(Debug, Default)]
 pub struct AdapterRegistry {
     entries: Vec<AdapterEntry>,
+    diagnostics: Vec<AdapterDiagnostic>,
 }
 
 impl AdapterRegistry {
@@ -302,25 +403,110 @@ impl AdapterRegistry {
     /// empty registry; malformed or unreadable manifests are skipped.
     pub fn scan(dir: &Path) -> Self {
         let mut entries = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut seen_provider_ids = BTreeSet::new();
         if let Ok(read_dir) = std::fs::read_dir(dir) {
-            for entry in read_dir.flatten() {
-                let folder = entry.path();
+            let mut folders = read_dir
+                .flatten()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>();
+            folders.sort();
+
+            for folder in folders {
+                if !folder.is_dir() {
+                    continue;
+                }
                 let manifest_path = folder.join("adapter.json");
                 let Ok(text) = std::fs::read_to_string(&manifest_path) else {
                     continue;
                 };
                 let Ok(manifest) = serde_json::from_str::<ManifestFile>(&text) else {
+                    push_diagnostic(
+                        &mut diagnostics,
+                        &manifest_path,
+                        None,
+                        None,
+                        "malformed adapter manifest",
+                    );
                     continue;
                 };
+                if !valid_provider_id(&manifest.provider_id) {
+                    push_diagnostic(
+                        &mut diagnostics,
+                        &manifest_path,
+                        Some(manifest.provider_id),
+                        Some(manifest.provider_label),
+                        "invalid provider id",
+                    );
+                    continue;
+                }
+                if folder.file_name().and_then(|name| name.to_str())
+                    != Some(manifest.provider_id.as_str())
+                {
+                    push_diagnostic(
+                        &mut diagnostics,
+                        &manifest_path,
+                        Some(manifest.provider_id),
+                        Some(manifest.provider_label),
+                        "adapter folder does not match provider id",
+                    );
+                    continue;
+                }
+                if !seen_provider_ids.insert(manifest.provider_id.to_ascii_lowercase()) {
+                    push_diagnostic(
+                        &mut diagnostics,
+                        &manifest_path,
+                        Some(manifest.provider_id),
+                        Some(manifest.provider_label),
+                        "duplicate adapter provider id",
+                    );
+                    continue;
+                }
+                if manifest.provider_label.trim().is_empty() {
+                    push_diagnostic(
+                        &mut diagnostics,
+                        &manifest_path,
+                        Some(manifest.provider_id),
+                        Some(manifest.provider_label),
+                        "empty provider label",
+                    );
+                    continue;
+                }
+
+                let program = resolve_program_path(&folder, &manifest.program);
+                if !program.is_file() {
+                    push_diagnostic(
+                        &mut diagnostics,
+                        &manifest_path,
+                        Some(manifest.provider_id),
+                        Some(manifest.provider_label),
+                        "adapter executable is missing",
+                    );
+                    continue;
+                }
+                let icon = manifest
+                    .icon
+                    .as_deref()
+                    .and_then(|icon| resolve_icon_path(&folder, icon));
+
                 entries.push(AdapterEntry {
                     provider_id: manifest.provider_id,
                     provider_label: manifest.provider_label,
-                    program: folder.join(&manifest.program),
-                    icon: manifest.icon.as_ref().map(|icon| folder.join(icon)),
+                    program,
+                    icon,
+                    integrity: manifest.integrity,
+                    capabilities: manifest.capabilities,
                 });
             }
         }
-        Self { entries }
+        Self {
+            entries,
+            diagnostics,
+        }
+    }
+
+    pub fn diagnostics(&self) -> &[AdapterDiagnostic] {
+        &self.diagnostics
     }
 
     pub fn find(&self, provider_id: &str) -> Option<&AdapterEntry> {
@@ -331,5 +517,194 @@ impl AdapterRegistry {
 
     pub fn entries(&self) -> &[AdapterEntry] {
         &self.entries
+    }
+}
+
+fn push_diagnostic(
+    diagnostics: &mut Vec<AdapterDiagnostic>,
+    manifest_path: &Path,
+    provider_id: Option<String>,
+    provider_label: Option<String>,
+    message: impl Into<String>,
+) {
+    let diagnostic = AdapterDiagnostic {
+        provider_id,
+        provider_label,
+        manifest_path: manifest_path.to_path_buf(),
+        message: message.into(),
+    };
+    if let Some(provider_id) = diagnostic.provider_id.as_deref() {
+        eprintln!(
+            "skipping adapter `{}`: {} ({})",
+            provider_id,
+            diagnostic.message,
+            diagnostic.manifest_path.display()
+        );
+    } else {
+        eprintln!(
+            "skipping adapter manifest: {} ({})",
+            diagnostic.message,
+            diagnostic.manifest_path.display()
+        );
+    }
+    diagnostics.push(diagnostic);
+}
+
+fn valid_provider_id(provider_id: &str) -> bool {
+    !provider_id.is_empty()
+        && provider_id.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.')
+        })
+}
+
+fn resolve_program_path(folder: &Path, program: &str) -> PathBuf {
+    let program = PathBuf::from(program);
+    if program.is_absolute() {
+        program
+    } else {
+        folder.join(program)
+    }
+}
+
+fn resolve_icon_path(folder: &Path, icon: &str) -> Option<PathBuf> {
+    let icon_path = folder.join(icon);
+    let Ok(folder) = folder.canonicalize() else {
+        return None;
+    };
+    let Ok(icon_path) = icon_path.canonicalize() else {
+        return None;
+    };
+    icon_path.starts_with(folder).then_some(icon_path)
+}
+
+fn file_sha256_hex(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open adapter executable {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read adapter executable {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("mothership_adapter_host_{name}_{stamp}"))
+    }
+
+    fn write_manifest(root: &Path, provider_id: &str, program: &str, extra: serde_json::Value) {
+        let dir = root.join(provider_id);
+        fs::create_dir_all(&dir).expect("create provider dir");
+        let mut manifest = serde_json::json!({
+            "provider_id": provider_id,
+            "provider_label": "Test",
+            "program": program,
+        });
+        let object = manifest.as_object_mut().expect("manifest object");
+        for (key, value) in extra.as_object().expect("extra object") {
+            object.insert(key.clone(), value.clone());
+        }
+        fs::write(dir.join("adapter.json"), manifest.to_string()).expect("write manifest");
+    }
+
+    #[test]
+    fn registry_keeps_capabilities_and_verifies_integrity() {
+        let root = temp_dir("valid");
+        let program = root.join("adapter.exe");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(&program, b"adapter bytes").expect("write program");
+        let sha256 = file_sha256_hex(&program).expect("hash");
+        write_manifest(
+            &root,
+            "test",
+            program.to_str().expect("program path"),
+            serde_json::json!({
+                "capabilities": ["llm.chat", "llm.models"],
+                "integrity": { "algorithm": "sha256", "sha256": sha256 },
+            }),
+        );
+
+        let registry = AdapterRegistry::scan(&root);
+        assert!(registry.diagnostics().is_empty());
+        let entry = registry.find("test").expect("entry");
+        assert!(entry.has_capability("llm.chat"));
+        assert!(entry.verify_program_integrity().is_ok());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registry_reports_bad_manifest_and_duplicate_provider() {
+        let root = temp_dir("diagnostics");
+        fs::create_dir_all(root.join("bad")).expect("create bad");
+        fs::write(root.join("bad").join("adapter.json"), "{not-json").expect("write bad");
+
+        let program = root.join("adapter.exe");
+        fs::write(&program, b"adapter bytes").expect("write program");
+        write_manifest(
+            &root,
+            "first",
+            program.to_str().expect("program path"),
+            serde_json::json!({}),
+        );
+        fs::create_dir_all(root.join("second")).expect("create second");
+        fs::write(
+            root.join("second").join("adapter.json"),
+            serde_json::json!({
+                "provider_id": "first",
+                "provider_label": "Duplicate",
+                "program": program,
+            })
+            .to_string(),
+        )
+        .expect("write duplicate");
+
+        let registry = AdapterRegistry::scan(&root);
+        assert_eq!(registry.entries().len(), 1);
+        assert!(registry.diagnostics().len() >= 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn integrity_mismatch_is_rejected_before_spawn() {
+        let root = temp_dir("mismatch");
+        let program = root.join("adapter.exe");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(&program, b"adapter bytes").expect("write program");
+        write_manifest(
+            &root,
+            "test",
+            program.to_str().expect("program path"),
+            serde_json::json!({
+                "integrity": {
+                    "algorithm": "sha256",
+                    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+                },
+            }),
+        );
+
+        let registry = AdapterRegistry::scan(&root);
+        let entry = registry.find("test").expect("entry");
+        assert!(entry.verify_program_integrity().is_err());
+
+        let _ = fs::remove_dir_all(root);
     }
 }

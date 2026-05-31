@@ -1,4 +1,5 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { listen } from "@tauri-apps/api/event";
 import {
   ChevronLeft,
   Cpu,
@@ -11,10 +12,14 @@ import {
   X,
 } from "lucide-solid";
 
-import {
+import type {
+  AdapterSettingPatchValue,
   AdapterSettingsView,
+  ConnectorSettingsEvent,
   ConnectorProviderSummary,
   ConnectorSettingsSnapshot,
+} from "../../shared/api/mothership";
+import {
   authenticateAdapter,
   cancelAuthenticateAdapter,
   getConnectorSettings,
@@ -29,9 +34,27 @@ export function Settings(props: { onBack: () => void }) {
   const [status, setStatus] = createSignal("");
   const [isLoading, setIsLoading] = createSignal(true);
   const [authorizingId, setAuthorizingId] = createSignal<string>();
+  let unlistenConnectorSettings: (() => void) | undefined;
 
   onMount(() => {
     void reloadSettings();
+
+    if (isTauriRuntime()) {
+      let disposed = false;
+      void listen<ConnectorSettingsEvent>("connector-settings-event", (event) => {
+        setSettings(event.payload.snapshot);
+      }).then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          unlistenConnectorSettings = unlisten;
+        }
+      });
+
+      onCleanup(() => {
+        disposed = true;
+      });
+    }
   });
 
   // Leaving Settings while an authorization is in flight cancels it (kills the
@@ -41,6 +64,7 @@ export function Settings(props: { onBack: () => void }) {
     if (inFlight) {
       void cancelAuthenticateAdapter(inFlight);
     }
+    unlistenConnectorSettings?.();
   });
 
   function goBack() {
@@ -77,12 +101,12 @@ export function Settings(props: { onBack: () => void }) {
 
   async function saveAdapter(
     providerId: string,
-    values: Record<string, string>,
+    patch: Record<string, AdapterSettingPatchValue>,
   ) {
     setError("");
 
     try {
-      setSettings(await saveAdapterSettings(providerId, values));
+      setSettings(await saveAdapterSettings(providerId, patch));
       setStatus("Adapter settings saved.");
     } catch (caughtError) {
       setError(errorMessage(caughtError));
@@ -186,9 +210,8 @@ export function Settings(props: { onBack: () => void }) {
               when={(settings()?.providers ?? []).length > 0}
               fallback={
                 <div class="settings-empty">
-                  No connectors installed. Drop an adapter into the app's
-                  plugins folder (or run <code>npm run adapters:install</code>)
-                  and hit Refresh.
+                  No connectors found. Restart the app; if this keeps happening,
+                  reinstall Mothership.
                 </div>
               }
             >
@@ -197,7 +220,7 @@ export function Settings(props: { onBack: () => void }) {
                   {(provider) => (
                     <ConnectorCard
                       provider={provider}
-                      selectedModelId={settings()?.selectedModel.modelId}
+                      selectedModelId={provider.selectedModelId ?? undefined}
                       busy={authorizingId() === provider.id}
                       onAuthorize={() => void authorize(provider.id)}
                       onCancelAuthorize={() => void cancelAuthorize(provider.id)}
@@ -205,8 +228,8 @@ export function Settings(props: { onBack: () => void }) {
                       onSelectModel={(modelId) =>
                         void selectModel(provider.id, modelId)
                       }
-                      onSaveSettings={(values) =>
-                        void saveAdapter(provider.id, values)
+                      onSaveSettings={(patch) =>
+                        void saveAdapter(provider.id, patch)
                       }
                     />
                   )}
@@ -235,7 +258,7 @@ function ConnectorCard(props: {
   onCancelAuthorize: () => void;
   onLogout: () => void;
   onSelectModel: (modelId: string) => void;
-  onSaveSettings: (values: Record<string, string>) => void;
+  onSaveSettings: (patch: Record<string, AdapterSettingPatchValue>) => void;
   provider: ConnectorProviderSummary;
   selectedModelId?: string;
 }) {
@@ -243,6 +266,18 @@ function ConnectorCard(props: {
   const needsAuthorize = () =>
     provider().authKind === "oauth_internal" ||
     provider().authKind === "external_process";
+  const refreshStatusText = () => {
+    switch (provider().refreshStatus) {
+      case "pending":
+        return "Waiting for connector.";
+      case "refreshing":
+        return "Updating models...";
+      case "failed":
+        return "Last update failed.";
+      default:
+        return "";
+    }
+  };
 
   return (
     <article class="connector-card">
@@ -256,6 +291,9 @@ function ConnectorCard(props: {
         </span>
         <div>
           <h3>{provider().label}</h3>
+          <Show when={refreshStatusText()}>
+            {(text) => <span>{text()}</span>}
+          </Show>
         </div>
         <Show when={needsAuthorize()}>
           <Show
@@ -299,14 +337,22 @@ function ConnectorCard(props: {
 
       <div class="connector-card__block">
         <h4>{provider().settingsSchema.modelManagement.title}</h4>
+        <Show when={provider().modelError}>
+          {(modelError) => (
+            <p class="muted-line">Connector unavailable: {modelError()}</p>
+          )}
+        </Show>
         <div class="model-list">
           <For
             each={provider().models}
             fallback={
               <p class="muted-line">
-                {needsAuthorize()
-                  ? "No models loaded — authorize to fetch them."
-                  : "No models loaded."}
+                {provider().refreshStatus === "refreshing" ||
+                provider().refreshStatus === "pending"
+                  ? "Loading models..."
+                  : needsAuthorize()
+                    ? "No models loaded — authorize to fetch them."
+                    : "No models loaded."}
               </p>
             }
           >
@@ -352,11 +398,13 @@ function ConnectorCard(props: {
 
 function AdapterSettingsForm(props: {
   view: AdapterSettingsView;
-  onSave: (values: Record<string, string>) => void;
+  onSave: (patch: Record<string, AdapterSettingPatchValue>) => void;
 }) {
-  // Scalar fields (text/secret/bool) live in one record; list fields are edited
-  // as string arrays and joined with "\n" on save.
+  // Secret inputs intentionally start empty: the backend returns only sanitized
+  // metadata, and an empty secret input means "leave existing value unchanged".
   const scalarInit: Record<string, string> = {};
+  const secretInit: Record<string, string> = {};
+  const secretClearInit: Record<string, boolean> = {};
   const listInit: Record<string, string[]> = {};
   for (const field of props.view.fields) {
     if (field.kind === "string_list") {
@@ -364,16 +412,37 @@ function AdapterSettingsForm(props: {
         .split(/[\n,]/)
         .map((item) => item.trim())
         .filter(Boolean);
+    } else if (field.kind === "secret") {
+      secretInit[field.key] = "";
+      secretClearInit[field.key] = false;
+    } else if (field.kind === "bool") {
+      scalarInit[field.key] =
+        props.view.values[field.key] === "true" ? "true" : "false";
     } else {
       scalarInit[field.key] = props.view.values[field.key] ?? "";
     }
   }
 
   const [scalars, setScalars] = createSignal<Record<string, string>>(scalarInit);
+  const [secrets, setSecrets] = createSignal<Record<string, string>>(secretInit);
+  const [secretClears, setSecretClears] =
+    createSignal<Record<string, boolean>>(secretClearInit);
   const [lists, setLists] = createSignal<Record<string, string[]>>(listInit);
 
   const setScalar = (key: string, value: string) =>
     setScalars((current) => ({ ...current, [key]: value }));
+  const setSecret = (key: string, value: string) => {
+    setSecrets((current) => ({ ...current, [key]: value }));
+    if (value.length > 0) {
+      setSecretClears((current) => ({ ...current, [key]: false }));
+    }
+  };
+  const setSecretClear = (key: string, checked: boolean) => {
+    setSecretClears((current) => ({ ...current, [key]: checked }));
+    if (checked) {
+      setSecrets((current) => ({ ...current, [key]: "" }));
+    }
+  };
   const setListItem = (key: string, index: number, value: string) =>
     setLists((current) => {
       const next = [...(current[key] ?? [])];
@@ -389,16 +458,47 @@ function AdapterSettingsForm(props: {
     }));
 
   function submit() {
-    const out: Record<string, string> = { ...scalars() };
+    const patch: Record<string, AdapterSettingPatchValue> = {};
     for (const field of props.view.fields) {
       if (field.kind === "string_list") {
-        out[field.key] = (lists()[field.key] ?? [])
-          .map((item) => item.trim())
-          .filter(Boolean)
-          .join("\n");
+        patch[field.key] = {
+          action: "set",
+          value: (lists()[field.key] ?? [])
+            .map((item) => item.trim())
+            .filter(Boolean)
+            .join("\n"),
+        };
+      } else if (field.kind === "secret") {
+        const value = secrets()[field.key] ?? "";
+        patch[field.key] =
+          value.length > 0
+            ? { action: "set", value }
+            : secretClears()[field.key]
+              ? { action: "clear" }
+              : { action: "unchanged" };
+      } else {
+        patch[field.key] = {
+          action: "set",
+          value: scalars()[field.key] ?? "",
+        };
       }
     }
-    props.onSave(out);
+    props.onSave(patch);
+  }
+
+  function secretDescription(key: string) {
+    const state = props.view.secrets?.[key];
+    if (!state?.hasValue) {
+      return "No secret saved.";
+    }
+
+    return state.last4
+      ? `Saved secret ending in ${state.last4}. Leave empty to keep it.`
+      : "Saved secret configured. Leave empty to keep it.";
+  }
+
+  function hasSavedSecret(key: string) {
+    return props.view.secrets?.[key]?.hasValue ?? false;
   }
 
   return (
@@ -413,19 +513,60 @@ function AdapterSettingsForm(props: {
                 <Show
                   when={field.kind === "bool"}
                   fallback={
-                    <label class="adapter-setting">
-                      <span>
-                        {field.label}
-                        {field.required ? " *" : ""}
-                      </span>
-                      <input
-                        type={field.kind === "secret" ? "password" : "text"}
-                        value={scalars()[field.key] ?? ""}
-                        onInput={(event) =>
-                          setScalar(field.key, event.currentTarget.value)
-                        }
-                      />
-                    </label>
+                    <Show
+                      when={field.kind === "secret"}
+                      fallback={
+                        <label class="adapter-setting">
+                          <span>
+                            {field.label}
+                            {field.required ? " *" : ""}
+                          </span>
+                          <input
+                            type="text"
+                            value={scalars()[field.key] ?? ""}
+                            onInput={(event) =>
+                              setScalar(field.key, event.currentTarget.value)
+                            }
+                          />
+                        </label>
+                      }
+                    >
+                      <div class="adapter-setting">
+                        <span>
+                          {field.label}
+                          {field.required ? " *" : ""}
+                        </span>
+                        <input
+                          aria-label={field.label}
+                          type="password"
+                          value={secrets()[field.key] ?? ""}
+                          placeholder={
+                            hasSavedSecret(field.key)
+                              ? "Leave blank to keep saved secret"
+                              : ""
+                          }
+                          onInput={(event) =>
+                            setSecret(field.key, event.currentTarget.value)
+                          }
+                        />
+                        <p class="muted-line">{secretDescription(field.key)}</p>
+                        <Show when={hasSavedSecret(field.key)}>
+                          <label class="adapter-setting adapter-setting--bool">
+                            <input
+                              type="checkbox"
+                              checked={secretClears()[field.key] ?? false}
+                              onChange={(event) =>
+                                setSecretClear(
+                                  field.key,
+                                  event.currentTarget.checked,
+                                )
+                              }
+                            />
+                            <span>Clear saved secret</span>
+                          </label>
+                        </Show>
+                      </div>
+                    </Show>
                   }
                 >
                   <label class="adapter-setting adapter-setting--bool">
@@ -509,4 +650,8 @@ function AdapterSettingsForm(props: {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isTauriRuntime() {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
