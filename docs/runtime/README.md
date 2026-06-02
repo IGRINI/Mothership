@@ -51,6 +51,9 @@ fork bomb.
   IPC transport, event backpressure.
 - [`CROSS_PLATFORM_PATTERN.md`](CROSS_PLATFORM_PATTERN.md) — how to keep Core
   platform-agnostic (ports & adapters, dependency direction, the leak test).
+- [`TOOL_LAYER_DESIGN.md`](TOOL_LAYER_DESIGN.md) — typed first-class tools
+  (`read_file`/`write_file`/`edit_file`/`apply_patch`) on top of the supervisor;
+  tool-declares-intent/policy-decides, the build order, decision log.
 - [`MIGRATION_PLAN.md`](MIGRATION_PLAN.md) — **live checklist**: the phased path from
   today's code to this runtime without breaking chat. Tick boxes as work lands.
 

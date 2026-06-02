@@ -8,7 +8,9 @@
 
 mod cancellation;
 mod catalog;
+mod file_edit;
 mod output;
+mod patch;
 mod permissions;
 mod process;
 mod registry;
