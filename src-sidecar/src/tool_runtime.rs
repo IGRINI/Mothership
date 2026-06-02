@@ -15,11 +15,11 @@ use mothership_core::{
     FileToolOutcome,
     FileToolSpill, LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResult, MothershipError,
     PendingToolApprovalGate, Result, SpawnedToolProcess, StdFileSystem, ToolApprovalDecision,
-    ToolBatchPlan, ToolCancellationToken, ToolCommand, ToolExecutionEvent, ToolExecutionEventKind,
-    ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest, ToolExecutionResult,
-    ToolExecutionStatus, ToolOutputPolicy, ToolOutputStore, ToolPermissionAction, ToolProcessExit,
-    ToolProcessSandbox, ToolProcessSpec, ToolSupervisor, Workspace, MAX_TOOL_EVENT_BYTES,
-    RUN_COMMAND_TOOL_NAME,
+    ToolBatchPlan, ToolCallContext, ToolCancellationToken, ToolCommand, ToolExecutionEvent,
+    ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest,
+    ToolExecutionResult, ToolExecutionStatus, ToolExecutor, ToolKind, ToolOutputPolicy,
+    ToolOutputStore, ToolPermissionAction, ToolProcessExit, ToolProcessSandbox, ToolProcessSpec,
+    ToolSupervisor, Workspace, MAX_TOOL_EVENT_BYTES,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -132,9 +132,33 @@ fn powershell_spec(
 }
 
 #[derive(Clone)]
-pub struct SidecarLlmToolHandler {
+struct ToolProjectContext {
+    id: String,
+    root: PathBuf,
+}
+
+// ---------------------------------------------------------------------------
+// Executors
+// ---------------------------------------------------------------------------
+
+/// Process-command executor. Wraps the unchanged [`ToolSupervisor`], which owns
+/// the full command lifecycle (queued → permission → approval → spawn → stream →
+/// terminal). The dispatcher supplies the per-call cancellation token and the
+/// shared registry slot; this executor only adapts arguments and maps the
+/// supervisor's result back to the model-facing response.
+struct CommandToolExecutor {
     supervisor: Arc<ToolSupervisor>,
-    registry: Arc<ToolExecutionRegistry>,
+    runtime: Arc<tokio::runtime::Runtime>,
+    sink: Arc<dyn ToolExecutionEventSink>,
+    project: Option<ToolProjectContext>,
+}
+
+/// Typed file/search executor. Runs the shared classify → permission → approval
+/// → started → execute → bound/spill → terminal lifecycle around the pure Core
+/// handlers. It mirrors the command lifecycle's cross-cuts (the same approval
+/// gate, cancellation token, and event sink) but the "execute" step calls an
+/// in-process handler instead of spawning a process.
+struct FileToolExecutor {
     runtime: Arc<tokio::runtime::Runtime>,
     sink: Arc<dyn ToolExecutionEventSink>,
     project: Option<ToolProjectContext>,
@@ -143,10 +167,20 @@ pub struct SidecarLlmToolHandler {
     output_store: Option<Arc<dyn ToolOutputStore>>,
 }
 
+// ---------------------------------------------------------------------------
+// Dispatcher
+// ---------------------------------------------------------------------------
+
+/// The sidecar's [`LlmToolCallHandler`]: a thin typed dispatcher over the two
+/// executors. It owns the cross-cuts shared by every tool call — the per-call
+/// cancellation slot synced to the chat token, the registry slot that rejects a
+/// duplicate active call, and the watcher thread that cancels on chat
+/// cancellation — then routes by [`ToolKind`] to the right executor.
 #[derive(Clone)]
-struct ToolProjectContext {
-    id: String,
-    root: PathBuf,
+pub struct SidecarLlmToolHandler {
+    command_executor: Arc<CommandToolExecutor>,
+    file_executor: Arc<FileToolExecutor>,
+    registry: Arc<ToolExecutionRegistry>,
 }
 
 impl SidecarLlmToolHandler {
@@ -159,16 +193,87 @@ impl SidecarLlmToolHandler {
         approvals: Arc<PendingToolApprovalGate>,
         output_store: Option<Arc<dyn ToolOutputStore>>,
     ) -> Self {
-        Self {
+        let project = project.map(|(id, root)| ToolProjectContext { id, root });
+        let command_executor = Arc::new(CommandToolExecutor {
             supervisor,
-            registry,
+            runtime: Arc::clone(&runtime),
+            sink: Arc::clone(&sink),
+            project: project.clone(),
+        });
+        let file_executor = Arc::new(FileToolExecutor {
             runtime,
             sink,
-            project: project.map(|(id, root)| ToolProjectContext { id, root }),
+            project,
             approvals,
             file_system: StdFileSystem::new(),
             output_store,
+        });
+        Self {
+            command_executor,
+            file_executor,
+            registry,
         }
+    }
+
+    /// Run the shared lifecycle scaffolding around one executor call: a per-call
+    /// cancellation slot synced to the chat token, a registry slot (rejecting a
+    /// duplicate active call), and a watcher thread that flips the per-call token
+    /// when the chat is cancelled — then dispatch by [`ToolKind`].
+    fn dispatch(
+        &self,
+        kind: ToolKind,
+        request: &LlmToolCallRequest,
+        chat_cancellation: &ChatCancellationToken,
+    ) -> LlmToolCallResult {
+        let cancellation = ToolCancellationToken::default();
+        if chat_cancellation.is_cancelled() {
+            cancellation.cancel();
+        }
+        if !self
+            .registry
+            .register(&request.tool_call_id, cancellation.clone())
+        {
+            return LlmToolCallResult {
+                ok: false,
+                content: format!("tool call already active: {}", request.tool_call_id),
+            };
+        }
+
+        // Watch the chat token so a chat cancelled while a tool is awaiting
+        // approval (or running) flips the per-call token and unblocks it.
+        let finished = Arc::new(AtomicBool::new(false));
+        let watcher_finished = Arc::clone(&finished);
+        let watcher_cancellation = cancellation.clone();
+        let watcher_chat_cancellation = chat_cancellation.clone();
+        let watcher = thread::spawn(move || {
+            while !watcher_finished.load(Ordering::SeqCst) {
+                if watcher_chat_cancellation.is_cancelled() {
+                    watcher_cancellation.cancel();
+                    return;
+                }
+                thread::sleep(CHAT_CANCEL_POLL_INTERVAL);
+            }
+        });
+
+        let ctx = ToolCallContext {
+            tool_call_id: request.tool_call_id.as_str(),
+            run_id: request.run_id.as_deref(),
+            tool_name: request.name.as_str(),
+            kind,
+            arguments: &request.arguments,
+            cancellation: &cancellation,
+            chat_cancellation,
+        };
+        let result = if kind.is_process() {
+            self.command_executor.execute(ctx)
+        } else {
+            self.file_executor.execute(ctx)
+        };
+
+        finished.store(true, Ordering::SeqCst);
+        let _ = watcher.join();
+        self.registry.finish(&request.tool_call_id);
+        result
     }
 }
 
@@ -178,14 +283,11 @@ impl LlmToolCallHandler for SidecarLlmToolHandler {
         request: LlmToolCallRequest,
         chat_cancellation: &ChatCancellationToken,
     ) -> LlmToolCallResult {
-        match request.name.as_str() {
-            RUN_COMMAND_TOOL_NAME => self.run_command(request, chat_cancellation),
-            other => match FileTool::from_name(other) {
-                Some(tool) => self.run_file_tool(tool, request, chat_cancellation),
-                None => LlmToolCallResult {
-                    ok: false,
-                    content: format!("unsupported tool `{other}`"),
-                },
+        match ToolKind::from_name(&request.name) {
+            Some(kind) => self.dispatch(kind, &request, chat_cancellation),
+            None => LlmToolCallResult {
+                ok: false,
+                content: format!("unsupported tool `{}`", request.name),
             },
         }
     }
@@ -232,13 +334,9 @@ impl LlmToolCallHandler for SidecarLlmToolHandler {
     }
 }
 
-impl SidecarLlmToolHandler {
-    fn run_command(
-        &self,
-        request: LlmToolCallRequest,
-        chat_cancellation: &ChatCancellationToken,
-    ) -> LlmToolCallResult {
-        let tool_request = match tool_execution_request(request, self.project.as_ref()) {
+impl ToolExecutor for CommandToolExecutor {
+    fn execute(&self, ctx: ToolCallContext<'_>) -> LlmToolCallResult {
+        let request = match command_request_from_ctx(&ctx, self.project.as_ref()) {
             Ok(request) => request,
             Err(error) => {
                 return LlmToolCallResult {
@@ -248,42 +346,13 @@ impl SidecarLlmToolHandler {
             }
         };
 
-        let cancellation = ToolCancellationToken::default();
-        if chat_cancellation.is_cancelled() {
-            cancellation.cancel();
-        }
-        if !self
-            .registry
-            .register(&tool_request.tool_call_id, cancellation.clone())
-        {
-            return LlmToolCallResult {
-                ok: false,
-                content: format!("tool call already active: {}", tool_request.tool_call_id),
-            };
-        }
-
-        let finished = Arc::new(AtomicBool::new(false));
-        let watcher_finished = Arc::clone(&finished);
-        let watcher_cancellation = cancellation.clone();
-        let chat_cancellation = chat_cancellation.clone();
-        let watcher = thread::spawn(move || {
-            while !watcher_finished.load(Ordering::SeqCst) {
-                if chat_cancellation.is_cancelled() {
-                    watcher_cancellation.cancel();
-                    return;
-                }
-                thread::sleep(CHAT_CANCEL_POLL_INTERVAL);
-            }
-        });
-
+        // The dispatcher already registered the cancellation slot and is watching
+        // the chat token; the supervisor owns the rest of the command lifecycle.
         let result = self.runtime.block_on(self.supervisor.run_command(
-            tool_request.clone(),
-            cancellation,
+            request,
+            ctx.cancellation.clone(),
             Arc::clone(&self.sink),
         ));
-        finished.store(true, Ordering::SeqCst);
-        let _ = watcher.join();
-        self.registry.finish(&tool_request.tool_call_id);
 
         match result {
             Ok(result) => LlmToolCallResult {
@@ -298,23 +367,21 @@ impl SidecarLlmToolHandler {
     }
 }
 
-impl SidecarLlmToolHandler {
-    /// Execute one of the typed file tools (`read_file` / `write_file` /
-    /// `edit_file` / `apply_patch`). Mirrors `run_command`'s cross-cuts —
-    /// per-tool registry slot, chat-cancellation honoring, and the same
-    /// `PermissionRequested` → approval-gate → `PermissionDenied` flow — but the
-    /// "execute" step calls a pure Core handler instead of spawning a process.
-    /// Synthesizes a [`ToolExecutionResult`] (text in the stdout fields,
-    /// `command: None`) so existing event/persistence plumbing works unchanged.
-    fn run_file_tool(
-        &self,
-        tool: FileTool,
-        request: LlmToolCallRequest,
-        chat_cancellation: &ChatCancellationToken,
-    ) -> LlmToolCallResult {
-        let tool_call_id = request.tool_call_id.clone();
-        let run_id = request.run_id.clone();
-        let arguments = request.arguments.clone();
+impl ToolExecutor for FileToolExecutor {
+    /// Execute one of the typed file/search tools. Mirrors the command lifecycle's
+    /// cross-cuts — the same `PermissionRequested` → approval-gate →
+    /// `PermissionDenied` flow, cancellation honoring, and event/persistence
+    /// plumbing — but the "execute" step calls a pure Core handler instead of
+    /// spawning a process. The per-call cancellation slot, registry slot, and
+    /// chat-cancellation watcher are owned by the dispatcher; this method only
+    /// resolves the project/workspace and runs the in-process lifecycle.
+    fn execute(&self, ctx: ToolCallContext<'_>) -> LlmToolCallResult {
+        let Some(tool) = ctx.kind.file_tool() else {
+            return LlmToolCallResult {
+                ok: false,
+                content: format!("not a file tool: {}", ctx.tool_name),
+            };
+        };
 
         // File tools require a known project root to resolve + contain paths.
         let Some(project) = self.project.clone() else {
@@ -325,6 +392,7 @@ impl SidecarLlmToolHandler {
             };
         };
         let project_id = Some(project.id.clone());
+        let run_id = ctx.run_id.map(str::to_string);
 
         let workspace = match Workspace::new(&project.root) {
             Ok(workspace) => workspace,
@@ -336,52 +404,20 @@ impl SidecarLlmToolHandler {
             }
         };
 
-        // Per-tool-call cancellation slot, kept in sync with the chat token so a
-        // cancelled chat denies a pending approval and short-circuits execution.
-        let cancellation = ToolCancellationToken::default();
-        if chat_cancellation.is_cancelled() {
-            cancellation.cancel();
-        }
-        if !self.registry.register(&tool_call_id, cancellation.clone()) {
-            return LlmToolCallResult {
-                ok: false,
-                content: format!("tool call already active: {tool_call_id}"),
-            };
-        }
-
-        // Watch the chat token like `run_command` does, so a chat cancelled while
-        // the tool is awaiting approval (or running) flips the per-call token and
-        // unblocks `request_decision`.
-        let finished = Arc::new(AtomicBool::new(false));
-        let watcher_finished = Arc::clone(&finished);
-        let watcher_cancellation = cancellation.clone();
-        let watcher_chat_cancellation = chat_cancellation.clone();
-        let watcher = thread::spawn(move || {
-            while !watcher_finished.load(Ordering::SeqCst) {
-                if watcher_chat_cancellation.is_cancelled() {
-                    watcher_cancellation.cancel();
-                    return;
-                }
-                thread::sleep(CHAT_CANCEL_POLL_INTERVAL);
-            }
-        });
-
-        let result = self.run_file_tool_inner(
+        self.run_file_tool_inner(
             tool,
-            &arguments,
+            ctx.arguments,
             &workspace,
-            &tool_call_id,
+            ctx.tool_call_id,
             &run_id,
             &project_id,
-            &cancellation,
-            chat_cancellation,
-        );
-
-        finished.store(true, Ordering::SeqCst);
-        let _ = watcher.join();
-        self.registry.finish(&tool_call_id);
-        result
+            ctx.cancellation,
+            ctx.chat_cancellation,
+        )
     }
+}
+
+impl FileToolExecutor {
 
     #[allow(clippy::too_many_arguments)]
     fn run_file_tool_inner(
@@ -821,11 +857,11 @@ struct RunCommandArguments {
     timeout_ms: Option<u64>,
 }
 
-fn tool_execution_request(
-    request: LlmToolCallRequest,
+fn command_request_from_ctx(
+    ctx: &ToolCallContext<'_>,
     project: Option<&ToolProjectContext>,
 ) -> std::result::Result<ToolExecutionRequest, String> {
-    let arguments = serde_json::from_value::<RunCommandArguments>(request.arguments)
+    let arguments = serde_json::from_value::<RunCommandArguments>(ctx.arguments.clone())
         .map_err(|error| format!("invalid run_command arguments: {error}"))?;
     let program = arguments.program.trim();
     if program.is_empty() {
@@ -841,8 +877,8 @@ fn tool_execution_request(
         .or_else(|| cwd.as_ref().map(|cwd| cwd.display().to_string()));
 
     Ok(ToolExecutionRequest {
-        tool_call_id: request.tool_call_id,
-        run_id: request.run_id,
+        tool_call_id: ctx.tool_call_id.to_string(),
+        run_id: ctx.run_id.map(str::to_string),
         project_id,
         cwd,
         command: ToolCommand {

@@ -14,6 +14,7 @@ mod filesystem;
 mod output;
 mod patch;
 mod permissions;
+mod pipeline;
 mod process;
 mod registry;
 mod repeat_guard;
@@ -44,6 +45,7 @@ pub use permissions::{
     ToolApprovalDecision, ToolApprovalGate, ToolPermissionAction, ToolPermissionEvaluation,
     ToolPermissionPolicy,
 };
+pub use pipeline::{ToolCallContext, ToolExecutor, ToolKind};
 pub use process::{SpawnedToolProcess, ToolProcessExit, ToolProcessSandbox, ToolProcessSpec};
 pub use registry::ToolExecutionRegistry;
 pub use repeat_guard::{ToolRepeatBlock, ToolRepeatGuard, ToolRepeatGuardConfig};
