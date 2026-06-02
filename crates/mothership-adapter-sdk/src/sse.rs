@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 
+use crate::CancellationToken;
+
 /// Incremental SSE line decoder. Feed it byte chunks; it returns the `data:`
 /// payloads of any complete lines, buffering partial lines across chunks.
 /// Comment lines (`:`), blank lines, and non-`data:` fields are skipped. The
@@ -27,9 +29,18 @@ impl SseDecoder {
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.try_push(chunk, usize::MAX)
+            .expect("unbounded SSE decoder cannot exceed max line bytes")
+    }
+
+    pub fn try_push(&mut self, chunk: &[u8], max_line_bytes: usize) -> Result<Vec<String>> {
         self.buf.extend_from_slice(chunk);
         let mut payloads = Vec::new();
+        reject_oversized_pending_line(&self.buf, max_line_bytes)?;
         while let Some(newline) = self.buf.iter().position(|&byte| byte == b'\n') {
+            if newline > max_line_bytes {
+                bail!("SSE line exceeded {max_line_bytes} bytes");
+            }
             let line: Vec<u8> = self.buf.drain(..=newline).collect();
             let line = String::from_utf8_lossy(&line[..line.len() - 1]);
             let line = line.trim_end_matches('\r').trim();
@@ -44,7 +55,8 @@ impl SseDecoder {
             }
             // Non-data fields (event:/id:/retry:) and comments (`:`) are ignored.
         }
-        payloads
+        reject_oversized_pending_line(&self.buf, max_line_bytes)?;
+        Ok(payloads)
     }
 }
 
@@ -64,7 +76,7 @@ where
     loop {
         match tokio::time::timeout(idle, response.chunk()).await {
             Ok(Ok(Some(chunk))) => {
-                for payload in decoder.push(chunk.as_ref()) {
+                for payload in decoder.try_push(chunk.as_ref(), usize::MAX)? {
                     if !on_event(&payload)? {
                         return Ok(());
                     }
@@ -75,6 +87,51 @@ where
             Err(_) => bail!("SSE stream idle for more than {idle:?}"),
         }
     }
+}
+
+/// Cancellable SSE reader for chat turns. It uses the same decoder as
+/// [`read_sse`], but returns cleanly when the host cancels the active turn and
+/// rejects a single unterminated line that grows beyond `max_line_bytes`.
+pub async fn read_sse_cancellable<F>(
+    mut response: reqwest::Response,
+    idle: Duration,
+    max_line_bytes: usize,
+    cancellation: CancellationToken,
+    mut on_event: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<bool>,
+{
+    let mut decoder = SseDecoder::new();
+    loop {
+        let chunk = {
+            let read = tokio::time::timeout(idle, response.chunk());
+            tokio::pin!(read);
+            tokio::select! {
+                result = &mut read => match result {
+                    Ok(Ok(chunk)) => chunk,
+                    Ok(Err(error)) => return Err(error.into()),
+                    Err(_) => bail!("SSE stream idle for more than {idle:?}"),
+                },
+                _ = cancellation.cancelled() => return Ok(()),
+            }
+        };
+        let Some(chunk) = chunk else {
+            return Ok(());
+        };
+        for payload in decoder.try_push(chunk.as_ref(), max_line_bytes)? {
+            if !on_event(&payload)? {
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn reject_oversized_pending_line(buffer: &[u8], max_line_bytes: usize) -> Result<()> {
+    if buffer.len() > max_line_bytes && !buffer.contains(&b'\n') {
+        bail!("SSE line exceeded {max_line_bytes} bytes without newline");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -109,5 +166,14 @@ mod tests {
         let mut decoder = SseDecoder::new();
         let out = decoder.push(b"data: [DONE]\n");
         assert_eq!(out, vec!["[DONE]".to_string()]);
+    }
+
+    #[test]
+    fn rejects_oversized_unterminated_line() {
+        let mut decoder = SseDecoder::new();
+        let error = decoder
+            .try_push(b"data: this line has no newline", 8)
+            .expect_err("oversized line should fail");
+        assert!(error.to_string().contains("SSE line exceeded 8 bytes"));
     }
 }

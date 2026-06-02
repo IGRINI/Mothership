@@ -13,6 +13,7 @@ use super::permissions::{
     ToolApprovalGate, ToolPermissionAction, ToolPermissionPolicy,
 };
 use super::process::{ToolProcessSandbox, ToolProcessSpec};
+use super::repeat_guard::ToolRepeatGuard;
 use super::resources::{ToolResourceGate, ToolResourceLimits};
 use super::types::{
     event, ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRequest,
@@ -25,6 +26,7 @@ pub struct ToolSupervisor {
     approval_gate: Arc<dyn ToolApprovalGate>,
     resources: ToolResourceGate,
     output_store: Option<Arc<dyn ToolOutputStore>>,
+    repeat_guard: Option<Arc<ToolRepeatGuard>>,
 }
 
 impl ToolSupervisor {
@@ -39,6 +41,7 @@ impl ToolSupervisor {
             resources: ToolResourceGate::new(limits),
             permission_policy: Arc::new(ConservativeCommandPermissionPolicy),
             approval_gate: StaticToolApprovalGate::deny("approval UI is not connected yet"),
+            repeat_guard: None,
         }
     }
 
@@ -49,6 +52,11 @@ impl ToolSupervisor {
     ) -> Self {
         self.permission_policy = permission_policy;
         self.approval_gate = approval_gate;
+        self
+    }
+
+    pub fn with_repeat_guard(mut self, repeat_guard: Arc<ToolRepeatGuard>) -> Self {
+        self.repeat_guard = Some(repeat_guard);
         self
     }
 
@@ -72,6 +80,27 @@ impl ToolSupervisor {
             return Ok(result);
         }
 
+        if let Some(block) = self
+            .repeat_guard
+            .as_ref()
+            .and_then(|guard| guard.check_command(&request))
+        {
+            let result = terminal_result(
+                &request,
+                ToolExecutionStatus::LoopBlocked,
+                None,
+                None,
+                Some(block.message),
+            );
+            emit_terminal(
+                &sink,
+                &request,
+                ToolExecutionEventKind::LoopBlocked,
+                &result,
+            );
+            return Ok(result);
+        }
+
         let evaluation = self.permission_policy.evaluate(&request);
         match evaluation.action {
             ToolPermissionAction::Allow => {}
@@ -83,6 +112,7 @@ impl ToolSupervisor {
                     None,
                     Some(evaluation.reason),
                 );
+                self.record_repeat_guard(&request, &result);
                 emit_terminal(
                     &sink,
                     &request,
@@ -111,6 +141,7 @@ impl ToolSupervisor {
                             None,
                             Some(reason),
                         );
+                        self.record_repeat_guard(&request, &result);
                         emit_terminal(
                             &sink,
                             &request,
@@ -133,6 +164,7 @@ impl ToolSupervisor {
                     None,
                     Some(error.to_string()),
                 );
+                self.record_repeat_guard(&request, &result);
                 emit_terminal(&sink, &request, ToolExecutionEventKind::Cancelled, &result);
                 return Ok(result);
             }
@@ -149,6 +181,7 @@ impl ToolSupervisor {
                     None,
                     Some(error.to_string()),
                 );
+                self.record_repeat_guard(&request, &result);
                 emit_terminal(&sink, &request, ToolExecutionEventKind::Failed, &result);
                 return Ok(result);
             }
@@ -281,10 +314,18 @@ impl ToolSupervisor {
             ToolExecutionStatus::Cancelled => ToolExecutionEventKind::Cancelled,
             ToolExecutionStatus::TimedOut => ToolExecutionEventKind::TimedOut,
             ToolExecutionStatus::PermissionDenied => ToolExecutionEventKind::PermissionDenied,
+            ToolExecutionStatus::LoopBlocked => ToolExecutionEventKind::LoopBlocked,
         };
+        self.record_repeat_guard(&request, &result);
         emit_terminal(&sink, &request, kind, &result);
 
         Ok(result)
+    }
+
+    fn record_repeat_guard(&self, request: &ToolExecutionRequest, result: &ToolExecutionResult) {
+        if let Some(repeat_guard) = &self.repeat_guard {
+            repeat_guard.record_command_result(request, result);
+        }
     }
 }
 
@@ -412,7 +453,7 @@ mod tests {
         ConservativeCommandPermissionPolicy, FileToolOutputStore, SpawnedToolProcess,
         StaticToolApprovalGate, ToolCommand, ToolExecutionEvent, ToolExecutionEventKind,
         ToolExecutionEventSink, ToolExecutionRequest, ToolExecutionStatus, ToolOutputPolicy,
-        ToolProcessExit, ToolProcessSandbox, ToolProcessSpec, ToolResourceLimits,
+        ToolProcessExit, ToolProcessSandbox, ToolProcessSpec, ToolRepeatGuard, ToolResourceLimits,
     };
     use crate::Result;
 
@@ -538,6 +579,46 @@ mod tests {
         assert!(sink.kinds().contains(&ToolExecutionEventKind::Failed));
     }
 
+    #[tokio::test]
+    async fn repeat_guard_blocks_third_identical_command_without_spawning() {
+        let sandbox = Arc::new(FakeSandbox::new(
+            b"nothing to commit".to_vec(),
+            Vec::new(),
+            Some(0),
+        ));
+        let sink = Arc::new(RecordingSink::default());
+        let supervisor = ToolSupervisor::new(sandbox.clone(), None, ToolResourceLimits::default())
+            .with_repeat_guard(Arc::new(ToolRepeatGuard::default()));
+
+        let first = repeat_guard_request("tool_repeat_1");
+        let second = repeat_guard_request("tool_repeat_2");
+        let third = repeat_guard_request("tool_repeat_3");
+
+        let first_result = supervisor
+            .run_command(first, ToolCancellationToken::default(), sink.clone())
+            .await
+            .unwrap();
+        let second_result = supervisor
+            .run_command(second, ToolCancellationToken::default(), sink.clone())
+            .await
+            .unwrap();
+        let third_result = supervisor
+            .run_command(third, ToolCancellationToken::default(), sink.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(first_result.status, ToolExecutionStatus::Completed);
+        assert_eq!(second_result.status, ToolExecutionStatus::Completed);
+        assert_eq!(third_result.status, ToolExecutionStatus::LoopBlocked);
+        assert_eq!(sandbox.spawn_count(), 2);
+        assert!(third_result
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Repeated identical tool call suppressed"));
+        assert!(sink.kinds().contains(&ToolExecutionEventKind::LoopBlocked));
+    }
+
     #[derive(Default)]
     struct RecordingSink {
         events: Mutex<Vec<ToolExecutionEvent>>,
@@ -641,5 +722,17 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("mothership-tool-test-{nanos}"))
+    }
+
+    fn repeat_guard_request(tool_call_id: &str) -> ToolExecutionRequest {
+        ToolExecutionRequest {
+            tool_call_id: tool_call_id.to_string(),
+            run_id: Some("run_repeat_guard".to_string()),
+            project_id: Some("project_1".to_string()),
+            cwd: None,
+            command: ToolCommand::new("git", ["status"]),
+            timeout_ms: None,
+            output_policy: ToolOutputPolicy::default(),
+        }
     }
 }

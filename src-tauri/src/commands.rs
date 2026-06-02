@@ -11,11 +11,12 @@ use std::collections::BTreeMap;
 use mothership_core::ipc::{CoreRequest, CoreResponse};
 use mothership_core::{
     AdapterSettingPatchValue, ChatConversation, ChatRunCancellationResult, ChatThreadSummary,
-    ConnectorSettingsSnapshot, DashboardSnapshot, SendChatMessageResult, SidecarStatus,
-    ToolApprovalAnswer, ToolExecutionAccepted, ToolExecutionCancellationResult,
+    ConnectorSettingsSnapshot, DashboardSnapshot, ProjectSnapshot, SendChatMessageResult,
+    SidecarStatus, ToolApprovalAnswer, ToolExecutionAccepted, ToolExecutionCancellationResult,
     ToolExecutionRequest,
 };
-use tauri::State;
+use tauri::{State, Window};
+use tauri_plugin_dialog::DialogExt;
 
 use crate::state::AppState;
 
@@ -58,22 +59,26 @@ pub async fn append_activity_event(
 #[tauri::command]
 pub async fn list_chats(
     state: State<'_, AppState>,
+    project_id: Option<String>,
     limit: Option<i64>,
 ) -> Result<Vec<ChatThreadSummary>, String> {
     let response = state
         .sidecar()
         .clone()
-        .request(CoreRequest::ListChats { limit })
+        .request(CoreRequest::ListChats { project_id, limit })
         .await?;
     expect_variant!(response, CoreResponse::ChatList)
 }
 
 #[tauri::command]
-pub async fn create_chat(state: State<'_, AppState>) -> Result<ChatConversation, String> {
+pub async fn create_chat(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<ChatConversation, String> {
     let response = state
         .sidecar()
         .clone()
-        .request(CoreRequest::CreateChat)
+        .request(CoreRequest::CreateChat { project_id })
         .await?;
     expect_variant!(response, CoreResponse::Chat)
 }
@@ -96,14 +101,90 @@ pub async fn get_chat(
 pub async fn send_chat_message(
     state: State<'_, AppState>,
     chat_id: Option<String>,
+    project_id: Option<String>,
     content: String,
 ) -> Result<SendChatMessageResult, String> {
     let response = state
         .sidecar()
         .clone()
-        .request(CoreRequest::SendChatMessage { chat_id, content })
+        .request(CoreRequest::SendChatMessage {
+            chat_id,
+            project_id,
+            content,
+        })
         .await?;
     expect_variant!(response, CoreResponse::ChatMessageStarted)
+}
+
+#[tauri::command]
+pub async fn list_projects(state: State<'_, AppState>) -> Result<ProjectSnapshot, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::ListProjects)
+        .await?;
+    expect_variant!(response, CoreResponse::ProjectSnapshot)
+}
+
+#[tauri::command]
+pub async fn pick_project_directory(window: Window) -> Result<Option<String>, String> {
+    #[cfg(not(desktop))]
+    {
+        let _ = window;
+        return Ok(None);
+    }
+
+    #[cfg(desktop)]
+    {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+
+        window
+            .dialog()
+            .file()
+            .set_parent(&window)
+            .set_title("Open project folder")
+            .pick_folder(move |folder| {
+                let selected_path = folder
+                    .map(|path| {
+                        path.into_path()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .map_err(|error| error.to_string())
+                    })
+                    .transpose();
+
+                let _ = sender.send(selected_path);
+            });
+
+        receiver
+            .await
+            .map_err(|_| "project directory picker was interrupted".to_string())?
+    }
+}
+
+#[tauri::command]
+pub async fn open_project(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<ProjectSnapshot, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::OpenProject { path })
+        .await?;
+    expect_variant!(response, CoreResponse::ProjectSnapshot)
+}
+
+#[tauri::command]
+pub async fn set_active_project(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<ProjectSnapshot, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::SetActiveProject { project_id })
+        .await?;
+    expect_variant!(response, CoreResponse::ProjectSnapshot)
 }
 
 #[tauri::command]
@@ -151,6 +232,19 @@ pub async fn retry_chat_message(
         .sidecar()
         .clone()
         .request(CoreRequest::RetryChatMessage { chat_id })
+        .await?;
+    expect_variant!(response, CoreResponse::ChatMessageStarted)
+}
+
+#[tauri::command]
+pub async fn continue_chat_message(
+    state: State<'_, AppState>,
+    chat_id: String,
+) -> Result<SendChatMessageResult, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::ContinueChatMessage { chat_id })
         .await?;
     expect_variant!(response, CoreResponse::ChatMessageStarted)
 }

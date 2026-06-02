@@ -9,13 +9,13 @@
 use std::sync::Arc;
 
 use mothership_adapter_host::protocol::{ChatMessage, ToolCallResult};
-use mothership_adapter_host::{AdapterEntry, ToolCallHandler, ToolCallRequest};
+use mothership_adapter_host::{AdapterEntry, ChatAdapterEvent, ToolCallHandler, ToolCallRequest};
 
 use crate::adapter_pool::AdapterPool;
 use crate::auth::FileCredentialVault;
 use crate::llm::{
     LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest, LlmChatRole,
-    LlmToolCallHandler, LlmToolCallRequest, LlmTransportKind,
+    LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResult, LlmTransportKind,
 };
 use crate::{ChatCancellationToken, MothershipError, Result};
 
@@ -63,27 +63,27 @@ impl LlmChatCompletionGateway for SubprocessChatGateway {
     ) -> Result<String> {
         sink.transport_selected(LlmTransportKind::Subprocess);
 
-        // The uniform chat shape: optional leading system message, then the
-        // conversation. The adapter maps this to whatever its provider expects.
-        let mut messages = Vec::new();
-        if !request.system_prompt.trim().is_empty() {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: request.system_prompt,
-            });
-        }
-        for message in request.messages {
-            let role = match message.role {
-                LlmChatRole::User => "user",
-                LlmChatRole::Assistant => "assistant",
-            };
-            messages.push(ChatMessage {
-                role: role.to_string(),
-                content: message.content,
-            });
-        }
+        // Core owns the runtime prompt and tool catalog. The adapter receives
+        // them as structured inputs and maps them to its provider-specific wire
+        // format.
+        let messages = request
+            .messages
+            .into_iter()
+            .map(|message| {
+                let role = match message.role {
+                    LlmChatRole::User => "user",
+                    LlmChatRole::Assistant => "assistant",
+                };
+                ChatMessage {
+                    role: role.to_string(),
+                    content: message.content,
+                }
+            })
+            .collect::<Vec<_>>();
 
         let model_id = request.model_id;
+        let prompt = request.prompt;
+        let tools = request.tools;
         let cancellation = cancellation.clone();
         let run_id = self.run_id.clone();
         let tool_handler = self.tool_handler.as_ref().map(|handler| {
@@ -98,14 +98,22 @@ impl LlmChatCompletionGateway for SubprocessChatGateway {
                 if let Some(tool_handler) = tool_handler {
                     adapter.chat_cancellable_with_tools(
                         &model_id,
+                        prompt,
                         messages,
+                        tools,
                         move || cancellation.is_cancelled(),
-                        |delta| sink.delta(delta),
+                        |event| match event {
+                            ChatAdapterEvent::Delta(delta) => sink.delta(delta),
+                            ChatAdapterEvent::ToolCall(tool_call_id) => {
+                                sink.before_tool_call(tool_call_id)
+                            }
+                        },
                         tool_handler,
                     )
                 } else {
-                    adapter.chat_cancellable(
+                    adapter.chat_cancellable_with_prompt(
                         &model_id,
+                        prompt,
                         messages,
                         move || cancellation.is_cancelled(),
                         |delta| sink.delta(delta),
@@ -126,18 +134,53 @@ struct SubprocessToolCallHandler {
 
 impl ToolCallHandler for SubprocessToolCallHandler {
     fn handle_tool_call(&self, request: ToolCallRequest) -> ToolCallResult {
-        let result = self.inner.handle_tool_call(
-            LlmToolCallRequest {
-                run_id: self.run_id.clone(),
-                tool_call_id: request.tool_call_id,
-                name: request.name,
-                arguments: request.arguments,
-            },
-            &self.cancellation,
-        );
+        let result = self
+            .inner
+            .handle_tool_call(self.llm_tool_call_request(request), &self.cancellation);
         ToolCallResult {
             ok: result.ok,
-            content: result.content,
+            content: model_facing_tool_content(result),
         }
+    }
+
+    fn handle_tool_calls(&self, requests: Vec<ToolCallRequest>) -> Vec<ToolCallResult> {
+        self.inner
+            .handle_tool_calls(
+                requests
+                    .into_iter()
+                    .map(|request| self.llm_tool_call_request(request))
+                    .collect(),
+                &self.cancellation,
+            )
+            .into_iter()
+            .map(|result| ToolCallResult {
+                ok: result.ok,
+                content: model_facing_tool_content(result),
+            })
+            .collect()
+    }
+}
+
+impl SubprocessToolCallHandler {
+    fn llm_tool_call_request(&self, request: ToolCallRequest) -> LlmToolCallRequest {
+        LlmToolCallRequest {
+            run_id: self.run_id.clone(),
+            tool_call_id: request.tool_call_id,
+            name: request.name,
+            arguments: request.arguments,
+        }
+    }
+}
+
+fn model_facing_tool_content(result: LlmToolCallResult) -> String {
+    if result.ok {
+        return result.content;
+    }
+
+    let content = result.content.trim();
+    if content.is_empty() {
+        "Tool call failed.".to_string()
+    } else {
+        format!("Tool call failed:\n{content}")
     }
 }

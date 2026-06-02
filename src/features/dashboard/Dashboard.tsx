@@ -1,4 +1,13 @@
-import { createSignal, JSX, onCleanup, onMount, Show } from "solid-js";
+import {
+  createEffect,
+  createMemo,
+  createSignal,
+  For,
+  JSX,
+  onCleanup,
+  onMount,
+  Show,
+} from "solid-js";
 import {
   AlertTriangle,
   Check,
@@ -10,7 +19,7 @@ import {
   GitBranch,
   MoreVertical,
   Paperclip,
-  Pencil,
+  Play,
   Plus,
   RefreshCw,
   Search,
@@ -20,13 +29,19 @@ import {
   X,
 } from "lucide-solid";
 import { listen } from "@tauri-apps/api/event";
+import { SolidMarkdown } from "solid-markdown";
+import remarkGfm from "remark-gfm";
 
 import {
   ChatRunEvent,
   ChatMessage,
+  ChatMessagePart,
   ChatThreadSummary,
   ConnectorSettingsEvent,
+  ConnectorProviderSummary,
   ConnectorSettingsSnapshot,
+  ProjectSummary,
+  ProjectSnapshot,
   ToolCommand,
   ToolExecutionEvent,
   ToolExecutionEventKind,
@@ -36,47 +51,44 @@ import {
   branchChatFromMessage,
   cancelChatRun,
   cancelToolExecution,
+  continueChatMessage,
   createChat,
   editChatUserMessage,
   getChat,
   getConnectorSettings,
   listChats,
+  listProjects,
+  openProject,
+  pickProjectDirectory,
   retryChatMessage,
   sendChatMessage,
+  setActiveProject,
   setSelectedModel,
 } from "../../shared/api/mothership";
 import { VirtualList } from "../../shared/ui/VirtualList";
-import { SolidMarkdown } from "solid-markdown";
-import remarkGfm from "remark-gfm";
+import { startWindowDrag } from "../../shared/window-drag";
 import mothershipLogoUrl from "../../assets/mothership-logo-sm.png";
 
-const projects: ProjectItem[] = [
-  {
-    id: "mothership",
-    name: "Mothership",
-    path: "E:/Mothership",
-    branch: "main",
-    tone: "green",
-  },
-  {
-    id: "research",
-    name: "Research",
-    path: "projects-to-research",
-    branch: "local",
-    tone: "yellow",
-  },
-  {
-    id: "sidecar",
-    name: "Sidecar",
-    path: "src-sidecar",
-    branch: "core",
-    tone: "blue",
-  },
-];
+const CHAT_MESSAGE_PAGE_SIZE = 60;
+const CHAT_SCROLL_BOTTOM_THRESHOLD_PX = 8;
+const CHAT_SCROLL_TOP_PADDING_PX = 12;
+const CHAT_SCROLL_BOTTOM_PADDING_PX = 32;
+const CHAT_SCROLL_RESTORE_FRAMES = 12;
+const TOOL_OUTPUT_MAX_VISIBLE_LINES = 10;
+
+interface ChatScrollPosition {
+  top: number;
+  fromBottom: number;
+}
 
 export function Dashboard(props: { onOpenSettings?: () => void }) {
+  const [projects, setProjects] = createSignal<ProjectSummary[]>([]);
+  const [activeProjectId, setActiveProjectId] = createSignal<string>();
   const [chats, setChats] = createSignal<ChatThreadSummary[]>([]);
   const [messages, setMessages] = createSignal<ChatMessage[]>([]);
+  const [messageParts, setMessageParts] = createSignal<
+    Record<string, MessagePartView[]>
+  >({});
   const [connectorSettings, setConnectorSettings] =
     createSignal<ConnectorSettingsSnapshot>();
   const [activeChatId, setActiveChatId] = createSignal<string>();
@@ -85,7 +97,9 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   const [runTransports, setRunTransports] = createSignal<Record<string, string>>(
     {},
   );
+  const [isLoadingProjects, setIsLoadingProjects] = createSignal(true);
   const [isLoadingChats, setIsLoadingChats] = createSignal(true);
+  const [isOpeningProject, setIsOpeningProject] = createSignal(false);
   const [isLoadingMessages, setIsLoadingMessages] = createSignal(false);
   const [isSending, setIsSending] = createSignal(false);
   const [editingMessageId, setEditingMessageId] = createSignal<string>();
@@ -98,16 +112,23 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   const [runMessageIds, setRunMessageIds] = createSignal<Record<string, string>>(
     {},
   );
-  const [expandedInlineTools, setExpandedInlineTools] = createSignal<
-    Record<string, boolean>
-  >({});
   const [toolExecutions, setToolExecutions] = createSignal<
     Record<string, ToolExecutionView>
+  >({});
+  const [expandedInlineTools, setExpandedInlineTools] = createSignal<
+    Record<string, boolean>
   >({});
   let unlistenChatRun: (() => void) | undefined;
   let unlistenConnectorSettings: (() => void) | undefined;
   let unlistenToolExecution: (() => void) | undefined;
+  let messageScrollElement: HTMLDivElement | undefined;
+  let restoreScrollFrame = 0;
+  let openChatRequestId = 0;
+  let liveMessagePartSequence = 0;
+  const chatScrollPositions = new Map<string, ChatScrollPosition>();
 
+  const activeProject = () =>
+    projects().find((project) => project.id === activeProjectId()) ?? null;
   const activeChat = () =>
     chats().find((chat) => chat.id === activeChatId()) ?? null;
   const activeRunId = () => {
@@ -120,7 +141,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     );
 
   onMount(() => {
-    void loadChats();
+    void loadProjectScope();
     void loadConnectorSettings();
 
     if (isTauriRuntime()) {
@@ -162,21 +183,66 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   });
 
   onCleanup(() => {
+    cancelAnimationFrame(restoreScrollFrame);
     unlistenChatRun?.();
     unlistenConnectorSettings?.();
     unlistenToolExecution?.();
   });
 
-  async function loadChats() {
+  async function loadProjectScope() {
+    setIsLoadingProjects(true);
     setIsLoadingChats(true);
     setError("");
 
     try {
-      const loadedChats = await listChats(100);
+      let snapshot = await listProjects();
+      applyProjectSnapshot(snapshot);
+      const projectId = snapshot.activeProjectId ?? snapshot.projects[0]?.id;
+      if (projectId) {
+        if (snapshot.activeProjectId !== projectId) {
+          snapshot = await setActiveProject(projectId);
+          applyProjectSnapshot(snapshot);
+        }
+        await loadChats(projectId);
+      } else {
+        setActiveProjectId(undefined);
+        setChats([]);
+        setMessages([]);
+        setMessageParts({});
+        setIsLoadingMessages(false);
+      }
+    } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    } finally {
+      setIsLoadingProjects(false);
+      setIsLoadingChats(false);
+    }
+  }
+
+  function applyProjectSnapshot(snapshot: ProjectSnapshot) {
+    setProjects(snapshot.projects);
+    setActiveProjectId(snapshot.activeProjectId ?? undefined);
+  }
+
+  async function loadChats(projectId: string) {
+    setIsLoadingChats(true);
+    setError("");
+
+    try {
+      const loadedChats = await listChats(100, projectId);
+      if (activeProjectId() !== projectId) {
+        return;
+      }
       setChats(loadedChats);
 
       if (loadedChats[0]) {
         await openChat(loadedChats[0].id);
+      } else {
+        openChatRequestId += 1;
+        setActiveChatId(undefined);
+        setMessages([]);
+        setMessageParts({});
+        setIsLoadingMessages(false);
       }
     } catch (caughtError) {
       setError(errorMessage(caughtError));
@@ -185,31 +251,123 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     }
   }
 
+  async function handleSelectProject(projectId: string) {
+    if (projectId === activeProjectId()) {
+      return;
+    }
+
+    saveActiveChatScroll();
+    openChatRequestId += 1;
+    setActiveProjectId(projectId);
+    setActiveChatId(undefined);
+    setChats([]);
+    setMessages([]);
+    setMessageParts({});
+    setIsLoadingMessages(false);
+    setToolExecutions({});
+    setExpandedInlineTools({});
+    setEditingMessageId(undefined);
+    setEditingDraft("");
+    setError("");
+
+    try {
+      applyProjectSnapshot(await setActiveProject(projectId));
+      await loadChats(projectId);
+    } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    }
+  }
+
+  async function openProjectPath(path: string) {
+    const snapshot = await openProject(path);
+    applyProjectSnapshot(snapshot);
+    const projectId = snapshot.activeProjectId;
+    if (!projectId) {
+      return;
+    }
+
+    saveActiveChatScroll();
+    openChatRequestId += 1;
+    setActiveChatId(undefined);
+    setMessages([]);
+    setMessageParts({});
+    setIsLoadingMessages(false);
+    setToolExecutions({});
+    setExpandedInlineTools({});
+    await loadChats(projectId);
+  }
+
+  async function handlePickProjectDirectory() {
+    if (isOpeningProject()) {
+      return;
+    }
+
+    setIsOpeningProject(true);
+    setError("");
+
+    try {
+      const path = await pickProjectDirectory();
+      if (path) {
+        await openProjectPath(path);
+      }
+    } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    } finally {
+      setIsOpeningProject(false);
+    }
+  }
+
   async function openChat(chatId: string) {
+    saveActiveChatScroll();
+    const requestId = ++openChatRequestId;
     setActiveChatId(chatId);
+    setMessages([]);
+    setMessageParts({});
+    setEditingMessageId(undefined);
+    setEditingDraft("");
     setIsLoadingMessages(true);
     setError("");
 
     try {
-      const conversation = await getChat(chatId, 200);
+      const conversation = await getChat(chatId, CHAT_MESSAGE_PAGE_SIZE);
+      if (requestId !== openChatRequestId || activeChatId() !== chatId) {
+        return;
+      }
       setChats((current) => mergeChatInPlace(current, conversation.chat));
       setMessages(normalizeMessages(conversation.messages));
+      setMessageParts(messagePartsByMessageId(conversation.messageParts ?? []));
       hydrateToolExecutions(conversation.toolExecutions ?? []);
+      restoreChatScroll(chatId);
     } catch (caughtError) {
-      setError(errorMessage(caughtError));
+      if (requestId === openChatRequestId) {
+        setError(errorMessage(caughtError));
+      }
     } finally {
-      setIsLoadingMessages(false);
+      if (requestId === openChatRequestId) {
+        setIsLoadingMessages(false);
+      }
     }
   }
 
   async function handleNewChat() {
+    const projectId = activeProjectId();
+    if (!projectId) {
+      setError("Open a project before starting a chat.");
+      return;
+    }
+
+    saveActiveChatScroll();
+    openChatRequestId += 1;
+    setIsLoadingMessages(false);
     setError("");
 
     try {
-      const conversation = await createChat();
+      const conversation = await createChat(projectId);
       setChats((current) => bumpChat(current, conversation.chat));
       setActiveChatId(conversation.chat.id);
       setMessages(normalizeMessages(conversation.messages));
+      setMessageParts({});
+      restoreChatScroll(conversation.chat.id);
     } catch (caughtError) {
       setError(errorMessage(caughtError));
     }
@@ -220,6 +378,11 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     if (!content || isSending() || isSubmittingEdit() || isChatRunning()) {
       return;
     }
+    const projectId = activeProjectId();
+    if (!projectId) {
+      setError("Open a project before sending a message.");
+      return;
+    }
 
     const currentChatId = activeChatId();
     setDraft("");
@@ -227,7 +390,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     setError("");
 
     try {
-      const result = await sendChatMessage(currentChatId, content);
+      const result = await sendChatMessage(currentChatId, content, projectId);
 
       setActiveRunIds((current) => ({
         ...current,
@@ -240,6 +403,9 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         const base = currentChatId === result.chat.id ? current : [];
         return mergeMessages(base, [result.userMessage, result.assistantMessage]);
       });
+      if (currentChatId !== result.chat.id) {
+        setMessageParts({});
+      }
     } catch (caughtError) {
       setDraft(content);
       setError(errorMessage(caughtError));
@@ -292,6 +458,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         [result.chat.id]: result.runId,
       }));
       clearToolExecutionsForMessageIds(removedMessageIds);
+      clearMessagePartsForMessageIds(removedMessageIds);
       rememberRunMessage(result.runId, result.assistantMessage.id);
       setChats((current) => bumpChat(current, result.chat));
       setMessages((current) =>
@@ -338,6 +505,8 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
       updatedAt: now,
     };
 
+    saveActiveChatScroll();
+    openChatRequestId += 1;
     setBranchingChatId(tempChatId);
     setEditingMessageId(undefined);
     setEditingDraft("");
@@ -345,6 +514,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     setChats((current) => bumpChat(current, tempChat));
     setActiveChatId(tempChatId);
     setMessages([]);
+    setMessageParts({});
     setIsLoadingMessages(true);
 
     try {
@@ -356,13 +526,16 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         ),
       );
       setActiveChatId(conversation.chat.id);
-      setMessages(normalizeMessages(conversation.messages));
+      setMessages(limitChatMessages(normalizeMessages(conversation.messages)));
+      setMessageParts(messagePartsByMessageId(conversation.messageParts ?? []));
       hydrateToolExecutions(conversation.toolExecutions ?? []);
+      restoreChatScroll(conversation.chat.id);
     } catch (caughtError) {
       setChats((current) => current.filter((chat) => chat.id !== tempChatId));
       setActiveChatId(sourceChatId);
       setMessages(sourceMessages);
       setError(errorMessage(caughtError));
+      restoreChatScroll(sourceChatId);
     } finally {
       setBranchingChatId(undefined);
       setIsLoadingMessages(false);
@@ -383,6 +556,30 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         [result.chat.id]: result.runId,
       }));
       clearMessageToolExecutions(result.assistantMessage.id);
+      clearMessagePartsForMessageIds([result.assistantMessage.id]);
+      rememberRunMessage(result.runId, result.assistantMessage.id);
+      setChats((current) => bumpChat(current, result.chat));
+      setMessages((current) =>
+        mergeMessages(current, [result.userMessage, result.assistantMessage]),
+      );
+    } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    }
+  }
+
+  async function handleContinue() {
+    const chatId = activeChatId();
+    if (!chatId || isChatRunning()) {
+      return;
+    }
+    setError("");
+
+    try {
+      const result = await continueChatMessage(chatId);
+      setActiveRunIds((current) => ({
+        ...current,
+        [result.chat.id]: result.runId,
+      }));
       rememberRunMessage(result.runId, result.assistantMessage.id);
       setChats((current) => bumpChat(current, result.chat));
       setMessages((current) =>
@@ -450,6 +647,13 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     }
   }
 
+  function handleToggleInlineTool(toolCallId: string) {
+    setExpandedInlineTools((current) => ({
+      ...current,
+      [toolCallId]: !current[toolCallId],
+    }));
+  }
+
   function applyChatRunEvent(event: ChatRunEvent) {
     rememberRunMessage(event.runId, event.messageId);
 
@@ -458,6 +662,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         ...current,
         [event.chatId]: event.runId,
       }));
+      clearMessagePartsForMessageIds([event.messageId]);
     }
 
     if (event.chat) {
@@ -501,6 +706,9 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
       setMessages((current) =>
         appendMessageDelta(current, event.messageId, event.delta!),
       );
+      appendMessageTextPart(event.messageId, event.delta);
+    } else if (event.kind === "tool_call" && event.toolCallId) {
+      appendMessageToolPart(event.messageId, event.toolCallId);
     }
     // A failed run is rendered inline as an error card on the failed assistant
     // message (see MessageRow), not as a bubble or the bottom error bar — the
@@ -519,6 +727,11 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     setToolExecutions((current) =>
       attachMessageIdToToolExecutions(current, runId, messageId),
     );
+    for (const tool of Object.values(toolExecutions())) {
+      if (tool.runId === runId) {
+        appendMessageToolPart(messageId, tool.toolCallId);
+      }
+    }
   }
 
   function hydrateToolExecutions(records: ToolExecutionRecord[]) {
@@ -580,7 +793,92 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     );
   }
 
+  function clearMessagePartsForMessageIds(messageIds: string[]) {
+    if (messageIds.length === 0) {
+      return;
+    }
+
+    const removed = new Set(messageIds);
+    setMessageParts((current) =>
+      Object.fromEntries(
+        Object.entries(current).filter(([messageId]) => !removed.has(messageId)),
+      ),
+    );
+  }
+
+  function appendMessageTextPart(messageId: string, delta: string) {
+    if (!delta) {
+      return;
+    }
+
+    setMessageParts((current) => {
+      const parts = current[messageId] ?? [];
+      const lastPart = parts[parts.length - 1];
+      if (lastPart?.kind === "text") {
+        return {
+          ...current,
+          [messageId]: [
+            ...parts.slice(0, -1),
+            {
+              ...lastPart,
+              text: `${lastPart.text ?? ""}${delta}`,
+            },
+          ],
+        };
+      }
+
+      return {
+        ...current,
+        [messageId]: [
+          ...parts,
+          {
+            id: `live-text:${messageId}:${liveMessagePartSequence++}`,
+            kind: "text",
+            messageId,
+            text: delta,
+            createdAt: Date.now(),
+          },
+        ],
+      };
+    });
+  }
+
+  function appendMessageToolPart(messageId: string, toolCallId: string) {
+    setMessageParts((current) => {
+      const parts = current[messageId] ?? [];
+      if (
+        parts.some(
+          (part) => part.kind === "tool" && part.toolCallId === toolCallId,
+        )
+      ) {
+        return current;
+      }
+
+      return {
+        ...current,
+        [messageId]: [
+          ...parts,
+          {
+            id: `live-tool:${toolCallId}`,
+            kind: "tool",
+            messageId,
+            toolCallId,
+            createdAt: Date.now(),
+          },
+        ],
+      };
+    });
+  }
+
   function applyToolExecutionEvent(event: ToolExecutionEvent) {
+    const previous = toolExecutions()[event.toolCallId];
+    const runId = event.runId ?? previous?.runId;
+    const messageId =
+      previous?.messageId ?? (runId ? runMessageIds()[runId] : undefined);
+    if (messageId && messages().some((message) => message.id === messageId)) {
+      appendMessageToolPart(messageId, event.toolCallId);
+    }
+
     setToolExecutions((current) => {
       const previous = current[event.toolCallId];
       const now = Date.now();
@@ -611,19 +909,78 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     });
   }
 
-  const visibleToolExecutions = () =>
-    Object.values(toolExecutions())
+  function handleMessageScrollElement(element: HTMLDivElement | undefined) {
+    messageScrollElement = element;
+  }
+
+  function saveActiveChatScroll() {
+    const chatId = activeChatId();
+    const element = messageScrollElement;
+    if (!chatId || !element) {
+      return;
+    }
+
+    const maxTop = Math.max(0, element.scrollHeight - element.clientHeight);
+    chatScrollPositions.set(chatId, {
+      top: Math.min(element.scrollTop, maxTop),
+      fromBottom: Math.max(0, maxTop - element.scrollTop),
+    });
+  }
+
+  function restoreChatScroll(chatId: string) {
+    cancelAnimationFrame(restoreScrollFrame);
+
+    const position = chatScrollPositions.get(chatId);
+    let frame = 0;
+    const apply = () => {
+      const element = messageScrollElement;
+      if (!element || activeChatId() !== chatId) {
+        return;
+      }
+
+      const maxTop = Math.max(0, element.scrollHeight - element.clientHeight);
+      element.scrollTop =
+        !position || position.fromBottom <= CHAT_SCROLL_BOTTOM_THRESHOLD_PX
+          ? maxTop
+          : Math.min(position.top, maxTop);
+
+      frame += 1;
+      if (frame < CHAT_SCROLL_RESTORE_FRAMES) {
+        restoreScrollFrame = requestAnimationFrame(apply);
+      }
+    };
+
+    restoreScrollFrame = requestAnimationFrame(apply);
+  }
+
+  const visibleToolExecutions = createMemo(() => {
+    const chatId = activeChatId();
+    const runId = activeRunId();
+    const messageIds = new Set(messages().map((message) => message.id));
+
+    return Object.values(toolExecutions())
+      .filter((tool) => {
+        if (chatId && tool.chatId) {
+          return tool.chatId === chatId;
+        }
+
+        if (tool.messageId) {
+          return messageIds.has(tool.messageId);
+        }
+
+        return Boolean(runId && tool.runId === runId);
+      })
       .sort((left, right) => right.updatedAt - left.updatedAt)
       .slice(0, 50);
+  });
 
-  const inlineToolExecutionsByMessageId = () => {
-    const messageIds = runMessageIds();
+  const toolExecutionsByMessageId = createMemo(() => {
+    const messageIds = new Set(messages().map((message) => message.id));
     const grouped: Record<string, ToolExecutionView[]> = {};
 
     for (const tool of Object.values(toolExecutions())) {
-      const messageId =
-        tool.messageId ?? (tool.runId ? messageIds[tool.runId] : undefined);
-      if (!messageId) {
+      const messageId = tool.messageId;
+      if (!messageId || !messageIds.has(messageId)) {
         continue;
       }
 
@@ -636,44 +993,48 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     }
 
     return grouped;
-  };
-
-  function handleToggleInlineTool(toolCallId: string) {
-    setExpandedInlineTools((current) => ({
-      ...current,
-      [toolCallId]: !current[toolCallId],
-    }));
-  }
+  });
 
   return (
     <main class="workspace-shell">
       <Sidebar
         activeChatId={activeChatId()}
+        activeProjectId={activeProjectId()}
         chats={chats()}
-        isLoading={isLoadingChats()}
+        isLoadingChats={isLoadingChats()}
+        isLoadingProjects={isLoadingProjects()}
+        isOpeningProject={isOpeningProject()}
         onNewChat={handleNewChat}
         onOpenChat={(chatId) => void openChat(chatId)}
+        onOpenProject={() => void handlePickProjectDirectory()}
         onOpenSettings={props.onOpenSettings}
+        onSelectProject={(projectId) => void handleSelectProject(projectId)}
+        projects={projects()}
       />
       <ConversationPane
         activeChat={activeChat()}
+        activeProject={activeProject()}
         connectorSettings={connectorSettings()}
         draft={draft()}
         error={error()}
         editingDraft={editingDraft()}
         editingMessageId={editingMessageId()}
         isLoading={
-          isLoadingMessages() || (isLoadingChats() && messages().length === 0)
+          isLoadingMessages() ||
+          (!activeChatId() && isLoadingChats() && messages().length === 0)
         }
         isSending={isSending() || isSubmittingEdit() || isChatRunning()}
         messages={messages()}
         runTransports={runTransports()}
-        toolExecutionsByMessageId={inlineToolExecutionsByMessageId()}
-        expandedInlineTools={expandedInlineTools()}
         activeRunId={activeRunId()}
+        expandedInlineTools={expandedInlineTools()}
+        messagePartsByMessageId={messageParts()}
+        toolExecutionsByMessageId={toolExecutionsByMessageId()}
         onApproveTool={handleApproveTool}
+        onMessageScrollElement={handleMessageScrollElement}
         onCancelRun={handleCancelRun}
         onCancelTool={handleCancelTool}
+        onContinue={handleContinue}
         onBranchMessage={(message) => void handleBranchMessage(message)}
         onCancelEdit={handleCancelEdit}
         onDenyTool={handleDenyTool}
@@ -700,36 +1061,64 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
 
 function Sidebar(props: {
   activeChatId?: string;
+  activeProjectId?: string;
   chats: ChatThreadSummary[];
-  isLoading: boolean;
+  isLoadingChats: boolean;
+  isLoadingProjects: boolean;
+  isOpeningProject: boolean;
   onNewChat: () => void;
   onOpenChat: (chatId: string) => void;
+  onOpenProject: () => void;
   onOpenSettings?: () => void;
+  onSelectProject: (projectId: string) => void;
+  projects: ProjectSummary[];
 }) {
   return (
     <aside class="sidebar" aria-label="Workspace navigation">
-      <div class="sidebar__brand" data-tauri-drag-region>
+      <div class="sidebar__brand" onMouseDown={startWindowDrag}>
         <BrandMark />
         <strong>Mothership</strong>
-        <button class="icon-button" type="button" title="New workspace">
-          <Plus size={16} />
+        <button
+          class="icon-button"
+          type="button"
+          title="Open project"
+          disabled={props.isOpeningProject}
+          onClick={props.onOpenProject}
+        >
+          <Folder size={16} />
         </button>
       </div>
 
-      <button class="new-chat-button" type="button" onClick={props.onNewChat}>
+      <button
+        class="new-chat-button"
+        type="button"
+        disabled={!props.activeProjectId}
+        onClick={props.onNewChat}
+      >
         <Plus size={18} />
         <span>New Chat</span>
         <kbd>Ctrl+K</kbd>
       </button>
 
       <section class="sidebar-section sidebar-section--recent">
-        <SectionHeader title="Recent" action={<Search size={16} />} />
+        <SectionHeader
+          title="Recent"
+          action={
+            <button class="icon-button icon-button--ghost" type="button" title="Search chats">
+              <Search size={16} />
+            </button>
+          }
+        />
         <VirtualList
           ariaLabel="Recent chats"
           class="recent-list"
           empty={
             <div class="list-empty">
-              {props.isLoading ? "Loading chats..." : "No chats yet"}
+              {props.isLoadingChats
+                ? "Loading chats..."
+                : props.activeProjectId
+                  ? "No chats yet"
+                  : "Open a project first"}
             </div>
           }
           estimateSize={42}
@@ -752,19 +1141,56 @@ function Sidebar(props: {
       </section>
 
       <section class="sidebar-section sidebar-section--projects">
-        <SectionHeader title="Projects" action={<Plus size={16} />} />
+        <SectionHeader
+          title="Projects"
+          action={
+            <button
+              class="icon-button icon-button--ghost"
+              type="button"
+              title="Open project"
+              disabled={props.isOpeningProject}
+              onClick={props.onOpenProject}
+            >
+              <Plus size={16} />
+            </button>
+          }
+        />
+        <button
+          class="project-open-button"
+          type="button"
+          disabled={props.isOpeningProject}
+          onClick={props.onOpenProject}
+        >
+          <Folder size={16} />
+          <span>{props.isOpeningProject ? "Opening..." : "Open folder"}</span>
+        </button>
         <VirtualList
           ariaLabel="Projects"
           class="project-list"
+          empty={
+            <div class="list-empty">
+              {props.isLoadingProjects ? "Loading projects..." : "No projects"}
+            </div>
+          }
           estimateSize={64}
           getItemKey={(project) => project.id}
-          items={projects}
+          items={props.projects}
           overscan={6}
         >
-          {(project) => <ProjectRow project={project} />}
+          {(project) => (
+            <ProjectRow
+              project={project}
+              selected={project.id === props.activeProjectId}
+              onClick={() => props.onSelectProject(project.id)}
+            />
+          )}
         </VirtualList>
-        <button class="text-button text-button--wide" type="button">
-          View all projects
+        <button
+          class="text-button text-button--wide"
+          type="button"
+          onClick={() => setIsProjectFormOpen((current) => !current)}
+        >
+          Open project
           <ChevronDown size={14} />
         </button>
       </section>
@@ -790,26 +1216,30 @@ function Sidebar(props: {
 
 function ConversationPane(props: {
   activeChat: ChatThreadSummary | null;
+  activeProject: ProjectSummary | null;
   activeRunId?: string;
   connectorSettings?: ConnectorSettingsSnapshot;
   draft: string;
   editingDraft: string;
   editingMessageId?: string;
   error: string;
+  expandedInlineTools: Record<string, boolean>;
   isLoading: boolean;
   isSending: boolean;
+  messagePartsByMessageId: Record<string, MessagePartView[]>;
   messages: ChatMessage[];
   runTransports: Record<string, string>;
   toolExecutionsByMessageId: Record<string, ToolExecutionView[]>;
-  expandedInlineTools: Record<string, boolean>;
   onApproveTool: (toolCallId: string) => void;
   onBranchMessage: (message: ChatMessage) => void;
   onCancelEdit: () => void;
   onCancelRun: () => void;
   onCancelTool: (toolCallId: string) => void;
+  onContinue: () => void;
   onDenyTool: (toolCallId: string) => void;
   onDraftChange: (value: string) => void;
   onEditDraftChange: (value: string) => void;
+  onMessageScrollElement: (element: HTMLDivElement | undefined) => void;
   onRetry: () => void;
   onSelectModel: (providerId: string, modelId: string) => void;
   onSendMessage: () => void;
@@ -817,12 +1247,38 @@ function ConversationPane(props: {
   onSubmitEdit: (messageId: string) => void;
   onToggleInlineTool: (toolCallId: string) => void;
 }) {
-  const timelineItems = () =>
-    buildConversationTimeline(props.messages, props.toolExecutionsByMessageId);
+  const timelineItems = createMemo(() =>
+    buildConversationTimeline(props.messages),
+  );
+
+  // Live, by-id lookups. Because timeline items hold only ids, a row reads its
+  // current message/tool from these maps reactively: a streaming delta or a
+  // tool-output chunk updates only the looked-up value, so the row stays mounted
+  // and SolidMarkdown's "reconcile" strategy patches just the changed nodes
+  // instead of tearing the row down and re-parsing the whole markdown AST.
+  const messagesById = createMemo(() => {
+    const map: Record<string, ChatMessage> = {};
+    for (const message of props.messages) {
+      map[message.id] = message;
+    }
+    return map;
+  });
+  const toolsById = createMemo(() => {
+    const map: Record<string, ToolExecutionView> = {};
+    for (const tools of Object.values(props.toolExecutionsByMessageId)) {
+      for (const tool of tools) {
+        map[tool.toolCallId] = tool;
+      }
+    }
+    return map;
+  });
+  const activeProvider = createMemo(() =>
+    selectedConnectorProvider(props.connectorSettings),
+  );
 
   return (
     <section class="conversation-pane" aria-label="Active chat">
-      <header class="conversation-header">
+      <header class="conversation-header" onMouseDown={startWindowDrag}>
         <div class="conversation-header__title">
           <h1>{props.activeChat?.title ?? "New chat"}</h1>
           <button
@@ -834,70 +1290,83 @@ function ConversationPane(props: {
           </button>
         </div>
 
-        <div class="agent-status-chip" title="Local agent connection">
+        <Show when={props.activeProject}>
+          {(project) => (
+            <div class="project-badge" title={project().path}>
+              <Folder size={14} />
+              <span>{project().name}</span>
+            </div>
+          )}
+        </Show>
+
+        <div class="agent-status-chip">
           <Terminal size={16} />
           <ModelSelector
             settings={props.connectorSettings}
             onSelectModel={props.onSelectModel}
           />
-          <Circle size={8} />
-          <strong>Storage</strong>
-          <ChevronDown size={14} />
+          <ProviderStatusDot provider={activeProvider()} />
+          <ProviderSelector
+            settings={props.connectorSettings}
+            onSelectModel={props.onSelectModel}
+          />
         </div>
       </header>
 
       <VirtualList
+        adjustScrollOnItemResize={false}
         ariaLabel="Chat messages"
         class="message-list"
         empty={
-          <ConversationState error={props.error} isLoading={props.isLoading} />
+          <ConversationState
+            error={props.error}
+            hasProject={Boolean(props.activeProject)}
+            isLoading={props.isLoading}
+          />
         }
-        estimateSize={(item) => estimateTimelineItemSize(item, props.expandedInlineTools)}
+        estimateSize={140}
         getItemKey={(item) => item.id}
         items={timelineItems()}
-        overscan={4}
-        scrollKey={props.activeChat?.id}
+        overscan={8}
+        paddingEnd={CHAT_SCROLL_BOTTOM_PADDING_PX}
+        paddingStart={CHAT_SCROLL_TOP_PADDING_PX}
+        scrollRef={props.onMessageScrollElement}
         stickToEnd
+        stickToEndThreshold={CHAT_SCROLL_BOTTOM_THRESHOLD_PX}
       >
-        {(item) => (
-          <Show
-            when={item.kind === "tool"}
-            fallback={
-              <MessageRow
-                message={(item as MessageTimelineItem).message}
-                transport={
-                  props.runTransports[(item as MessageTimelineItem).message.id]
-                }
-                editingDraft={props.editingDraft}
-                isEditing={
-                  props.editingMessageId ===
-                  (item as MessageTimelineItem).message.id
-                }
-                isBusy={props.isSending}
-                onBranchMessage={props.onBranchMessage}
-                onCancelEdit={props.onCancelEdit}
-                onEditDraftChange={props.onEditDraftChange}
-                onRetry={props.onRetry}
-                settings={props.connectorSettings}
-                onStartEdit={props.onStartEdit}
-                onSubmitEdit={props.onSubmitEdit}
-              />
-            }
-          >
-            <TimelineToolRow
-              expanded={Boolean(
-                props.expandedInlineTools[
-                  (item as ToolTimelineItem).tool.toolCallId
-                ],
-              )}
-              tool={(item as ToolTimelineItem).tool}
-              onApproveTool={props.onApproveTool}
+        {(item) => {
+          // Per-row memo: it re-runs on every messages/tools change but, thanks to
+          // createMemo's `===` dedup, only *notifies* (and so only re-renders the
+          // markdown) when this row's own message/tool object actually changes.
+          // Without it, every row would re-parse on each streaming delta because
+          // they all read the shared by-id map.
+          const message = createMemo(() => messagesById()[item.messageId]);
+          return (
+            <MessageRow
+              message={message()}
+              transport={props.runTransports[item.messageId]}
+              expandedInlineTools={props.expandedInlineTools}
+              editingDraft={props.editingDraft}
+              isEditing={props.editingMessageId === item.messageId}
+              isBusy={props.isSending}
+              parts={props.messagePartsByMessageId[item.messageId] ?? []}
+              onBranchMessage={props.onBranchMessage}
+              onCancelEdit={props.onCancelEdit}
               onCancelTool={props.onCancelTool}
+              onContinue={props.onContinue}
               onDenyTool={props.onDenyTool}
-              onToggleTool={props.onToggleInlineTool}
+              onEditDraftChange={props.onEditDraftChange}
+              onRetry={props.onRetry}
+              settings={props.connectorSettings}
+              onStartEdit={props.onStartEdit}
+              onSubmitEdit={props.onSubmitEdit}
+              onApproveTool={props.onApproveTool}
+              onToggleInlineTool={props.onToggleInlineTool}
+              tools={props.toolExecutionsByMessageId[item.messageId] ?? []}
+              toolsById={toolsById()}
             />
-          </Show>
-        )}
+          );
+        }}
       </VirtualList>
 
       <Show when={props.error}>
@@ -909,6 +1378,7 @@ function ConversationPane(props: {
       <Composer
         activeRunId={props.activeRunId}
         draft={props.draft}
+        hasProject={Boolean(props.activeProject)}
         isSending={props.isSending}
         onCancelRun={props.onCancelRun}
         onDraftChange={props.onDraftChange}
@@ -918,7 +1388,11 @@ function ConversationPane(props: {
   );
 }
 
-function ConversationState(props: { error: string; isLoading: boolean }) {
+function ConversationState(props: {
+  error: string;
+  hasProject: boolean;
+  isLoading: boolean;
+}) {
   if (props.error) {
     return (
       <div class="conversation-state conversation-state--error">
@@ -937,6 +1411,16 @@ function ConversationState(props: { error: string; isLoading: boolean }) {
     );
   }
 
+  if (!props.hasProject) {
+    return (
+      <div class="conversation-state">
+        <Folder size={22} />
+        <strong>Open a project</strong>
+        <span>No project selected.</span>
+      </div>
+    );
+  }
+
   return (
     <div class="conversation-state">
       <BrandMark compact />
@@ -950,59 +1434,410 @@ function ModelSelector(props: {
   onSelectModel: (providerId: string, modelId: string) => void;
   settings?: ConnectorSettingsSnapshot;
 }) {
-  const models = () =>
-    props.settings?.providers.flatMap((provider) => provider.models) ?? [];
-  const isRefreshing = () =>
-    props.settings?.providers.some(
-      (provider) =>
-        provider.refreshStatus === "pending" ||
-        provider.refreshStatus === "refreshing",
-    ) ?? true;
-  const hasConnectorError = () =>
-    props.settings?.providers.some(
-      (provider) => provider.modelError && provider.models.length === 0,
-    ) ?? false;
+  const activeProvider = () => selectedConnectorProvider(props.settings);
+  const models = () => activeProvider()?.models ?? [];
+  const isRefreshing = () => {
+    const provider = activeProvider();
+    const providers = props.settings?.providers;
+
+    if (!provider) {
+      return providers?.some(
+        (item) =>
+          item.refreshStatus === "pending" ||
+          item.refreshStatus === "refreshing",
+      ) ?? true;
+    }
+
+    return (
+      provider.refreshStatus === "pending" ||
+      provider.refreshStatus === "refreshing"
+    );
+  };
+  const hasConnectorError = () => {
+    const provider = activeProvider();
+    if (provider) {
+      return Boolean(provider.modelError && provider.models.length === 0);
+    }
+
+    return (
+      props.settings?.providers.some(
+        (item) => item.modelError && item.models.length === 0,
+      ) ?? false
+    );
+  };
   const selectedValue = () => {
     const selected = props.settings?.selectedModel;
     return selected
       ? modelOptionValue(selected.providerId, selected.modelId)
       : "";
   };
+  const placeholder = () =>
+    isRefreshing()
+      ? "Loading models..."
+      : hasConnectorError()
+        ? "Connector unavailable"
+        : activeProvider()
+          ? "No models for provider"
+          : "No models connected";
+  const options = createMemo<SearchSelectOption[]>(() =>
+    models().map((model) => ({
+      detail: model.id === model.label ? model.providerLabel : model.id,
+      label: model.label,
+      searchText: `${model.providerLabel} ${model.label} ${model.id}`,
+      value: modelOptionValue(model.providerId, model.id),
+    })),
+  );
 
   return (
-    <select
-      class="model-select"
-      aria-label="Active model"
+    <SearchSelect
+      ariaLabel="Active model"
+      class="model-search-select"
+      emptyLabel={placeholder()}
+      options={options()}
+      placeholder={placeholder()}
       value={selectedValue()}
-      onChange={(event) => {
-        const [providerId, modelId] = parseModelOptionValue(
-          event.currentTarget.value,
-        );
+      onSelect={(value) => {
+        const [providerId, modelId] = parseModelOptionValue(value);
         if (providerId && modelId) {
           props.onSelectModel(providerId, modelId);
         }
       }}
-    >
-      <Show
-        when={models().length > 0}
-        fallback={
-          <option value="">
-            {isRefreshing()
-              ? "Loading models..."
-              : hasConnectorError()
-                ? "Connector unavailable"
-                : "No models connected"}
-          </option>
-        }
-      >
-        {models().map((model) => (
-          <option value={modelOptionValue(model.providerId, model.id)}>
-            {model.providerLabel} / {model.label}
-          </option>
-        ))}
-      </Show>
-    </select>
+    />
   );
+}
+
+function ProviderStatusDot(props: { provider?: ConnectorProviderSummary }) {
+  const status = () => providerStatusSummary(props.provider);
+
+  return (
+    <span
+      class={`provider-status-dot provider-status-dot--${status().tone}`}
+      title={status().tooltip}
+      aria-label={status().label}
+    />
+  );
+}
+
+function ProviderSelector(props: {
+  onSelectModel: (providerId: string, modelId: string) => void;
+  settings?: ConnectorSettingsSnapshot;
+}) {
+  const providers = () => props.settings?.providers ?? [];
+  const selectedProviderId = () => props.settings?.selectedModel.providerId ?? "";
+  const activeProvider = () => selectedConnectorProvider(props.settings);
+  const status = () => providerStatusSummary(activeProvider());
+  const options = createMemo<SearchSelectOption[]>(() =>
+    providers().map((provider) => {
+      const providerStatus = providerStatusSummary(provider);
+      const modelId = selectableProviderModelId(provider);
+      const modelCount = provider.models.length;
+
+      return {
+        detail: modelId
+          ? `${modelCount} ${modelCount === 1 ? "model" : "models"}`
+          : providerStatus.tooltip,
+        disabled: !modelId,
+        label: provider.label,
+        searchText: [
+          provider.label,
+          providerStatus.label,
+          providerStatus.tooltip,
+          ...provider.models.map((model) => `${model.label} ${model.id}`),
+        ].join(" "),
+        status: {
+          label: providerStatusBadgeLabel(providerStatus),
+          tone: providerStatus.tone,
+        },
+        title: providerStatus.tooltip,
+        value: provider.id,
+      };
+    }),
+  );
+
+  return (
+    <SearchSelect
+      ariaLabel="Active provider"
+      class="provider-search-select"
+      emptyLabel="No providers"
+      options={options()}
+      placeholder="No provider"
+      title={status().tooltip}
+      value={selectedProviderId()}
+      onSelect={(providerId) => {
+        const provider = providers().find((item) => item.id === providerId);
+        const modelId = provider ? selectableProviderModelId(provider) : undefined;
+        if (provider && modelId) {
+          props.onSelectModel(provider.id, modelId);
+        }
+      }}
+    />
+  );
+}
+
+interface SearchSelectOption {
+  detail?: string;
+  disabled?: boolean;
+  label: string;
+  searchText?: string;
+  status?: {
+    label: string;
+    tone: ProviderStatusTone;
+  };
+  title?: string;
+  value: string;
+}
+
+function SearchSelect(props: {
+  ariaLabel: string;
+  class?: string;
+  emptyLabel: string;
+  options: SearchSelectOption[];
+  placeholder: string;
+  title?: string;
+  value?: string;
+  onSelect: (value: string) => void;
+}) {
+  const [isOpen, setIsOpen] = createSignal(false);
+  const [query, setQuery] = createSignal("");
+  const [activeIndex, setActiveIndex] = createSignal(-1);
+  let rootRef: HTMLDivElement | undefined;
+  let inputRef: HTMLInputElement | undefined;
+
+  const selectedOption = () =>
+    props.options.find((option) => option.value === props.value);
+  const emptyLabel = () =>
+    query().trim().length > 0 ? "No matches" : props.emptyLabel;
+  const filteredOptions = createMemo(() => {
+    const normalizedQuery = normalizeSearchQuery(query());
+    if (!normalizedQuery) {
+      return props.options;
+    }
+
+    return props.options.filter((option) =>
+      normalizeSearchQuery(
+        [option.label, option.detail, option.searchText, option.status?.label]
+          .filter(Boolean)
+          .join(" "),
+      ).includes(normalizedQuery),
+    );
+  });
+
+  createEffect(() => {
+    if (!isOpen()) {
+      return;
+    }
+
+    const options = filteredOptions();
+    const current = activeIndex();
+    if (current >= 0 && current < options.length && !options[current]?.disabled) {
+      return;
+    }
+
+    setActiveIndex(firstSelectableOptionIndex(options));
+  });
+
+  onMount(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!isOpen() || !rootRef) {
+        return;
+      }
+
+      if (event.target instanceof Node && !rootRef.contains(event.target)) {
+        closeDropdown();
+      }
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+    });
+  });
+
+  const openDropdown = () => {
+    setIsOpen(true);
+    setQuery("");
+    setActiveIndex(firstSelectableOptionIndex(filteredOptions()));
+    window.setTimeout(() => inputRef?.focus(), 0);
+  };
+  const closeDropdown = () => {
+    setIsOpen(false);
+    setQuery("");
+    setActiveIndex(-1);
+  };
+  const toggleDropdown = () => {
+    if (isOpen()) {
+      closeDropdown();
+    } else {
+      openDropdown();
+    }
+  };
+  const selectOption = (option: SearchSelectOption) => {
+    if (option.disabled) {
+      return;
+    }
+
+    props.onSelect(option.value);
+    closeDropdown();
+  };
+  const moveActiveOption = (delta: number) => {
+    const options = filteredOptions();
+    if (options.length === 0) {
+      setActiveIndex(-1);
+      return;
+    }
+
+    let nextIndex = activeIndex();
+    for (let attempts = 0; attempts < options.length; attempts += 1) {
+      nextIndex = (nextIndex + delta + options.length) % options.length;
+      if (!options[nextIndex]?.disabled) {
+        setActiveIndex(nextIndex);
+        return;
+      }
+    }
+
+    setActiveIndex(-1);
+  };
+  const selectActiveOption = () => {
+    const option = filteredOptions()[activeIndex()];
+    if (option) {
+      selectOption(option);
+    }
+  };
+  const handleTriggerKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      openDropdown();
+    }
+  };
+  const handleSearchKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      moveActiveOption(1);
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      moveActiveOption(-1);
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      selectActiveOption();
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeDropdown();
+    }
+  };
+
+  return (
+    <div class={`search-select ${props.class ?? ""}`} ref={rootRef}>
+      <button
+        class="search-select__trigger"
+        type="button"
+        aria-expanded={isOpen()}
+        aria-haspopup="listbox"
+        aria-label={props.ariaLabel}
+        title={props.title ?? selectedOption()?.label ?? props.placeholder}
+        onClick={toggleDropdown}
+        onKeyDown={handleTriggerKeyDown}
+      >
+        <span class="search-select__value">
+          {selectedOption()?.label ?? props.placeholder}
+        </span>
+        <ChevronDown
+          classList={{
+            "search-select__chevron": true,
+            "search-select__chevron--open": isOpen(),
+          }}
+          size={14}
+        />
+      </button>
+
+      <Show when={isOpen()}>
+        <div class="search-select__popover">
+          <label class="search-select__search">
+            <Search size={13} />
+            <input
+              ref={inputRef}
+              aria-label={`Search ${props.ariaLabel.toLowerCase()}`}
+              autocomplete="off"
+              spellcheck={false}
+              placeholder="Search..."
+              value={query()}
+              onInput={(event) => setQuery(event.currentTarget.value)}
+              onKeyDown={handleSearchKeyDown}
+            />
+          </label>
+
+          <div class="search-select__list" role="listbox">
+            <For
+              each={filteredOptions()}
+              fallback={<div class="search-select__empty">{emptyLabel()}</div>}
+            >
+              {(option, index) => (
+                <button
+                  classList={{
+                    "search-select__option": true,
+                    "search-select__option--active": index() === activeIndex(),
+                    "search-select__option--selected": option.value === props.value,
+                  }}
+                  type="button"
+                  role="option"
+                  aria-selected={option.value === props.value}
+                  disabled={option.disabled}
+                  title={option.title}
+                  onMouseEnter={() => {
+                    if (!option.disabled) {
+                      setActiveIndex(index());
+                    }
+                  }}
+                  onClick={() => selectOption(option)}
+                >
+                  <span class="search-select__option-text">
+                    <span class="search-select__option-label">{option.label}</span>
+                    <Show when={option.detail}>
+                      <span class="search-select__option-detail">
+                        {option.detail}
+                      </span>
+                    </Show>
+                  </span>
+                  <Show when={option.status}>
+                    <span
+                      class={`search-select__option-status search-select__option-status--${option.status!.tone}`}
+                    >
+                      {option.status!.label}
+                    </span>
+                  </Show>
+                  <Show when={option.value === props.value}>
+                    <Check class="search-select__check" size={14} />
+                  </Show>
+                </button>
+              )}
+            </For>
+          </div>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+function firstSelectableOptionIndex(options: SearchSelectOption[]) {
+  return options.findIndex((option) => !option.disabled);
+}
+
+function normalizeSearchQuery(value: string) {
+  return value.trim().toLowerCase();
+}
+
+function providerStatusBadgeLabel(status: ProviderStatusSummary) {
+  const labels: Record<ProviderStatusTone, string> = {
+    error: "Error",
+    idle: "Setup",
+    loading: "Loading",
+    ready: "Ready",
+    warmup: "Warmup",
+  };
+
+  return labels[status.tone];
 }
 
 function modelOptionValue(providerId: string, modelId: string) {
@@ -1020,6 +1855,142 @@ function parseModelOptionValue(value: string): [string, string] {
   }
 }
 
+type ProviderStatusTone = "ready" | "warmup" | "loading" | "error" | "idle";
+
+interface ProviderStatusSummary {
+  label: string;
+  tone: ProviderStatusTone;
+  tooltip: string;
+}
+
+function selectedConnectorProvider(settings?: ConnectorSettingsSnapshot) {
+  const providerId = settings?.selectedModel.providerId;
+  if (!providerId) {
+    return undefined;
+  }
+
+  return settings?.providers.find((provider) => provider.id === providerId);
+}
+
+function selectableProviderModelId(provider: ConnectorProviderSummary) {
+  if (
+    provider.selectedModelId &&
+    provider.models.some((model) => model.id === provider.selectedModelId)
+  ) {
+    return provider.selectedModelId;
+  }
+
+  return provider.models[0]?.id;
+}
+
+function providerStatusSummary(
+  provider: ConnectorProviderSummary | undefined,
+): ProviderStatusSummary {
+  if (!provider) {
+    return {
+      label: "No provider",
+      tone: "idle",
+      tooltip: "No model provider is selected.",
+    };
+  }
+
+  const name = provider.label;
+  if (provider.refreshStatus === "failed") {
+    return {
+      label: "Provider failed",
+      tone: "error",
+      tooltip: provider.modelError
+        ? `${name}: ${provider.modelError}`
+        : `${name}: provider refresh failed.`,
+    };
+  }
+
+  if (provider.refreshStatus === "pending") {
+    return {
+      label: "Provider pending",
+      tone: "loading",
+      tooltip: `${name}: provider catalog has not loaded yet.`,
+    };
+  }
+
+  if (provider.refreshStatus === "refreshing") {
+    return {
+      label: "Provider loading",
+      tone: "loading",
+      tooltip: `${name}: loading provider catalog and settings.`,
+    };
+  }
+
+  if (requiresInteractiveAuth(provider)) {
+    return {
+      label: "Provider needs auth",
+      tone: "warmup",
+      tooltip: `${name}: authorization is required before chat.`,
+    };
+  }
+
+  const missingSettings = missingRequiredAdapterSettings(provider);
+  if (missingSettings.length > 0) {
+    return {
+      label: "Provider needs settings",
+      tone: "warmup",
+      tooltip: `${name}: required settings missing (${missingSettings.join(", ")}).`,
+    };
+  }
+
+  if (provider.models.length === 0) {
+    return {
+      label: "Provider needs model",
+      tone: "warmup",
+      tooltip: `${name}: no chat model is available yet.`,
+    };
+  }
+
+  if (!provider.runtimeReady) {
+    return {
+      label: "Provider needs warmup",
+      tone: "warmup",
+      tooltip: `${name}: catalog is ready, adapter will warm up on the next request.`,
+    };
+  }
+
+  return {
+    label: "Provider ready",
+    tone: "ready",
+    tooltip: `${name}: adapter is loaded and ready.`,
+  };
+}
+
+function requiresInteractiveAuth(provider: ConnectorProviderSummary) {
+  return (
+    (provider.authKind === "oauth_internal" ||
+      provider.authKind === "external_process") &&
+    !provider.authenticated
+  );
+}
+
+function missingRequiredAdapterSettings(provider: ConnectorProviderSummary) {
+  const settings = provider.adapterSettings;
+  if (!settings) {
+    return [];
+  }
+
+  return settings.fields
+    .filter((field) => field.required)
+    .filter((field) => {
+      if (field.kind === "secret") {
+        return !settings.secrets[field.key]?.hasValue;
+      }
+
+      if (field.kind === "bool") {
+        return false;
+      }
+
+      return !settings.values[field.key]?.trim();
+    })
+    .map((field) => field.label);
+}
+
 function InspectorPane(props: {
   activeChat: ChatThreadSummary | null;
   messageCount: number;
@@ -1033,7 +2004,12 @@ function InspectorPane(props: {
 
   return (
     <aside class="inspector-pane" aria-label="Run inspector">
-      <div class="inspector-tabs" role="tablist" aria-label="Inspector tabs">
+      <div
+        class="inspector-tabs"
+        role="tablist"
+        aria-label="Inspector tabs"
+        onMouseDown={startWindowDrag}
+      >
         <button class="inspector-tab inspector-tab--active" type="button">
           Inspector
         </button>
@@ -1085,14 +2061,16 @@ function InspectorPane(props: {
             fallback={<div class="panel-empty">Tool calls will appear here.</div>}
           >
             <div class="tool-call-list">
-              {props.toolExecutions.map((tool) => (
-                <ToolCallRow
-                  tool={tool}
-                  onApprove={() => props.onApproveTool(tool.toolCallId)}
-                  onCancel={() => props.onCancelTool(tool.toolCallId)}
-                  onDeny={() => props.onDenyTool(tool.toolCallId)}
-                />
-              ))}
+              <For each={props.toolExecutions}>
+                {(tool) => (
+                  <ToolCallRow
+                    tool={tool}
+                    onApprove={() => props.onApproveTool(tool.toolCallId)}
+                    onCancel={() => props.onCancelTool(tool.toolCallId)}
+                    onDeny={() => props.onDenyTool(tool.toolCallId)}
+                  />
+                )}
+              </For>
             </div>
           </Show>
         </InspectorSection>
@@ -1161,19 +2139,118 @@ function ToolCallRow(props: {
   );
 }
 
+function InlineToolCall(props: {
+  expanded: boolean;
+  tool: ToolExecutionView;
+  onApprove: () => void;
+  onCancel: () => void;
+  onDeny: () => void;
+  onToggle: () => void;
+}) {
+  const command = () => formatToolCommand(props.tool.command);
+  const output = () => formatToolOutput(props.tool);
+  const outputLineCount = () => countTextLines(output());
+  const isOutputScrollable = () =>
+    outputLineCount() > TOOL_OUTPUT_MAX_VISIBLE_LINES;
+  const canApprove = () => props.tool.kind === "permission_requested";
+  const canCancel = () =>
+    !canApprove() && !isTerminalToolKind(props.tool.kind);
+
+  return (
+    <div class="inline-tool-call">
+      <button
+        class="inline-tool-call__summary"
+        type="button"
+        aria-expanded={props.expanded}
+        onClick={props.onToggle}
+      >
+        <ChevronDown
+          classList={{
+            "inline-tool-call__chevron": true,
+            "inline-tool-call__chevron--open": props.expanded,
+          }}
+          size={14}
+        />
+        <Terminal size={15} />
+        <span class="inline-tool-call__title" title={command()}>
+          {formatToolHeadline(props.tool.command)}
+        </span>
+        <span class={`tool-status tool-status--${toolTone(props.tool.kind)}`}>
+          {toolStatusLabel(props.tool.kind)}
+        </span>
+      </button>
+
+      <Show when={props.expanded}>
+        <div class="inline-tool-call__body">
+          <span class="inline-tool-call__label">
+            {toolCommandLabel(props.tool.command)}
+          </span>
+          <pre class="inline-tool-call__command">{command()}</pre>
+
+          <Show when={props.tool.message}>
+            <p class="inline-tool-call__message">{props.tool.message}</p>
+          </Show>
+
+          <Show when={shouldShowInlineToolOutput(props.tool, output())}>
+            <pre
+              classList={{
+                "inline-tool-call__output": true,
+                "inline-tool-call__output--scrollable": isOutputScrollable(),
+              }}
+              style={`--tool-output-lines: ${TOOL_OUTPUT_MAX_VISIBLE_LINES}`}
+            >
+              {output()}
+            </pre>
+          </Show>
+
+          <Show when={canApprove() || canCancel()}>
+            <div class="inline-tool-call__actions">
+              <Show when={canApprove()}>
+                <button type="button" onClick={props.onApprove}>
+                  <Check size={14} />
+                  Approve
+                </button>
+                <button type="button" onClick={props.onDeny}>
+                  <X size={14} />
+                  Deny
+                </button>
+              </Show>
+              <Show when={canCancel()}>
+                <button type="button" onClick={props.onCancel}>
+                  <Square size={13} />
+                  Cancel
+                </button>
+              </Show>
+            </div>
+          </Show>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
 function MessageRow(props: {
   message: ChatMessage;
   transport?: string;
+  expandedInlineTools: Record<string, boolean>;
   editingDraft: string;
   isEditing: boolean;
   isBusy?: boolean;
+  parts: MessagePartView[];
+  tools: ToolExecutionView[];
+  toolsById: Record<string, ToolExecutionView>;
+  onApproveTool: (toolCallId: string) => void;
   onBranchMessage: (message: ChatMessage) => void;
   onCancelEdit: () => void;
+  onCancelTool: (toolCallId: string) => void;
+  onContinue?: () => void;
+  onDenyTool: (toolCallId: string) => void;
   onEditDraftChange: (value: string) => void;
   onRetry?: () => void;
   settings?: ConnectorSettingsSnapshot;
   onStartEdit: (message: ChatMessage) => void;
   onSubmitEdit: (messageId: string) => void;
+  onToggleInlineTool: (toolCallId: string) => void;
 }) {
   const message = () => props.message;
   const isUser = () => message().role === "user";
@@ -1188,111 +2265,147 @@ function MessageRow(props: {
       : message().status === "sending"
         ? thinkingLabel(props.transport)
         : "No content.");
+  const assistantParts = createMemo(() =>
+    buildRenderableMessageParts(
+      message(),
+      props.parts,
+      props.tools,
+      props.toolsById,
+      props.transport,
+    ),
+  );
 
   // Messenger layout: user on the right in a colored bubble, agent on the left
-  // with an avatar. A failed run is not an agent message — it renders as a
-  // dedicated red error card (human summary + raw details + retry) instead.
-  // Both render Markdown (GFM) via solid-markdown (component output, not
-  // innerHTML, so it is XSS-safe). Kept scroll-cheap.
+  // with an avatar. A failed run keeps the partial assistant response visible
+  // and appends the error controls underneath it.
   return (
-    <Show
-      when={isFailed()}
-      fallback={
-        <article
-          classList={{
-            "message-row": true,
-            "message-row--user": isUser(),
-            "message-row--assistant": !isUser(),
-          }}
-        >
-          <Show when={!isUser()}>
-            <Avatar role="assistant" iconUrl={attribution().icon} />
-          </Show>
-          <div class="message-row__content">
-            <Show when={!isUser()}>
-              <div class="message-meta">
-                <strong>{attribution().name}</strong>
-                <span>{formatMessageTime(message().createdAt)}</span>
-              </div>
-            </Show>
-            <Show
-              when={props.isEditing}
-              fallback={
-                <>
-                  <div class="message-md">
-                    <SolidMarkdown
-                      renderingStrategy="reconcile"
-                      remarkPlugins={[remarkGfm]}
-                      children={body()}
-                    />
-                  </div>
-                  <MessageActions
-                    disabled={Boolean(props.isBusy)}
-                    isUser={isUser()}
-                    message={message()}
-                    onBranch={props.onBranchMessage}
-                    onEdit={props.onStartEdit}
-                  />
-                </>
-              }
-            >
-              <MessageEditor
-                disabled={Boolean(props.isBusy)}
-                messageId={message().id}
-                value={props.editingDraft}
-                onCancel={props.onCancelEdit}
-                onChange={props.onEditDraftChange}
-                onSubmit={props.onSubmitEdit}
-              />
-            </Show>
-          </div>
-        </article>
-      }
+    <article
+      classList={{
+        "message-row": true,
+        "message-row--user": isUser(),
+        "message-row--assistant": !isUser(),
+      }}
     >
-      <article class="message-row message-row--error">
-        <div class="message-row__content message-row__content--error">
-          <ErrorCard
-            error={message().content}
+      <Show when={!isUser()}>
+        <Avatar role="assistant" iconUrl={attribution().icon} />
+      </Show>
+      <div class="message-row__content">
+        <Show when={!isUser()}>
+          <div class="message-meta">
+            <strong>{attribution().name}</strong>
+            <span>{formatMessageTime(message().createdAt)}</span>
+          </div>
+        </Show>
+        <Show
+          when={props.isEditing}
+          fallback={
+            <>
+              <Show
+                when={!isUser()}
+                fallback={<MessageMarkdown content={body()} />}
+              >
+                <MessageParts
+                  expandedInlineTools={props.expandedInlineTools}
+                  parts={assistantParts()}
+                  onApproveTool={props.onApproveTool}
+                  onCancelTool={props.onCancelTool}
+                  onDenyTool={props.onDenyTool}
+                  onToggleTool={props.onToggleInlineTool}
+                />
+              </Show>
+            </>
+          }
+        >
+          <MessageEditor
             disabled={Boolean(props.isBusy)}
+            messageId={message().id}
+            value={props.editingDraft}
+            onCancel={props.onCancelEdit}
+            onChange={props.onEditDraftChange}
+            onSubmit={props.onSubmitEdit}
+          />
+        </Show>
+        <Show when={isFailed()}>
+          <ErrorCard
+            error={message().error ?? "The run failed before Core recorded an error."}
+            disabled={Boolean(props.isBusy)}
+            onContinue={props.onContinue}
             onRetry={props.onRetry}
           />
-        </div>
-      </article>
-    </Show>
+        </Show>
+      </div>
+    </article>
   );
 }
 
-function MessageActions(props: {
-  disabled: boolean;
-  isUser: boolean;
-  message: ChatMessage;
-  onBranch: (message: ChatMessage) => void;
-  onEdit: (message: ChatMessage) => void;
+function MessageParts(props: {
+  expandedInlineTools: Record<string, boolean>;
+  parts: RenderableMessagePart[];
+  onApproveTool: (toolCallId: string) => void;
+  onCancelTool: (toolCallId: string) => void;
+  onDenyTool: (toolCallId: string) => void;
+  onToggleTool: (toolCallId: string) => void;
 }) {
   return (
-    <div class="message-actions">
-      <Show when={props.isUser}>
-        <button
-          class="message-action-button"
-          type="button"
-          title="Edit message"
-          disabled={props.disabled || props.message.status !== "complete"}
-          onClick={() => props.onEdit(props.message)}
-        >
-          <Pencil size={14} />
-        </button>
-      </Show>
-      <Show when={!props.isUser}>
-        <button
-          class="message-action-button"
-          type="button"
-          title="Branch from this response"
-          disabled={props.disabled || props.message.status === "sending"}
-          onClick={() => props.onBranch(props.message)}
-        >
-          <GitBranch size={14} />
-        </button>
-      </Show>
+    <div class="message-parts">
+      <For each={props.parts}>
+        {(part) => (
+          <Show
+            when={part.kind === "tool"}
+            fallback={
+              <div class="message-part message-part--text">
+                <MessageMarkdown content={part.text ?? ""} />
+              </div>
+            }
+          >
+            <div class="message-part message-part--tool">
+              <Show
+                when={part.tool}
+                fallback={
+                  <div class="inline-tool-call inline-tool-call--pending">
+                    <div class="inline-tool-call__summary">
+                      <ChevronDown
+                        class="inline-tool-call__chevron"
+                        size={14}
+                      />
+                      <Terminal size={15} />
+                      <span class="inline-tool-call__title">Tool call</span>
+                      <span class="tool-status tool-status--pending">
+                        Queued
+                      </span>
+                    </div>
+                  </div>
+                }
+              >
+                {(tool) => (
+                  <InlineToolCall
+                    expanded={Boolean(
+                      props.expandedInlineTools[tool().toolCallId],
+                    )}
+                    tool={tool()}
+                    onApprove={() => props.onApproveTool(tool().toolCallId)}
+                    onCancel={() => props.onCancelTool(tool().toolCallId)}
+                    onDeny={() => props.onDenyTool(tool().toolCallId)}
+                    onToggle={() => props.onToggleTool(tool().toolCallId)}
+                  />
+                )}
+              </Show>
+            </div>
+          </Show>
+        )}
+      </For>
+    </div>
+  );
+}
+
+function MessageMarkdown(props: { content: string }) {
+  return (
+    <div class="message-md">
+      <SolidMarkdown
+        renderingStrategy="reconcile"
+        remarkPlugins={[remarkGfm]}
+        children={props.content}
+      />
     </div>
   );
 }
@@ -1361,113 +2474,10 @@ function MessageEditor(props: {
   );
 }
 
-function TimelineToolRow(props: {
-  expanded: boolean;
-  tool: ToolExecutionView;
-  onApproveTool: (toolCallId: string) => void;
-  onCancelTool: (toolCallId: string) => void;
-  onDenyTool: (toolCallId: string) => void;
-  onToggleTool: (toolCallId: string) => void;
-}) {
-  return (
-    <article class="message-row message-row--tool">
-      <div class="message-row__avatar-spacer" aria-hidden="true" />
-      <div class="message-row__content message-row__content--tool">
-        <InlineToolCall
-          expanded={props.expanded}
-          tool={props.tool}
-          onApprove={() => props.onApproveTool(props.tool.toolCallId)}
-          onCancel={() => props.onCancelTool(props.tool.toolCallId)}
-          onDeny={() => props.onDenyTool(props.tool.toolCallId)}
-          onToggle={() => props.onToggleTool(props.tool.toolCallId)}
-        />
-      </div>
-    </article>
-  );
-}
-
-function InlineToolCall(props: {
-  expanded: boolean;
-  tool: ToolExecutionView;
-  onApprove: () => void;
-  onCancel: () => void;
-  onDeny: () => void;
-  onToggle: () => void;
-}) {
-  const command = () => formatToolCommand(props.tool.command);
-  const output = () => formatToolOutput(props.tool);
-  const canApprove = () => props.tool.kind === "permission_requested";
-  const canCancel = () =>
-    !canApprove() && !isTerminalToolKind(props.tool.kind);
-
-  return (
-    <div
-      classList={{
-        "inline-tool-call": true,
-        "inline-tool-call--open": props.expanded,
-      }}
-    >
-      <button
-        class="inline-tool-call__summary"
-        type="button"
-        aria-expanded={props.expanded}
-        onClick={props.onToggle}
-      >
-        <ChevronDown
-          size={14}
-          classList={{
-            "inline-tool-call__chevron": true,
-            "inline-tool-call__chevron--open": props.expanded,
-          }}
-        />
-        <Terminal size={15} />
-        <span class="inline-tool-call__title" title={command()}>
-          {formatToolHeadline(props.tool.command)}
-        </span>
-        <span class={`tool-status tool-status--${toolTone(props.tool.kind)}`}>
-          {toolStatusLabel(props.tool.kind)}
-        </span>
-      </button>
-
-      <Show when={props.expanded}>
-        <div class="inline-tool-call__body">
-          <div class="inline-tool-call__label">{toolCommandLabel(props.tool.command)}</div>
-          <pre class="inline-tool-call__command">$ {command()}</pre>
-          <Show when={props.tool.message}>
-            <p class="inline-tool-call__message">{props.tool.message}</p>
-          </Show>
-          <Show when={output()}>
-            <pre class="inline-tool-call__output">{output()}</pre>
-          </Show>
-          <Show when={canApprove() || canCancel()}>
-            <div class="inline-tool-call__actions">
-              <Show when={canApprove()}>
-                <button type="button" onClick={props.onApprove}>
-                  <Check size={14} />
-                  Approve
-                </button>
-                <button type="button" onClick={props.onDeny}>
-                  <X size={14} />
-                  Deny
-                </button>
-              </Show>
-              <Show when={canCancel()}>
-                <button type="button" onClick={props.onCancel}>
-                  <Square size={12} />
-                  Cancel
-                </button>
-              </Show>
-            </div>
-          </Show>
-        </div>
-      </Show>
-    </div>
-  );
-}
-
 function ErrorCard(props: {
   error: string;
   disabled: boolean;
+  onContinue?: () => void;
   onRetry?: () => void;
 }) {
   return (
@@ -1478,6 +2488,17 @@ function ErrorCard(props: {
       </div>
       <p class="chat-error-card__summary">{humanizeError(props.error)}</p>
       <div class="chat-error-card__actions">
+        <Show when={props.onContinue}>
+          <button
+            class="chat-error-card__continue"
+            type="button"
+            disabled={props.disabled}
+            onClick={() => props.onContinue?.()}
+          >
+            <Play size={14} />
+            Continue
+          </button>
+        </Show>
         <Show when={props.onRetry}>
           <button
             class="chat-error-card__retry"
@@ -1504,12 +2525,14 @@ function ErrorCard(props: {
 function Composer(props: {
   activeRunId?: string;
   draft: string;
+  hasProject: boolean;
   isSending: boolean;
   onCancelRun: () => void;
   onDraftChange: (value: string) => void;
   onSend: () => void;
 }) {
-  const canSend = () => props.draft.trim().length > 0 && !props.isSending;
+  const canSend = () =>
+    props.hasProject && props.draft.trim().length > 0 && !props.isSending;
 
   return (
     <form
@@ -1521,8 +2544,9 @@ function Composer(props: {
     >
       <textarea
         rows={2}
-        placeholder="Ask Mothership anything..."
+        placeholder={props.hasProject ? "Ask Mothership anything..." : "Open a project..."}
         value={props.draft}
+        disabled={!props.hasProject}
         onInput={(event) => props.onDraftChange(event.currentTarget.value)}
         onKeyDown={(event) => {
           // Enter sends; Shift+Enter inserts a newline. (`isComposing` guards IME.)
@@ -1567,11 +2591,7 @@ function SectionHeader(props: { action?: JSX.Element; title: string }) {
   return (
     <div class="section-header">
       <span>{props.title}</span>
-      {props.action && (
-        <button class="icon-button icon-button--ghost" type="button">
-          {props.action}
-        </button>
-      )}
+      {props.action}
     </div>
   );
 }
@@ -1625,9 +2645,20 @@ function RecentIcon(props: { status: RecentStatus }) {
   return <Circle size={14} />;
 }
 
-function ProjectRow(props: { project: ProjectItem }) {
+function ProjectRow(props: {
+  onClick: () => void;
+  project: ProjectSummary;
+  selected: boolean;
+}) {
   return (
-    <button class="project-row" type="button">
+    <button
+      classList={{
+        "project-row": true,
+        "project-row--selected": props.selected,
+      }}
+      type="button"
+      onClick={props.onClick}
+    >
       <span class="project-icon">
         <Folder size={18} />
       </span>
@@ -1635,8 +2666,8 @@ function ProjectRow(props: { project: ProjectItem }) {
         <strong>{props.project.name}</strong>
         <small>{props.project.path}</small>
       </span>
-      <span class={`branch-dot branch-dot--${props.project.tone}`} />
-      <span>{props.project.branch}</span>
+      <span class="branch-dot branch-dot--green" />
+      <span>{props.project.chatCount}</span>
       <ChevronDown size={14} />
     </button>
   );
@@ -1731,6 +2762,134 @@ function appendMessageDelta(
   return changed ? next : current;
 }
 
+function messagePartsByMessageId(
+  parts: ChatMessagePart[],
+): Record<string, MessagePartView[]> {
+  const grouped: Record<string, MessagePartView[]> = {};
+
+  for (const part of parts) {
+    grouped[part.messageId] ??= [];
+    grouped[part.messageId].push(messagePartViewFromApi(part));
+  }
+
+  for (const messageParts of Object.values(grouped)) {
+    messageParts.sort(compareMessageParts);
+  }
+
+  return grouped;
+}
+
+function messagePartViewFromApi(part: ChatMessagePart): MessagePartView {
+  return {
+    id: `part:${part.id}`,
+    kind: part.kind,
+    messageId: part.messageId,
+    text: part.text ?? undefined,
+    toolCallId: part.toolCallId ?? undefined,
+    createdAt: timestampToMillis(part.createdAt),
+    sequence: part.id,
+  };
+}
+
+function compareMessageParts(left: MessagePartView, right: MessagePartView) {
+  if (left.sequence !== undefined && right.sequence !== undefined) {
+    return left.sequence - right.sequence;
+  }
+
+  if (left.createdAt !== right.createdAt) {
+    return left.createdAt - right.createdAt;
+  }
+
+  return left.id.localeCompare(right.id);
+}
+
+function buildRenderableMessageParts(
+  message: ChatMessage,
+  parts: MessagePartView[],
+  tools: ToolExecutionView[],
+  toolsById: Record<string, ToolExecutionView>,
+  transport?: string,
+): RenderableMessagePart[] {
+  const orderedParts = [...parts].sort(compareMessageParts);
+  const renderedTools = new Set<string>();
+  const renderedParts: RenderableMessagePart[] = [];
+
+  for (const part of orderedParts) {
+    if (part.kind === "text") {
+      if (part.text) {
+        renderedParts.push({
+          id: part.id,
+          kind: "text",
+          text: part.text,
+        });
+      }
+      continue;
+    }
+
+    if (!part.toolCallId) {
+      continue;
+    }
+
+    renderedTools.add(part.toolCallId);
+    renderedParts.push({
+      id: part.id,
+      kind: "tool",
+      tool: toolsById[part.toolCallId],
+      toolCallId: part.toolCallId,
+    });
+  }
+
+  if (orderedParts.length === 0) {
+    const fallback = fallbackMessageBody(message, transport);
+    if (fallback) {
+      renderedParts.push({
+        id: `text:${message.id}:fallback`,
+        kind: "text",
+        text: fallback,
+      });
+    }
+  }
+
+  for (const tool of tools) {
+    if (renderedTools.has(tool.toolCallId)) {
+      continue;
+    }
+
+    renderedParts.push({
+      id: `tool:${tool.toolCallId}`,
+      kind: "tool",
+      tool,
+      toolCallId: tool.toolCallId,
+    });
+  }
+
+  if (renderedParts.length === 0) {
+    const fallback = fallbackMessageBody(message, transport);
+    if (fallback) {
+      renderedParts.push({
+        id: `text:${message.id}:fallback`,
+        kind: "text",
+        text: fallback,
+      });
+    }
+  }
+
+  return renderedParts;
+}
+
+function fallbackMessageBody(message: ChatMessage, transport?: string) {
+  return (
+    message.content ||
+    (message.status === "cancelled"
+      ? "Response cancelled."
+      : message.status === "sending"
+        ? thinkingLabel(transport)
+        : message.status === "failed"
+          ? ""
+        : "No content.")
+  );
+}
+
 function attachMessageIdToToolExecutions(
   current: Record<string, ToolExecutionView>,
   runId: string,
@@ -1781,49 +2940,20 @@ function compareToolExecutions(
   return left.toolCallId.localeCompare(right.toolCallId);
 }
 
-function buildConversationTimeline(
-  messages: ChatMessage[],
-  toolExecutionsByMessageId: Record<string, ToolExecutionView[]>,
-): ConversationTimelineItem[] {
-  const items: ConversationTimelineItem[] = [];
-
-  for (const message of messages) {
-    const tools = toolExecutionsByMessageId[message.id] ?? [];
-    if (message.role === "assistant" && tools.length > 0) {
-      for (const tool of tools) {
-        items.push({
-          id: `tool:${tool.toolCallId}`,
-          kind: "tool",
-          messageId: message.id,
-          tool,
-        });
-      }
-    }
-
-    items.push({
-      id: `message:${message.id}`,
-      kind: "message",
-      message,
-    });
-  }
-
-  return items;
-}
-
-function estimateTimelineItemSize(
-  item: ConversationTimelineItem,
-  expandedTools: Record<string, boolean>,
-) {
-  if (item.kind === "tool") {
-    return expandedTools[item.tool.toolCallId] ? 340 : 56;
-  }
-
-  const message = item.message;
-  return Math.max(120, Math.min(520, 100 + message.content.length * 0.4));
+function buildConversationTimeline(messages: ChatMessage[]): ConversationTimelineItem[] {
+  return messages.map((message) => ({
+    id: `message:${message.id}`,
+    kind: "message",
+    messageId: message.id,
+  }));
 }
 
 function normalizeMessages(messages: ChatMessage[]) {
   return mergeMessages([], messages);
+}
+
+function limitChatMessages(messages: ChatMessage[]) {
+  return messages.slice(-CHAT_MESSAGE_PAGE_SIZE);
 }
 
 function compareMessages(left: ChatMessage, right: ChatMessage) {
@@ -2026,15 +3156,34 @@ function formatToolOutput(tool: ToolExecutionView) {
     return "";
   }
 
-  const chunks = [
-    (tool.result.stdoutPreview || tool.result.stdoutTail || "").trim(),
-    (tool.result.stderrPreview || tool.result.stderrTail || "").trim()
-      ? `[stderr]\n${(tool.result.stderrPreview || tool.result.stderrTail || "").trim()}`
-      : "",
-    tool.result.message?.trim() ?? "",
-  ].filter(Boolean);
+  const stdout = (tool.result.stdoutPreview || tool.result.stdoutTail || "").trim();
+  const stderr = (tool.result.stderrPreview || tool.result.stderrTail || "").trim();
+  const message = tool.result.message?.trim() ?? "";
 
-  return chunks.join("\n\n");
+  return [
+    stdout,
+    stderr ? `[stderr]\n${stderr}` : "",
+    message,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function countTextLines(text: string) {
+  const visibleText = text.replace(/(?:\r\n|\r|\n)+$/, "");
+  if (visibleText.length === 0) {
+    return 1;
+  }
+
+  return visibleText.split(/\r\n|\r|\n/).length;
+}
+
+function shouldShowInlineToolOutput(tool: ToolExecutionView, output: string) {
+  if (output.trim().length > 0) {
+    return true;
+  }
+
+  return tool.kind === "started" || tool.kind === "output";
 }
 
 function isTerminalToolKind(kind: ToolExecutionEventKind) {
@@ -2043,7 +3192,8 @@ function isTerminalToolKind(kind: ToolExecutionEventKind) {
     kind === "failed" ||
     kind === "cancelled" ||
     kind === "timed_out" ||
-    kind === "permission_denied"
+    kind === "permission_denied" ||
+    kind === "loop_blocked"
   );
 }
 
@@ -2059,6 +3209,7 @@ function toolStatusLabel(kind: ToolExecutionEventKind) {
     failed: "Failed",
     cancelled: "Cancelled",
     timed_out: "Timed out",
+    loop_blocked: "Blocked",
   };
   return labels[kind];
 }
@@ -2075,7 +3226,11 @@ function toolTone(kind: ToolExecutionEventKind) {
   ) {
     return "error";
   }
-  if (kind === "permission_requested" || kind === "waiting_for_resource") {
+  if (
+    kind === "permission_requested" ||
+    kind === "waiting_for_resource" ||
+    kind === "loop_blocked"
+  ) {
     return "pending";
   }
   return "running";
@@ -2087,27 +3242,16 @@ function isTauriRuntime() {
 
 type RecentStatus = "active" | "branch" | "clock";
 
-type ConversationTimelineItem = MessageTimelineItem | ToolTimelineItem;
+type ConversationTimelineItem = MessageTimelineItem;
 
+// Timeline items intentionally carry only ids — never the message/tool objects
+// themselves. That keeps an item's identity stable across content changes (a
+// streaming delta, a tool-output chunk), so the row stays mounted and updates in
+// place. Rows read the live message/tool by id from a reactive lookup.
 interface MessageTimelineItem {
   id: string;
   kind: "message";
-  message: ChatMessage;
-}
-
-interface ToolTimelineItem {
-  id: string;
-  kind: "tool";
   messageId: string;
-  tool: ToolExecutionView;
-}
-
-interface ProjectItem {
-  branch: string;
-  id: string;
-  name: string;
-  path: string;
-  tone: "blue" | "green" | "yellow";
 }
 
 interface ToolExecutionView {
@@ -2123,4 +3267,22 @@ interface ToolExecutionView {
   result?: ToolExecutionResult | null;
   createdAt: number;
   updatedAt: number;
+}
+
+interface MessagePartView {
+  id: string;
+  kind: "text" | "tool";
+  messageId: string;
+  text?: string;
+  toolCallId?: string;
+  createdAt: number;
+  sequence?: number;
+}
+
+interface RenderableMessagePart {
+  id: string;
+  kind: "text" | "tool";
+  text?: string;
+  tool?: ToolExecutionView;
+  toolCallId?: string;
 }

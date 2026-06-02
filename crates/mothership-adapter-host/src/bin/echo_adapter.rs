@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 
 use mothership_adapter_host::protocol::{
-    AuthKind, Model, ModelManagement, Outbound, Request, SettingsField, SettingsFieldKind,
-    PROTOCOL_VERSION,
+    AuthKind, AuthStatus, Model, ModelManagement, Outbound, Request, SettingsField,
+    SettingsFieldKind, PROTOCOL_VERSION,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -17,6 +17,7 @@ fn main() -> anyhow::Result<()> {
     let mut reader = stdin.lock();
     let mut stdout = std::io::stdout();
     let mut line = String::new();
+    let mut api_key_configured = false;
 
     loop {
         line.clear();
@@ -77,6 +78,10 @@ fn main() -> anyhow::Result<()> {
                 },
             )?,
             Request::SetSettings { id, values } => {
+                api_key_configured = values
+                    .get("api_key")
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
                 // Test hook for the reverse secret channel: if asked, push a
                 // secret back to the host *before* acking. The host consumes the
                 // `StoreSecret` transparently inside `recv`, so the ack still
@@ -97,6 +102,17 @@ fn main() -> anyhow::Result<()> {
                     id,
                     auth: AuthKind::ApiKey {
                         label: "API key".to_string(),
+                    },
+                },
+            )?,
+            Request::GetAuthStatus { id } => emit(
+                &mut stdout,
+                &Outbound::AuthStatus {
+                    id,
+                    status: if api_key_configured {
+                        AuthStatus::configured("API key is configured")
+                    } else {
+                        AuthStatus::missing("API key is not configured")
                     },
                 },
             )?,

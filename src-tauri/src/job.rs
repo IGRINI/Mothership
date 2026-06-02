@@ -20,8 +20,8 @@ mod imp {
 
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
@@ -60,8 +60,7 @@ mod imp {
         /// just means that process won't be auto-killed with the host.
         pub fn assign(&self, pid: u32) {
             unsafe {
-                if let Ok(process) =
-                    OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid)
+                if let Ok(process) = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid)
                 {
                     let _ = AssignProcessToJobObject(self.0, process);
                     let _ = CloseHandle(process);

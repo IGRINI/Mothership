@@ -27,6 +27,7 @@ import {
   saveAdapterSettings,
   setSelectedModel,
 } from "../../shared/api/mothership";
+import { startWindowDrag } from "../../shared/window-drag";
 
 export function Settings(props: { onBack: () => void }) {
   const [settings, setSettings] = createSignal<ConnectorSettingsSnapshot>();
@@ -167,7 +168,7 @@ export function Settings(props: { onBack: () => void }) {
 
   return (
     <main class="settings-shell">
-      <header class="settings-header" data-tauri-drag-region>
+      <header class="settings-header" onMouseDown={startWindowDrag}>
         <button class="settings-back" type="button" onClick={goBack}>
           <ChevronLeft size={17} />
           Back
@@ -278,6 +279,31 @@ function ConnectorCard(props: {
         return "";
     }
   };
+  const authStatusText = () => {
+    const status = provider().authStatus;
+    if (status.accountLabel) {
+      return status.expiresAt
+        ? `Signed in as ${status.accountLabel}.`
+        : `Signed in as ${status.accountLabel}.`;
+    }
+    if (status.detail) {
+      return status.detail;
+    }
+    switch (status.kind) {
+      case "not_required":
+        return "";
+      case "configured":
+        return "Credentials configured.";
+      case "authenticated":
+        return "Authorized.";
+      case "expired":
+        return "Credential expired.";
+      case "error":
+        return "Authorization status error.";
+      default:
+        return "";
+    }
+  };
 
   return (
     <article class="connector-card">
@@ -292,6 +318,9 @@ function ConnectorCard(props: {
         <div>
           <h3>{provider().label}</h3>
           <Show when={refreshStatusText()}>
+            {(text) => <span>{text()}</span>}
+          </Show>
+          <Show when={authStatusText()}>
             {(text) => <span>{text()}</span>}
           </Show>
         </div>

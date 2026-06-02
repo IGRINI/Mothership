@@ -94,6 +94,7 @@ pub enum ToolExecutionStatus {
     Cancelled,
     TimedOut,
     PermissionDenied,
+    LoopBlocked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -127,6 +128,7 @@ pub enum ToolExecutionEventKind {
     Failed,
     Cancelled,
     TimedOut,
+    LoopBlocked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use mothership_adapter_host::protocol::PromptBundle;
 use mothership_adapter_host::AdapterEntry;
 use mothership_core::auth::FileCredentialVault;
 use mothership_core::{
@@ -86,7 +87,8 @@ fn streams_chat_through_subprocess_adapter() {
             LlmChatCompletionRequest {
                 provider_id: "echo".to_string(),
                 model_id: "echo-1".to_string(),
-                system_prompt: "be brief".to_string(),
+                prompt: PromptBundle::default(),
+                tools: Vec::new(),
                 messages: vec![LlmChatMessage {
                     role: LlmChatRole::User,
                     content: "hello brave world".to_string(),
@@ -128,7 +130,8 @@ fn pushes_settings_before_streaming() {
             LlmChatCompletionRequest {
                 provider_id: "echo".to_string(),
                 model_id: "echo-1".to_string(),
-                system_prompt: String::new(),
+                prompt: PromptBundle::default(),
+                tools: Vec::new(),
                 messages: vec![LlmChatMessage {
                     role: LlmChatRole::User,
                     content: "ping pong".to_string(),

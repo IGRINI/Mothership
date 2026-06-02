@@ -216,7 +216,10 @@ mod tests {
             .save_adapter_settings("openrouter", &values)
             .expect("save");
 
-        assert_eq!(vault.load_adapter_settings("openrouter").expect("load"), values);
+        assert_eq!(
+            vault.load_adapter_settings("openrouter").expect("load"),
+            values
+        );
 
         let _ = fs::remove_dir_all(vault.root_dir());
     }
@@ -237,7 +240,10 @@ mod tests {
             .merge_adapter_settings("codex", BTreeMap::new())
             .expect("merge empty");
         assert_eq!(
-            vault.load_adapter_settings("codex").expect("load").get("credential"),
+            vault
+                .load_adapter_settings("codex")
+                .expect("load")
+                .get("credential"),
             Some(&"old-token".to_string())
         );
 
@@ -249,7 +255,10 @@ mod tests {
             )
             .expect("merge update");
         assert_eq!(
-            vault.load_adapter_settings("codex").expect("load").get("credential"),
+            vault
+                .load_adapter_settings("codex")
+                .expect("load")
+                .get("credential"),
             Some(&"new-token".to_string())
         );
 

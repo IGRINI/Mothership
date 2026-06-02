@@ -40,18 +40,10 @@ button {
   cursor: pointer;
 }
 
-*[data-tauri-drag-region] {
-  -webkit-app-region: drag;
-  app-region: drag;
-}
-
-button,
-input,
-textarea,
-.window-controls {
-  -webkit-app-region: no-drag;
-  app-region: no-drag;
-}
+/* Window dragging is driven from JS (startWindowDrag), NOT CSS app-region: on
+   Windows/WebView2 the `-webkit-app-region: drag` non-client regions force the
+   whole page into a single compositor layer, so scrolling repaints the entire
+   window. See src/shared/window-drag.ts. */
 
 .app-frame {
   position: relative;
@@ -290,9 +282,11 @@ textarea,
   display: grid;
   grid-template-columns: minmax(280px, 330px) minmax(380px, 1fr) minmax(280px, 350px);
   width: 100%;
+  max-width: 100%;
   height: 100%;
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
   background: #07101a;
   contain: layout paint style;
 }
@@ -366,6 +360,13 @@ textarea,
   box-shadow: 0 12px 34px rgb(7 95 255 / 24%);
 }
 
+.new-chat-button:disabled {
+  cursor: not-allowed;
+  background: #162231;
+  color: #738294;
+  box-shadow: none;
+}
+
 kbd,
 .shortcut-pill {
   border: 1px solid rgb(255 255 255 / 10%);
@@ -384,6 +385,8 @@ kbd,
 }
 
 .sidebar-section--projects {
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 8px;
   border-top: 1px solid #1c2a38;
   padding-top: 14px;
 }
@@ -417,6 +420,13 @@ kbd,
   border-color: #34506b;
   background: #142335;
   color: #eef5fb;
+}
+
+.icon-button:disabled {
+  cursor: not-allowed;
+  border-color: #1f2d3c;
+  background: #0c1621;
+  color: #536273;
 }
 
 .icon-button--ghost {
@@ -500,6 +510,34 @@ kbd,
   padding: 4px 0;
 }
 
+.project-open-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  border: 1px solid #27394b;
+  border-radius: 8px;
+  padding: 0 10px;
+  background: #0b1622;
+  color: #cbd8e6;
+  font-size: 12px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.project-open-button:hover:not(:disabled) {
+  border-color: #216ce3;
+  color: #f5f8fc;
+}
+
+.project-open-button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
 .project-row {
   display: grid;
   grid-template-columns: 36px minmax(0, 1fr) 8px auto 14px;
@@ -515,8 +553,13 @@ kbd,
 }
 
 .project-row:hover,
-.project-row:first-child {
+.project-row--selected {
   background: #101b27;
+}
+
+.project-row--selected {
+  outline: 1px solid #1b4f91;
+  outline-offset: -1px;
 }
 
 .project-icon {
@@ -555,14 +598,15 @@ kbd,
 
 .branch-dot,
 .artifact-dot,
-.agent-status-chip svg:nth-of-type(2),
+.provider-status-dot,
 .live-pill svg {
   border-radius: 999px;
   fill: currentColor;
 }
 
 .branch-dot,
-.artifact-dot {
+.artifact-dot,
+.provider-status-dot {
   width: 7px;
   height: 7px;
 }
@@ -679,18 +723,29 @@ kbd,
 .conversation-pane {
   display: grid;
   grid-template-rows: 56px minmax(0, 1fr) auto;
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
   background: #07101a;
 }
 
+.conversation-pane > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
 .conversation-header {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  z-index: 2;
+  width: 100%;
+  min-width: 0;
+  overflow: visible;
   gap: 18px;
   border-bottom: 1px solid #1b2a3a;
   padding: 0 20px;
-  -webkit-app-region: drag;
-  app-region: drag;
 }
 
 .conversation-header button,
@@ -703,6 +758,7 @@ kbd,
 .conversation-header__title {
   display: flex;
   align-items: center;
+  flex: 1 1 auto;
   min-width: 0;
   gap: 8px;
 }
@@ -729,6 +785,9 @@ kbd,
 
 .project-badge {
   flex: 0 0 auto;
+  min-width: 0;
+  max-width: 220px;
+  gap: 7px;
   border: 1px solid #27394b;
   border-radius: 7px;
   padding: 5px 10px;
@@ -738,45 +797,298 @@ kbd,
   font-weight: 800;
 }
 
+.project-badge span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .agent-status-chip {
-  flex: 0 0 auto;
+  position: relative;
+  flex: 0 1 auto;
   height: 34px;
-  gap: 8px;
+  min-width: 0;
+  max-width: min(420px, 100%);
+  gap: 6px;
   border: 1px solid #27394b;
   border-radius: 8px;
-  padding: 0 12px;
+  padding: 0 8px 0 10px;
   background: #0f1a26;
   color: #dce7f3;
   font-size: 13px;
   font-weight: 700;
 }
 
-.model-select {
-  max-width: 260px;
+.provider-status-dot {
+  flex: 0 0 auto;
+  box-shadow: 0 0 0 3px rgb(255 255 255 / 4%);
+}
+
+.provider-status-dot--ready {
+  background: #41d981;
+}
+
+.provider-status-dot--warmup {
+  background: #f0b84d;
+}
+
+.provider-status-dot--loading {
+  background: #58a6ff;
+}
+
+.provider-status-dot--error {
+  background: #ff6262;
+}
+
+.provider-status-dot--idle {
+  background: #66798d;
+}
+
+.search-select {
+  position: relative;
+  min-width: 0;
+  color: #dce7f3;
+}
+
+.model-search-select {
+  width: 132px;
+}
+
+.provider-search-select {
+  width: 128px;
+}
+
+.search-select__trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  height: 28px;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 0 7px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 750;
+  text-align: left;
+}
+
+.search-select__trigger:hover,
+.search-select__trigger:focus-visible,
+.search-select__trigger[aria-expanded="true"] {
+  border-color: #2c4055;
+  background: #142131;
+  color: #f5f8fc;
+}
+
+.search-select__trigger:focus-visible {
+  outline: 2px solid #2e7bff;
+  outline-offset: 1px;
+}
+
+.search-select__value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-select__chevron {
+  flex: 0 0 auto;
+  color: #9fb0c3;
+  transition: transform 140ms ease, color 140ms ease;
+}
+
+.search-select__chevron--open {
+  transform: rotate(180deg);
+  color: #dce7f3;
+}
+
+.search-select__popover {
+  position: absolute;
+  z-index: 50;
+  top: calc(100% + 8px);
+  left: 0;
+  width: min(360px, calc(100vw - 32px));
+  border: 1px solid #26384c;
+  border-radius: 8px;
+  padding: 8px;
+  background: #0b1520;
+  box-shadow: 0 18px 50px rgb(0 0 0 / 44%);
+}
+
+.model-search-select .search-select__popover {
+  right: 0;
+  left: auto;
+  width: min(320px, calc(100vw - 32px));
+}
+
+.provider-search-select .search-select__popover {
+  right: 0;
+  left: auto;
+  width: min(280px, calc(100vw - 32px));
+}
+
+.search-select__search {
+  display: flex;
+  align-items: center;
+  height: 34px;
+  gap: 8px;
+  border: 1px solid #233649;
+  border-radius: 7px;
+  padding: 0 9px;
+  background: #101d2b;
+  color: #8fa1b5;
+}
+
+.search-select__search:focus-within {
+  border-color: #2f6fd8;
+  box-shadow: 0 0 0 2px rgb(47 111 216 / 18%);
+  color: #c6d6e7;
+}
+
+.search-select__search input {
+  min-width: 0;
+  flex: 1;
   border: 0;
   outline: 0;
   background: transparent;
+  color: #edf5fd;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.search-select__search input::placeholder {
+  color: #6f8296;
+}
+
+.search-select__list {
+  display: grid;
+  max-height: 280px;
+  margin-top: 7px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.search-select__option {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+  border: 0;
+  border-radius: 7px;
+  padding: 7px 8px;
+  background: transparent;
   color: #dce7f3;
   font: inherit;
-  font-weight: 750;
+  text-align: left;
 }
 
-.model-select option {
-  background: #0f1a26;
-  color: #e9f1f8;
+.search-select__option:hover,
+.search-select__option--active {
+  background: #152435;
+  color: #f6faff;
 }
 
-.agent-status-chip svg:nth-of-type(2) {
-  color: #41d981;
+.search-select__option--selected {
+  background: #172a3f;
 }
 
-.message-list {
-  padding: 12px 0;
-  contain: layout paint style;
+.search-select__option:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.search-select__option-text {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.search-select__option-label,
+.search-select__option-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-select__option-label {
+  color: inherit;
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.search-select__option-detail {
+  color: #8ea0b4;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.search-select__option-status {
+  border-radius: 999px;
+  padding: 3px 7px;
+  background: #1a2a3b;
+  color: #9fb2c6;
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.search-select__option-status--ready {
+  background: rgb(65 217 129 / 12%);
+  color: #68e79b;
+}
+
+.search-select__option-status--warmup {
+  background: rgb(240 184 77 / 13%);
+  color: #f1c878;
+}
+
+.search-select__option-status--loading {
+  background: rgb(88 166 255 / 14%);
+  color: #79bbff;
+}
+
+.search-select__option-status--error {
+  background: rgb(255 98 98 / 13%);
+  color: #ff8585;
+}
+
+.search-select__option-status--idle {
+  background: rgb(102 121 141 / 16%);
+  color: #a4b2c2;
+}
+
+.search-select__check {
+  color: #65d893;
+}
+
+.search-select__empty {
+  padding: 16px 10px;
+  color: #8193a8;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
 }
 
 .message-list .virtual-list__row {
+  width: 100%;
+  max-width: 100%;
   padding: 8px 22px;
+  contain: layout;
+}
+
+.message-list {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: clip;
 }
 
 /* The blurred box-shadow on the agent avatar gets re-rasterized on every scroll
@@ -787,6 +1099,9 @@ kbd,
 
 .message-row {
   display: flex;
+  width: min(100%, 1000px);
+  max-width: 1000px;
+  margin-inline: auto;
   gap: 12px;
   align-items: flex-start;
 }
@@ -809,19 +1124,29 @@ kbd,
 }
 
 .message-row__content {
+  flex: 1 1 auto;
   position: relative;
   min-width: 0;
-  max-width: 680px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .message-row__content--tool {
-  width: min(680px, 100%);
+  width: 100%;
+}
+
+.message-row--assistant .message-row__content {
+  flex: 1 1 0;
+  width: auto;
+  max-width: none;
 }
 
 /* User messages: right-aligned chat bubble. Solid accent fill, no blurred shadow
    (blur repaints on scroll). */
 .message-row--user .message-row__content {
-  max-width: 72%;
+  flex: 0 1 auto;
+  width: auto;
+  max-width: min(680px, 72%);
   border-radius: 14px 14px 4px 14px;
   padding: 9px 13px;
   background: #1d5fd6;
@@ -927,6 +1252,7 @@ kbd,
   color: #c7d2de;
   font-size: 14px;
   line-height: 1.55;
+  overflow-wrap: anywhere;
 }
 
 .message-md > :first-child {
@@ -1021,6 +1347,24 @@ kbd,
   max-width: 100%;
 }
 
+.message-parts {
+  display: grid;
+  gap: 10px;
+  max-width: 100%;
+}
+
+.message-part {
+  min-width: 0;
+}
+
+.message-part--text:empty {
+  display: none;
+}
+
+.message-part--tool {
+  width: 100%;
+}
+
 .inline-tool-list {
   display: grid;
   gap: 8px;
@@ -1099,7 +1443,7 @@ kbd,
 .inline-tool-call__command,
 .inline-tool-call__output {
   margin: 0;
-  overflow: auto;
+  overflow: hidden;
   border: 1px solid #1d2b3b;
   border-radius: 7px;
   background: #060d15;
@@ -1117,8 +1461,18 @@ kbd,
 }
 
 .inline-tool-call__output {
-  max-height: 260px;
+  overflow-anchor: none;
+  overscroll-behavior: contain;
   padding: 9px;
+  scrollbar-color: #33465b transparent;
+  scrollbar-width: thin;
+}
+
+.inline-tool-call__output--scrollable {
+  --tool-output-lines: 10;
+
+  max-height: calc((1em * 1.45 * var(--tool-output-lines)) + 18px);
+  overflow: auto;
 }
 
 .inline-tool-call__message {
@@ -1200,7 +1554,7 @@ kbd,
   align-content: center;
   justify-items: stretch;
   gap: 12px;
-  width: min(680px, 100%);
+  width: min(1000px, 100%);
   margin: 0 auto;
 }
 
@@ -1254,8 +1608,8 @@ kbd,
   font-size: 13px;
 }
 
-/* A failed run renders as a dedicated error card in the message stream, not as
-   an agent bubble. */
+/* Kept for older failed-row markup; current failed runs render their partial
+   assistant response plus an inline error card. */
 .message-row--error {
   justify-content: stretch;
 }
@@ -1281,6 +1635,10 @@ kbd,
   background: #2a1114;
 }
 
+.message-row--assistant .chat-error-card {
+  margin-top: 12px;
+}
+
 .chat-error-card__head {
   display: flex;
   align-items: center;
@@ -1302,9 +1660,11 @@ kbd,
 .chat-error-card__actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
+.chat-error-card__continue,
 .chat-error-card__retry,
 .chat-error-card__toggle {
   display: inline-flex;
@@ -1317,6 +1677,16 @@ kbd,
   border: 1px solid transparent;
 }
 
+.chat-error-card__continue {
+  background: #183827;
+  border-color: #2f754e;
+  color: #d8f7e4;
+}
+
+.chat-error-card__continue:hover:not(:disabled) {
+  background: #1f4932;
+}
+
 .chat-error-card__retry {
   background: #7a2a2a;
   border-color: #9c3a3a;
@@ -1327,6 +1697,7 @@ kbd,
   background: #8f3232;
 }
 
+.chat-error-card__continue:disabled,
 .chat-error-card__retry:disabled {
   opacity: 0.55;
   cursor: default;
@@ -1567,6 +1938,7 @@ kbd,
 .composer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
+  min-width: 0;
   gap: 12px;
   margin: 0 20px 10px;
   border: 1px solid #1468e8;
@@ -1646,8 +2018,6 @@ kbd,
   gap: 26px;
   border-bottom: 1px solid #1b2a3a;
   padding: 0 16px;
-  -webkit-app-region: drag;
-  app-region: drag;
 }
 
 .app-frame--windows .inspector-tabs {
@@ -1701,8 +2071,6 @@ kbd,
   gap: 16px;
   border-bottom: 1px solid #1b2a3a;
   padding: 0 20px;
-  -webkit-app-region: drag;
-  app-region: drag;
 }
 
 .settings-header button {
@@ -2279,17 +2647,27 @@ kbd,
 }
 
 .virtual-list {
+  width: 100%;
+  max-width: 100%;
   min-height: 0;
   overflow: auto;
+  overflow-x: hidden;
+  overflow-anchor: none;
   overscroll-behavior: contain;
   scrollbar-color: #33465b transparent;
   scrollbar-width: thin;
   contain: layout paint style;
+  /* Promote the scroller to its own compositor layer so scrolling moves a GPU
+     layer instead of repainting the whole window each frame (the trace showed
+     full-document Paints on every scroll = non-composited scrolling). */
+  will-change: transform;
 }
 
 .virtual-list__spacer {
   position: relative;
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .virtual-list__window {
@@ -2297,10 +2675,14 @@ kbd,
   top: 0;
   left: 0;
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .virtual-list__row {
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
   contain: layout style;
 }
 

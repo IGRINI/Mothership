@@ -8,9 +8,10 @@ use std::{
 use rusqlite::{params, params_from_iter, types::Type, Connection, OptionalExtension};
 
 use crate::{
-    id::generate_id, ActivityEvent, ChatConversation, ChatMessage, ChatMessageRole,
-    ChatMessageStatus, ChatRunEvent, ChatRunEventKind, ChatThreadSummary, DashboardMetric,
-    DashboardSnapshot, LlmChatMessage, LlmChatRole, MothershipError, Result, SelectedLlmModel,
+    id::generate_id, ActivityEvent, ChatConversation, ChatMessage, ChatMessagePart,
+    ChatMessagePartKind, ChatMessageRole, ChatMessageStatus, ChatRunContextSpec, ChatRunEvent,
+    ChatRunEventKind, ChatThreadSummary, DashboardMetric, DashboardSnapshot, LlmChatMessage,
+    LlmChatRole, MothershipError, ProjectSnapshot, ProjectSummary, Result, SelectedLlmModel,
     SendChatMessageResult, SidecarStatus, ToolCommand, ToolExecutionEvent, ToolExecutionEventKind,
     ToolExecutionRecord, ToolExecutionResult, ToolOutputStream, WorkspaceItem,
 };
@@ -22,6 +23,8 @@ const CHAT_MESSAGE_LIMIT: i64 = 200;
 const CHAT_MESSAGE_MAX_BYTES: usize = 20_000;
 const TOOL_OUTPUT_DISPLAY_MAX_BYTES: usize = 12_000;
 const DEFAULT_MODEL_SCOPE: &str = "default";
+const ACTIVE_PROJECT_SETTING_KEY: &str = "active_project_id";
+const CONTINUE_CHAT_MESSAGE_CONTENT: &str = "Continue from where you stopped.";
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -119,16 +122,99 @@ impl Database {
         })
     }
 
-    pub fn list_chats(&self, limit: i64) -> Result<Vec<ChatThreadSummary>> {
+    pub fn list_projects(&self) -> Result<ProjectSnapshot> {
         let connection = self.connect()?;
-        select_chat_summaries(&connection, normalize_limit(limit, CHAT_LIST_LIMIT))
+        project_snapshot(&connection)
     }
 
-    pub fn create_chat(&self) -> Result<ChatConversation> {
+    pub fn open_project(&self, path: &str) -> Result<ProjectSnapshot> {
+        let project_path = normalize_project_path(path)?;
+        let name = project_name_from_path(&project_path);
+        let now = current_timestamp();
+        let mut connection = self.connect()?;
+        let tx = connection.transaction()?;
+
+        let existing_id = tx
+            .query_row(
+                "SELECT id FROM projects WHERE path = ?1",
+                params![project_path],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        let project_id = match existing_id {
+            Some(id) => {
+                tx.execute(
+                    "
+                    UPDATE projects
+                    SET name = ?2,
+                        updated_at = ?3,
+                        last_opened_at = ?4
+                    WHERE id = ?1
+                    ",
+                    params![id, name, now, now],
+                )?;
+                id
+            }
+            None => {
+                let id = generate_id("project")?;
+                tx.execute(
+                    "
+                    INSERT INTO projects (id, name, path, created_at, updated_at, last_opened_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    ",
+                    params![id, name, project_path, now, now, now],
+                )?;
+                id
+            }
+        };
+
+        set_setting(&tx, ACTIVE_PROJECT_SETTING_KEY, &project_id, &now)?;
+        tx.commit()?;
+
+        project_snapshot(&connection)
+    }
+
+    pub fn set_active_project(&self, project_id: &str) -> Result<ProjectSnapshot> {
+        validate_identifier("project_id", project_id)?;
+
         let connection = self.connect()?;
+        select_project_summary(&connection, project_id)?;
+        let now = current_timestamp();
+        set_setting(&connection, ACTIVE_PROJECT_SETTING_KEY, project_id, &now)?;
+
+        project_snapshot(&connection)
+    }
+
+    pub fn chat_project(&self, chat_id: &str) -> Result<Option<ProjectSummary>> {
+        validate_identifier("chat_id", chat_id)?;
+
+        let connection = self.connect()?;
+        select_chat_project(&connection, chat_id)
+    }
+
+    pub fn list_chats(
+        &self,
+        project_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ChatThreadSummary>> {
+        let connection = self.connect()?;
+        select_chat_summaries(
+            &connection,
+            project_id,
+            normalize_limit(limit, CHAT_LIST_LIMIT),
+        )
+    }
+
+    pub fn create_chat(&self, project_id: &str) -> Result<ChatConversation> {
+        validate_identifier("project_id", project_id)?;
+
+        let connection = self.connect()?;
+        select_project_summary(&connection, project_id)?;
         let now = current_timestamp();
         let chat = ChatThreadSummary {
             id: generate_id("chat")?,
+            project_id: Some(project_id.to_string()),
             title: "New chat".to_string(),
             preview: String::new(),
             message_count: 0,
@@ -138,11 +224,12 @@ impl Database {
 
         connection.execute(
             "
-            INSERT INTO chats (id, title, preview, message_count, archived, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
+            INSERT INTO chats (id, project_id, title, preview, message_count, archived, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
             ",
             params![
                 chat.id,
+                chat.project_id.as_deref(),
                 chat.title,
                 chat.preview,
                 chat.message_count,
@@ -155,6 +242,7 @@ impl Database {
             chat,
             messages: Vec::new(),
             tool_executions: Vec::new(),
+            message_parts: Vec::new(),
         })
     }
 
@@ -173,11 +261,13 @@ impl Database {
             .map(|message| message.id.as_str())
             .collect::<Vec<_>>();
         let tool_executions = select_chat_tool_executions(&connection, chat_id, &message_ids)?;
+        let message_parts = select_chat_message_parts(&connection, chat_id, &message_ids)?;
 
         Ok(ChatConversation {
             chat,
             messages,
             tool_executions,
+            message_parts,
         })
     }
 
@@ -233,12 +323,29 @@ impl Database {
         Ok(())
     }
 
+    pub fn record_chat_tool_call_part(
+        &self,
+        run_id: &str,
+        chat_id: &str,
+        message_id: &str,
+        tool_call_id: &str,
+    ) -> Result<()> {
+        validate_identifier("run_id", run_id)?;
+        validate_identifier("chat_id", chat_id)?;
+        validate_identifier("message_id", message_id)?;
+        validate_identifier("tool_call_id", tool_call_id)?;
+
+        let connection = self.connect()?;
+        insert_tool_message_part(&connection, run_id, chat_id, message_id, tool_call_id)
+    }
+
     pub fn send_chat_message(
         &self,
         chat_id: Option<&str>,
+        project_id: Option<&str>,
         content: &str,
     ) -> Result<SendChatMessageResult> {
-        self.begin_chat_run(chat_id, content)
+        self.begin_chat_run(chat_id, project_id, content)
     }
 
     pub fn recover_interrupted_chat_runs(&self) -> Result<usize> {
@@ -250,17 +357,13 @@ impl Database {
             "
             UPDATE chat_messages
             SET status = ?1,
-                content = CASE
-                    WHEN trim(content) = '' THEN ?2
-                    ELSE content || ?3
-                END
-            WHERE role = ?4
-              AND status = ?5
+                error = ?2
+            WHERE role = ?3
+              AND status = ?4
             ",
             params![
                 chat_status_to_db(ChatMessageStatus::Failed),
                 interrupted_message,
-                format!("\n\n{interrupted_message}"),
                 chat_role_to_db(ChatMessageRole::Assistant),
                 chat_status_to_db(ChatMessageStatus::Sending),
             ],
@@ -272,6 +375,7 @@ impl Database {
     pub fn begin_chat_run(
         &self,
         chat_id: Option<&str>,
+        project_id: Option<&str>,
         content: &str,
     ) -> Result<SendChatMessageResult> {
         let content = validate_chat_message_content(content)?;
@@ -288,11 +392,28 @@ impl Database {
         let chat = match chat_id {
             Some(id) => {
                 validate_identifier("chat_id", id)?;
-                select_chat_summary(&tx, id)?
+                let chat = select_chat_summary(&tx, id)?;
+                if let Some(project_id) = project_id {
+                    validate_identifier("project_id", project_id)?;
+                    if chat.project_id.as_deref() != Some(project_id) {
+                        return Err(MothershipError::InvalidRequest(
+                            "chat does not belong to the selected project".to_string(),
+                        ));
+                    }
+                }
+                chat
             }
             None => {
+                let project_id = project_id.ok_or_else(|| {
+                    MothershipError::InvalidRequest(
+                        "select or open a project before starting a chat".to_string(),
+                    )
+                })?;
+                validate_identifier("project_id", project_id)?;
+                select_project_summary(&tx, project_id)?;
                 let chat = ChatThreadSummary {
                     id: generate_id("chat")?,
+                    project_id: Some(project_id.to_string()),
                     title: derive_chat_title(content),
                     preview: String::new(),
                     message_count: 0,
@@ -301,11 +422,12 @@ impl Database {
                 };
                 tx.execute(
                     "
-                    INSERT INTO chats (id, title, preview, message_count, archived, created_at, updated_at)
-                    VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
+                    INSERT INTO chats (id, project_id, title, preview, message_count, archived, created_at, updated_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
                     ",
                     params![
                         chat.id,
+                        chat.project_id.as_deref(),
                         chat.title,
                         chat.preview,
                         chat.message_count,
@@ -325,6 +447,7 @@ impl Database {
             content: content.to_string(),
             status: ChatMessageStatus::Complete,
             created_at: now.clone(),
+            error: None,
             provider_id: None,
             model_id: None,
         };
@@ -336,6 +459,7 @@ impl Database {
             content: String::new(),
             status: ChatMessageStatus::Sending,
             created_at: now.clone(),
+            error: None,
             // Attribute the reply to the model that will produce it.
             provider_id: Some(selected_model.provider_id.clone()),
             model_id: Some(selected_model.model_id.clone()),
@@ -351,6 +475,7 @@ impl Database {
         };
         let updated_chat = ChatThreadSummary {
             id: chat.id,
+            project_id: chat.project_id,
             title,
             preview: derive_chat_preview(content),
             message_count: chat.message_count + 2,
@@ -383,6 +508,7 @@ impl Database {
             chat: updated_chat,
             user_message,
             assistant_message,
+            context: ChatRunContextSpec::default(),
         })
     }
 
@@ -455,6 +581,7 @@ impl Database {
             content: content.to_string(),
             status: ChatMessageStatus::Complete,
             created_at: now.clone(),
+            error: None,
             provider_id: None,
             model_id: None,
             ..original_user_message
@@ -467,6 +594,7 @@ impl Database {
             content: String::new(),
             status: ChatMessageStatus::Sending,
             created_at: now.clone(),
+            error: None,
             provider_id: Some(selected_model.provider_id.clone()),
             model_id: Some(selected_model.model_id.clone()),
         };
@@ -480,6 +608,7 @@ impl Database {
         };
         let updated_chat = ChatThreadSummary {
             id: chat.id,
+            project_id: chat.project_id,
             title,
             preview: derive_chat_preview(content),
             message_count,
@@ -494,6 +623,7 @@ impl Database {
             chat: updated_chat,
             user_message,
             assistant_message,
+            context: ChatRunContextSpec::default(),
         })
     }
 
@@ -539,6 +669,7 @@ impl Database {
         let now = current_timestamp();
         let chat = ChatThreadSummary {
             id: generate_id("chat")?,
+            project_id: source_chat.project_id.clone(),
             title: branch_chat_title(&source_chat.title),
             preview: derive_chat_preview(&branch_point.content),
             message_count: source_messages.len() as i64,
@@ -562,25 +693,27 @@ impl Database {
             copied_messages.push(copied_message);
         }
 
-        copy_chat_tool_events(&tx, chat_id, &chat.id, &message_id_map)?;
+        let tool_call_id_map = copy_chat_tool_events(&tx, chat_id, &chat.id, &message_id_map)?;
+        copy_chat_message_parts(&tx, chat_id, &chat.id, &message_id_map, &tool_call_id_map)?;
         let copied_message_ids = copied_messages
             .iter()
             .map(|message| message.id.as_str())
             .collect::<Vec<_>>();
         let tool_executions = select_chat_tool_executions(&tx, &chat.id, &copied_message_ids)?;
+        let message_parts = select_chat_message_parts(&tx, &chat.id, &copied_message_ids)?;
         tx.commit()?;
 
         Ok(ChatConversation {
             chat,
             messages: copied_messages,
             tool_executions,
+            message_parts,
         })
     }
 
-    /// Rolls the last (failed) assistant message in a chat back to a fresh
-    /// pending state in place and returns a run handle to re-drive it — reusing
-    /// the existing user message instead of creating a duplicate exchange.
-    /// Errors if there's nothing to retry (no failed assistant message).
+    /// Starts a fresh assistant attempt for the last failed assistant message,
+    /// reusing the original user prompt without deleting the failed partial
+    /// answer or its tool history.
     pub fn begin_retry_run(&self, chat_id: &str) -> Result<SendChatMessageResult> {
         validate_identifier("chat_id", chat_id)?;
         let mut connection = self.connect()?;
@@ -603,50 +736,122 @@ impl Database {
                 "the latest run did not fail; nothing to retry".to_string(),
             ));
         }
-        let user_message = select_last_message_by_role(&tx, chat_id, "user")?.ok_or_else(|| {
-            MothershipError::InvalidRequest("no user message to retry".to_string())
-        })?;
-
-        tx.execute(
-            "
-            UPDATE chat_messages
-            SET content = '', status = ?2, provider_id = ?4, model_id = ?5
-            WHERE id = ?1 AND chat_id = ?3
-            ",
-            params![
-                assistant_message.id,
-                chat_status_to_db(ChatMessageStatus::Sending),
-                chat_id,
-                selected_model.provider_id,
-                selected_model.model_id
-            ],
-        )?;
-        tx.execute(
-            "DELETE FROM chat_tool_events WHERE message_id = ?1",
-            params![assistant_message.id],
-        )?;
+        let user_message =
+            select_last_user_message_before_position(&tx, chat_id, assistant_message.position)?
+                .ok_or_else(|| {
+                    MothershipError::InvalidRequest("no user message to retry".to_string())
+                })?;
 
         let now = current_timestamp();
-        tx.execute(
-            "UPDATE chats SET updated_at = ?2 WHERE id = ?1",
-            params![chat_id, now],
-        )?;
+        let mut next_assistant_message = ChatMessage {
+            id: generate_id("chat_message")?,
+            chat_id: chat_id.to_string(),
+            position: 0,
+            role: ChatMessageRole::Assistant,
+            content: String::new(),
+            status: ChatMessageStatus::Sending,
+            created_at: now.clone(),
+            error: None,
+            provider_id: Some(selected_model.provider_id.clone()),
+            model_id: Some(selected_model.model_id.clone()),
+        };
+        next_assistant_message.position = insert_chat_message(&tx, &next_assistant_message)?;
+
+        let updated_chat = ChatThreadSummary {
+            id: chat.id,
+            project_id: chat.project_id,
+            title: chat.title,
+            preview: chat.preview,
+            message_count: chat.message_count + 1,
+            created_at: chat.created_at,
+            updated_at: now,
+        };
+        update_chat_summary(&tx, &updated_chat)?;
         tx.commit()?;
 
         Ok(SendChatMessageResult {
             run_id: generate_id("chat_run")?,
-            chat: ChatThreadSummary {
-                updated_at: now,
-                ..chat
-            },
+            chat: updated_chat,
             user_message,
-            // Re-attribute to the model the retry will actually use.
-            assistant_message: ChatMessage {
-                content: String::new(),
-                status: ChatMessageStatus::Sending,
-                provider_id: Some(selected_model.provider_id.clone()),
-                model_id: Some(selected_model.model_id.clone()),
-                ..assistant_message
+            assistant_message: next_assistant_message,
+            context: ChatRunContextSpec::default(),
+        })
+    }
+
+    /// Adds an explicit continuation prompt after the last failed assistant
+    /// message and starts a new assistant run. The failed assistant content is
+    /// included as a one-off context anchor for this run, but remains failed in
+    /// history so the UI can still render the error.
+    pub fn begin_continue_run(&self, chat_id: &str) -> Result<SendChatMessageResult> {
+        validate_identifier("chat_id", chat_id)?;
+        let mut connection = self.connect()?;
+        let selected_model = selected_llm_model(&connection)?;
+        if selected_model.model_id.trim().is_empty() {
+            return Err(MothershipError::InvalidRequest(
+                "no LLM model selected; connect a provider and choose a model first".to_string(),
+            ));
+        }
+
+        let tx = connection.transaction()?;
+        let chat = select_chat_summary(&tx, chat_id)?;
+        let failed_assistant_message = select_last_message_by_role(&tx, chat_id, "assistant")?
+            .ok_or_else(|| {
+                MothershipError::InvalidRequest("no assistant message to continue".to_string())
+            })?;
+        if failed_assistant_message.status != ChatMessageStatus::Failed {
+            return Err(MothershipError::InvalidRequest(
+                "the latest run did not fail; nothing to continue".to_string(),
+            ));
+        }
+
+        let now = current_timestamp();
+        let mut user_message = ChatMessage {
+            id: generate_id("chat_message")?,
+            chat_id: chat_id.to_string(),
+            position: 0,
+            role: ChatMessageRole::User,
+            content: CONTINUE_CHAT_MESSAGE_CONTENT.to_string(),
+            status: ChatMessageStatus::Complete,
+            created_at: now.clone(),
+            error: None,
+            provider_id: None,
+            model_id: None,
+        };
+        let mut assistant_message = ChatMessage {
+            id: generate_id("chat_message")?,
+            chat_id: chat_id.to_string(),
+            position: 0,
+            role: ChatMessageRole::Assistant,
+            content: String::new(),
+            status: ChatMessageStatus::Sending,
+            created_at: now.clone(),
+            error: None,
+            provider_id: Some(selected_model.provider_id.clone()),
+            model_id: Some(selected_model.model_id.clone()),
+        };
+
+        user_message.position = insert_chat_message(&tx, &user_message)?;
+        assistant_message.position = insert_chat_message(&tx, &assistant_message)?;
+
+        let updated_chat = ChatThreadSummary {
+            id: chat.id,
+            project_id: chat.project_id,
+            title: chat.title,
+            preview: derive_chat_preview(CONTINUE_CHAT_MESSAGE_CONTENT),
+            message_count: chat.message_count + 2,
+            created_at: chat.created_at,
+            updated_at: now,
+        };
+        update_chat_summary(&tx, &updated_chat)?;
+        tx.commit()?;
+
+        Ok(SendChatMessageResult {
+            run_id: generate_id("chat_run")?,
+            chat: updated_chat,
+            user_message,
+            assistant_message,
+            context: ChatRunContextSpec {
+                include_failed_assistant_message_id: Some(failed_assistant_message.id),
             },
         })
     }
@@ -656,9 +861,13 @@ impl Database {
         chat_id: &str,
         assistant_message_id: &str,
         limit: i64,
+        context: &ChatRunContextSpec,
     ) -> Result<Vec<LlmChatMessage>> {
         validate_identifier("chat_id", chat_id)?;
         validate_identifier("assistant_message_id", assistant_message_id)?;
+        if let Some(message_id) = &context.include_failed_assistant_message_id {
+            validate_identifier("include_failed_assistant_message_id", message_id)?;
+        }
 
         let connection = self.connect()?;
         let mut statement = connection.prepare(
@@ -669,7 +878,16 @@ impl Database {
                 FROM chat_messages
                 WHERE chat_id = ?1
                     AND id <> ?2
-                    AND status = 'complete'
+                    AND (
+                        status = 'complete'
+                        OR (
+                            ?4 IS NOT NULL
+                            AND id = ?4
+                            AND role = 'assistant'
+                            AND status = 'failed'
+                            AND trim(content) <> ''
+                        )
+                    )
                     AND role IN ('user', 'assistant')
                 ORDER BY rowid DESC
                 LIMIT ?3
@@ -681,7 +899,8 @@ impl Database {
             params![
                 chat_id,
                 assistant_message_id,
-                normalize_limit(limit, CHAT_MESSAGE_LIMIT)
+                normalize_limit(limit, CHAT_MESSAGE_LIMIT),
+                context.include_failed_assistant_message_id.as_deref()
             ],
             |row| {
                 let role: String = row.get(0)?;
@@ -734,6 +953,7 @@ impl Database {
                 )?),
                 chat: None,
                 transport: None,
+                tool_call_id: None,
                 error: None,
             });
         }
@@ -747,6 +967,7 @@ impl Database {
             ",
             params![assistant_message_id, delta, chat_id],
         )?;
+        append_text_message_part(&connection, run_id, chat_id, assistant_message_id, delta)?;
 
         Ok(ChatRunEvent {
             run_id: run_id.to_string(),
@@ -760,6 +981,7 @@ impl Database {
             )?),
             chat: None,
             transport: None,
+            tool_call_id: None,
             error: None,
         })
     }
@@ -780,6 +1002,7 @@ impl Database {
             message: None,
             chat: None,
             transport: Some(transport.to_string()),
+            tool_call_id: None,
             error: None,
         })
     }
@@ -815,6 +1038,7 @@ impl Database {
             message: Some(message),
             chat: Some(chat),
             transport: None,
+            tool_call_id: None,
             error: None,
         })
     }
@@ -859,6 +1083,7 @@ impl Database {
             message: Some(message),
             chat: Some(chat),
             transport: None,
+            tool_call_id: None,
             error: None,
         })
     }
@@ -885,13 +1110,18 @@ impl Database {
             "
             UPDATE chat_messages
             SET status = 'failed',
-                content = ?2
+                error = ?2
             WHERE id = ?1 AND chat_id = ?3
             ",
             params![assistant_message_id, content, chat_id],
         )?;
         let message = select_chat_message_by_id(&connection, assistant_message_id)?;
-        let chat = update_chat_after_assistant(&connection, chat_id, &message.content)?;
+        let preview = if message.content.trim().is_empty() {
+            content.as_str()
+        } else {
+            message.content.as_str()
+        };
+        let chat = update_chat_after_assistant(&connection, chat_id, preview)?;
 
         Ok(ChatRunEvent {
             run_id: run_id.to_string(),
@@ -902,6 +1132,7 @@ impl Database {
             message: Some(message),
             chat: Some(chat),
             transport: None,
+            tool_call_id: None,
             error: Some(content),
         })
     }
@@ -1000,14 +1231,34 @@ fn migrate(connection: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_activity_events_occurred_at
             ON activity_events (occurred_at DESC);
 
+        CREATE TABLE IF NOT EXISTS projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_opened_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_projects_last_opened
+            ON projects (last_opened_at DESC);
+
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS chats (
             id TEXT PRIMARY KEY,
+            project_id TEXT,
             title TEXT NOT NULL,
             preview TEXT NOT NULL,
             message_count INTEGER NOT NULL DEFAULT 0,
             archived INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_chats_updated_at
@@ -1020,6 +1271,7 @@ fn migrate(connection: &Connection) -> Result<()> {
             content TEXT NOT NULL,
             status TEXT NOT NULL,
             created_at TEXT NOT NULL,
+            error TEXT,
             provider_id TEXT,
             model_id TEXT,
             FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
@@ -1052,6 +1304,26 @@ fn migrate(connection: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_chat_tool_events_message
             ON chat_tool_events (message_id, id);
 
+        CREATE TABLE IF NOT EXISTS chat_message_parts (
+            id INTEGER PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            run_id TEXT,
+            kind TEXT NOT NULL,
+            text TEXT,
+            tool_call_id TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE,
+            FOREIGN KEY(message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chat_message_parts_message
+            ON chat_message_parts (message_id, id);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_message_parts_tool
+            ON chat_message_parts (message_id, tool_call_id)
+            WHERE kind = 'tool' AND tool_call_id IS NOT NULL;
+
         CREATE TABLE IF NOT EXISTS llm_model_preferences (
             scope TEXT PRIMARY KEY,
             provider_id TEXT NOT NULL,
@@ -1082,11 +1354,16 @@ fn migrate(connection: &Connection) -> Result<()> {
         params![5_i64, current_timestamp()],
     )?;
 
-    // Migration 6: per-message model attribution. The CREATE above already has
-    // these columns for fresh databases; ALTER brings existing ones up to date
-    // (guarded, so re-running is a no-op).
+    // Fresh databases already have these columns; ALTER brings existing ones
+    // up to date (guarded, so re-running is a no-op).
     add_column_if_missing(connection, "chat_messages", "provider_id", "TEXT")?;
     add_column_if_missing(connection, "chat_messages", "model_id", "TEXT")?;
+    add_column_if_missing(connection, "chat_messages", "error", "TEXT")?;
+    add_column_if_missing(connection, "chats", "project_id", "TEXT")?;
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chats_project_updated_at ON chats (project_id, updated_at DESC)",
+        [],
+    )?;
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
         params![6_i64, current_timestamp()],
@@ -1094,6 +1371,18 @@ fn migrate(connection: &Connection) -> Result<()> {
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
         params![7_i64, current_timestamp()],
+    )?;
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+        params![8_i64, current_timestamp()],
+    )?;
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+        params![9_i64, current_timestamp()],
+    )?;
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+        params![10_i64, current_timestamp()],
     )?;
 
     Ok(())
@@ -1212,10 +1501,137 @@ fn select_activity_events(connection: &Connection) -> Result<Vec<ActivityEvent>>
         .map_err(Into::into)
 }
 
-fn select_chat_summaries(connection: &Connection, limit: i64) -> Result<Vec<ChatThreadSummary>> {
+fn project_snapshot(connection: &Connection) -> Result<ProjectSnapshot> {
+    let projects = select_project_summaries(connection)?;
+    let active_project_id = get_setting(connection, ACTIVE_PROJECT_SETTING_KEY)?
+        .filter(|project_id| projects.iter().any(|project| project.id == *project_id));
+
+    Ok(ProjectSnapshot {
+        projects,
+        active_project_id,
+    })
+}
+
+fn select_project_summaries(connection: &Connection) -> Result<Vec<ProjectSummary>> {
     let mut statement = connection.prepare(
         "
-        SELECT id, title, preview, message_count, created_at, updated_at
+        SELECT
+            projects.id,
+            projects.name,
+            projects.path,
+            COUNT(chats.id) AS chat_count,
+            projects.created_at,
+            projects.updated_at,
+            projects.last_opened_at
+        FROM projects
+        LEFT JOIN chats
+            ON chats.project_id = projects.id
+            AND chats.archived = 0
+        GROUP BY projects.id
+        ORDER BY projects.last_opened_at DESC, projects.updated_at DESC
+        ",
+    )?;
+
+    let rows = statement.query_map([], project_summary_from_row)?;
+
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn select_project_summary(connection: &Connection, project_id: &str) -> Result<ProjectSummary> {
+    connection
+        .query_row(
+            "
+            SELECT
+                projects.id,
+                projects.name,
+                projects.path,
+                COUNT(chats.id) AS chat_count,
+                projects.created_at,
+                projects.updated_at,
+                projects.last_opened_at
+            FROM projects
+            LEFT JOIN chats
+                ON chats.project_id = projects.id
+                AND chats.archived = 0
+            WHERE projects.id = ?1
+            GROUP BY projects.id
+            ",
+            params![project_id],
+            project_summary_from_row,
+        )
+        .optional()?
+        .ok_or_else(|| MothershipError::InvalidRequest(format!("project not found: {project_id}")))
+}
+
+fn select_chat_project(connection: &Connection, chat_id: &str) -> Result<Option<ProjectSummary>> {
+    let project_id = connection
+        .query_row(
+            "SELECT project_id FROM chats WHERE id = ?1 AND archived = 0",
+            params![chat_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| MothershipError::InvalidRequest(format!("chat not found: {chat_id}")))?;
+
+    match project_id {
+        Some(project_id) => select_project_summary(connection, &project_id).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn get_setting(connection: &Connection, key: &str) -> Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn set_setting(connection: &Connection, key: &str, value: &str, updated_at: &str) -> Result<()> {
+    connection.execute(
+        "
+        INSERT INTO app_settings (key, value, updated_at)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at
+        ",
+        params![key, value, updated_at],
+    )?;
+    Ok(())
+}
+
+fn select_chat_summaries(
+    connection: &Connection,
+    project_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<ChatThreadSummary>> {
+    if let Some(project_id) = project_id {
+        validate_identifier("project_id", project_id)?;
+        let mut statement = connection.prepare(
+            "
+            SELECT id, project_id, title, preview, message_count, created_at, updated_at
+            FROM chats
+            WHERE archived = 0 AND project_id = ?1
+            ORDER BY updated_at DESC, rowid DESC
+            LIMIT ?2
+            ",
+        )?;
+
+        let rows = statement.query_map(params![project_id, limit], chat_summary_from_row)?;
+
+        return rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into);
+    }
+
+    let mut statement = connection.prepare(
+        "
+        SELECT id, project_id, title, preview, message_count, created_at, updated_at
         FROM chats
         WHERE archived = 0
         ORDER BY updated_at DESC, rowid DESC
@@ -1233,7 +1649,7 @@ fn select_chat_summary(connection: &Connection, chat_id: &str) -> Result<ChatThr
     connection
         .query_row(
             "
-            SELECT id, title, preview, message_count, created_at, updated_at
+            SELECT id, project_id, title, preview, message_count, created_at, updated_at
             FROM chats
             WHERE id = ?1 AND archived = 0
             ",
@@ -1247,11 +1663,12 @@ fn select_chat_summary(connection: &Connection, chat_id: &str) -> Result<ChatThr
 fn insert_chat_summary(connection: &Connection, chat: &ChatThreadSummary) -> Result<()> {
     connection.execute(
         "
-        INSERT INTO chats (id, title, preview, message_count, archived, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
+        INSERT INTO chats (id, project_id, title, preview, message_count, archived, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
         ",
         params![
             chat.id,
+            chat.project_id.as_deref(),
             chat.title,
             chat.preview,
             chat.message_count,
@@ -1314,9 +1731,9 @@ fn select_chat_messages(
 ) -> Result<Vec<ChatMessage>> {
     let mut statement = connection.prepare(
         "
-        SELECT id, chat_id, rowid, role, content, status, created_at, provider_id, model_id
+        SELECT id, chat_id, rowid, role, content, status, created_at, error, provider_id, model_id
         FROM (
-            SELECT rowid, id, chat_id, role, content, status, created_at, provider_id, model_id
+            SELECT rowid, id, chat_id, role, content, status, created_at, error, provider_id, model_id
             FROM chat_messages
             WHERE chat_id = ?1
             ORDER BY rowid DESC
@@ -1339,7 +1756,7 @@ fn select_chat_messages_through_position(
 ) -> Result<Vec<ChatMessage>> {
     let mut statement = connection.prepare(
         "
-        SELECT id, chat_id, rowid, role, content, status, created_at, provider_id, model_id
+        SELECT id, chat_id, rowid, role, content, status, created_at, error, provider_id, model_id
         FROM chat_messages
         WHERE chat_id = ?1 AND rowid <= ?2
         ORDER BY rowid ASC
@@ -1350,6 +1767,122 @@ fn select_chat_messages_through_position(
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+fn select_chat_message_parts(
+    connection: &Connection,
+    chat_id: &str,
+    message_ids: &[&str],
+) -> Result<Vec<ChatMessagePart>> {
+    if message_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = std::iter::repeat("?")
+        .take(message_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "
+        SELECT id, chat_id, message_id, kind, text, tool_call_id, created_at
+        FROM chat_message_parts
+        WHERE chat_id = ?
+          AND message_id IN ({placeholders})
+        ORDER BY message_id ASC, id ASC
+        "
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let params = std::iter::once(chat_id)
+        .chain(message_ids.iter().copied())
+        .collect::<Vec<_>>();
+    let rows = statement.query_map(params_from_iter(params), chat_message_part_from_row)?;
+
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn append_text_message_part(
+    connection: &Connection,
+    run_id: &str,
+    chat_id: &str,
+    message_id: &str,
+    delta: &str,
+) -> Result<()> {
+    if delta.is_empty() {
+        return Ok(());
+    }
+
+    let latest = connection
+        .query_row(
+            "
+            SELECT id, kind
+            FROM chat_message_parts
+            WHERE message_id = ?1
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+            params![message_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+
+    if let Some((part_id, kind)) = latest {
+        if kind == chat_message_part_kind_to_db(ChatMessagePartKind::Text) {
+            connection.execute(
+                "
+                UPDATE chat_message_parts
+                SET text = COALESCE(text, '') || ?2
+                WHERE id = ?1
+                ",
+                params![part_id, delta],
+            )?;
+            return Ok(());
+        }
+    }
+
+    connection.execute(
+        "
+        INSERT INTO chat_message_parts (
+            chat_id, message_id, run_id, kind, text, tool_call_id, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)
+        ",
+        params![
+            chat_id,
+            message_id,
+            run_id,
+            chat_message_part_kind_to_db(ChatMessagePartKind::Text),
+            delta,
+            current_timestamp()
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_tool_message_part(
+    connection: &Connection,
+    run_id: &str,
+    chat_id: &str,
+    message_id: &str,
+    tool_call_id: &str,
+) -> Result<()> {
+    connection.execute(
+        "
+        INSERT OR IGNORE INTO chat_message_parts (
+            chat_id, message_id, run_id, kind, text, tool_call_id, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)
+        ",
+        params![
+            chat_id,
+            message_id,
+            run_id,
+            chat_message_part_kind_to_db(ChatMessagePartKind::Tool),
+            tool_call_id,
+            current_timestamp()
+        ],
+    )?;
+    Ok(())
 }
 
 fn select_chat_tool_executions(
@@ -1418,9 +1951,9 @@ fn copy_chat_tool_events(
     source_chat_id: &str,
     target_chat_id: &str,
     message_id_map: &HashMap<String, String>,
-) -> Result<()> {
+) -> Result<HashMap<String, String>> {
     if message_id_map.is_empty() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
 
     let source_message_ids = message_id_map
@@ -1524,6 +2057,96 @@ fn copy_chat_tool_events(
         )?;
     }
 
+    Ok(tool_call_id_map)
+}
+
+fn copy_chat_message_parts(
+    connection: &Connection,
+    source_chat_id: &str,
+    target_chat_id: &str,
+    message_id_map: &HashMap<String, String>,
+    tool_call_id_map: &HashMap<String, String>,
+) -> Result<()> {
+    if message_id_map.is_empty() {
+        return Ok(());
+    }
+
+    let source_message_ids = message_id_map
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let placeholders = std::iter::repeat("?")
+        .take(source_message_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "
+        SELECT message_id, kind, text, tool_call_id, created_at
+        FROM chat_message_parts
+        WHERE chat_id = ?
+          AND message_id IN ({placeholders})
+        ORDER BY id ASC
+        "
+    );
+
+    struct PartCopyRow {
+        message_id: String,
+        kind: String,
+        text: Option<String>,
+        tool_call_id: Option<String>,
+        created_at: String,
+    }
+
+    let rows = {
+        let mut statement = connection.prepare(&sql)?;
+        let params = std::iter::once(source_chat_id)
+            .chain(source_message_ids.iter().copied())
+            .collect::<Vec<_>>();
+        let rows = statement.query_map(params_from_iter(params), |row| {
+            Ok(PartCopyRow {
+                message_id: row.get(0)?,
+                kind: row.get(1)?,
+                text: row.get(2)?,
+                tool_call_id: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    for row in rows {
+        let Some(target_message_id) = message_id_map.get(&row.message_id) else {
+            continue;
+        };
+        let target_tool_call_id = row
+            .tool_call_id
+            .as_ref()
+            .and_then(|id| tool_call_id_map.get(id))
+            .cloned();
+        if row.kind == chat_message_part_kind_to_db(ChatMessagePartKind::Tool)
+            && target_tool_call_id.is_none()
+        {
+            continue;
+        }
+
+        connection.execute(
+            "
+            INSERT INTO chat_message_parts (
+                chat_id, message_id, run_id, kind, text, tool_call_id, created_at
+            )
+            VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)
+            ",
+            params![
+                target_chat_id,
+                target_message_id,
+                row.kind,
+                row.text,
+                target_tool_call_id,
+                row.created_at
+            ],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1609,8 +2232,8 @@ fn append_tool_output(output: &mut String, stream: Option<ToolOutputStream>, chu
 fn insert_chat_message(connection: &Connection, message: &ChatMessage) -> Result<i64> {
     connection.execute(
         "
-        INSERT INTO chat_messages (id, chat_id, role, content, status, created_at, provider_id, model_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        INSERT INTO chat_messages (id, chat_id, role, content, status, created_at, error, provider_id, model_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         ",
         params![
             message.id,
@@ -1619,6 +2242,7 @@ fn insert_chat_message(connection: &Connection, message: &ChatMessage) -> Result
             message.content,
             chat_status_to_db(message.status),
             message.created_at,
+            message.error,
             message.provider_id,
             message.model_id
         ],
@@ -1631,7 +2255,7 @@ fn select_chat_message_by_id(connection: &Connection, message_id: &str) -> Resul
     connection
         .query_row(
             "
-            SELECT id, chat_id, rowid, role, content, status, created_at, provider_id, model_id
+            SELECT id, chat_id, rowid, role, content, status, created_at, error, provider_id, model_id
             FROM chat_messages
             WHERE id = ?1
             ",
@@ -1654,13 +2278,36 @@ fn select_last_message_by_role(
     connection
         .query_row(
             "
-            SELECT id, chat_id, rowid, role, content, status, created_at, provider_id, model_id
+            SELECT id, chat_id, rowid, role, content, status, created_at, error, provider_id, model_id
             FROM chat_messages
             WHERE chat_id = ?1 AND role = ?2
             ORDER BY rowid DESC
             LIMIT 1
             ",
             params![chat_id, role],
+            chat_message_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn select_last_user_message_before_position(
+    connection: &Connection,
+    chat_id: &str,
+    position: i64,
+) -> Result<Option<ChatMessage>> {
+    connection
+        .query_row(
+            "
+            SELECT id, chat_id, rowid, role, content, status, created_at, error, provider_id, model_id
+            FROM chat_messages
+            WHERE chat_id = ?1
+              AND role = 'user'
+              AND rowid < ?2
+            ORDER BY rowid DESC
+            LIMIT 1
+            ",
+            params![chat_id, position],
             chat_message_from_row,
         )
         .optional()
@@ -1714,11 +2361,24 @@ fn selected_llm_model(connection: &Connection) -> Result<SelectedLlmModel> {
 fn chat_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatThreadSummary> {
     Ok(ChatThreadSummary {
         id: row.get(0)?,
-        title: row.get(1)?,
-        preview: row.get(2)?,
-        message_count: row.get(3)?,
+        project_id: row.get(1)?,
+        title: row.get(2)?,
+        preview: row.get(3)?,
+        message_count: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn project_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectSummary> {
+    Ok(ProjectSummary {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        path: row.get(2)?,
+        chat_count: row.get(3)?,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
+        last_opened_at: row.get(6)?,
     })
 }
 
@@ -1734,9 +2394,47 @@ fn chat_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessag
         content: row.get(4)?,
         status: chat_status_from_db(&status_value)?,
         created_at: row.get(6)?,
-        provider_id: row.get(7)?,
-        model_id: row.get(8)?,
+        error: row.get(7)?,
+        provider_id: row.get(8)?,
+        model_id: row.get(9)?,
     })
+}
+
+fn chat_message_part_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessagePart> {
+    let kind_value: String = row.get(3)?;
+    Ok(ChatMessagePart {
+        id: row.get(0)?,
+        chat_id: row.get(1)?,
+        message_id: row.get(2)?,
+        kind: chat_message_part_kind_from_db(&kind_value, 3)?,
+        text: row.get(4)?,
+        tool_call_id: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
+fn chat_message_part_kind_to_db(kind: ChatMessagePartKind) -> &'static str {
+    match kind {
+        ChatMessagePartKind::Text => "text",
+        ChatMessagePartKind::Tool => "tool",
+    }
+}
+
+fn chat_message_part_kind_from_db(
+    value: &str,
+    column: usize,
+) -> rusqlite::Result<ChatMessagePartKind> {
+    match value {
+        "text" => Ok(ChatMessagePartKind::Text),
+        "tool" => Ok(ChatMessagePartKind::Tool),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            Box::new(MothershipError::InvalidRequest(format!(
+                "unsupported chat message part kind: {value}"
+            ))),
+        )),
+    }
 }
 
 fn chat_role_to_db(role: ChatMessageRole) -> &'static str {
@@ -1797,6 +2495,7 @@ fn tool_event_kind_to_db(kind: ToolExecutionEventKind) -> &'static str {
         ToolExecutionEventKind::Failed => "failed",
         ToolExecutionEventKind::Cancelled => "cancelled",
         ToolExecutionEventKind::TimedOut => "timed_out",
+        ToolExecutionEventKind::LoopBlocked => "loop_blocked",
     }
 }
 
@@ -1812,6 +2511,7 @@ fn tool_event_kind_from_db(value: &str, column: usize) -> rusqlite::Result<ToolE
         "failed" => Ok(ToolExecutionEventKind::Failed),
         "cancelled" => Ok(ToolExecutionEventKind::Cancelled),
         "timed_out" => Ok(ToolExecutionEventKind::TimedOut),
+        "loop_blocked" => Ok(ToolExecutionEventKind::LoopBlocked),
         _ => Err(rusqlite::Error::FromSqlConversionFailure(
             column,
             Type::Text,
@@ -1891,6 +2591,51 @@ fn validate_chat_message_content(content: &str) -> Result<&str> {
     Ok(content)
 }
 
+fn normalize_project_path(path: &str) -> Result<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(MothershipError::InvalidRequest(
+            "project path cannot be empty".to_string(),
+        ));
+    }
+
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        MothershipError::InvalidRequest(format!("project path is not available: {error}"))
+    })?;
+    if !canonical.is_dir() {
+        return Err(MothershipError::InvalidRequest(
+            "project path must be a directory".to_string(),
+        ));
+    }
+
+    Ok(display_project_path(&canonical))
+}
+
+fn project_name_from_path(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn display_project_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = raw.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{stripped}");
+        }
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            return stripped.to_string();
+        }
+    }
+
+    raw.to_string()
+}
+
 fn normalize_limit(limit: i64, default_limit: i64) -> i64 {
     if limit <= 0 {
         default_limit
@@ -1966,7 +2711,7 @@ fn current_timestamp() -> String {
 mod tests {
     use std::{
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1980,16 +2725,20 @@ mod tests {
         database
             .set_selected_llm_model("openai", "test-model")
             .expect("select model");
+        let project = create_project(&database, &database_path, "persistent_conversation");
 
         let result = database
-            .send_chat_message(None, "Hello from the UI")
+            .send_chat_message(None, Some(&project.id), "Hello from the UI")
             .expect("send message");
 
         assert_eq!(result.chat.message_count, 2);
+        assert_eq!(result.chat.project_id.as_deref(), Some(project.id.as_str()));
         assert_eq!(result.user_message.role, ChatMessageRole::User);
         assert_eq!(result.assistant_message.role, ChatMessageRole::Assistant);
 
-        let listed = database.list_chats(10).expect("list chats");
+        let listed = database
+            .list_chats(Some(&project.id), 10)
+            .expect("list chats");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, result.chat.id);
 
@@ -2011,15 +2760,17 @@ mod tests {
     }
 
     #[test]
-    fn retry_resets_failed_assistant_in_place() {
-        let database_path = temp_database_path("retry_resets_failed_assistant_in_place");
+    fn retry_keeps_failed_assistant_and_starts_new_attempt() {
+        let database_path =
+            temp_database_path("retry_keeps_failed_assistant_and_starts_new_attempt");
         let database = Database::open(database_path.clone()).expect("open database");
         database
             .set_selected_llm_model("openai", "test-model")
             .expect("select model");
+        let project = create_project(&database, &database_path, "retry");
 
         let run = database
-            .begin_chat_run(None, "Retry me")
+            .begin_chat_run(None, Some(&project.id), "Retry me")
             .expect("begin run");
         database
             .record_chat_tool_execution_event(
@@ -2039,19 +2790,34 @@ mod tests {
             )
             .expect("record tool event");
         database
+            .append_chat_run_delta(
+                &run.run_id,
+                &run.chat.id,
+                &run.assistant_message.id,
+                "Partial answer",
+            )
+            .expect("append partial answer");
+        database
             .fail_chat_run(&run.run_id, &run.chat.id, &run.assistant_message.id, "boom")
             .expect("fail run");
 
         let retry = database.begin_retry_run(&run.chat.id).expect("begin retry");
-        // Same assistant message, rolled back to a fresh pending state.
-        assert_eq!(retry.assistant_message.id, run.assistant_message.id);
+        assert_ne!(retry.assistant_message.id, run.assistant_message.id);
         assert_eq!(retry.assistant_message.status, ChatMessageStatus::Sending);
         assert!(retry.assistant_message.content.is_empty());
         // The original prompt is reused, not duplicated.
         assert_eq!(retry.user_message.content, "Retry me");
         let conversation = database.get_chat(&run.chat.id, 200).expect("get chat");
-        assert_eq!(conversation.messages.len(), 2);
-        assert!(conversation.tool_executions.is_empty());
+        assert_eq!(conversation.messages.len(), 3);
+        let failed = conversation
+            .messages
+            .iter()
+            .find(|message| message.id == run.assistant_message.id)
+            .expect("failed assistant message");
+        assert_eq!(failed.status, ChatMessageStatus::Failed);
+        assert_eq!(failed.content, "Partial answer");
+        assert_eq!(failed.error.as_deref(), Some("boom"));
+        assert_eq!(conversation.tool_executions.len(), 1);
 
         // Nothing to retry while the run is pending again.
         let error = database
@@ -2063,14 +2829,76 @@ mod tests {
     }
 
     #[test]
+    fn continue_run_includes_failed_assistant_as_context_anchor() {
+        let database_path =
+            temp_database_path("continue_run_includes_failed_assistant_as_context_anchor");
+        let database = Database::open(database_path.clone()).expect("open database");
+        database
+            .set_selected_llm_model("openai", "test-model")
+            .expect("select model");
+        let project = create_project(&database, &database_path, "continue");
+
+        let run = database
+            .begin_chat_run(None, Some(&project.id), "Continue me")
+            .expect("begin run");
+        database
+            .append_chat_run_delta(
+                &run.run_id,
+                &run.chat.id,
+                &run.assistant_message.id,
+                "Partial work",
+            )
+            .expect("append partial work");
+        database
+            .fail_chat_run(&run.run_id, &run.chat.id, &run.assistant_message.id, "boom")
+            .expect("fail run");
+
+        let continued = database
+            .begin_continue_run(&run.chat.id)
+            .expect("begin continue run");
+
+        assert_eq!(
+            continued.user_message.content,
+            CONTINUE_CHAT_MESSAGE_CONTENT
+        );
+        assert_eq!(
+            continued
+                .context
+                .include_failed_assistant_message_id
+                .as_deref(),
+            Some(run.assistant_message.id.as_str())
+        );
+
+        let context = database
+            .llm_chat_context(
+                &continued.chat.id,
+                &continued.assistant_message.id,
+                20,
+                &continued.context,
+            )
+            .expect("load LLM context");
+        let context_contents = context
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            context_contents,
+            vec!["Continue me", "Partial work", CONTINUE_CHAT_MESSAGE_CONTENT]
+        );
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn chat_tool_events_are_restored_with_conversation() {
         let database_path = temp_database_path("chat_tool_events_are_restored");
         let database = Database::open(database_path.clone()).expect("open database");
         database
             .set_selected_llm_model("openai", "test-model")
             .expect("select model");
+        let project = create_project(&database, &database_path, "tool_history");
         let run = database
-            .begin_chat_run(None, "Show the current folder")
+            .begin_chat_run(None, Some(&project.id), "Show the current folder")
             .expect("begin run");
         let command = ToolCommand::new("powershell", ["-Command", "Get-Location"]);
 
@@ -2163,15 +2991,109 @@ mod tests {
     }
 
     #[test]
+    fn chat_message_parts_preserve_text_tool_text_order() {
+        let database_path = temp_database_path("chat_message_parts_preserve_order");
+        let database = Database::open(database_path.clone()).expect("open database");
+        database
+            .set_selected_llm_model("openai", "test-model")
+            .expect("select model");
+        let project = create_project(&database, &database_path, "message_parts");
+
+        let run = database
+            .begin_chat_run(None, Some(&project.id), "Inspect the workspace")
+            .expect("begin run");
+        database
+            .append_chat_run_delta(
+                &run.run_id,
+                &run.chat.id,
+                &run.assistant_message.id,
+                "I'll inspect the files first.\n",
+            )
+            .expect("append first text");
+        database
+            .record_chat_tool_call_part(
+                &run.run_id,
+                &run.chat.id,
+                &run.assistant_message.id,
+                "tool_order_1",
+            )
+            .expect("record tool part");
+        database
+            .record_chat_tool_execution_event(
+                &run.chat.id,
+                &run.assistant_message.id,
+                &ToolExecutionEvent {
+                    tool_call_id: "tool_order_1".to_string(),
+                    run_id: Some(run.run_id.clone()),
+                    project_id: Some("project_1".to_string()),
+                    command: Some(ToolCommand::new(
+                        "powershell",
+                        ["-Command", "Get-ChildItem"],
+                    )),
+                    kind: ToolExecutionEventKind::Queued,
+                    stream: None,
+                    chunk: None,
+                    message: None,
+                    result: None,
+                },
+            )
+            .expect("record tool event");
+        database
+            .append_chat_run_delta(
+                &run.run_id,
+                &run.chat.id,
+                &run.assistant_message.id,
+                "Done, here is what changed.",
+            )
+            .expect("append second text");
+
+        drop(database);
+
+        let reopened = Database::open(database_path.clone()).expect("reopen database");
+        let conversation = reopened
+            .get_chat(&run.chat.id, 200)
+            .expect("restore conversation");
+
+        assert_eq!(conversation.message_parts.len(), 3);
+        assert_eq!(
+            conversation.message_parts[0].kind,
+            ChatMessagePartKind::Text
+        );
+        assert_eq!(
+            conversation.message_parts[0].text.as_deref(),
+            Some("I'll inspect the files first.\n")
+        );
+        assert_eq!(
+            conversation.message_parts[1].kind,
+            ChatMessagePartKind::Tool
+        );
+        assert_eq!(
+            conversation.message_parts[1].tool_call_id.as_deref(),
+            Some("tool_order_1")
+        );
+        assert_eq!(
+            conversation.message_parts[2].kind,
+            ChatMessagePartKind::Text
+        );
+        assert_eq!(
+            conversation.message_parts[2].text.as_deref(),
+            Some("Done, here is what changed.")
+        );
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn editing_user_message_truncates_later_history_and_starts_run() {
         let database_path = temp_database_path("editing_user_message_truncates_history");
         let database = Database::open(database_path.clone()).expect("open database");
         database
             .set_selected_llm_model("openai", "test-model")
             .expect("select model");
+        let project = create_project(&database, &database_path, "editing");
 
         let first = database
-            .begin_chat_run(None, "Original prompt")
+            .begin_chat_run(None, Some(&project.id), "Original prompt")
             .expect("begin first run");
         database
             .append_chat_run_delta(
@@ -2186,7 +3108,7 @@ mod tests {
             .expect("complete first run");
 
         let second = database
-            .begin_chat_run(Some(&first.chat.id), "Follow-up prompt")
+            .begin_chat_run(Some(&first.chat.id), Some(&project.id), "Follow-up prompt")
             .expect("begin second run");
         database
             .record_chat_tool_execution_event(
@@ -2247,9 +3169,10 @@ mod tests {
         database
             .set_selected_llm_model("openai", "test-model")
             .expect("select model");
+        let project = create_project(&database, &database_path, "branch");
 
         let first = database
-            .begin_chat_run(None, "First prompt")
+            .begin_chat_run(None, Some(&project.id), "First prompt")
             .expect("begin first run");
         database
             .append_chat_run_delta(
@@ -2264,7 +3187,7 @@ mod tests {
             .expect("complete first run");
 
         let second = database
-            .begin_chat_run(Some(&first.chat.id), "Second prompt")
+            .begin_chat_run(Some(&first.chat.id), Some(&project.id), "Second prompt")
             .expect("begin second run");
         database
             .record_chat_tool_execution_event(
@@ -2329,10 +3252,15 @@ mod tests {
         database
             .set_selected_llm_model("openai", "test-model")
             .expect("select model");
-        let conversation = database.create_chat().expect("create chat");
+        let project = create_project(&database, &database_path, "empty_chat");
+        let conversation = database.create_chat(&project.id).expect("create chat");
 
         let result = database
-            .send_chat_message(Some(&conversation.chat.id), "  Implement Codex auth  ")
+            .send_chat_message(
+                Some(&conversation.chat.id),
+                Some(&project.id),
+                "  Implement Codex auth  ",
+            )
             .expect("send message");
 
         assert_eq!(result.chat.title, "Implement Codex auth");
@@ -2349,8 +3277,9 @@ mod tests {
         database
             .set_selected_llm_model("openai", "test-model")
             .expect("select model");
+        let project = create_project(&database, &database_path, "startup_recovery");
         let result = database
-            .begin_chat_run(None, "Hello")
+            .begin_chat_run(None, Some(&project.id), "Hello")
             .expect("begin chat run");
 
         let changed = database
@@ -2367,7 +3296,67 @@ mod tests {
             .find(|message| message.id == result.assistant_message.id)
             .expect("assistant message");
         assert_eq!(assistant.status, ChatMessageStatus::Failed);
-        assert!(assistant.content.contains("Run interrupted"));
+        assert!(assistant.content.is_empty());
+        assert!(assistant
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Run interrupted"));
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn project_snapshot_tracks_active_project_and_project_chats() {
+        let database_path = temp_database_path("project_snapshot_tracks_chats");
+        let database = Database::open(database_path.clone()).expect("open database");
+        database
+            .set_selected_llm_model("openai", "test-model")
+            .expect("select model");
+
+        let first_project = create_project(&database, &database_path, "first");
+        let second_project = create_project(&database, &database_path, "second");
+
+        database
+            .begin_chat_run(None, Some(&first_project.id), "First project prompt")
+            .expect("begin first project run");
+        database
+            .begin_chat_run(None, Some(&second_project.id), "Second project prompt")
+            .expect("begin second project run");
+
+        let first_chats = database
+            .list_chats(Some(&first_project.id), 10)
+            .expect("list first project chats");
+        let second_chats = database
+            .list_chats(Some(&second_project.id), 10)
+            .expect("list second project chats");
+
+        assert_eq!(first_chats.len(), 1);
+        assert_eq!(second_chats.len(), 1);
+        assert_eq!(
+            first_chats[0].project_id.as_deref(),
+            Some(first_project.id.as_str())
+        );
+        assert_eq!(
+            second_chats[0].project_id.as_deref(),
+            Some(second_project.id.as_str())
+        );
+
+        let snapshot = database
+            .set_active_project(&first_project.id)
+            .expect("select first project");
+        assert_eq!(
+            snapshot.active_project_id.as_deref(),
+            Some(first_project.id.as_str())
+        );
+        assert_eq!(
+            snapshot
+                .projects
+                .iter()
+                .find(|project| project.id == first_project.id)
+                .map(|project| project.chat_count),
+            Some(1)
+        );
 
         let _ = fs::remove_file(database_path);
     }
@@ -2400,5 +3389,25 @@ mod tests {
             .unwrap_or_default();
 
         std::env::temp_dir().join(format!("mothership_{name}_{unique}.sqlite3"))
+    }
+
+    fn create_project(database: &Database, database_path: &Path, name: &str) -> ProjectSummary {
+        let project_path = database_path.with_file_name(format!(
+            "{}_{name}_project",
+            database_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("mothership")
+        ));
+        fs::create_dir_all(&project_path).expect("create project dir");
+        let snapshot = database
+            .open_project(project_path.to_str().expect("project path"))
+            .expect("open project");
+        let active_project_id = snapshot.active_project_id.expect("active project id");
+        snapshot
+            .projects
+            .into_iter()
+            .find(|project| project.id == active_project_id)
+            .expect("active project")
     }
 }

@@ -18,7 +18,7 @@ A working `chat + LLM + auth` vertical slice exists, but:
 - there is no tool execution, no `ProcessSandbox`, no resource control.
 
 Resolved since this plan was written:
-- run orchestration moved into Core (`ChatRunService`, `ConnectorService`) — "move behavior to Core";
+- run orchestration moved into Core (`ChatRunService`, `ConnectorManager`) — "move behavior to Core";
 - **the sidecar is now a long-running daemon, not a one-shot CLI.** Core runs *in it*; the desktop host is a thin client over a newline-JSON protocol (`mothership-core::ipc`). See the note at the end of Phase 5 for why this was pulled forward.
 
 Guiding order: **relocate → change execution model → add data-plane → wire tools →

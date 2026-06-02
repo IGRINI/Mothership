@@ -8,21 +8,23 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use mothership_adapter_sdk::agentic::AgenticTurnPolicy;
+use mothership_adapter_sdk::http;
 use mothership_adapter_sdk::protocol::{
-    AuthKind, ChatMessage, Model, ModelManagement, SettingsField, SettingsFieldKind, ToolCallResult,
+    AuthKind, AuthStatus, Model, ModelManagement, SettingsField, SettingsFieldKind, ToolDescriptor,
 };
-use mothership_adapter_sdk::{Context, ProviderAdapter};
+use mothership_adapter_sdk::sse;
+use mothership_adapter_sdk::tools::{dispatch_tool_calls, ProviderToolCall, ProviderToolResult};
+use mothership_adapter_sdk::{ChatRequest, Context, ProviderAdapter};
 use serde_json::{json, Value};
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const SSE_BUFFER_BYTES: usize = 8192;
 const MAX_SSE_LINE_BYTES: usize = 256 * 1024;
 const MAX_ERROR_BODY_CHARS: usize = 300;
-const MAX_TOOL_ROUNDS: usize = 8;
-const RUN_COMMAND_TOOL_NAME: &str = "run_command";
+const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct OpenRouterSettings {
@@ -80,6 +82,14 @@ impl ProviderAdapter for OpenRouterAdapter {
         }
     }
 
+    fn auth_status(&self) -> AuthStatus {
+        if self.settings.api_key.trim().is_empty() {
+            AuthStatus::missing("OpenRouter API key is not configured")
+        } else {
+            AuthStatus::configured("OpenRouter API key is configured")
+        }
+    }
+
     async fn set_settings(&mut self, values: BTreeMap<String, String>) -> anyhow::Result<()> {
         self.settings.api_key = values.get("api_key").cloned().unwrap_or_default();
         self.settings.base_url = values.get("base_url").cloned().unwrap_or_default();
@@ -96,12 +106,11 @@ impl ProviderAdapter for OpenRouterAdapter {
 
     async fn chat(
         &mut self,
-        model: &str,
-        messages: Vec<ChatMessage>,
+        request: ChatRequest,
         _ctx: &Context,
         sink: &mut mothership_adapter_sdk::ChatSink,
     ) -> anyhow::Result<()> {
-        stream_chat(&self.client, &self.settings, model, &messages, sink).await
+        stream_chat(&self.client, &self.settings, &request, sink).await
     }
 }
 
@@ -121,8 +130,7 @@ fn parse_models(spec: &str) -> Vec<Model> {
 async fn stream_chat(
     client: &reqwest::Client,
     settings: &OpenRouterSettings,
-    model: &str,
-    messages: &[ChatMessage],
+    request: &ChatRequest,
     sink: &mut mothership_adapter_sdk::ChatSink,
 ) -> anyhow::Result<()> {
     if settings.api_key.trim().is_empty() {
@@ -134,26 +142,84 @@ async fn stream_chat(
         settings.base_url.trim()
     };
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
-    let mut conversation = messages
-        .iter()
-        .map(|message| json!({ "role": message.role, "content": message.content }))
-        .collect::<Vec<_>>();
+    let mut conversation = Vec::new();
+    let instructions = request.prompt.rendered_text();
+    if !instructions.trim().is_empty() {
+        conversation.push(json!({ "role": "system", "content": instructions }));
+    }
+    conversation.extend(
+        request
+            .messages
+            .iter()
+            .map(|message| json!({ "role": message.role, "content": message.content })),
+    );
+    let agentic_policy = AgenticTurnPolicy::default();
 
-    for _ in 0..MAX_TOOL_ROUNDS {
-        let tool_calls =
-            stream_chat_once(client, settings, &url, model, &conversation, sink).await?;
-        if tool_calls.is_empty() {
+    for _ in 0..agentic_policy.max_turns() {
+        let round = stream_chat_once(
+            client,
+            settings,
+            &url,
+            &request.model,
+            &conversation,
+            sink,
+            &request.tools,
+        )
+        .await?;
+        if round.tool_calls.is_empty() {
             return Ok(());
         }
 
-        let tool_results = execute_tool_calls(tool_calls.clone(), sink).await?;
-        conversation.push(assistant_tool_call_message(&tool_calls));
-        for (tool_call, result) in tool_results {
-            conversation.push(tool_result_message(&tool_call, result));
+        let tool_results = dispatch_openrouter_tool_calls(round.tool_calls.clone(), sink).await?;
+        if sink.is_cancelled() {
+            return Ok(());
+        }
+        conversation.push(assistant_tool_call_message(
+            &round.tool_calls,
+            &round.assistant_content,
+        ));
+        for tool_result in tool_results {
+            conversation.push(tool_result_message(tool_result));
         }
     }
 
-    anyhow::bail!("OpenRouter tool loop exceeded {MAX_TOOL_ROUNDS} rounds")
+    conversation.push(json!({
+        "role": "user",
+        "content": agentic_policy.final_synthesis_prompt(),
+    }));
+    match stream_chat_once(
+        client,
+        settings,
+        &url,
+        &request.model,
+        &conversation,
+        sink,
+        &[],
+    )
+    .await
+    {
+        Ok(round) if !round.tool_calls.is_empty() => {
+            sink.delta(agentic_policy.fallback_message());
+            eprintln!(
+                "openrouter-adapter: final no-tool synthesis unexpectedly returned {} tool call(s)",
+                round.tool_calls.len()
+            );
+            Ok(())
+        }
+        Ok(round) if round.assistant_content.trim().is_empty() => {
+            sink.delta(agentic_policy.fallback_message());
+            Ok(())
+        }
+        Ok(_round) => Ok(()),
+        Err(error) => {
+            sink.delta(agentic_policy.fallback_message());
+            eprintln!(
+                "openrouter-adapter: final no-tool synthesis after {} agentic turns failed: {error:#}",
+                agentic_policy.max_turns()
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn stream_chat_once(
@@ -163,37 +229,46 @@ async fn stream_chat_once(
     model: &str,
     messages: &[Value],
     sink: &mut mothership_adapter_sdk::ChatSink,
-) -> anyhow::Result<Vec<PendingToolCall>> {
-    let body = json!({
+    tools: &[ToolDescriptor],
+) -> anyhow::Result<ChatRound> {
+    let mut body = json!({
         "model": model,
         "messages": messages,
         "stream": true,
-        "tools": [run_command_tool_schema()],
-        "tool_choice": "auto",
-        "parallel_tool_calls": true,
     });
-
-    let request = client
-        .post(url)
-        .bearer_auth(settings.api_key.trim())
-        .json(&body)
-        .send();
-    let response = tokio::select! {
-        result = request => result.context("send OpenRouter chat request")?,
-        _ = sink.cancelled() => return Ok(Vec::new()),
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = read_error_body(response).await;
-        let text = sanitize_provider_error(&text, settings.api_key.trim());
-        anyhow::bail!(
-            "OpenRouter HTTP {status}: {}",
-            text.chars().take(MAX_ERROR_BODY_CHARS).collect::<String>()
-        );
+    if !tools.is_empty() {
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "tools".to_string(),
+                Value::Array(tools.iter().map(chat_completions_tool_schema).collect()),
+            );
+            object.insert("tool_choice".to_string(), json!("auto"));
+            object.insert("parallel_tool_calls".to_string(), json!(true));
+        }
     }
 
+    let api_key = settings.api_key.trim();
+    let headers = auth_headers(api_key);
+    let redacted_values = [api_key];
+    let request = http::post_stream_redacted(
+        client,
+        url,
+        &headers,
+        &body,
+        ERROR_BODY_TIMEOUT,
+        MAX_ERROR_BODY_CHARS,
+        &redacted_values,
+    );
+    let response = tokio::select! {
+        result = request => result.context("send OpenRouter chat request")?,
+        _ = sink.cancelled() => return Ok(ChatRound::default()),
+    };
+
     read_sse_stream(response, sink).await
+}
+
+fn auth_headers(api_key: &str) -> Vec<(String, String)> {
+    vec![("Authorization".to_string(), format!("Bearer {api_key}"))]
 }
 
 fn http_client() -> anyhow::Result<reqwest::Client> {
@@ -204,72 +279,43 @@ fn http_client() -> anyhow::Result<reqwest::Client> {
         .context("build OpenRouter HTTP client")
 }
 
-async fn read_error_body(response: reqwest::Response) -> String {
-    match tokio::time::timeout(STREAM_IDLE_TIMEOUT, response.text()).await {
-        Ok(Ok(text)) => text,
-        Ok(Err(_)) | Err(_) => String::new(),
-    }
-}
-
 async fn read_sse_stream(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     sink: &mut mothership_adapter_sdk::ChatSink,
-) -> anyhow::Result<Vec<PendingToolCall>> {
-    let mut pending = Vec::with_capacity(SSE_BUFFER_BYTES);
+) -> anyhow::Result<ChatRound> {
     let mut tool_calls = Vec::<StreamingToolCall>::new();
+    let mut assistant_content = String::new();
 
-    loop {
-        let chunk = tokio::select! {
-            result = tokio::time::timeout(STREAM_IDLE_TIMEOUT, response.chunk()) => {
-                result
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "OpenRouter SSE stream idle timeout after {} seconds",
-                            STREAM_IDLE_TIMEOUT.as_secs()
-                        )
-                    })?
-                    .context("read OpenRouter SSE stream")?
+    sse::read_sse_cancellable(
+        response,
+        STREAM_IDLE_TIMEOUT,
+        MAX_SSE_LINE_BYTES,
+        sink.cancellation_token(),
+        |payload| {
+            if handle_sse_payload(payload, sink, &mut tool_calls, &mut assistant_content)? {
+                return Ok(false);
             }
-            _ = sink.cancelled() => return Ok(Vec::new()),
-        };
-        let Some(chunk) = chunk else {
-            return Ok(finish_tool_calls(tool_calls));
-        };
-        if chunk.is_empty() {
-            continue;
-        }
-        pending.extend_from_slice(&chunk);
-        if pending.len() > MAX_SSE_LINE_BYTES && !pending.contains(&b'\n') {
-            anyhow::bail!(
-                "OpenRouter SSE line exceeded {} bytes without newline",
-                MAX_SSE_LINE_BYTES
-            );
-        }
-        while let Some(newline_index) = pending.iter().position(|byte| *byte == b'\n') {
-            let mut line = pending.drain(..=newline_index).collect::<Vec<_>>();
-            trim_line_ending(&mut line);
-            let line = std::str::from_utf8(&line).context("decode OpenRouter SSE line as UTF-8")?;
-            if handle_sse_line(line, sink, &mut tool_calls)? {
-                return Ok(finish_tool_calls(tool_calls));
-            }
-        }
-        if pending.len() > MAX_SSE_LINE_BYTES {
-            anyhow::bail!(
-                "OpenRouter SSE line exceeded {} bytes without newline",
-                MAX_SSE_LINE_BYTES
-            );
-        }
+            Ok(true)
+        },
+    )
+    .await?;
+
+    if sink.is_cancelled() {
+        return Ok(ChatRound::default());
     }
+
+    Ok(ChatRound {
+        assistant_content,
+        tool_calls: finish_tool_calls(tool_calls),
+    })
 }
 
-fn handle_sse_line(
-    line: &str,
+fn handle_sse_payload(
+    data: &str,
     sink: &mothership_adapter_sdk::ChatSink,
     tool_calls: &mut Vec<StreamingToolCall>,
+    assistant_content: &mut String,
 ) -> anyhow::Result<bool> {
-    let Some(data) = line.trim().strip_prefix("data:") else {
-        return Ok(false);
-    };
     let data = data.trim();
     if data == "[DONE]" {
         return Ok(true);
@@ -279,6 +325,7 @@ fn handle_sse_line(
         if let Some(text) = delta["content"].as_str() {
             if !text.is_empty() {
                 sink.delta(text);
+                assistant_content.push_str(text);
             }
         }
         if let Some(calls) = delta["tool_calls"].as_array() {
@@ -288,6 +335,12 @@ fn handle_sse_line(
         }
     }
     Ok(false)
+}
+
+#[derive(Debug, Default)]
+struct ChatRound {
+    assistant_content: String,
+    tool_calls: Vec<PendingToolCall>,
 }
 
 #[derive(Debug, Clone)]
@@ -361,41 +414,29 @@ fn finish_tool_calls(tool_calls: Vec<StreamingToolCall>) -> Vec<PendingToolCall>
         .collect()
 }
 
-async fn execute_tool_calls(
+async fn dispatch_openrouter_tool_calls(
     tool_calls: Vec<PendingToolCall>,
     sink: &mothership_adapter_sdk::ChatSink,
-) -> anyhow::Result<Vec<(PendingToolCall, ToolCallResult)>> {
-    let mut tasks = Vec::with_capacity(tool_calls.len());
-    for tool_call in tool_calls {
-        let sink = sink.clone();
-        tasks.push(tokio::spawn(async move {
-            let arguments = parse_tool_arguments(&tool_call.arguments);
-            let result = sink
-                .request_tool(tool_call.id.clone(), tool_call.name.clone(), arguments)
-                .await;
-            (tool_call, result)
-        }));
-    }
-
-    let mut results = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        let (tool_call, result) = task.await.context("join OpenRouter tool call task")?;
-        results.push((tool_call, result?));
-    }
-    Ok(results)
+) -> anyhow::Result<Vec<ProviderToolResult>> {
+    dispatch_tool_calls(
+        tool_calls.into_iter().map(|call| {
+            ProviderToolCall::from_raw_json_arguments(call.id, call.name, &call.arguments)
+        }),
+        sink,
+    )
+    .await
 }
 
-fn parse_tool_arguments(arguments: &str) -> Value {
-    if arguments.trim().is_empty() {
-        return json!({});
-    }
-    serde_json::from_str(arguments).unwrap_or_else(|_| json!({ "rawArguments": arguments }))
-}
+fn assistant_tool_call_message(tool_calls: &[PendingToolCall], assistant_content: &str) -> Value {
+    let content = if assistant_content.trim().is_empty() {
+        Value::Null
+    } else {
+        Value::String(assistant_content.to_string())
+    };
 
-fn assistant_tool_call_message(tool_calls: &[PendingToolCall]) -> Value {
     json!({
         "role": "assistant",
-        "content": null,
+        "content": content,
         "tool_calls": tool_calls
             .iter()
             .map(|call| {
@@ -412,85 +453,57 @@ fn assistant_tool_call_message(tool_calls: &[PendingToolCall]) -> Value {
     })
 }
 
-fn tool_result_message(tool_call: &PendingToolCall, result: ToolCallResult) -> Value {
-    let content = if result.ok {
-        result.content
-    } else {
-        format!("tool_error:\n{}", result.content)
-    };
+fn tool_result_message(tool_result: ProviderToolResult) -> Value {
     json!({
         "role": "tool",
-        "tool_call_id": tool_call.id,
-        "content": content,
+        "tool_call_id": tool_result.call.id,
+        "content": tool_result.result.content,
     })
 }
 
-fn run_command_tool_schema() -> Value {
+fn chat_completions_tool_schema(tool: &ToolDescriptor) -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": RUN_COMMAND_TOOL_NAME,
-            "description": "Run a local command through Mothership's supervised tool runtime. Use it for project inspection, tests, builds, git operations, and other development tasks. The app may ask the user for approval before execution.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "program": {
-                        "type": "string",
-                        "description": "Executable to run, for example git, npm, cargo, powershell, or python."
-                    },
-                    "args": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Command arguments without shell quoting."
-                    },
-                    "cwd": {
-                        "type": "string",
-                        "description": "Absolute working directory for the command. Omit only when the current project directory is not known."
-                    },
-                    "timeoutMs": {
-                        "type": "integer",
-                        "minimum": 1000,
-                        "maximum": 1800000,
-                        "description": "Optional timeout in milliseconds."
-                    }
-                },
-                "required": ["program"],
-                "additionalProperties": false
-            },
-            "strict": false
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters.clone(),
+            "strict": tool.strict,
         }
     })
 }
 
-fn trim_line_ending(line: &mut Vec<u8>) {
-    if line.last() == Some(&b'\n') {
-        line.pop();
-    }
-    if line.last() == Some(&b'\r') {
-        line.pop();
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn sanitize_provider_error(text: &str, api_key: &str) -> String {
-    let redacted = if api_key.is_empty() {
-        text.to_string()
-    } else {
-        text.replace(api_key, "[redacted]")
-    };
+    #[test]
+    fn assistant_tool_call_message_preserves_visible_progress_text() {
+        let message = assistant_tool_call_message(
+            &[PendingToolCall {
+                id: "call_1".to_string(),
+                name: "run_command".to_string(),
+                arguments: "{\"program\":\"git\"}".to_string(),
+            }],
+            "I will inspect the repository first.",
+        );
 
-    redacted
-        .lines()
-        .map(|line| {
-            let lower = line.to_ascii_lowercase();
-            if lower.contains("authorization")
-                || lower.contains("api-key")
-                || lower.contains("api_key")
-            {
-                "[redacted sensitive provider error line]"
-            } else {
-                line
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        assert_eq!(message["role"], "assistant");
+        assert_eq!(message["content"], "I will inspect the repository first.");
+        assert_eq!(message["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn assistant_tool_call_message_uses_null_content_without_progress_text() {
+        let message = assistant_tool_call_message(
+            &[PendingToolCall {
+                id: "call_1".to_string(),
+                name: "run_command".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            "",
+        );
+
+        assert!(message["content"].is_null());
+    }
 }

@@ -13,27 +13,17 @@ use crate::connectors::{
 };
 use crate::llm::{
     LlmChatCompletionEventSink, LlmChatCompletionRequest, LlmToolCallHandler, LlmTransportKind,
+    ProviderRequestPipeline,
 };
+use crate::prompt::runtime_prompt_bundle;
 use crate::provider_runtime::ProviderRuntimeManager;
+use crate::tools::default_tool_catalog;
 use crate::{Database, MothershipError, Result};
 
 const CHAT_CONTEXT_LIMIT: i64 = 80;
 const CHAT_DELTA_FLUSH_BYTES: usize = 1024;
 const CHAT_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const CHAT_CANCEL_PROCESS_GRACE: Duration = Duration::from_secs(10);
-const BASE_SYSTEM_PROMPT: &str = "You are Mothership's local AI coding assistant.
-Answer in the user's language unless the user asks otherwise.
-Be direct, practical, and precise.
-Use only the conversation context and tool results available in this request.
-Do not claim that you edited files, ran commands, opened applications, or inspected the local machine unless a tool result shows it.
-
-Runtime context:
-- The local host operating system is {host_os}.
-- Tool calls run through Mothership's supervised runtime, not directly inside the model provider.
-- When using run_command, pass the executable as program and command arguments as args. Do not rely on POSIX shell syntax unless you explicitly invoke a shell.
-- Prefer Windows-compatible commands. Simple read-only aliases such as pwd, ls, dir, cat, type, and grep are accepted and normalized by the runtime.
-- If the project folder is not known, say so and ask the user to open or select a project before running project-specific commands.";
-
 #[derive(Default)]
 pub struct ChatRunRegistry {
     inner: Mutex<ChatRunRegistryState>,
@@ -119,6 +109,7 @@ pub struct ChatRunService<'a> {
     database: &'a Database,
     providers: Arc<ProviderRuntimeManager>,
     tool_handler: Option<Arc<dyn LlmToolCallHandler>>,
+    provider_pipeline: ProviderRequestPipeline,
 }
 
 impl<'a> ChatRunService<'a> {
@@ -127,11 +118,17 @@ impl<'a> ChatRunService<'a> {
             database,
             providers,
             tool_handler: None,
+            provider_pipeline: ProviderRequestPipeline::default(),
         }
     }
 
     pub fn with_tool_handler(mut self, handler: Arc<dyn LlmToolCallHandler>) -> Self {
         self.tool_handler = Some(handler);
+        self
+    }
+
+    pub fn with_provider_request_pipeline(mut self, pipeline: ProviderRequestPipeline) -> Self {
+        self.provider_pipeline = pipeline;
         self
     }
 
@@ -153,6 +150,7 @@ impl<'a> ChatRunService<'a> {
             message: Some(run.assistant_message.clone()),
             chat: Some(run.chat.clone()),
             transport: None,
+            tool_call_id: None,
             error: None,
         });
 
@@ -174,6 +172,7 @@ impl<'a> ChatRunService<'a> {
                     message: None,
                     chat: None,
                     transport: None,
+                    tool_call_id: None,
                     error: Some(error.to_string()),
                 });
             sink.emit(event);
@@ -208,12 +207,14 @@ impl<'a> ChatRunService<'a> {
             &run.chat.id,
             &run.assistant_message.id,
             CHAT_CONTEXT_LIMIT,
+            &run.context,
         )?;
         if messages.is_empty() {
             return Err(MothershipError::InvalidRequest(
                 "chat context is empty".to_string(),
             ));
         }
+        let project = database.chat_project(&run.chat.id)?;
 
         let cancellation = ChatCancellationToken::default();
         let already_cancelled = registry.register(
@@ -241,17 +242,23 @@ impl<'a> ChatRunService<'a> {
         // user model list, OAuth tokens, …) live in the app's shared credential
         // vault, keyed by provider, and are pushed to the adapter on spawn.
         let vault = FileCredentialVault::new(auth_store_path(database));
+        let request = self.provider_pipeline.apply(LlmChatCompletionRequest {
+            provider_id: selected_model.provider_id,
+            model_id: selected_model.model_id,
+            prompt: runtime_prompt_bundle(project.as_ref()),
+            tools: self
+                .tool_handler
+                .as_ref()
+                .map(|_| default_tool_catalog())
+                .unwrap_or_default(),
+            messages,
+        })?;
         let result = self.providers.complete_subprocess_chat(
             entry,
             vault,
             Some(run.run_id.clone()),
             self.tool_handler.clone(),
-            LlmChatCompletionRequest {
-                provider_id: selected_model.provider_id,
-                model_id: selected_model.model_id,
-                system_prompt: runtime_system_prompt(),
-                messages,
-            },
+            request,
             &cancellation,
             &mut llm_sink,
         );
@@ -272,10 +279,6 @@ impl<'a> ChatRunService<'a> {
         llm_sink.emit(event);
         Ok(())
     }
-}
-
-fn runtime_system_prompt() -> String {
-    BASE_SYSTEM_PROMPT.replace("{host_os}", std::env::consts::OS)
 }
 
 pub fn schedule_cancel_fallback(
@@ -368,12 +371,40 @@ impl LlmChatCompletionEventSink for DbForwardingSink<'_> {
             message: None,
             chat: None,
             transport: None,
+            tool_call_id: None,
             error: None,
         });
         if self.pending_delta.len() >= CHAT_DELTA_FLUSH_BYTES
             || self.last_flush.elapsed() >= CHAT_DELTA_FLUSH_INTERVAL
         {
             self.flush();
+        }
+    }
+
+    fn before_tool_call(&mut self, tool_call_id: &str) {
+        self.flush();
+        if self
+            .database
+            .record_chat_tool_call_part(
+                self.run_id,
+                self.chat_id,
+                self.assistant_message_id,
+                tool_call_id,
+            )
+            .is_ok()
+        {
+            self.sink.emit(ChatRunEvent {
+                run_id: self.run_id.to_string(),
+                chat_id: self.chat_id.to_string(),
+                message_id: self.assistant_message_id.to_string(),
+                kind: ChatRunEventKind::ToolCall,
+                delta: None,
+                message: None,
+                chat: None,
+                transport: None,
+                tool_call_id: Some(tool_call_id.to_string()),
+                error: None,
+            });
         }
     }
 }
@@ -447,7 +478,13 @@ mod tests {
     /// A run handle over a freshly created (message-less) chat. Enough to drive
     /// the orchestration's early error paths without any network.
     fn run_handle(database: &Database) -> SendChatMessageResult {
-        let conversation = database.create_chat().expect("create chat");
+        let project_path = database.path().with_file_name("run_test_project");
+        fs::create_dir_all(&project_path).expect("create project dir");
+        let snapshot = database
+            .open_project(project_path.to_str().expect("project path"))
+            .expect("open project");
+        let project_id = snapshot.active_project_id.expect("active project id");
+        let conversation = database.create_chat(&project_id).expect("create chat");
         let chat = conversation.chat;
         let assistant_message = ChatMessage {
             id: "chat_message_assistant_test".to_string(),
@@ -457,6 +494,7 @@ mod tests {
             content: String::new(),
             status: ChatMessageStatus::Sending,
             created_at: "0".to_string(),
+            error: None,
             provider_id: None,
             model_id: None,
         };
@@ -468,6 +506,7 @@ mod tests {
             content: "Hello there".to_string(),
             status: ChatMessageStatus::Complete,
             created_at: "0".to_string(),
+            error: None,
             provider_id: None,
             model_id: None,
         };
@@ -477,6 +516,7 @@ mod tests {
             chat,
             user_message,
             assistant_message,
+            context: Default::default(),
         }
     }
 
@@ -503,13 +543,5 @@ mod tests {
         assert!(sink.error_text().contains("no LLM model selected"));
 
         let _ = fs::remove_file(database_path);
-    }
-
-    #[test]
-    fn runtime_prompt_includes_host_os_and_tool_context() {
-        let prompt = runtime_system_prompt();
-        assert!(prompt.contains(std::env::consts::OS));
-        assert!(prompt.contains("supervised runtime"));
-        assert!(prompt.contains("run_command"));
     }
 }

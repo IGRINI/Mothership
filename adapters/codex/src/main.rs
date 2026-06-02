@@ -1,30 +1,32 @@
 //! Codex provider adapter — built on the shared adapter SDK.
 //!
-//! Provider-specific logic only: OAuth (PKCE + browser + localhost callback +
-//! refresh + revoke), the model catalog (server-fetched, cached), and wiring the
+//! Provider-specific logic only: Codex OAuth endpoints/request shapes, the
+//! model catalog, and wiring the
 //! OpenAI Responses transport. Everything generic — the stdio protocol loop, the
-//! HTTP/SSE/WebSocket transports, the WS-primary→SSE→JSON fallback, idle
-//! timeouts, structured Responses parsing — comes from `mothership-adapter-sdk`
-//! and `mothership-openai-responses`, shared with any other Responses adapter.
+//! HTTP/SSE/WebSocket transports, OAuth mechanics, the WS-primary→SSE→JSON
+//! fallback, idle timeouts, structured Responses parsing — comes from
+//! `mothership-adapter-sdk` and `mothership-openai-responses`, shared with any
+//! other adapter.
 //!
 //! Credentials are pushed in by the host under the `credential` settings key and
 //! pushed back via `StoreSecret`; nothing is stored next to the adapter.
 
-use std::collections::{BTreeMap, HashMap};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context as _, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use anyhow::{bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use url::Url;
 
-use mothership_adapter_sdk::protocol::{AuthKind, ChatMessage, Model, ModelManagement};
+use mothership_adapter_sdk::oauth;
+use mothership_adapter_sdk::protocol::{
+    AuthKind, AuthStatus, Model, ModelManagement, PromptBundle, ToolDescriptor,
+};
+use mothership_adapter_sdk::tools::{dispatch_tool_calls, ProviderToolCall};
 use mothership_adapter_sdk::ws::WsSession;
-use mothership_adapter_sdk::{Context, ProviderAdapter};
+use mothership_adapter_sdk::{http, ChatRequest, Context, ProviderAdapter};
 use mothership_openai_responses as responses;
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -39,20 +41,13 @@ const CLIENT_VERSION: &str = "0.133.0";
 /// Codex Responses-over-WebSocket beta opt-in (matches the real Codex CLI).
 const WS_BETA_HEADER: &str = "responses_websockets=2026-02-06";
 const REFRESH_MARGIN_MS: u64 = 60_000;
-const MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_ERROR_BODY_CHARS: usize = 300;
+const OAUTH_ACCEPT_TIMEOUT: Duration = Duration::from_secs(300);
+const OAUTH_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Settings key under which the host stores/loads the whole credential JSON.
 const CREDENTIAL_SETTINGS_KEY: &str = "credential";
-const RUN_COMMAND_TOOL_NAME: &str = "run_command";
-
-/// Fallback system prompt when the core sends no system message (the Codex
-/// backend requires non-empty `instructions`).
-const DEFAULT_INSTRUCTIONS: &str = "You are Mothership's local AI coding assistant.
-Answer in the user's language unless the user asks otherwise.
-Be direct, technically precise, and practical.
-Use only the conversation context available in this request.
-Do not claim that you edited files, ran commands, opened applications, or inspected the local machine unless that information is present in the conversation context.
-When code or commands are useful, provide concrete, executable examples.";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -68,7 +63,6 @@ struct CodexAdapter {
     ws: Option<WsSession>,
     /// Set when a WS attempt fell back; skip WS until the credential changes.
     ws_disabled: bool,
-    models_cache: Option<(Instant, Vec<Model>)>,
 }
 
 impl CodexAdapter {
@@ -79,7 +73,6 @@ impl CodexAdapter {
             credential: None,
             ws: None,
             ws_disabled: false,
-            models_cache: None,
         })
     }
 
@@ -88,7 +81,6 @@ impl CodexAdapter {
         self.credential = credential;
         self.ws = None;
         self.ws_disabled = false;
-        self.models_cache = None;
     }
 
     /// A valid access token + account id, running browser OAuth if there is no
@@ -161,6 +153,28 @@ impl ProviderAdapter for CodexAdapter {
         AuthKind::OauthInternal
     }
 
+    fn auth_status(&self) -> AuthStatus {
+        match &self.credential {
+            None => AuthStatus::missing("Codex OAuth is not authorized"),
+            Some(credential) => {
+                let account_label = credential.account_id.clone();
+                let expires_at = credential.expires_at.clone();
+                let expired_without_refresh = expires_at
+                    .as_deref()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(|expires_at| {
+                        expires_at <= now_millis() && credential.refresh_token.trim().is_empty()
+                    })
+                    .unwrap_or(false);
+                if expired_without_refresh {
+                    AuthStatus::expired(account_label, expires_at)
+                } else {
+                    AuthStatus::authenticated(account_label, expires_at)
+                }
+            }
+        }
+    }
+
     async fn set_settings(&mut self, values: BTreeMap<String, String>) -> Result<()> {
         self.set_credential(
             values
@@ -171,11 +185,6 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     async fn models(&mut self, ctx: &Context) -> Result<(ModelManagement, Vec<Model>)> {
-        if let Some((fetched_at, cached)) = &self.models_cache {
-            if fetched_at.elapsed() < MODEL_CACHE_TTL {
-                return Ok((ModelManagement::Server, cached.clone()));
-            }
-        }
         // Never trigger OAuth from model listing — only use an existing credential.
         let models = if self.credential.is_some() {
             self.refresh_if_needed(ctx).await?;
@@ -190,9 +199,6 @@ impl ProviderAdapter for CodexAdapter {
         } else {
             Vec::new()
         };
-        if !models.is_empty() {
-            self.models_cache = Some((Instant::now(), models.clone()));
-        }
         Ok((ModelManagement::Server, models))
     }
 
@@ -205,14 +211,13 @@ impl ProviderAdapter for CodexAdapter {
 
     async fn chat(
         &mut self,
-        model: &str,
-        messages: Vec<ChatMessage>,
+        request: ChatRequest,
         ctx: &Context,
         sink: &mut mothership_adapter_sdk::ChatSink,
     ) -> Result<()> {
         let (access_token, account_id) = self.ensure_token(ctx).await?;
         let headers = auth_headers(&access_token, account_id.as_deref());
-        let instructions = resolve_instructions(&messages);
+        let instructions = provider_instructions(&request.prompt)?;
 
         let had_ws = !self.ws_disabled;
         if had_ws && self.ws.is_none() {
@@ -226,16 +231,20 @@ impl ProviderAdapter for CodexAdapter {
         let cancellation = sink.cancellation_token();
         let mut on_delta = |text: &str| sink.delta(text);
         let tool_dispatcher = CodexToolDispatcher { sink: sink.clone() };
-        let tools = [run_command_tool_schema()];
+        let tools = request
+            .tools
+            .iter()
+            .map(responses_tool_schema)
+            .collect::<Vec<_>>();
         let ws_arg = if had_ws { self.ws.as_mut() } else { None };
         let transport = tokio::select! {
             result = responses::chat_with_tools(
                 &self.client,
                 &self.endpoint,
                 &headers,
-                model,
+                &request.model,
                 &instructions,
-                &messages,
+                &request.messages,
                 ws_arg,
                 &mut on_delta,
                 &tools,
@@ -285,47 +294,36 @@ impl responses::ToolDispatcher for CodexToolDispatcher {
             .sink
             .request_tool(call.call_id, call.name, call.arguments)
             .await?;
-        let output = if result.ok {
-            result.content
-        } else {
-            format!("tool_error:\n{}", result.content)
-        };
-        Ok(responses::ToolOutput { output })
+        Ok(responses::ToolOutput {
+            output: result.content,
+        })
+    }
+
+    async fn dispatch_many(
+        &self,
+        calls: Vec<responses::ToolCall>,
+    ) -> Result<Vec<responses::ToolOutput>> {
+        let calls = calls
+            .into_iter()
+            .map(|call| ProviderToolCall::new(call.call_id, call.name, call.arguments))
+            .collect::<Vec<_>>();
+        let results = dispatch_tool_calls(calls, &self.sink).await?;
+        Ok(results
+            .into_iter()
+            .map(|result| responses::ToolOutput {
+                output: result.result.content,
+            })
+            .collect())
     }
 }
 
-fn run_command_tool_schema() -> serde_json::Value {
+fn responses_tool_schema(tool: &ToolDescriptor) -> serde_json::Value {
     json!({
         "type": "function",
-        "name": RUN_COMMAND_TOOL_NAME,
-        "description": "Run a local command through Mothership's supervised tool runtime. Use it for project inspection, tests, builds, git operations, and other development tasks. The app may ask the user for approval before execution.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "program": {
-                    "type": "string",
-                    "description": "Executable to run, for example git, npm, cargo, powershell, or python."
-                },
-                "args": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Command arguments without shell quoting."
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": "Absolute working directory for the command. Omit only when the current project directory is not known."
-                },
-                "timeoutMs": {
-                    "type": "integer",
-                    "minimum": 1000,
-                    "maximum": 1800000,
-                    "description": "Optional timeout in milliseconds."
-                }
-            },
-            "required": ["program"],
-            "additionalProperties": false
-        },
-        "strict": false
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.parameters.clone(),
+        "strict": tool.strict,
     })
 }
 
@@ -365,18 +363,12 @@ fn is_near_expiry(credential: &CodexCredential) -> bool {
         .unwrap_or(false)
 }
 
-fn resolve_instructions(messages: &[ChatMessage]) -> String {
-    let system = messages
-        .iter()
-        .filter(|message| message.role == "system")
-        .map(|message| message.content.trim())
-        .filter(|content| !content.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if system.is_empty() {
-        DEFAULT_INSTRUCTIONS.to_string()
+fn provider_instructions(prompt: &PromptBundle) -> Result<String> {
+    let instructions = prompt.rendered_text();
+    if instructions.trim().is_empty() {
+        bail!("core prompt bundle rendered empty; refusing to send empty Codex instructions")
     } else {
-        system
+        Ok(instructions)
     }
 }
 
@@ -406,22 +398,27 @@ fn persist_credential(ctx: &Context, credential: &CodexCredential) {
 }
 
 async fn run_oauth(client: &reqwest::Client) -> Result<CodexCredential> {
-    let verifier = random_b64url(32);
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    let state = random_b64url(16);
+    let pkce = oauth::pkce_pair(32);
+    let state = oauth::random_state(16);
 
     // Bind the callback listener before opening the browser to avoid a race.
     let listener = TcpListener::bind(CALLBACK_ADDR)
         .await
         .context("bind OAuth callback listener")?;
-    let auth_url = authorize_url(&challenge, &state);
+    let auth_url = authorize_url(&pkce.challenge, &state);
     let _ = open::that(&auth_url);
     eprintln!(
         "codex-adapter: waiting for browser OAuth on {REDIRECT_URI}\nif the browser didn't open, paste this URL:\n{auth_url}"
     );
 
-    let (code, returned_state) = wait_for_callback(&listener).await?;
-    if returned_state != state {
+    let callback = oauth::wait_for_localhost_callback(
+        &listener,
+        OAUTH_ACCEPT_TIMEOUT,
+        OAUTH_READ_TIMEOUT,
+        OAUTH_SUCCESS_BODY,
+    )
+    .await?;
+    if callback.state != state {
         bail!("OAuth state mismatch");
     }
 
@@ -429,10 +426,10 @@ async fn run_oauth(client: &reqwest::Client) -> Result<CodexCredential> {
         client,
         &[
             ("grant_type", "authorization_code"),
-            ("code", &code),
+            ("code", &callback.code),
             ("redirect_uri", REDIRECT_URI),
             ("client_id", CLIENT_ID),
-            ("code_verifier", &verifier),
+            ("code_verifier", &pkce.verifier),
         ],
     )
     .await?;
@@ -441,7 +438,7 @@ async fn run_oauth(client: &reqwest::Client) -> Result<CodexCredential> {
         .id_token
         .as_deref()
         .or(Some(tokens.access_token.as_str()))
-        .and_then(parse_jwt_claims)
+        .and_then(oauth::parse_jwt_claims)
         .and_then(|claims| account_id_from_claims(&claims));
 
     Ok(CodexCredential {
@@ -458,14 +455,36 @@ async fn run_oauth(client: &reqwest::Client) -> Result<CodexCredential> {
     })
 }
 
+const OAUTH_SUCCESS_BODY: &str = "<!doctype html><meta charset=utf-8><title>Mothership</title>\
+        <body style=\"font-family:system-ui;background:#0b0f14;color:#eaf1f8\">\
+        <p>Codex authorized. You can close this tab and return to Mothership.</p>";
+
 async fn post_token(client: &reqwest::Client, form: &[(&str, &str)]) -> Result<TokenResponse> {
     let response = client
         .post(format!("{ISSUER}/oauth/token"))
         .timeout(HTTP_TIMEOUT)
         .form(form)
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let redacted_values = form
+        .iter()
+        .filter_map(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            if key.contains("token") || key.contains("code") || key.contains("verifier") {
+                Some(*value)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let response = http::ensure_success_redacted(
+        response,
+        ERROR_BODY_TIMEOUT,
+        MAX_ERROR_BODY_CHARS,
+        &[],
+        &redacted_values,
+    )
+    .await?;
     response.json().await.context("decode token response")
 }
 
@@ -483,45 +502,6 @@ fn authorize_url(code_challenge: &str, state: &str) -> String {
         .append_pair("state", state)
         .append_pair("originator", "mothership");
     url.to_string()
-}
-
-async fn wait_for_callback(listener: &TcpListener) -> Result<(String, String)> {
-    // Bound the wait so an abandoned login can't wedge the adapter forever.
-    let (stream, _) = tokio::time::timeout(Duration::from_secs(300), listener.accept())
-        .await
-        .map_err(|_| anyhow!("timed out waiting for browser OAuth callback"))?
-        .context("accept OAuth callback")?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut request_line = String::new();
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        BufReader::new(read_half).read_line(&mut request_line),
-    )
-    .await
-    .map_err(|_| anyhow!("timed out reading OAuth callback request"))??;
-
-    let path = request_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow!("invalid OAuth callback request"))?;
-    let url = Url::parse(&format!("http://localhost{path}"))?;
-    let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
-    let code = query
-        .get("code")
-        .cloned()
-        .ok_or_else(|| anyhow!("callback missing code"))?;
-    let state = query.get("state").cloned().unwrap_or_default();
-
-    let body = "<!doctype html><meta charset=utf-8><title>Mothership</title>\
-        <body style=\"font-family:system-ui;background:#0b0f14;color:#eaf1f8\">\
-        <p>Codex authorized. You can close this tab and return to Mothership.</p>";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = write_half.write_all(response.as_bytes()).await;
-    Ok((code, state))
 }
 
 #[derive(Debug, Serialize)]
@@ -556,25 +536,21 @@ async fn revoke_credential(client: &reqwest::Client, credential: &CodexCredentia
         .send()
         .await
     {
-        Ok(response) if response.status().is_success() => {}
-        Ok(response) => eprintln!(
-            "codex-adapter: token revoke rejected: {}",
-            response.status()
-        ),
+        Ok(response) => {
+            if let Err(error) = http::ensure_success_redacted(
+                response,
+                ERROR_BODY_TIMEOUT,
+                MAX_ERROR_BODY_CHARS,
+                &[],
+                &[token],
+            )
+            .await
+            {
+                eprintln!("codex-adapter: token revoke rejected: {error:#}");
+            }
+        }
         Err(error) => eprintln!("codex-adapter: token revoke failed: {error}"),
     }
-}
-
-fn random_b64url(bytes: usize) -> String {
-    let mut buffer = vec![0u8; bytes];
-    getrandom::getrandom(&mut buffer).expect("getrandom");
-    URL_SAFE_NO_PAD.encode(buffer)
-}
-
-fn parse_jwt_claims(token: &str) -> Option<serde_json::Value> {
-    let payload = token.split('.').nth(1)?;
-    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    serde_json::from_slice(&bytes).ok()
 }
 
 fn account_id_from_claims(claims: &serde_json::Value) -> Option<String> {
@@ -610,14 +586,23 @@ async fn fetch_models(
     access_token: &str,
     account_id: Option<&str>,
 ) -> Result<Vec<Model>> {
+    let headers = auth_headers(access_token, account_id);
     let mut request = client
         .get(format!("{MODELS_ENDPOINT}?client_version={CLIENT_VERSION}"))
-        .timeout(HTTP_TIMEOUT)
-        .bearer_auth(access_token);
-    if let Some(account_id) = account_id {
-        request = request.header("ChatGPT-Account-Id", account_id);
+        .timeout(HTTP_TIMEOUT);
+    for (name, value) in &headers {
+        request = request.header(name, value);
     }
-    let payload: serde_json::Value = request.send().await?.error_for_status()?.json().await?;
+    let response = request.send().await?;
+    let response = http::ensure_success_redacted(
+        response,
+        ERROR_BODY_TIMEOUT,
+        MAX_ERROR_BODY_CHARS,
+        &headers,
+        &[],
+    )
+    .await?;
+    let payload: serde_json::Value = response.json().await?;
     let mut models: Vec<RemoteModel> =
         serde_json::from_value(payload.get("models").cloned().unwrap_or(json!([])))?;
     models.sort_by_key(|model| model.priority.unwrap_or(i64::MAX));

@@ -534,7 +534,7 @@ Do not build:
 
 The current codebase is an early scaffold. The target mapping is:
 
-- `crates/mothership-core/`: Agent Core — domain, application services (`ChatRunService`, `ConnectorService`), repositories, and the host↔sidecar wire protocol (`ipc`). Runs in the sidecar process.
+- `crates/mothership-core/`: Agent Core — domain, application services (`ChatRunService`, `ConnectorManager`), repositories, and the host↔sidecar wire protocol (`ipc`). Runs in the sidecar process.
 - `src-sidecar/`: the long-running Core host process. Owns the database, the credential vault, and provider-adapter subprocesses; serves the host over stdio.
 - `src-tauri/`: thin desktop host — window/webview, the sidecar supervisor (spawn, handshake, request/response correlation, crash-restart), and Tauri commands that forward to the sidecar. Holds no database or adapters.
 - `src/`: thin SolidJS desktop client.

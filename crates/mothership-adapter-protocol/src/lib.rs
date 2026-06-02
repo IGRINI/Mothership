@@ -20,7 +20,7 @@ use serde_json::Value;
 /// `initialize` and refuses an adapter that reports a different version, rather
 /// than mis-parsing a contract it doesn't understand. Bump on any incompatible
 /// change to `Request`/`Outbound`.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Host -> adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +49,9 @@ pub enum Request {
     GetAuthSchema {
         id: u64,
     },
+    GetAuthStatus {
+        id: u64,
+    },
     /// Ask the adapter to run its own auth flow now (e.g. browser OAuth) and
     /// persist the result via [`Outbound::StoreSecret`]. Drives the UI's
     /// per-adapter "Authorize" action for `oauth_internal` / `external_process`
@@ -59,7 +62,11 @@ pub enum Request {
     ChatStart {
         id: u64,
         model: String,
+        #[serde(default)]
+        prompt: PromptBundle,
         messages: Vec<ChatMessage>,
+        #[serde(default)]
+        tools: Vec<ToolDescriptor>,
     },
     /// Return the result for a model-requested tool call. This is a continuation
     /// frame for an active chat turn and intentionally has no separate adapter
@@ -112,6 +119,10 @@ pub enum Outbound {
         id: u64,
         auth: AuthKind,
     },
+    AuthStatus {
+        id: u64,
+        status: AuthStatus,
+    },
     Delta {
         id: u64,
         text: String,
@@ -124,6 +135,13 @@ pub enum Outbound {
         tool_call_id: String,
         name: String,
         arguments: Value,
+    },
+    /// Batch form of [`Outbound::ToolCall`]. Adapters use this when a provider
+    /// returns multiple tool calls in one model turn; the host/Core receives the
+    /// whole batch and owns the execution policy.
+    ToolCalls {
+        id: u64,
+        calls: Vec<ToolCallInvocation>,
     },
     Done {
         id: u64,
@@ -141,9 +159,69 @@ pub enum Outbound {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallInvocation {
+    pub tool_call_id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptBundle {
+    #[serde(default)]
+    pub sections: Vec<PromptSection>,
+}
+
+impl PromptBundle {
+    pub fn rendered_text(&self) -> String {
+        let mut sections = self
+            .sections
+            .iter()
+            .filter(|section| !section.content.trim().is_empty())
+            .collect::<Vec<_>>();
+        sections.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        sections
+            .into_iter()
+            .map(|section| section.content.trim())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptSection {
+    pub id: String,
+    #[serde(default)]
+    pub source: String,
+    pub priority: i32,
+    pub locked: bool,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDescriptor {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+    #[serde(default)]
+    pub strict: bool,
+    #[serde(default)]
+    pub annotations: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -208,4 +286,83 @@ pub enum AuthKind {
     OauthInternal,
     /// The adapter launches and drives an external process (e.g. claude-code).
     ExternalProcess,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthStatusKind {
+    NotRequired,
+    Missing,
+    Configured,
+    Authenticated,
+    Expired,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthStatus {
+    pub kind: AuthStatusKind,
+    #[serde(default)]
+    pub account_label: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl AuthStatus {
+    pub fn not_required() -> Self {
+        Self {
+            kind: AuthStatusKind::NotRequired,
+            account_label: None,
+            expires_at: None,
+            detail: None,
+        }
+    }
+
+    pub fn missing(detail: impl Into<String>) -> Self {
+        Self {
+            kind: AuthStatusKind::Missing,
+            account_label: None,
+            expires_at: None,
+            detail: Some(detail.into()),
+        }
+    }
+
+    pub fn configured(detail: impl Into<String>) -> Self {
+        Self {
+            kind: AuthStatusKind::Configured,
+            account_label: None,
+            expires_at: None,
+            detail: Some(detail.into()),
+        }
+    }
+
+    pub fn authenticated(account_label: Option<String>, expires_at: Option<String>) -> Self {
+        Self {
+            kind: AuthStatusKind::Authenticated,
+            account_label,
+            expires_at,
+            detail: None,
+        }
+    }
+
+    pub fn expired(account_label: Option<String>, expires_at: Option<String>) -> Self {
+        Self {
+            kind: AuthStatusKind::Expired,
+            account_label,
+            expires_at,
+            detail: Some("credential expired".to_string()),
+        }
+    }
+
+    pub fn error(detail: impl Into<String>) -> Self {
+        Self {
+            kind: AuthStatusKind::Error,
+            account_label: None,
+            expires_at: None,
+            detail: Some(detail.into()),
+        }
+    }
 }

@@ -34,7 +34,7 @@ use mothership_core::{
     ToolApprovalDecision, ToolCancellationToken, ToolExecutionAccepted,
     ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionEventKind,
     ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest, ToolExecutionResult,
-    ToolExecutionStatus, ToolResourceLimits, ToolSupervisor,
+    ToolExecutionStatus, ToolRepeatGuard, ToolResourceLimits, ToolSupervisor,
 };
 use sha2::{Digest, Sha256};
 
@@ -129,8 +129,12 @@ fn serve() -> anyhow::Result<()> {
     // Resident adapter processes, reused across operations instead of spawning
     // one per request.
     let pool = Arc::new(AdapterPool::new());
-    let connector_manager = Arc::new(ConnectorManager::new(database.clone(), Arc::clone(&pool)));
     let provider_manager = Arc::new(ProviderRuntimeManager::new(Arc::clone(&pool)));
+    let connector_manager = Arc::new(ConnectorManager::with_runtime(
+        database.clone(),
+        Arc::clone(&pool),
+        Arc::clone(&provider_manager),
+    ));
     let async_runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -138,6 +142,7 @@ fn serve() -> anyhow::Result<()> {
             .build()?,
     );
     let tool_approvals = PendingToolApprovalGate::new();
+    let tool_repeat_guard = Arc::new(ToolRepeatGuard::default());
     let tool_supervisor = Arc::new(
         ToolSupervisor::new(
             Arc::new(tool_runtime::ProcessSandboxToolAdapter::new(
@@ -152,7 +157,8 @@ fn serve() -> anyhow::Result<()> {
         .with_policy(
             Arc::new(ConservativeCommandPermissionPolicy),
             Arc::clone(&tool_approvals) as Arc<dyn mothership_core::ToolApprovalGate>,
-        ),
+        )
+        .with_repeat_guard(tool_repeat_guard),
     );
     let tool_registry = Arc::new(ToolExecutionRegistry::new());
     let chat_registry = Arc::new(ChatRunRegistry::new());
@@ -388,8 +394,13 @@ fn handle_request(
 ) {
     // Streaming requests answer immediately with the persisted placeholder, then
     // stream the run; handle them before the uniform request/response path.
-    if let CoreRequest::SendChatMessage { chat_id, content } = &request {
-        let started = database.begin_chat_run(chat_id.as_deref(), content);
+    if let CoreRequest::SendChatMessage {
+        chat_id,
+        project_id,
+        content,
+    } = &request
+    {
+        let started = database.begin_chat_run(chat_id.as_deref(), project_id.as_deref(), content);
         run_chat_message(
             id,
             started,
@@ -425,6 +436,21 @@ fn handle_request(
     }
     if let CoreRequest::RetryChatMessage { chat_id } = &request {
         let started = database.begin_retry_run(chat_id);
+        run_chat_message(
+            id,
+            started,
+            database,
+            outbox,
+            provider_manager,
+            tool_supervisor,
+            tool_registry,
+            async_runtime,
+            chat_registry,
+        );
+        return;
+    }
+    if let CoreRequest::ContinueChatMessage { chat_id } = &request {
+        let started = database.begin_continue_run(chat_id);
         run_chat_message(
             id,
             started,
@@ -497,10 +523,12 @@ fn compute(
             database.append_activity_event(&message)?;
             response(CoreResponse::Dashboard(database.snapshot()?))
         }
-        CoreRequest::ListChats { limit } => response(CoreResponse::ChatList(
-            database.list_chats(limit.unwrap_or(100))?,
+        CoreRequest::ListChats { project_id, limit } => response(CoreResponse::ChatList(
+            database.list_chats(project_id.as_deref(), limit.unwrap_or(100))?,
         )),
-        CoreRequest::CreateChat => response(CoreResponse::Chat(database.create_chat()?)),
+        CoreRequest::CreateChat { project_id } => {
+            response(CoreResponse::Chat(database.create_chat(&project_id)?))
+        }
         CoreRequest::GetChat { chat_id, limit } => response(CoreResponse::Chat(
             database.get_chat(&chat_id, limit.unwrap_or(200))?,
         )),
@@ -588,6 +616,15 @@ fn compute(
             connector_manager.logout(&provider_id)?,
             Some(ConnectorRefreshScope::Provider(provider_id)),
         ),
+        CoreRequest::ListProjects => {
+            response(CoreResponse::ProjectSnapshot(database.list_projects()?))
+        }
+        CoreRequest::OpenProject { path } => {
+            response(CoreResponse::ProjectSnapshot(database.open_project(&path)?))
+        }
+        CoreRequest::SetActiveProject { project_id } => response(CoreResponse::ProjectSnapshot(
+            database.set_active_project(&project_id)?,
+        )),
         CoreRequest::SidecarStatus => {
             response(CoreResponse::SidecarStatus(database.sidecar_status()?))
         }
@@ -595,6 +632,7 @@ fn compute(
         CoreRequest::SendChatMessage { .. }
         | CoreRequest::EditChatUserMessage { .. }
         | CoreRequest::RetryChatMessage { .. }
+        | CoreRequest::ContinueChatMessage { .. }
         | CoreRequest::RunToolCommand { .. } => {
             unreachable!("handled as a streaming request")
         }
@@ -751,6 +789,7 @@ fn run_chat_message(
 ) {
     match started {
         Ok(started) => {
+            let project = database.chat_project(&started.chat.id).ok().flatten();
             let _ = outbox.send(ServerFrame::Response {
                 id,
                 result: CoreResponse::ChatMessageStarted(started.clone()),
@@ -767,6 +806,7 @@ fn run_chat_message(
                     tool_registry,
                     async_runtime,
                     tool_sink,
+                    project.map(|project| (project.id, PathBuf::from(project.path))),
                 ));
             let mut sink = ProtocolChatRunSink { outbox };
             ChatRunService::new(&database, provider_manager)

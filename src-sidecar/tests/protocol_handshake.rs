@@ -73,7 +73,7 @@ fn sidecar_handshake_and_dashboard_roundtrip() {
 
     // 5. The connector path runs Core's adapter logic inside the sidecar. With no
     // plugins in this temp dir it returns an empty provider list — the point is
-    // that ConnectorService executes in-process without panicking over IPC.
+    // that ConnectorManager executes in-process without panicking over IPC.
     write_frame(
         &mut stdin,
         &ClientFrame::Request {
@@ -92,19 +92,46 @@ fn sidecar_handshake_and_dashboard_roundtrip() {
         other => panic!("expected Response, got {other:?}"),
     }
 
-    // 6. Create a chat, then list chats. `ListChats` returns a sequence payload,
+    // 6. Open a project, create a chat in it, then list project chats.
+    // `ListChats` returns a sequence payload,
     // which is the exact shape that must survive serialization end to end
     // (a regression guard for enum tagging).
+    let project_path = dir.join("project");
+    std::fs::create_dir_all(&project_path).expect("create project dir");
     write_frame(
         &mut stdin,
         &ClientFrame::Request {
             id: 3,
-            request: CoreRequest::CreateChat,
+            request: CoreRequest::OpenProject {
+                path: project_path.to_string_lossy().to_string(),
+            },
+        },
+    );
+    let project_id = match read_frame(&mut reader) {
+        ServerFrame::Response { id, result } => {
+            assert_eq!(id, 3);
+            match result {
+                CoreResponse::ProjectSnapshot(snapshot) => {
+                    snapshot.active_project_id.expect("active project id")
+                }
+                other => panic!("expected ProjectSnapshot, got {other:?}"),
+            }
+        }
+        other => panic!("expected Response, got {other:?}"),
+    };
+
+    write_frame(
+        &mut stdin,
+        &ClientFrame::Request {
+            id: 4,
+            request: CoreRequest::CreateChat {
+                project_id: project_id.clone(),
+            },
         },
     );
     match read_frame(&mut reader) {
         ServerFrame::Response { id, result } => {
-            assert_eq!(id, 3);
+            assert_eq!(id, 4);
             assert!(
                 matches!(result, CoreResponse::Chat(_)),
                 "expected Chat, got {result:?}"
@@ -115,13 +142,16 @@ fn sidecar_handshake_and_dashboard_roundtrip() {
     write_frame(
         &mut stdin,
         &ClientFrame::Request {
-            id: 4,
-            request: CoreRequest::ListChats { limit: None },
+            id: 5,
+            request: CoreRequest::ListChats {
+                project_id: Some(project_id),
+                limit: None,
+            },
         },
     );
     match read_frame(&mut reader) {
         ServerFrame::Response { id, result } => {
-            assert_eq!(id, 4);
+            assert_eq!(id, 5);
             match result {
                 CoreResponse::ChatList(chats) => {
                     assert_eq!(chats.len(), 1, "the chat we just created should be listed");

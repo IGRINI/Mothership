@@ -40,8 +40,24 @@ export interface DashboardSnapshot {
 export type ChatMessageRole = "assistant" | "user";
 export type ChatMessageStatus = "complete" | "cancelled" | "failed" | "sending";
 
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  path: string;
+  chatCount: number;
+  createdAt: string;
+  updatedAt: string;
+  lastOpenedAt: string;
+}
+
+export interface ProjectSnapshot {
+  projects: ProjectSummary[];
+  activeProjectId?: string | null;
+}
+
 export interface ChatThreadSummary {
   id: string;
+  projectId?: string | null;
   title: string;
   preview: string;
   messageCount: number;
@@ -57,6 +73,7 @@ export interface ChatMessage {
   content: string;
   status: ChatMessageStatus;
   createdAt: string;
+  error?: string | null;
   /** For assistant messages: the provider/model that produced the reply, so the
    * UI can show the adapter icon + model name. Null for user messages. */
   providerId?: string | null;
@@ -67,6 +84,19 @@ export interface ChatConversation {
   chat: ChatThreadSummary;
   messages: ChatMessage[];
   toolExecutions?: ToolExecutionRecord[];
+  messageParts?: ChatMessagePart[];
+}
+
+export type ChatMessagePartKind = "text" | "tool";
+
+export interface ChatMessagePart {
+  id: number;
+  chatId: string;
+  messageId: string;
+  kind: ChatMessagePartKind;
+  text?: string | null;
+  toolCallId?: string | null;
+  createdAt: string;
 }
 
 export interface SendChatMessageResult {
@@ -85,6 +115,7 @@ export type ChatRunEventKind =
   | "started"
   | "transport_selected"
   | "delta"
+  | "tool_call"
   | "cancelled"
   | "completed"
   | "failed";
@@ -98,6 +129,7 @@ export interface ChatRunEvent {
   message?: ChatMessage | null;
   chat?: ChatThreadSummary | null;
   transport?: string | null;
+  toolCallId?: string | null;
   error?: string | null;
 }
 
@@ -145,7 +177,8 @@ export type ToolExecutionStatus =
   | "failed"
   | "cancelled"
   | "timed_out"
-  | "permission_denied";
+  | "permission_denied"
+  | "loop_blocked";
 
 export interface ToolExecutionResult {
   toolCallId: string;
@@ -173,7 +206,8 @@ export type ToolExecutionEventKind =
   | "completed"
   | "failed"
   | "cancelled"
-  | "timed_out";
+  | "timed_out"
+  | "loop_blocked";
 
 export interface ToolExecutionEvent {
   toolCallId: string;
@@ -266,6 +300,34 @@ export type ConnectorRefreshStatus =
   | "ready"
   | "failed";
 
+export type AdapterAuthStatusKind =
+  | "not_required"
+  | "missing"
+  | "configured"
+  | "authenticated"
+  | "expired"
+  | "error";
+
+export interface AdapterAuthStatus {
+  kind: AdapterAuthStatusKind;
+  accountLabel?: string | null;
+  expiresAt?: string | null;
+  detail?: string | null;
+}
+
+export type ProviderRuntimeHealth = "healthy" | "degraded" | "cooling_down";
+
+export interface ProviderRuntimeStatus {
+  health: ProviderRuntimeHealth;
+  active: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+  consecutiveFailures: number;
+  retryAfterMs?: number | null;
+  lastError?: string | null;
+}
+
 export interface ConnectorProviderSummary {
   id: string;
   label: string;
@@ -275,8 +337,11 @@ export interface ConnectorProviderSummary {
   models: LlmModel[];
   modelError?: string | null;
   refreshStatus: ConnectorRefreshStatus;
+  runtimeReady: boolean;
+  runtimeStatus: ProviderRuntimeStatus;
   selectedModelId?: string | null;
   authKind: AdapterAuthKind;
+  authStatus: AdapterAuthStatus;
   authenticated: boolean;
   adapterSettings?: AdapterSettingsView | null;
 }
@@ -347,21 +412,58 @@ export function runSidecarStatus(): Promise<SidecarStatus> {
   return invoke<SidecarStatus>("run_sidecar_status");
 }
 
-export function listChats(limit = 100): Promise<ChatThreadSummary[]> {
+export function listProjects(): Promise<ProjectSnapshot> {
   if (!isTauriRuntime()) {
-    return Promise.resolve(getPreviewChats().map(copyChat));
+    return Promise.resolve(copyProjectSnapshot(getPreviewProjectSnapshot()));
   }
 
-  return invoke<ChatThreadSummary[]>("list_chats", { limit });
+  return invoke<ProjectSnapshot>("list_projects");
 }
 
-export function createChat(): Promise<ChatConversation> {
+export function openProject(path: string): Promise<ProjectSnapshot> {
   if (!isTauriRuntime()) {
-    const chat = createPreviewChat();
+    return Promise.resolve(openPreviewProject(path));
+  }
+
+  return invoke<ProjectSnapshot>("open_project", { path });
+}
+
+export function pickProjectDirectory(): Promise<string | undefined> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve(undefined);
+  }
+
+  return invoke<string | null>("pick_project_directory").then((path) => path ?? undefined);
+}
+
+export function setActiveProject(projectId: string): Promise<ProjectSnapshot> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve(selectPreviewProject(projectId));
+  }
+
+  return invoke<ProjectSnapshot>("set_active_project", { projectId });
+}
+
+export function listChats(
+  limit = 100,
+  projectId?: string | null,
+): Promise<ChatThreadSummary[]> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve(
+      getPreviewChats(projectId).map(copyChat),
+    );
+  }
+
+  return invoke<ChatThreadSummary[]>("list_chats", { limit, projectId });
+}
+
+export function createChat(projectId: string): Promise<ChatConversation> {
+  if (!isTauriRuntime()) {
+    const chat = createPreviewChat(projectId);
     return Promise.resolve({ chat: copyChat(chat), messages: [] });
   }
 
-  return invoke<ChatConversation>("create_chat");
+  return invoke<ChatConversation>("create_chat", { projectId });
 }
 
 export function getChat(
@@ -382,13 +484,15 @@ export function getChat(
 export function sendChatMessage(
   chatId: string | undefined,
   content: string,
+  projectId?: string | null,
 ): Promise<SendChatMessageResult> {
   if (!isTauriRuntime()) {
-    return Promise.resolve(sendPreviewChatMessage(chatId, content));
+    return Promise.resolve(sendPreviewChatMessage(chatId, content, projectId));
   }
 
   return invoke<SendChatMessageResult>("send_chat_message", {
     chatId,
+    projectId,
     content,
   });
 }
@@ -436,6 +540,16 @@ export function retryChatMessage(
   }
 
   return invoke<SendChatMessageResult>("retry_chat_message", { chatId });
+}
+
+export function continueChatMessage(
+  chatId: string,
+): Promise<SendChatMessageResult> {
+  if (!isTauriRuntime()) {
+    return Promise.reject(new Error("Continue requires the desktop app."));
+  }
+
+  return invoke<SendChatMessageResult>("continue_chat_message", { chatId });
 }
 
 export function cancelChatRun(
@@ -582,6 +696,7 @@ let previewSnapshot: DashboardSnapshot | null = null;
 let previewChats: ChatThreadSummary[] | null = null;
 const previewMessages = new Map<string, ChatMessage[]>();
 let previewConnectorSettings: ConnectorSettingsSnapshot | null = null;
+let previewProjectSnapshot: ProjectSnapshot | null = null;
 let previewChatSequence = 0;
 let previewMessageSequence = 0;
 
@@ -652,15 +767,86 @@ function currentTimestamp() {
   return Math.floor(Date.now() / 1000).toString();
 }
 
-function getPreviewChats() {
-  previewChats ??= [];
-  return previewChats;
+function getPreviewProjectSnapshot() {
+  previewProjectSnapshot ??= {
+    projects: [
+      {
+        id: "preview-project-mothership",
+        name: "Mothership",
+        path: "E:/Mothership",
+        chatCount: 0,
+        createdAt: currentTimestamp(),
+        updatedAt: currentTimestamp(),
+        lastOpenedAt: currentTimestamp(),
+      },
+    ],
+    activeProjectId: "preview-project-mothership",
+  };
+  return previewProjectSnapshot;
 }
 
-function createPreviewChat() {
+function openPreviewProject(path: string) {
+  const normalizedPath = path.trim();
+  if (!normalizedPath) {
+    throw new Error("project path cannot be empty");
+  }
+  const now = currentTimestamp();
+  const snapshot = getPreviewProjectSnapshot();
+  const existing = snapshot.projects.find(
+    (project) => project.path.toLowerCase() === normalizedPath.toLowerCase(),
+  );
+  if (existing) {
+    existing.lastOpenedAt = now;
+    existing.updatedAt = now;
+    snapshot.activeProjectId = existing.id;
+    previewProjectSnapshot = copyProjectSnapshot(snapshot);
+    return copyProjectSnapshot(previewProjectSnapshot);
+  }
+
+  const project: ProjectSummary = {
+    id: `preview-project-${snapshot.projects.length + 1}`,
+    name: deriveProjectName(normalizedPath),
+    path: normalizedPath,
+    chatCount: 0,
+    createdAt: now,
+    updatedAt: now,
+    lastOpenedAt: now,
+  };
+  previewProjectSnapshot = {
+    projects: [project, ...snapshot.projects],
+    activeProjectId: project.id,
+  };
+  return copyProjectSnapshot(previewProjectSnapshot);
+}
+
+function selectPreviewProject(projectId: string) {
+  const snapshot = getPreviewProjectSnapshot();
+  if (!snapshot.projects.some((project) => project.id === projectId)) {
+    throw new Error(`project not found: ${projectId}`);
+  }
+  previewProjectSnapshot = {
+    projects: snapshot.projects.map((project) => ({ ...project })),
+    activeProjectId: projectId,
+  };
+  return copyProjectSnapshot(previewProjectSnapshot);
+}
+
+function getPreviewChats(projectId?: string | null) {
+  previewChats ??= [];
+  if (!projectId) {
+    return previewChats;
+  }
+  return previewChats.filter((chat) => chat.projectId === projectId);
+}
+
+function createPreviewChat(projectId: string) {
+  if (!getPreviewProjectSnapshot().projects.some((project) => project.id === projectId)) {
+    throw new Error(`project not found: ${projectId}`);
+  }
   const now = currentTimestamp();
   const chat: ChatThreadSummary = {
     id: `preview-chat-${++previewChatSequence}`,
+    projectId,
     title: "New chat",
     preview: "",
     messageCount: 0,
@@ -668,14 +854,15 @@ function createPreviewChat() {
     updatedAt: now,
   };
 
-  previewChats = [chat, ...getPreviewChats()];
+  previewChats = [chat, ...(previewChats ?? [])];
   previewMessages.set(chat.id, []);
+  updatePreviewProjectChatCount(projectId);
 
   return chat;
 }
 
 function findPreviewChat(chatId: string) {
-  const chat = getPreviewChats().find((item) => item.id === chatId);
+  const chat = (previewChats ?? []).find((item) => item.id === chatId);
   if (!chat) {
     throw new Error(`chat not found: ${chatId}`);
   }
@@ -694,13 +881,21 @@ function getPreviewMessages(chatId: string) {
 function sendPreviewChatMessage(
   chatId: string | undefined,
   content: string,
+  projectId?: string | null,
 ): SendChatMessageResult {
   const message = content.trim();
   if (!message) {
     throw new Error("chat message cannot be empty");
   }
 
-  const chat = chatId ? findPreviewChat(chatId) : createPreviewChat();
+  const targetProjectId = projectId ?? getPreviewProjectSnapshot().activeProjectId;
+  if (!targetProjectId) {
+    throw new Error("select or open a project before starting a chat");
+  }
+  const chat = chatId ? findPreviewChat(chatId) : createPreviewChat(targetProjectId);
+  if (chat.projectId && chat.projectId !== targetProjectId) {
+    throw new Error("chat does not belong to the selected project");
+  }
   const now = currentTimestamp();
   const userMessage: ChatMessage = {
     id: `preview-message-${++previewMessageSequence}`,
@@ -734,8 +929,9 @@ function sendPreviewChatMessage(
   chat.updatedAt = now;
   previewChats = [
     chat,
-    ...getPreviewChats().filter((item) => item.id !== chat.id),
+    ...(previewChats ?? []).filter((item) => item.id !== chat.id),
   ];
+  updatePreviewProjectChatCount(chat.projectId);
 
   return {
     runId: `preview-run-${previewMessageSequence}`,
@@ -793,8 +989,9 @@ function editPreviewChatUserMessage(
   chat.updatedAt = now;
   previewChats = [
     chat,
-    ...getPreviewChats().filter((item) => item.id !== chat.id),
+    ...(previewChats ?? []).filter((item) => item.id !== chat.id),
   ];
+  updatePreviewProjectChatCount(chat.projectId);
 
   return {
     runId: `preview-run-${previewMessageSequence}`,
@@ -821,6 +1018,7 @@ function branchPreviewChatFromMessage(
   const now = currentTimestamp();
   const chat: ChatThreadSummary = {
     id: `preview-chat-${++previewChatSequence}`,
+    projectId: sourceChat.projectId,
     title: truncatePreview(`${sourceChat.title} branch`, 64),
     preview: derivePreviewPreview(sourceMessages[messageIndex].content),
     messageCount: messageIndex + 1,
@@ -833,8 +1031,9 @@ function branchPreviewChatFromMessage(
     chatId: chat.id,
   }));
 
-  previewChats = [chat, ...getPreviewChats()];
+  previewChats = [chat, ...(previewChats ?? [])];
   previewMessages.set(chat.id, messages);
+  updatePreviewProjectChatCount(chat.projectId);
 
   return {
     chat: copyChat(chat),
@@ -859,6 +1058,39 @@ function truncatePreview(content: string, maxLength: number) {
   return content.length > maxLength
     ? `${content.slice(0, maxLength).trimEnd()}...`
     : content;
+}
+
+function deriveProjectName(path: string) {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  return normalized.split("/").pop() || normalized || "Project";
+}
+
+function updatePreviewProjectChatCount(projectId?: string | null) {
+  if (!projectId || !previewProjectSnapshot) {
+    return;
+  }
+
+  previewProjectSnapshot = {
+    ...previewProjectSnapshot,
+    projects: previewProjectSnapshot.projects.map((project) =>
+      project.id === projectId
+        ? {
+            ...project,
+            chatCount: (previewChats ?? []).filter(
+              (chat) => chat.projectId === projectId,
+            ).length,
+            updatedAt: currentTimestamp(),
+          }
+        : project,
+    ),
+  };
+}
+
+function copyProjectSnapshot(snapshot: ProjectSnapshot): ProjectSnapshot {
+  return {
+    activeProjectId: snapshot.activeProjectId ?? null,
+    projects: snapshot.projects.map((project) => ({ ...project })),
+  };
 }
 
 function copyChat(chat: ChatThreadSummary): ChatThreadSummary {
@@ -886,8 +1118,25 @@ function getPreviewConnectorSettings() {
         },
         models: previewModels,
         refreshStatus: "ready",
+        runtimeReady: true,
+        runtimeStatus: {
+          health: "healthy",
+          active: 0,
+          completed: 12,
+          failed: 0,
+          cancelled: 0,
+          consecutiveFailures: 0,
+          retryAfterMs: null,
+          lastError: null,
+        },
         selectedModelId: "gpt-5.5",
         authKind: "oauth_internal",
+        authStatus: {
+          kind: "authenticated",
+          accountLabel: "preview",
+          expiresAt: null,
+          detail: null,
+        },
         authenticated: true,
         adapterSettings: { fields: [], values: {}, secrets: {} },
       },
@@ -904,8 +1153,25 @@ function getPreviewConnectorSettings() {
         },
         models: [],
         refreshStatus: "ready",
+        runtimeReady: false,
+        runtimeStatus: {
+          health: "healthy",
+          active: 0,
+          completed: 0,
+          failed: 0,
+          cancelled: 0,
+          consecutiveFailures: 0,
+          retryAfterMs: null,
+          lastError: null,
+        },
         selectedModelId: null,
         authKind: "api_key",
+        authStatus: {
+          kind: "missing",
+          accountLabel: null,
+          expiresAt: null,
+          detail: "OpenRouter API key is not configured",
+        },
         authenticated: false,
         adapterSettings: {
           fields: [
@@ -1090,6 +1356,8 @@ function copyConnectorSettings(
     selectedModel: { ...snapshot.selectedModel },
     providers: snapshot.providers.map((provider) => ({
       ...provider,
+      authStatus: { ...provider.authStatus },
+      runtimeStatus: { ...provider.runtimeStatus },
       settingsSchema: {
         modelManagement: { ...provider.settingsSchema.modelManagement },
       },

@@ -69,13 +69,10 @@ impl WsSession {
             for (name, value) in &self.headers {
                 let name = HeaderName::from_bytes(name.as_bytes())
                     .with_context(|| format!("invalid header name: {name}"))?;
-                let value =
-                    HeaderValue::from_str(value).context("invalid header value")?;
+                let value = HeaderValue::from_str(value).context("invalid header value")?;
                 request.headers_mut().insert(name, value);
             }
-            let (stream, _response) = connect_async(request)
-                .await
-                .context("websocket connect")?;
+            let (stream, _response) = connect_async(request).await.context("websocket connect")?;
             self.connection = Some(stream);
         }
         self.last_activity = Instant::now();

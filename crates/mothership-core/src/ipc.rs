@@ -25,8 +25,8 @@ use crate::connectors::{
 };
 use crate::{
     ChatConversation, ChatRunCancellationResult, ChatRunEvent, ChatThreadSummary,
-    DashboardSnapshot, MothershipError, SendChatMessageResult, SidecarStatus, ToolApprovalAnswer,
-    ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
+    DashboardSnapshot, MothershipError, ProjectSnapshot, SendChatMessageResult, SidecarStatus,
+    ToolApprovalAnswer, ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
     ToolExecutionRequest,
 };
 
@@ -84,15 +84,19 @@ pub enum CoreRequest {
         message: String,
     },
     ListChats {
+        project_id: Option<String>,
         limit: Option<i64>,
     },
-    CreateChat,
+    CreateChat {
+        project_id: String,
+    },
     GetChat {
         chat_id: String,
         limit: Option<i64>,
     },
     SendChatMessage {
         chat_id: Option<String>,
+        project_id: Option<String>,
         content: String,
     },
     /// Edit an existing user message, remove everything after it in that chat,
@@ -108,9 +112,14 @@ pub enum CoreRequest {
         chat_id: String,
         message_id: String,
     },
-    /// Re-run the last failed assistant message in a chat (rolled back in place,
-    /// no duplicate exchange). Like `SendChatMessage`, it streams `Event::ChatRun`s.
+    /// Re-run the last failed assistant message in a chat without deleting the
+    /// failed partial answer. Like `SendChatMessage`, it streams `Event::ChatRun`s.
     RetryChatMessage {
+        chat_id: String,
+    },
+    /// Continue from the last failed assistant message by appending an explicit
+    /// continuation prompt and starting a fresh assistant run.
+    ContinueChatMessage {
         chat_id: String,
     },
     CancelChatRun {
@@ -149,6 +158,13 @@ pub enum CoreRequest {
     Logout {
         provider_id: String,
     },
+    ListProjects,
+    OpenProject {
+        path: String,
+    },
+    SetActiveProject {
+        project_id: String,
+    },
     SidecarStatus,
 }
 
@@ -174,6 +190,7 @@ pub enum CoreResponse {
     ToolApproval(ToolApprovalAnswer),
     ToolExecutionCancellation(ToolExecutionCancellationResult),
     ConnectorSettings(ConnectorSettingsSnapshot),
+    ProjectSnapshot(ProjectSnapshot),
     SidecarStatus(SidecarStatus),
 }
 

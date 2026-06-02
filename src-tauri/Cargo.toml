@@ -25,6 +25,7 @@ mothership-core = { path = "../crates/mothership-core" }
 serde.workspace = true
 serde_json.workspace = true
 tauri = { workspace = true, features = ["image-png"] }
+tauri-plugin-dialog.workspace = true
 tauri-plugin-opener.workspace = true
 tauri-plugin-shell.workspace = true
 tokio.workspace = true
@@ -39,4 +40,3 @@ windows = { version = "0.61", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
-

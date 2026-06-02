@@ -100,6 +100,7 @@ pub(crate) async fn drain_stream(
     let mut preview = BoundedCapture::new(policy.memory_preview_bytes);
     let mut tail = TailCapture::new(policy.agent_tail_bytes);
     let mut throttler = OutputThrottler::new(policy.ui_stream_bytes_per_sec);
+    let mut decoder = ProcessOutputDecoder::new();
     let mut buf = [0_u8; 8 * 1024];
 
     loop {
@@ -115,8 +116,8 @@ pub(crate) async fn drain_stream(
             writer.lock().await.append(stream, chunk).await?;
         }
 
-        if let Some(visible) = throttler.visible_chunk(chunk) {
-            if !visible.is_empty() {
+        if let Some(text) = decoder.decode_chunk(chunk) {
+            if let Some(visible) = throttler.visible_text_chunk(&text) {
                 sink.emit(ToolExecutionEvent {
                     tool_call_id: request.tool_call_id.clone(),
                     run_id: request.run_id.clone(),
@@ -124,11 +125,27 @@ pub(crate) async fn drain_stream(
                     command: None,
                     kind: ToolExecutionEventKind::Output,
                     stream: Some(stream),
-                    chunk: Some(String::from_utf8_lossy(&visible).into_owned()),
+                    chunk: Some(visible),
                     message: None,
                     result: None,
                 });
             }
+        }
+    }
+
+    if let Some(text) = decoder.finish() {
+        if let Some(visible) = throttler.visible_text_chunk(&text) {
+            sink.emit(ToolExecutionEvent {
+                tool_call_id: request.tool_call_id.clone(),
+                run_id: request.run_id.clone(),
+                project_id: request.project_id.clone(),
+                command: None,
+                kind: ToolExecutionEventKind::Output,
+                stream: Some(stream),
+                chunk: Some(visible),
+                message: None,
+                result: None,
+            });
         }
     }
 
@@ -139,6 +156,67 @@ pub(crate) async fn drain_stream(
         preview: preview.into_string_lossy(),
         tail: tail.into_string_lossy(),
     })
+}
+
+#[derive(Debug)]
+struct ProcessOutputDecoder {
+    pending: Vec<u8>,
+    use_platform_fallback: bool,
+}
+
+impl ProcessOutputDecoder {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            use_platform_fallback: false,
+        }
+    }
+
+    fn decode_chunk(&mut self, chunk: &[u8]) -> Option<String> {
+        if chunk.is_empty() {
+            return None;
+        }
+
+        if self.use_platform_fallback {
+            return Some(decode_platform_process_output(chunk));
+        }
+
+        self.pending.extend_from_slice(chunk);
+        match std::str::from_utf8(&self.pending) {
+            Ok(text) => {
+                let decoded = text.to_string();
+                self.pending.clear();
+                Some(decoded)
+            }
+            Err(error) if error.error_len().is_some() => {
+                self.use_platform_fallback = true;
+                let decoded = decode_platform_process_output(&self.pending);
+                self.pending.clear();
+                Some(decoded)
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to == 0 {
+                    return None;
+                }
+
+                let decoded = std::str::from_utf8(&self.pending[..valid_up_to])
+                    .ok()?
+                    .to_string();
+                self.pending = self.pending[valid_up_to..].to_vec();
+                Some(decoded)
+            }
+        }
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+
+        let pending = std::mem::take(&mut self.pending);
+        Some(decode_process_output(&pending))
+    }
 }
 
 #[derive(Debug)]
@@ -157,8 +235,8 @@ impl OutputThrottler {
         }
     }
 
-    fn visible_chunk(&mut self, chunk: &[u8]) -> Option<Vec<u8>> {
-        if self.bytes_per_sec == 0 {
+    fn visible_text_chunk(&mut self, text: &str) -> Option<String> {
+        if self.bytes_per_sec == 0 || text.is_empty() {
             return None;
         }
         if self.window_start.elapsed() >= Duration::from_secs(1) {
@@ -169,9 +247,27 @@ impl OutputThrottler {
         if remaining == 0 {
             return None;
         }
-        let take = remaining.min(chunk.len());
+
+        if text.len() <= remaining {
+            self.emitted += text.len();
+            return Some(text.to_string());
+        }
+
+        let mut take = 0;
+        for (index, ch) in text.char_indices() {
+            let next = index + ch.len_utf8();
+            if next > remaining {
+                break;
+            }
+            take = next;
+        }
+
+        if take == 0 {
+            return None;
+        }
+
         self.emitted += take;
-        Some(chunk[..take].to_vec())
+        Some(text[..take].to_string())
     }
 }
 
@@ -237,7 +333,7 @@ impl BoundedCapture {
             out.extend_from_slice(format!("\n... {elided} bytes elided ...\n").as_bytes());
         }
         out.extend(self.tail);
-        String::from_utf8_lossy(&out).into_owned()
+        decode_process_output(&out)
     }
 }
 
@@ -278,8 +374,104 @@ impl TailCapture {
     }
 
     fn into_string_lossy(self) -> String {
-        String::from_utf8_lossy(&self.tail.into_iter().collect::<Vec<_>>()).into_owned()
+        let bytes = self.tail.into_iter().collect::<Vec<_>>();
+        decode_process_output(&bytes)
     }
+}
+
+fn decode_process_output(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(error) if error.error_len().is_none() => String::from_utf8_lossy(bytes).into_owned(),
+        Err(_) => decode_platform_process_output(bytes),
+    }
+}
+
+#[cfg(not(windows))]
+fn decode_platform_process_output(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(windows)]
+fn decode_platform_process_output(bytes: &[u8]) -> String {
+    for code_page in windows_output_code_pages() {
+        if let Some(decoded) = decode_windows_code_page(bytes, code_page) {
+            return decoded;
+        }
+    }
+
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(windows)]
+fn windows_output_code_pages() -> Vec<u32> {
+    let mut code_pages = Vec::with_capacity(4);
+    push_unique_code_page(&mut code_pages, unsafe { GetOEMCP() });
+    push_unique_code_page(&mut code_pages, unsafe { GetACP() });
+    code_pages
+}
+
+#[cfg(windows)]
+fn push_unique_code_page(code_pages: &mut Vec<u32>, code_page: u32) {
+    if code_page != 0 && !code_pages.contains(&code_page) {
+        code_pages.push(code_page);
+    }
+}
+
+#[cfg(windows)]
+fn decode_windows_code_page(bytes: &[u8], code_page: u32) -> Option<String> {
+    const MB_ERR_INVALID_CHARS: u32 = 0x0000_0008;
+
+    let byte_count = i32::try_from(bytes.len()).ok()?;
+    let wide_len = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            byte_count,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if wide_len <= 0 {
+        return None;
+    }
+
+    let mut wide = vec![0_u16; wide_len as usize];
+    let written = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            byte_count,
+            wide.as_mut_ptr(),
+            wide_len,
+        )
+    };
+    if written <= 0 {
+        return None;
+    }
+
+    String::from_utf16(&wide[..written as usize]).ok()
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetACP() -> u32;
+    fn GetOEMCP() -> u32;
+    fn MultiByteToWideChar(
+        code_page: u32,
+        flags: u32,
+        multi_byte_str: *const u8,
+        multi_byte_count: i32,
+        wide_char_str: *mut u16,
+        wide_char_count: i32,
+    ) -> i32;
 }
 
 fn sanitize_file_stem(value: &str) -> String {

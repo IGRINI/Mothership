@@ -30,7 +30,8 @@ use sha2::{Digest, Sha256};
 pub use mothership_adapter_protocol as protocol;
 
 use protocol::{
-    AuthKind, ChatMessage, Model, ModelManagement, Outbound, Request, SettingsField, ToolCallResult,
+    AuthKind, AuthStatus, ChatMessage, Model, ModelManagement, Outbound, PromptBundle, Request,
+    SettingsField, ToolCallInvocation, ToolCallResult, ToolDescriptor,
 };
 
 /// Handler the host registers to persist secrets an adapter pushes via the
@@ -48,6 +49,18 @@ pub struct ToolCallRequest {
 
 pub trait ToolCallHandler: Send + Sync {
     fn handle_tool_call(&self, request: ToolCallRequest) -> ToolCallResult;
+
+    fn handle_tool_calls(&self, requests: Vec<ToolCallRequest>) -> Vec<ToolCallResult> {
+        requests
+            .into_iter()
+            .map(|request| self.handle_tool_call(request))
+            .collect()
+    }
+}
+
+pub enum ChatAdapterEvent<'a> {
+    Delta(&'a str),
+    ToolCall(&'a str),
 }
 
 struct RejectingToolCallHandler;
@@ -226,6 +239,15 @@ impl Adapter {
         }
     }
 
+    pub fn auth_status(&mut self) -> Result<AuthStatus> {
+        let id = self.next_id();
+        self.send(&Request::GetAuthStatus { id })?;
+        match self.recv()? {
+            Outbound::AuthStatus { status, .. } => Ok(status),
+            other => bail!("unexpected reply to get_auth_status: {other:?}"),
+        }
+    }
+
     /// Asks the adapter to run its own auth flow now (e.g. browser OAuth) and
     /// returns once it acks completion. The adapter persists any resulting
     /// credential via `StoreSecret`, which `recv` forwards to the registered
@@ -278,9 +300,40 @@ impl Adapter {
     ) -> Result<String> {
         self.chat_cancellable_with_tools(
             model,
+            PromptBundle::default(),
             messages,
+            Vec::new(),
             is_cancelled,
-            |delta| on_delta(delta),
+            |event| {
+                if let ChatAdapterEvent::Delta(delta) = event {
+                    on_delta(delta);
+                }
+            },
+            Arc::new(RejectingToolCallHandler),
+        )
+    }
+
+    /// Runs a cancellable chat turn with a core-owned prompt bundle but without
+    /// advertising any host tools to the adapter.
+    pub fn chat_cancellable_with_prompt(
+        &mut self,
+        model: &str,
+        prompt: PromptBundle,
+        messages: Vec<ChatMessage>,
+        is_cancelled: impl Fn() -> bool + Send + 'static,
+        mut on_delta: impl FnMut(&str),
+    ) -> Result<String> {
+        self.chat_cancellable_with_tools(
+            model,
+            prompt,
+            messages,
+            Vec::new(),
+            is_cancelled,
+            |event| {
+                if let ChatAdapterEvent::Delta(delta) = event {
+                    on_delta(delta);
+                }
+            },
             Arc::new(RejectingToolCallHandler),
         )
     }
@@ -292,16 +345,20 @@ impl Adapter {
     pub fn chat_cancellable_with_tools(
         &mut self,
         model: &str,
+        prompt: PromptBundle,
         messages: Vec<ChatMessage>,
+        tools: Vec<ToolDescriptor>,
         is_cancelled: impl Fn() -> bool + Send + 'static,
-        mut on_delta: impl FnMut(&str),
+        mut on_event: impl FnMut(ChatAdapterEvent<'_>),
         tool_handler: Arc<dyn ToolCallHandler>,
     ) -> Result<String> {
         let id = self.next_id();
         self.send(&Request::ChatStart {
             id,
             model: model.to_string(),
+            prompt,
             messages,
+            tools,
         })?;
 
         let stdin = Arc::clone(&self.stdin);
@@ -322,7 +379,7 @@ impl Adapter {
             match self.recv() {
                 Ok(Outbound::Delta { id: got, text }) if got == id => {
                     full.push_str(&text);
-                    on_delta(&text);
+                    on_event(ChatAdapterEvent::Delta(&text));
                 }
                 Ok(Outbound::ToolCall {
                     id: got,
@@ -330,24 +387,43 @@ impl Adapter {
                     name,
                     arguments,
                 }) if got == id => {
-                    let request_id = self.next_id();
-                    let stdin = Arc::clone(&self.stdin);
-                    let handler = Arc::clone(&tool_handler);
-                    thread::spawn(move || {
-                        let result = handler.handle_tool_call(ToolCallRequest {
-                            tool_call_id: tool_call_id.clone(),
-                            name,
-                            arguments,
-                        });
-                        let _ = write_request(
-                            &stdin,
-                            &Request::ToolResult {
-                                id: request_id,
-                                tool_call_id,
-                                result,
-                            },
-                        );
+                    on_event(ChatAdapterEvent::ToolCall(&tool_call_id));
+                    let result = tool_handler.handle_tool_call(ToolCallRequest {
+                        tool_call_id: tool_call_id.clone(),
+                        name,
+                        arguments,
                     });
+                    let request_id = self.next_id();
+                    self.send(&Request::ToolResult {
+                        id: request_id,
+                        tool_call_id,
+                        result,
+                    })?;
+                }
+                Ok(Outbound::ToolCalls { id: got, calls }) if got == id => {
+                    for call in &calls {
+                        on_event(ChatAdapterEvent::ToolCall(&call.tool_call_id));
+                    }
+                    let requests = calls
+                        .iter()
+                        .map(tool_call_request_from_invocation)
+                        .collect::<Vec<_>>();
+                    let results = tool_handler.handle_tool_calls(requests);
+                    if results.len() != calls.len() {
+                        break Err(anyhow::anyhow!(
+                            "tool handler returned {} result(s) for {} tool call(s)",
+                            results.len(),
+                            calls.len()
+                        ));
+                    }
+                    for (call, result) in calls.into_iter().zip(results) {
+                        let request_id = self.next_id();
+                        self.send(&Request::ToolResult {
+                            id: request_id,
+                            tool_call_id: call.tool_call_id,
+                            result,
+                        })?;
+                    }
                 }
                 Ok(Outbound::Done { id: got }) if got == id => break Ok(full),
                 Ok(Outbound::Error { id: got, message }) if got == id => {
@@ -370,6 +446,14 @@ fn write_request(stdin: &Arc<Mutex<ChildStdin>>, request: &Request) -> Result<()
     stdin.write_all(b"\n")?;
     stdin.flush()?;
     Ok(())
+}
+
+fn tool_call_request_from_invocation(call: &ToolCallInvocation) -> ToolCallRequest {
+    ToolCallRequest {
+        tool_call_id: call.tool_call_id.clone(),
+        name: call.name.clone(),
+        arguments: call.arguments.clone(),
+    }
 }
 
 impl Drop for Adapter {

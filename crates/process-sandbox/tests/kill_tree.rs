@@ -72,10 +72,7 @@ async fn kill_tree_terminates_grandchild() {
     let sandbox = platform_sandbox();
 
     // cmd.exe (child) launches ping.exe (grandchild) that runs ~1000s.
-    let spec = ToolSpec::new(
-        "cmd",
-        ["/c", "ping", "-n", "1000", "127.0.0.1"],
-    );
+    let spec = ToolSpec::new("cmd", ["/c", "ping", "-n", "1000", "127.0.0.1"]);
     let mut proc = sandbox.spawn(spec).await.expect("spawn failed");
     let child_pid = proc.pid();
     assert!(child_pid > 0, "expected a real PID");
@@ -148,10 +145,9 @@ async fn spawn_capture_and_wait_clean_exit() {
 
     let stdout = proc.take_stdout();
     let stderr = proc.take_stderr();
-    let drained =
-        tokio::spawn(
-            async move { process_sandbox::drain_parallel(stdout, stderr, OutputPolicy::default()).await },
-        );
+    let drained = tokio::spawn(async move {
+        process_sandbox::drain_parallel(stdout, stderr, OutputPolicy::default()).await
+    });
 
     let exit = proc.wait().await.expect("wait failed");
     assert!(exit.is_success(), "echo should exit 0, got {exit:?}");

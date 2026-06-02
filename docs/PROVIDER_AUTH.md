@@ -71,7 +71,7 @@ provider API           (HTTP / WS / SSE / внешний CLI)
 Один универсальный контракт для всех адаптеров. Wire-формат — по одному JSON на
 строку. Host шлёт `Request`, адаптер отвечает одним или несколькими `Outbound`,
 повторяя `id` исходного запроса. Определения — в
-`crates/mothership-adapter-host/src/protocol.rs`.
+`crates/mothership-adapter-protocol/src/lib.rs`.
 
 Host → adapter (`Request`, поле `method`):
 
@@ -82,6 +82,7 @@ get_models            список моделей + режим управлен�
 get_settings_schema   поля настроек для UI
 set_settings          { values }  текущие значения настроек (host шлёт при изменении)
 get_auth_schema       схема авторизации
+get_auth_status       provider-agnostic статус после применения текущих settings
 authenticate          запустить свой auth-flow (например browser OAuth) сейчас
 chat_start            { model, messages }  один ход чата
 chat_cancel           отмена
@@ -97,6 +98,7 @@ identity        { provider_id, provider_label }
 models          { management, models }
 settings_schema { fields }
 auth_schema     { auth }
+auth_status     { kind, account_label?, expires_at?, detail? }
 delta           { text }     потоковый кусок ответа
 done            конец потока
 error           { message }
@@ -129,6 +131,12 @@ external_process  адаптер запускает и ведёт внешний
 `StoreSecret` обрабатывается прозрачно внутри `Adapter::recv` и не всплывает
 вызывающему: адаптер может сохранить credential в любой момент, в том числе
 посреди чата, не ломая поток request/response.
+
+Статус авторизации (`AuthStatus`) остаётся provider-agnostic, но вычисляется
+адаптером, потому что только адаптер знает форму своего credential:
+`not_required`, `missing`, `configured`, `authenticated`, `expired`, `error`.
+Core не интерпретирует OAuth/API-key payload, а только агрегирует этот статус в
+connector snapshot.
 
 ## Discovery и манифест
 
@@ -239,9 +247,10 @@ send_chat_message(chat_id, content)      begin_chat_run + фоновый ChatRun
 Провайдеры в снимке — это ровно установленные адаптеры: те, что отдают модели,
 и те, что отдают форму настроек (свежеустановленный адаптер виден по форме
 настроек ещё до того, как у него есть модели). `ConnectorProviderSummary`
-содержит `{ id, label, settings_schema, models, selected_model_id,
-adapter_settings }`. `adapter_settings` — задекларированные адаптером поля плюс
-текущие значения из vault, чтобы UI отрисовал и сохранил конфиг-форму.
+содержит `{ id, label, settings_schema, models, selected_model_id, auth_kind,
+auth_status, runtime_status, adapter_settings }`. `adapter_settings` —
+задекларированные адаптером поля плюс текущие значения из vault, чтобы UI
+отрисовал и сохранил конфиг-форму.
 
 Старый host-driven Connect/OAuth flow удалён: команд `start_provider_auth` /
 `complete_provider_auth` / `disconnect_provider_connection` /
@@ -357,14 +366,13 @@ subprocess-адаптер, как Codex (самодостаточный, вла�
 откроет public OAuth client registration; тогда он добавляется **рядом** с
 paste-адаптером, не вместо него.
 
-## Что в Core от auth — только общий vault
+## Что в Core от auth
 
-Никакой generic-подсистемы авторизации в Core нет. Реальная авторизация целиком
+Core не содержит provider-specific авторизации. Реальная авторизация целиком
 внутри адаптеров (Codex водит свой browser OAuth; OpenRouter использует api key).
-Core держит ровно одну auth-вещь — общий `FileCredentialVault`
-(`crates/mothership-core/src/auth/`, файлы только `mod.rs` + `vault.rs`):
-конкретную структуру с API `load/save/merge_adapter_settings` для настроек
-адаптеров (см. «Секреты и общий vault»).
+Core держит общий `FileCredentialVault` (`crates/mothership-core/src/auth/`) и
+provider-agnostic `AuthStatus`, который адаптер возвращает через протокол.
+Core не парсит provider token payload и не знает OAuth endpoints.
 
 `ProviderAuthService`, connections/sessions/auth-methods, mock-адаптер,
 `ProviderAuthAdapter`/registry, трейт `CredentialVault` и SQLite-таблицы

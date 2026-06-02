@@ -4,8 +4,8 @@
 //! platform axis. Use it to test the supervisor/drain layers without touching the
 //! OS.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use tokio::io::AsyncRead;
 
@@ -117,7 +117,7 @@ impl SpawnedProcess for MockProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::{OutputPolicy, drain_parallel};
+    use crate::output::{drain_parallel, OutputPolicy};
 
     #[tokio::test]
     async fn mock_yields_canned_output_and_exit() {
@@ -148,7 +148,10 @@ mod tests {
     #[tokio::test]
     async fn mock_kill_changes_exit() {
         let sandbox = MockSandbox::with_stdout("data");
-        let mut proc = sandbox.spawn(ToolSpec::new("sleep", ["100"])).await.unwrap();
+        let mut proc = sandbox
+            .spawn(ToolSpec::new("sleep", ["100"]))
+            .await
+            .unwrap();
         proc.kill_tree().await.unwrap();
         let exit = proc.wait().await.unwrap();
         assert_eq!(exit.code, Some(1));

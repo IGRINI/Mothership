@@ -26,6 +26,11 @@ use mothership_adapter_host::{Adapter, AdapterEntry};
 
 use crate::auth::FileCredentialVault;
 
+pub struct PreparedAdapter {
+    pub adapter: Adapter,
+    pub settings_hash: u64,
+}
+
 /// Resident adapter processes shared across the sidecar's worker threads.
 #[derive(Default)]
 pub struct AdapterPool {
@@ -65,8 +70,8 @@ impl AdapterPool {
             Ok(mut guard) => run_resident(&slot, &mut guard, entry, vault, op),
             // Resident busy → one-off spawn, untouched by the pool.
             Err(_) => {
-                let (mut adapter, _) = spawn_ready(entry, vault)?;
-                op(&mut adapter)
+                let mut session = spawn_ready_adapter(entry, vault)?;
+                op(&mut session.adapter)
             }
         };
         outcome
@@ -95,6 +100,15 @@ impl AdapterPool {
         }
     }
 
+    pub fn is_resident_ready(&self, provider_id: &str) -> bool {
+        self.slots
+            .lock()
+            .unwrap()
+            .get(provider_id)
+            .map(|slot| slot.resident_pid.load(Ordering::SeqCst) != 0)
+            .unwrap_or(false)
+    }
+
     fn slot(&self, provider_id: &str) -> Arc<ProviderSlot> {
         Arc::clone(
             self.slots
@@ -114,12 +128,12 @@ fn run_resident<T>(
     op: impl FnOnce(&mut Adapter) -> Result<T>,
 ) -> Result<T> {
     if slot.adapter.is_none() {
-        let (adapter, hash) = spawn_ready(entry, vault)?;
+        let session = spawn_ready_adapter(entry, vault)?;
         provider_slot
             .resident_pid
-            .store(adapter.process_id(), Ordering::SeqCst);
-        slot.adapter = Some(adapter);
-        slot.settings_hash = hash;
+            .store(session.adapter.process_id(), Ordering::SeqCst);
+        slot.settings_hash = session.settings_hash;
+        slot.adapter = Some(session.adapter);
     } else {
         // Re-push only if the stored settings changed since the last push.
         let settings = load_settings(entry, vault);
@@ -149,25 +163,62 @@ fn run_resident<T>(
 /// Spawns an adapter, wires the credential-store side channel, initializes it,
 /// and pushes current settings. Returns the adapter and the hash of the pushed
 /// settings (so the caller can detect later changes).
-fn spawn_ready(entry: &AdapterEntry, vault: &FileCredentialVault) -> Result<(Adapter, u64)> {
+pub fn spawn_ready_adapter(
+    entry: &AdapterEntry,
+    vault: &FileCredentialVault,
+) -> Result<PreparedAdapter> {
+    let settings = load_settings(entry, vault);
+    spawn_ready_adapter_with_settings(entry, vault, settings)
+}
+
+/// Like [`spawn_ready_adapter`], but uses an explicit settings snapshot while
+/// still wiring `StoreSecret` into the supplied vault.
+pub fn spawn_ready_adapter_with_settings(
+    entry: &AdapterEntry,
+    vault: &FileCredentialVault,
+    settings: BTreeMap<String, String>,
+) -> Result<PreparedAdapter> {
+    spawn_ready_adapter_session(entry, settings, Some(vault))
+}
+
+/// Like [`spawn_ready_adapter_with_settings`], but intentionally does not wire
+/// `StoreSecret`. Logout/revoke flows must be able to seed the adapter with the
+/// old token without letting that adapter re-persist it after Core has deleted
+/// the vault entry.
+pub fn spawn_ready_adapter_without_secret_sink(
+    entry: &AdapterEntry,
+    settings: BTreeMap<String, String>,
+) -> Result<PreparedAdapter> {
+    spawn_ready_adapter_session(entry, settings, None)
+}
+
+fn spawn_ready_adapter_session(
+    entry: &AdapterEntry,
+    settings: BTreeMap<String, String>,
+    secret_vault: Option<&FileCredentialVault>,
+) -> Result<PreparedAdapter> {
     let mut adapter = Adapter::spawn(&entry.program)?;
 
-    let sink_vault = vault.clone();
-    let provider = entry.provider_id.clone();
-    adapter.set_store_secret_handler(move |values| {
-        if let Err(error) = sink_vault.merge_adapter_settings(&provider, values) {
-            eprintln!("failed to persist adapter secret for {provider}: {error}");
-        }
-    });
+    if let Some(vault) = secret_vault {
+        let sink_vault = vault.clone();
+        let provider = entry.provider_id.clone();
+        adapter.set_store_secret_handler(move |values| {
+            if let Err(error) = sink_vault.merge_adapter_settings(&provider, values) {
+                eprintln!("failed to persist adapter secret for {provider}: {error}");
+            }
+        });
+    }
 
     adapter.initialize()?;
 
-    let settings = load_settings(entry, vault);
     let hash = settings_hash(&settings);
     if !settings.is_empty() {
         adapter.set_settings(settings)?;
     }
-    Ok((adapter, hash))
+    Ok(PreparedAdapter {
+        adapter,
+        settings_hash: hash,
+    })
 }
 
 fn load_settings(entry: &AdapterEntry, vault: &FileCredentialVault) -> BTreeMap<String, String> {

@@ -14,21 +14,25 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use mothership_adapter_host::protocol::{
-    AuthKind, ModelManagement, SettingsField, SettingsFieldKind,
+    AuthKind, AuthStatus, AuthStatusKind, ModelManagement, SettingsField, SettingsFieldKind,
 };
-use mothership_adapter_host::{Adapter, AdapterEntry, AdapterRegistry};
+use mothership_adapter_host::{AdapterEntry, AdapterRegistry};
 
-use crate::adapter_pool::AdapterPool;
+use crate::adapter_pool::{
+    spawn_ready_adapter, spawn_ready_adapter_without_secret_sink, AdapterPool,
+};
 use crate::auth::FileCredentialVault;
 use crate::llm::{
     ConnectorModelManagementKind, ConnectorModelManagementSchema, ConnectorSettingsSchema,
     LlmModel, SelectedLlmModel,
 };
+use crate::provider_runtime::{ProviderRuntimeManager, ProviderRuntimeStatus};
 use crate::{Database, MothershipError, Result};
 
 const CODEX_ADAPTER_SHA256: Option<&str> = option_env!("MOTHERSHIP_BUILTIN_CODEX_ADAPTER_SHA256");
@@ -41,11 +45,12 @@ const CAPABILITY_SETTINGS_READ: &str = "settings.read";
 const CAPABILITY_SETTINGS_WRITE: &str = "settings.write";
 const CAPABILITY_AUTH_INTERACTIVE: &str = "auth.interactive";
 const CAPABILITY_AUTH_LOGOUT: &str = "auth.logout";
+const MODEL_CATALOG_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Tracks in-flight `authenticate` flows by provider id -> adapter process id, so
 /// a [`cancel_authenticate`] (or the client leaving Settings) can terminate one.
 /// Owned by whoever runs the auth flows (the sidecar); passed into
-/// [`ConnectorService::authenticate`] / [`ConnectorService::cancel_authenticate`].
+/// [`ConnectorManager::authenticate`] / [`ConnectorManager::cancel_authenticate`].
 pub type AuthProcessRegistry = Mutex<HashMap<String, u32>>;
 
 pub fn trusted_built_in_adapter_sha256(provider_id: &str) -> Option<&'static str> {
@@ -96,12 +101,19 @@ pub struct ConnectorProviderSummary {
     pub models: Vec<LlmModel>,
     pub model_error: Option<String>,
     pub refresh_status: ConnectorRefreshStatus,
+    /// Whether the adapter has a resident process already initialized in the
+    /// pool. `false` means the next provider-backed operation may pay a warm-up
+    /// cost even if the model catalog is already ready.
+    pub runtime_ready: bool,
+    pub runtime_status: ProviderRuntimeStatus,
     pub selected_model_id: Option<String>,
     /// The adapter's auth scheme: `none` / `api_key` / `oauth_internal` /
     /// `external_process`. Drives whether the UI shows an "Authorize" button.
     pub auth_kind: String,
-    /// Whether the adapter currently has a stored credential — toggles the UI
-    /// between "Authorize" and "Log out".
+    /// Provider-agnostic auth state reported by the adapter after Core has
+    /// pushed the current vault settings into it.
+    pub auth_status: AuthStatus,
+    /// Convenience boolean for UI actions derived from [`auth_status`].
     pub authenticated: bool,
     /// Present for subprocess adapters: the settings fields they declare plus
     /// their current values, so the UI can render and save a config form.
@@ -151,6 +163,7 @@ pub struct AdapterSettingsFieldView {
 struct AdapterInfo {
     view: AdapterSettingsView,
     auth_kind: String,
+    auth_status: AuthStatus,
     authenticated: bool,
 }
 
@@ -164,6 +177,7 @@ struct AdapterModelCatalog {
 #[derive(Default)]
 struct ConnectorManagerState {
     catalogs: BTreeMap<String, AdapterModelCatalog>,
+    catalog_fetched_at: BTreeMap<String, Instant>,
     adapter_info: BTreeMap<String, AdapterInfo>,
     refreshing: BTreeSet<String>,
 }
@@ -177,6 +191,7 @@ struct ConnectorManagerState {
 pub struct ConnectorManager {
     database: Database,
     pool: Arc<AdapterPool>,
+    runtime: Option<Arc<ProviderRuntimeManager>>,
     state: Mutex<ConnectorManagerState>,
 }
 
@@ -185,6 +200,20 @@ impl ConnectorManager {
         Self {
             database,
             pool,
+            runtime: None,
+            state: Mutex::new(ConnectorManagerState::default()),
+        }
+    }
+
+    pub fn with_runtime(
+        database: Database,
+        pool: Arc<AdapterPool>,
+        runtime: Arc<ProviderRuntimeManager>,
+    ) -> Self {
+        Self {
+            database,
+            pool,
+            runtime: Some(runtime),
             state: Mutex::new(ConnectorManagerState::default()),
         }
     }
@@ -205,6 +234,8 @@ impl ConnectorManager {
                 &provider_icons,
                 &state.refreshing,
                 &provider_errors,
+                &self.pool,
+                self.runtime.as_deref(),
             ),
             selected_model,
         })
@@ -240,8 +271,7 @@ impl ConnectorManager {
         provider_id: &str,
         patch: BTreeMap<String, AdapterSettingPatchValue>,
     ) -> Result<ConnectorSettingsSnapshot> {
-        ConnectorService::new(&self.database, Arc::clone(&self.pool))
-            .save_adapter_settings_only(provider_id, patch)?;
+        self.save_adapter_settings_only(provider_id, patch)?;
         self.invalidate_provider(provider_id);
         self.snapshot()
     }
@@ -251,8 +281,7 @@ impl ConnectorManager {
         provider_id: &str,
         registry: &AuthProcessRegistry,
     ) -> Result<ConnectorSettingsSnapshot> {
-        ConnectorService::new(&self.database, Arc::clone(&self.pool))
-            .authenticate_only(provider_id, registry)?;
+        self.authenticate_only(provider_id, registry)?;
         self.invalidate_provider(provider_id);
         self.snapshot()
     }
@@ -262,15 +291,147 @@ impl ConnectorManager {
         provider_id: &str,
         registry: &AuthProcessRegistry,
     ) -> Result<ConnectorSettingsSnapshot> {
-        ConnectorService::new(&self.database, Arc::clone(&self.pool))
-            .cancel_authenticate_only(provider_id, registry)?;
+        self.cancel_authenticate_only(provider_id, registry)?;
         self.snapshot()
     }
 
     pub fn logout(&self, provider_id: &str) -> Result<ConnectorSettingsSnapshot> {
-        ConnectorService::new(&self.database, Arc::clone(&self.pool)).logout_only(provider_id)?;
+        self.logout_only(provider_id)?;
         self.invalidate_provider(provider_id);
         self.snapshot()
+    }
+
+    fn save_adapter_settings_only(
+        &self,
+        provider_id: &str,
+        patch: BTreeMap<String, AdapterSettingPatchValue>,
+    ) -> Result<()> {
+        let entry = find_trusted_adapter_entry(&self.plugins_dir(), provider_id)?;
+        ensure_adapter_capability(&entry, CAPABILITY_SETTINGS_WRITE, "save settings")
+            .map_err(MothershipError::InvalidRequest)?;
+
+        let vault = self.vault();
+        let fields = adapter_settings_fields(&self.pool, &entry, &vault).map_err(|error| {
+            MothershipError::InvalidRequest(format!(
+                "failed to read settings schema for {provider_id}: {error}"
+            ))
+        })?;
+        let field_kinds = fields
+            .iter()
+            .map(|field| (field.key.clone(), field.kind))
+            .collect::<BTreeMap<_, _>>();
+        for key in patch.keys() {
+            if !field_kinds.contains_key(key) {
+                return Err(MothershipError::InvalidRequest(format!(
+                    "unsupported adapter setting for {provider_id}: {key}"
+                )));
+            }
+        }
+
+        let mut values = vault.load_adapter_settings(provider_id)?;
+        let mut secret_changed = false;
+        for (key, change) in patch {
+            let is_secret = matches!(field_kinds.get(&key), Some(SettingsFieldKind::Secret));
+            match change {
+                AdapterSettingPatchValue::Set { value } => {
+                    if is_secret {
+                        secret_changed = true;
+                    }
+                    values.insert(key, value);
+                }
+                AdapterSettingPatchValue::Clear => {
+                    if is_secret {
+                        secret_changed = true;
+                    }
+                    values.remove(&key);
+                }
+                AdapterSettingPatchValue::Unchanged => {}
+            }
+        }
+
+        vault.save_adapter_settings(provider_id, &values)?;
+        if secret_changed {
+            self.pool.force_evict(provider_id);
+        }
+        Ok(())
+    }
+
+    /// Replaces the stored settings map for tests and adapter-owned internals.
+    /// UI code should use [`save_adapter_settings`](Self::save_adapter_settings)
+    /// so keys are validated against the adapter schema.
+    pub fn save_adapter_settings_snapshot(
+        &self,
+        provider_id: &str,
+        values: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let entry = find_trusted_adapter_entry(&self.plugins_dir(), provider_id)?;
+        ensure_adapter_capability(&entry, CAPABILITY_SETTINGS_WRITE, "save settings")
+            .map_err(MothershipError::InvalidRequest)?;
+        self.vault().save_adapter_settings(provider_id, values)
+    }
+
+    fn logout_only(&self, provider_id: &str) -> Result<()> {
+        let vault = self.vault();
+        if let Ok(entry) = find_trusted_adapter_entry(&self.plugins_dir(), provider_id) {
+            let can_logout =
+                ensure_adapter_capability(&entry, CAPABILITY_AUTH_LOGOUT, "log out").is_ok();
+            let stored_settings = vault.load_adapter_settings(provider_id)?;
+            // First kill any resident instance so a busy adapter cannot keep using
+            // the old credential after logout. Then remove the vault entry before
+            // best-effort revoke so concurrent spawns cannot read the old secret.
+            self.pool.force_evict(provider_id);
+            vault.delete_adapter_settings(provider_id)?;
+            if can_logout {
+                let _ = adapter_logout_once(&entry, stored_settings);
+            }
+        } else {
+            vault.delete_adapter_settings(provider_id)?;
+        }
+        Ok(())
+    }
+
+    fn authenticate_only(&self, provider_id: &str, registry: &AuthProcessRegistry) -> Result<()> {
+        let entry = find_trusted_adapter_entry(&self.plugins_dir(), provider_id)?;
+        ensure_adapter_capability(&entry, CAPABILITY_AUTH_INTERACTIVE, "authenticate")
+            .map_err(MothershipError::InvalidRequest)?;
+
+        let vault = self.vault();
+        let mut session = spawn_ready_adapter(&entry, &vault)
+            .map_err(|error| MothershipError::InvalidRequest(error.to_string()))?;
+
+        if let Ok(mut map) = registry.lock() {
+            map.insert(provider_id.to_string(), session.adapter.process_id());
+        }
+        let result = session.adapter.authenticate();
+        // If our registration is already gone, a cancel took it and killed us —
+        // treat that as a clean (not error) outcome.
+        let cancelled = registry
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(provider_id))
+            .is_none();
+        drop(session);
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(_) if cancelled => Ok(()),
+            Err(error) => Err(MothershipError::InvalidRequest(error.to_string())),
+        }
+    }
+
+    fn cancel_authenticate_only(
+        &self,
+        provider_id: &str,
+        registry: &AuthProcessRegistry,
+    ) -> Result<()> {
+        let pid = registry
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(provider_id));
+        if let Some(pid) = pid {
+            kill_process(pid);
+        }
+        Ok(())
     }
 
     pub fn refresh_all(&self, mut emit: impl FnMut(ConnectorSettingsEvent)) {
@@ -350,20 +511,31 @@ impl ConnectorManager {
                     error: Some(error),
                 },
             );
+            state.catalog_fetched_at.remove(&entry.provider_id);
             state.adapter_info.remove(&entry.provider_id);
             state.refreshing.remove(&entry.provider_id);
             return self.event(ConnectorSettingsEventKind::ProviderUpdated);
         }
 
         let vault = self.vault();
-        let catalog_result = adapter_model_catalog(&self.pool, entry, &vault);
+        let catalog_result = self
+            .cached_model_catalog(&entry.provider_id)
+            .map(|catalog| Ok((catalog, false)))
+            .unwrap_or_else(|| {
+                adapter_model_catalog(&self.pool, entry, &vault).map(|catalog| (catalog, true))
+            });
         let info_result = adapter_info_result(&self.pool, entry, &vault);
 
         {
             let mut state = self.state.lock().unwrap();
             match catalog_result {
-                Ok(catalog) => {
+                Ok((catalog, fetched)) => {
                     state.catalogs.insert(entry.provider_id.clone(), catalog);
+                    if fetched {
+                        state
+                            .catalog_fetched_at
+                            .insert(entry.provider_id.clone(), Instant::now());
+                    }
                 }
                 Err(error) => {
                     let previous = state.catalogs.get(&entry.provider_id).cloned();
@@ -381,6 +553,7 @@ impl ConnectorManager {
                             error: Some(error),
                         },
                     );
+                    state.catalog_fetched_at.remove(&entry.provider_id);
                 }
             }
 
@@ -406,7 +579,21 @@ impl ConnectorManager {
     fn invalidate_provider(&self, provider_id: &str) {
         let mut state = self.state.lock().unwrap();
         state.catalogs.remove(provider_id);
+        state.catalog_fetched_at.remove(provider_id);
         state.adapter_info.remove(provider_id);
+    }
+
+    fn cached_model_catalog(&self, provider_id: &str) -> Option<AdapterModelCatalog> {
+        let state = self.state.lock().unwrap();
+        let fetched_at = state.catalog_fetched_at.get(provider_id)?;
+        if fetched_at.elapsed() > MODEL_CATALOG_CACHE_TTL {
+            return None;
+        }
+        let catalog = state.catalogs.get(provider_id)?;
+        if catalog.error.is_some() {
+            return None;
+        }
+        Some(catalog.clone())
     }
 
     fn vault(&self) -> FileCredentialVault {
@@ -452,338 +639,6 @@ pub enum AdapterSettingPatchValue {
     Unchanged,
 }
 
-/// Reads and mutates the connector configuration for one database (and its
-/// sibling plugins/auth directories). Borrows the database like
-/// [`crate::ChatRunService`]; cheap to construct per request.
-pub struct ConnectorService<'a> {
-    database: &'a Database,
-    pool: Arc<AdapterPool>,
-}
-
-impl<'a> ConnectorService<'a> {
-    pub fn new(database: &'a Database, pool: Arc<AdapterPool>) -> Self {
-        Self { database, pool }
-    }
-
-    /// The full Connectors snapshot: every installed adapter's models, settings
-    /// form, auth state, plus the active model selection.
-    pub fn snapshot(&self) -> Result<ConnectorSettingsSnapshot> {
-        let models = self.available_models();
-        let selected_model = self.database.selected_llm_model()?;
-        let adapter_info = self.adapter_infos();
-        let provider_labels = self.provider_labels();
-        let provider_icons = self.provider_icons();
-        let provider_errors = self.provider_errors();
-
-        Ok(ConnectorSettingsSnapshot {
-            providers: connector_providers(
-                &models,
-                &selected_model,
-                &adapter_info,
-                &provider_labels,
-                &provider_icons,
-                &BTreeSet::new(),
-                &provider_errors,
-            ),
-            selected_model,
-        })
-    }
-
-    /// Validates that `provider_id`/`model_id` is one an installed adapter
-    /// advertises, persists the selection, and returns the refreshed snapshot.
-    pub fn set_selected_model(
-        &self,
-        provider_id: &str,
-        model_id: &str,
-    ) -> Result<ConnectorSettingsSnapshot> {
-        let available = self.available_models();
-        if !available
-            .values()
-            .flat_map(|catalog| catalog.models.iter())
-            .any(|model| model.provider_id == provider_id && model.id == model_id)
-        {
-            return Err(MothershipError::InvalidRequest(format!(
-                "unsupported model: {provider_id}/{model_id}"
-            )));
-        }
-        self.database
-            .set_selected_llm_model(provider_id, model_id)?;
-        self.snapshot()
-    }
-
-    /// Persists adapter settings into the shared vault, merged so secrets the
-    /// form doesn't carry (e.g. an OAuth token the adapter stored itself) survive.
-    pub fn save_adapter_settings(
-        &self,
-        provider_id: &str,
-        patch: BTreeMap<String, AdapterSettingPatchValue>,
-    ) -> Result<ConnectorSettingsSnapshot> {
-        self.save_adapter_settings_only(provider_id, patch)?;
-        self.snapshot()
-    }
-
-    fn save_adapter_settings_only(
-        &self,
-        provider_id: &str,
-        patch: BTreeMap<String, AdapterSettingPatchValue>,
-    ) -> Result<()> {
-        let entry = find_trusted_adapter_entry(&self.plugins_dir(), provider_id)?;
-        ensure_adapter_capability(&entry, CAPABILITY_SETTINGS_WRITE, "save settings")
-            .map_err(MothershipError::InvalidRequest)?;
-
-        let vault = self.vault();
-        let fields = adapter_settings_fields(&self.pool, &entry, &vault).map_err(|error| {
-            MothershipError::InvalidRequest(format!(
-                "failed to read settings schema for {provider_id}: {error}"
-            ))
-        })?;
-        let field_kinds = fields
-            .iter()
-            .map(|field| (field.key.clone(), field.kind))
-            .collect::<BTreeMap<_, _>>();
-        for key in patch.keys() {
-            if !field_kinds.contains_key(key) {
-                return Err(MothershipError::InvalidRequest(format!(
-                    "unsupported adapter setting for {provider_id}: {key}"
-                )));
-            }
-        }
-
-        let mut values = vault.load_adapter_settings(provider_id)?;
-        let mut secret_changed = false;
-        for (key, change) in patch {
-            let is_secret = matches!(field_kinds.get(&key), Some(SettingsFieldKind::Secret));
-            match change {
-                AdapterSettingPatchValue::Set { value } => {
-                    if is_secret {
-                        secret_changed = true;
-                    }
-                    values.insert(key, value);
-                }
-                AdapterSettingPatchValue::Clear => {
-                    if is_secret {
-                        secret_changed = true;
-                    }
-                    values.remove(&key);
-                }
-                AdapterSettingPatchValue::Unchanged => {}
-            }
-        }
-
-        vault.save_adapter_settings(provider_id, &values)?;
-        if secret_changed {
-            self.pool.force_evict(provider_id);
-        }
-        Ok(())
-    }
-
-    /// Replaces the stored settings map for tests and adapter-owned internals.
-    /// UI code should use [`save_adapter_settings`](Self::save_adapter_settings)
-    /// so keys are validated against the adapter schema.
-    pub fn save_adapter_settings_snapshot(
-        &self,
-        provider_id: &str,
-        values: &BTreeMap<String, String>,
-    ) -> Result<()> {
-        let entry = find_trusted_adapter_entry(&self.plugins_dir(), provider_id)?;
-        ensure_adapter_capability(&entry, CAPABILITY_SETTINGS_WRITE, "save settings")
-            .map_err(MothershipError::InvalidRequest)?;
-        self.vault().save_adapter_settings(provider_id, values)
-    }
-
-    /// Logs an adapter out. Best-effort: first asks the adapter to revoke its
-    /// credential server-side (e.g. Codex OAuth token revoke), then forgets it in
-    /// the shared vault. A revoke failure never blocks local logout.
-    pub fn logout(&self, provider_id: &str) -> Result<ConnectorSettingsSnapshot> {
-        self.logout_only(provider_id)?;
-        self.snapshot()
-    }
-
-    fn logout_only(&self, provider_id: &str) -> Result<()> {
-        let vault = self.vault();
-        if let Ok(entry) = find_trusted_adapter_entry(&self.plugins_dir(), provider_id) {
-            let can_logout =
-                ensure_adapter_capability(&entry, CAPABILITY_AUTH_LOGOUT, "log out").is_ok();
-            let stored_settings = vault.load_adapter_settings(provider_id)?;
-            // First kill any resident instance so a busy adapter cannot keep using
-            // the old credential after logout. Then remove the vault entry before
-            // best-effort revoke so concurrent spawns cannot read the old secret.
-            self.pool.force_evict(provider_id);
-            vault.delete_adapter_settings(provider_id)?;
-            if can_logout {
-                let _ = adapter_logout_once(&entry, stored_settings);
-            }
-        } else {
-            vault.delete_adapter_settings(provider_id)?;
-        }
-        Ok(())
-    }
-
-    /// Runs an adapter's own auth flow (e.g. Codex browser OAuth) on demand. The
-    /// adapter owns the flow end-to-end; Core spawns it, seeds stored settings,
-    /// wires the secret sink so a resulting token lands in the shared vault,
-    /// registers the process so it can be cancelled, and waits for completion.
-    ///
-    /// Blocks for as long as the flow takes (the user finishing the browser
-    /// step), so the caller must run it off any UI/reader thread. If a concurrent
-    /// [`cancel_authenticate`](Self::cancel_authenticate) already removed this
-    /// flow's registration, the adapter was killed — that's a clean (cancelled),
-    /// not failed, outcome.
-    pub fn authenticate(
-        &self,
-        provider_id: &str,
-        registry: &AuthProcessRegistry,
-    ) -> Result<ConnectorSettingsSnapshot> {
-        self.authenticate_only(provider_id, registry)?;
-        self.snapshot()
-    }
-
-    fn authenticate_only(&self, provider_id: &str, registry: &AuthProcessRegistry) -> Result<()> {
-        let entry = find_trusted_adapter_entry(&self.plugins_dir(), provider_id)?;
-        ensure_adapter_capability(&entry, CAPABILITY_AUTH_INTERACTIVE, "authenticate")
-            .map_err(MothershipError::InvalidRequest)?;
-
-        let vault = self.vault();
-        let mut adapter = Adapter::spawn(&entry.program)
-            .map_err(|error| MothershipError::InvalidRequest(error.to_string()))?;
-
-        let sink_vault = vault.clone();
-        let sink_provider = provider_id.to_string();
-        adapter.set_store_secret_handler(move |values| {
-            if let Err(error) = sink_vault.merge_adapter_settings(&sink_provider, values) {
-                eprintln!("failed to persist adapter secret for {sink_provider}: {error}");
-            }
-        });
-
-        adapter
-            .initialize()
-            .map_err(|error| MothershipError::InvalidRequest(error.to_string()))?;
-        let settings = vault.load_adapter_settings(provider_id)?;
-        if !settings.is_empty() {
-            adapter
-                .set_settings(settings)
-                .map_err(|error| MothershipError::InvalidRequest(error.to_string()))?;
-        }
-
-        if let Ok(mut map) = registry.lock() {
-            map.insert(provider_id.to_string(), adapter.process_id());
-        }
-        let result = adapter.authenticate();
-        // If our registration is already gone, a cancel took it and killed us —
-        // treat that as a clean (not error) outcome.
-        let cancelled = registry
-            .lock()
-            .ok()
-            .and_then(|mut map| map.remove(provider_id))
-            .is_none();
-        drop(adapter);
-
-        match result {
-            Ok(()) => Ok(()),
-            Err(_) if cancelled => Ok(()),
-            Err(error) => Err(MothershipError::InvalidRequest(error.to_string())),
-        }
-    }
-
-    /// Cancels an in-flight `authenticate` for `provider_id` by terminating the
-    /// adapter process (generic — works for any adapter's auth flow).
-    pub fn cancel_authenticate(
-        &self,
-        provider_id: &str,
-        registry: &AuthProcessRegistry,
-    ) -> Result<ConnectorSettingsSnapshot> {
-        self.cancel_authenticate_only(provider_id, registry)?;
-        self.snapshot()
-    }
-
-    fn cancel_authenticate_only(
-        &self,
-        provider_id: &str,
-        registry: &AuthProcessRegistry,
-    ) -> Result<()> {
-        let pid = registry
-            .lock()
-            .ok()
-            .and_then(|mut map| map.remove(provider_id));
-        if let Some(pid) = pid {
-            kill_process(pid);
-        }
-        Ok(())
-    }
-
-    /// Models available to the UI: exactly what the installed adapters advertise.
-    fn available_models(&self) -> BTreeMap<String, AdapterModelCatalog> {
-        let vault = self.vault();
-        let mut catalogs = BTreeMap::new();
-        for entry in trusted_adapter_entries(&self.plugins_dir()) {
-            match adapter_model_catalog(&self.pool, &entry, &vault) {
-                Ok(catalog) => {
-                    catalogs.insert(entry.provider_id.clone(), catalog);
-                }
-                Err(error) => {
-                    eprintln!("skipping adapter {}: {error}", entry.provider_id);
-                    catalogs.insert(
-                        entry.provider_id.clone(),
-                        AdapterModelCatalog {
-                            models: Vec::new(),
-                            management: ModelManagement::Fixed,
-                            error: Some(error),
-                        },
-                    );
-                }
-            }
-        }
-        catalogs
-    }
-
-    /// Spawns each installed adapter once to read its settings form + auth scheme.
-    fn adapter_infos(&self) -> BTreeMap<String, AdapterInfo> {
-        let vault = self.vault();
-        let mut infos = BTreeMap::new();
-        for entry in trusted_adapter_entries(&self.plugins_dir()) {
-            if let Some(info) = adapter_info(&self.pool, &entry, &vault) {
-                infos.insert(entry.provider_id.clone(), info);
-            }
-        }
-        infos
-    }
-
-    /// Maps each installed adapter's provider id to its human label (cheap; no
-    /// spawn), so the UI can name a connector before its models load.
-    fn provider_labels(&self) -> BTreeMap<String, String> {
-        adapter_provider_labels(&self.plugins_dir())
-    }
-
-    /// Maps each installed adapter's provider id to its icon as a data URI, if it
-    /// ships one — read + inlined so the webview needs no disk access.
-    fn provider_icons(&self) -> BTreeMap<String, String> {
-        AdapterRegistry::scan(&self.plugins_dir())
-            .entries()
-            .iter()
-            .filter_map(|entry| {
-                let uri = icon_data_uri(entry.icon.as_deref()?)?;
-                Some((entry.provider_id.clone(), uri))
-            })
-            .collect()
-    }
-
-    fn provider_errors(&self) -> BTreeMap<String, String> {
-        adapter_diagnostics(&self.plugins_dir())
-    }
-
-    fn vault(&self) -> FileCredentialVault {
-        FileCredentialVault::new(self.auth_dir())
-    }
-
-    fn plugins_dir(&self) -> PathBuf {
-        sibling_dir(self.database, "plugins")
-    }
-
-    fn auth_dir(&self) -> PathBuf {
-        sibling_dir(self.database, "auth")
-    }
-}
-
 /// Best-effort terminate a child process by id (a spawned adapter). Core can
 /// always kill an adapter — crash isolation is part of the contract.
 /// Fire-and-forget (`spawn`, not `output`) so it never blocks the caller.
@@ -816,20 +671,6 @@ fn verified_adapter_entry(entry: &AdapterEntry) -> std::result::Result<(), Strin
         ));
     }
     Ok(())
-}
-
-fn trusted_adapter_entries(plugins_dir: &Path) -> Vec<AdapterEntry> {
-    AdapterRegistry::scan(plugins_dir)
-        .entries()
-        .iter()
-        .filter_map(|entry| match verified_adapter_entry(entry) {
-            Ok(()) => Some(entry.clone()),
-            Err(error) => {
-                eprintln!("skipping adapter {}: {error}", entry.provider_id);
-                None
-            }
-        })
-        .collect()
 }
 
 fn adapter_provider_labels(plugins_dir: &Path) -> BTreeMap<String, String> {
@@ -947,25 +788,18 @@ fn adapter_settings_fields(
         .map_err(|error| error.to_string())
 }
 
-fn adapter_info(
-    pool: &AdapterPool,
-    entry: &AdapterEntry,
-    vault: &FileCredentialVault,
-) -> Option<AdapterInfo> {
-    adapter_info_result(pool, entry, vault).ok()
-}
-
 fn adapter_info_result(
     pool: &AdapterPool,
     entry: &AdapterEntry,
     vault: &FileCredentialVault,
 ) -> std::result::Result<AdapterInfo, String> {
     ensure_adapter_capability(entry, CAPABILITY_SETTINGS_READ, "read adapter info")?;
-    let (fields, auth) = pool
+    let (fields, auth, auth_status) = pool
         .with(entry, vault, |adapter| {
             let fields = adapter.settings_schema()?;
             let auth = adapter.auth_schema()?;
-            Ok((fields, auth))
+            let auth_status = adapter.auth_status()?;
+            Ok((fields, auth, auth_status))
         })
         .map_err(|error| error.to_string())?;
     let auth_kind = match auth {
@@ -979,19 +813,23 @@ fn adapter_info_result(
     let values = vault
         .load_adapter_settings(&entry.provider_id)
         .unwrap_or_default();
-    // Core owns the credential store, so it knows the auth STATUS: an
-    // oauth/external adapter is "logged in" iff something is stored for it.
-    // (Api-key adapters don't show an Authorize/Log-out button, so it's moot.)
-    let authenticated =
-        matches!(auth_kind.as_str(), "oauth_internal" | "external_process") && !values.is_empty();
+    let authenticated = is_authenticated(&auth_status);
 
     let view = sanitized_adapter_settings(fields, &values);
 
     Ok(AdapterInfo {
         view,
         auth_kind,
+        auth_status,
         authenticated,
     })
+}
+
+fn is_authenticated(status: &AuthStatus) -> bool {
+    matches!(
+        status.kind,
+        AuthStatusKind::Authenticated | AuthStatusKind::Configured | AuthStatusKind::NotRequired
+    )
 }
 
 fn connector_providers(
@@ -1002,6 +840,8 @@ fn connector_providers(
     provider_icons: &BTreeMap<String, String>,
     refreshing: &BTreeSet<String>,
     provider_errors: &BTreeMap<String, String>,
+    pool: &AdapterPool,
+    runtime: Option<&ProviderRuntimeManager>,
 ) -> Vec<ConnectorProviderSummary> {
     let models = catalogs
         .values()
@@ -1053,6 +893,9 @@ fn connector_providers(
                 .map(|info| info.auth_kind.clone())
                 .unwrap_or_else(|| "none".to_string());
             let authenticated = info.map(|info| info.authenticated).unwrap_or(false);
+            let auth_status = info
+                .map(|info| info.auth_status.clone())
+                .unwrap_or_else(|| AuthStatus::missing("connector has not reported auth status"));
             let adapter_settings = info.map(|info| info.view.clone());
             let icon = provider_icons.get(&provider_id).cloned();
             let catalog = catalogs.get(&provider_id);
@@ -1068,6 +911,10 @@ fn connector_providers(
             } else {
                 ConnectorRefreshStatus::Pending
             };
+            let runtime_ready = pool.is_resident_ready(&provider_id);
+            let runtime_status = runtime
+                .map(|runtime| runtime.status(&provider_id))
+                .unwrap_or_else(ProviderRuntimeStatus::idle);
 
             ConnectorProviderSummary {
                 id: provider_id,
@@ -1079,8 +926,11 @@ fn connector_providers(
                 models: provider_models,
                 model_error,
                 refresh_status,
+                runtime_ready,
+                runtime_status,
                 selected_model_id,
                 auth_kind,
+                auth_status,
                 authenticated,
                 adapter_settings,
             }
@@ -1191,14 +1041,9 @@ fn adapter_logout_once(
     entry: &AdapterEntry,
     settings: BTreeMap<String, String>,
 ) -> std::result::Result<(), String> {
-    let mut adapter = Adapter::spawn(&entry.program).map_err(|error| error.to_string())?;
-    adapter.initialize().map_err(|error| error.to_string())?;
-    if !settings.is_empty() {
-        adapter
-            .set_settings(settings)
-            .map_err(|error| error.to_string())?;
-    }
-    adapter.logout().map_err(|error| error.to_string())
+    let mut session = spawn_ready_adapter_without_secret_sink(entry, settings)
+        .map_err(|error| error.to_string())?;
+    session.adapter.logout().map_err(|error| error.to_string())
 }
 
 /// Reads an icon file and encodes it as a `data:` URI (base64). Returns `None`
@@ -1302,9 +1147,9 @@ mod tests {
             )
             .expect("seed settings");
 
-        let snapshot = ConnectorService::new(&database, Arc::new(AdapterPool::new()))
-            .snapshot()
-            .expect("snapshot");
+        let manager = ConnectorManager::new(database, Arc::new(AdapterPool::new()));
+        manager.refresh_all(|_| {});
+        let snapshot = manager.snapshot().expect("snapshot");
         let provider = snapshot
             .providers
             .iter()
@@ -1353,7 +1198,7 @@ mod tests {
         install_echo_adapter(&app_dir, &adapter_path);
         let database = Database::open(app_dir.join("mothership.sqlite3")).expect("open database");
 
-        let error = ConnectorService::new(&database, Arc::new(AdapterPool::new()))
+        let error = ConnectorManager::new(database, Arc::new(AdapterPool::new()))
             .save_adapter_settings(
                 "echo",
                 BTreeMap::from([(
@@ -1408,13 +1253,11 @@ mod tests {
             .expect("broken provider");
 
         assert_eq!(provider.refresh_status, ConnectorRefreshStatus::Failed);
-        assert!(
-            provider
-                .model_error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("integrity mismatch")
-        );
+        assert!(provider
+            .model_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("integrity mismatch"));
 
         let _ = fs::remove_dir_all(app_dir);
     }

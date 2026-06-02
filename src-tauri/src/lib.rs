@@ -16,6 +16,7 @@ pub fn run() {
     configure_process_platform();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
@@ -35,18 +36,23 @@ pub fn run() {
             commands::cancel_authenticate_adapter,
             commands::cancel_chat_run,
             commands::cancel_tool_execution,
+            commands::continue_chat_message,
             commands::create_chat,
             commands::edit_chat_user_message,
             commands::get_chat,
             commands::get_connector_settings,
             commands::get_dashboard_snapshot,
             commands::list_chats,
+            commands::list_projects,
             commands::logout_adapter,
+            commands::open_project,
+            commands::pick_project_directory,
             commands::retry_chat_message,
             commands::run_tool_command,
             commands::run_sidecar_status,
             commands::save_adapter_settings,
             commands::send_chat_message,
+            commands::set_active_project,
             commands::set_selected_model,
         ])
         .build(tauri::generate_context!())

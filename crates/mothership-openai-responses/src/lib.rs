@@ -21,6 +21,7 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
+use mothership_adapter_sdk::agentic::AgenticTurnPolicy;
 use mothership_adapter_sdk::http;
 use mothership_adapter_sdk::protocol::ChatMessage;
 use mothership_adapter_sdk::sse;
@@ -36,7 +37,6 @@ pub const WS_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const WS_SESSION_IDLE: Duration = Duration::from_secs(60);
 /// Overall bound on the non-streaming JSON fallback.
 pub const JSON_TIMEOUT: Duration = Duration::from_secs(180);
-const MAX_TOOL_ROUNDS: usize = 8;
 
 /// Which transport produced the answer (so the caller can disable a WS tier that
 /// keeps falling back).
@@ -76,6 +76,14 @@ pub struct ToolOutput {
 #[async_trait::async_trait]
 pub trait ToolDispatcher: Send + Sync {
     async fn dispatch(&self, call: ToolCall) -> Result<ToolOutput>;
+
+    async fn dispatch_many(&self, calls: Vec<ToolCall>) -> Result<Vec<ToolOutput>> {
+        let mut outputs = Vec::with_capacity(calls.len());
+        for call in calls {
+            outputs.push(self.dispatch(call).await?);
+        }
+        Ok(outputs)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +110,7 @@ struct PartialToolCall {
 
 #[derive(Debug, Default)]
 struct RoundOutput {
+    visible_text: String,
     tool_calls: Vec<RawToolCall>,
 }
 
@@ -196,8 +205,10 @@ async fn chat_with_optional_tools(
     dispatcher: Option<&dyn ToolDispatcher>,
 ) -> Result<Transport> {
     let mut input = build_input(messages);
+    let mut last_transport = None;
+    let agentic_policy = AgenticTurnPolicy::default();
 
-    for _ in 0..MAX_TOOL_ROUNDS {
+    for _ in 0..agentic_policy.max_turns() {
         let (transport, round) = chat_round(
             client,
             endpoint,
@@ -210,6 +221,7 @@ async fn chat_with_optional_tools(
             tools,
         )
         .await?;
+        last_transport = Some(transport);
 
         if round.tool_calls.is_empty() {
             return Ok(transport);
@@ -219,8 +231,25 @@ async fn chat_with_optional_tools(
             bail!("model requested a tool call, but no tool dispatcher is configured");
         };
 
-        for call in round.tool_calls {
-            let output = dispatcher.dispatch(tool_call_for_dispatch(&call)).await?;
+        if !round.visible_text.trim().is_empty() {
+            input.push(assistant_text_input_item(&round.visible_text));
+        }
+
+        let dispatch_calls = round
+            .tool_calls
+            .iter()
+            .map(tool_call_for_dispatch)
+            .collect::<Vec<_>>();
+        let outputs = dispatcher.dispatch_many(dispatch_calls).await?;
+        if outputs.len() != round.tool_calls.len() {
+            bail!(
+                "tool dispatcher returned {} result(s) for {} tool call(s)",
+                outputs.len(),
+                round.tool_calls.len()
+            );
+        }
+
+        for (call, output) in round.tool_calls.into_iter().zip(outputs) {
             input.push(function_call_input_item(&call));
             input.push(json!({
                 "type": "function_call_output",
@@ -230,7 +259,43 @@ async fn chat_with_optional_tools(
         }
     }
 
-    bail!("responses tool loop exceeded {MAX_TOOL_ROUNDS} rounds")
+    input.push(agentic_turn_limit_final_input_item(agentic_policy));
+    match chat_round(
+        client,
+        endpoint,
+        auth_headers,
+        model,
+        instructions,
+        &input,
+        ws.as_deref_mut(),
+        on_delta,
+        &[],
+    )
+    .await
+    {
+        Ok((transport, round)) if round.tool_calls.is_empty() => {
+            if round.visible_text.trim().is_empty() {
+                on_delta(agentic_policy.fallback_message());
+            }
+            Ok(transport)
+        }
+        Ok((transport, round)) => {
+            on_delta(agentic_policy.fallback_message());
+            eprintln!(
+                "openai-responses: final no-tool synthesis unexpectedly returned {} tool call(s)",
+                round.tool_calls.len()
+            );
+            Ok(transport)
+        }
+        Err(error) => {
+            on_delta(agentic_policy.fallback_message());
+            eprintln!(
+                "openai-responses: final no-tool synthesis after {} agentic turns failed: {error:#}",
+                agentic_policy.max_turns()
+            );
+            Ok(last_transport.unwrap_or(Transport::Json))
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -321,6 +386,7 @@ async fn chat_ws(
     let body = build_request_from_input(model, instructions, input, true, tools);
     session.send_text(body.to_string()).await?;
     let mut accumulator = ToolCallAccumulator::default();
+    let mut round = RoundOutput::default();
     loop {
         match session.next_text(WS_READ_IDLE_TIMEOUT).await? {
             Some(frame) => {
@@ -331,11 +397,11 @@ async fn chat_ws(
                     Event::OutputText(text) => {
                         *committed = true;
                         on_delta(&text);
+                        round.visible_text.push_str(&text);
                     }
                     Event::Completed => {
-                        return Ok(RoundOutput {
-                            tool_calls: accumulator.finish(),
-                        })
+                        round.tool_calls = accumulator.finish();
+                        return Ok(round);
                     }
                     Event::Failed(message) => bail!("{message}"),
                     Event::Reasoning | Event::Other => {}
@@ -343,9 +409,8 @@ async fn chat_ws(
             }
             None => {
                 if *committed {
-                    return Ok(RoundOutput {
-                        tool_calls: accumulator.finish(),
-                    });
+                    round.tool_calls = accumulator.finish();
+                    return Ok(round);
                 }
                 bail!("websocket closed before any response");
             }
@@ -367,6 +432,7 @@ async fn chat_sse(
     let body = build_request_from_input(model, instructions, input, true, tools);
     let response = http::post_stream(client, &endpoint.https_url, auth_headers, &body).await?;
     let mut accumulator = ToolCallAccumulator::default();
+    let mut round = RoundOutput::default();
     sse::read_sse(response, SSE_IDLE_TIMEOUT, |payload| {
         if payload == "[DONE]" {
             return Ok(false);
@@ -378,6 +444,7 @@ async fn chat_sse(
             Event::OutputText(text) => {
                 *committed = true;
                 on_delta(&text);
+                round.visible_text.push_str(&text);
                 Ok(true)
             }
             Event::Completed => Ok(false),
@@ -386,9 +453,8 @@ async fn chat_sse(
         }
     })
     .await?;
-    Ok(RoundOutput {
-        tool_calls: accumulator.finish(),
-    })
+    round.tool_calls = accumulator.finish();
+    Ok(round)
 }
 
 async fn chat_json(
@@ -416,7 +482,10 @@ async fn chat_json(
         bail!("empty response from provider");
     }
     on_delta(&text);
-    Ok(RoundOutput { tool_calls })
+    Ok(RoundOutput {
+        visible_text: text,
+        tool_calls,
+    })
 }
 
 /// Build the Responses request body. System messages feed `instructions`
@@ -447,6 +516,20 @@ fn build_input(messages: &[ChatMessage]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn assistant_text_input_item(text: &str) -> Value {
+    json!({
+        "role": "assistant",
+        "content": [{ "type": "output_text", "text": text }],
+    })
+}
+
+fn agentic_turn_limit_final_input_item(policy: AgenticTurnPolicy) -> Value {
+    json!({
+        "role": "user",
+        "content": [{ "type": "input_text", "text": policy.final_synthesis_prompt() }],
+    })
 }
 
 fn build_request_from_input(
@@ -886,6 +969,18 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].call_id, "call_1");
         assert_eq!(calls[0].name, "run_command");
+    }
+
+    #[test]
+    fn assistant_text_input_item_preserves_visible_progress_between_agentic_turns() {
+        let item = assistant_text_input_item("I will inspect the project first.");
+
+        assert_eq!(item["role"], "assistant");
+        assert_eq!(item["content"][0]["type"], "output_text");
+        assert_eq!(
+            item["content"][0]["text"],
+            "I will inspect the project first."
+        );
     }
 
     #[test]

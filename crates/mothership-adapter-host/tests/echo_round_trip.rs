@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use mothership_adapter_host::protocol::{AuthKind, ChatMessage, ModelManagement, SettingsFieldKind};
+use mothership_adapter_host::protocol::{
+    AuthKind, ChatMessage, ModelManagement, SettingsFieldKind,
+};
 use mothership_adapter_host::Adapter;
 
 #[test]
@@ -55,7 +57,10 @@ fn echo_adapter_round_trip() {
 
     assert_eq!(full.trim(), "hello brave world");
     // Streamed word-by-word, not delivered in one shot.
-    assert!(deltas.len() >= 3, "expected streamed deltas, got {deltas:?}");
+    assert!(
+        deltas.len() >= 3,
+        "expected streamed deltas, got {deltas:?}"
+    );
 }
 
 /// The adapter->host `StoreSecret` side channel: the adapter can push a secret

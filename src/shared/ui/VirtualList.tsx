@@ -1,188 +1,261 @@
-import { createEffect, For, JSX, Show, onCleanup } from "solid-js";
+import { createEffect, createMemo, For, JSX, onCleanup, Show } from "solid-js";
+import { createVirtualizer, type Virtualizer } from "@tanstack/solid-virtual";
 
-// Plain native-scroll list (the previous @tanstack/solid-virtual wrapper drove a
-// measure -> re-render -> re-measure loop that froze scrolling). Public API is
-// unchanged; `estimateSize` and `overscan` are accepted but ignored.
-//
-// Scroll behaviour:
-// - With `scrollKey` (e.g. a chat id): the scroll position is saved per key and
-//   persisted to localStorage, so switching chats restores where you were and it
-//   survives an app restart. A key seen for the first time opens at the bottom.
-//   "Was at the bottom" is stored as a flag, so a bottom-anchored chat re-anchors
-//   to the bottom. Restoration runs as a short multi-frame "pin" so it holds the
-//   target while messages/markdown/avatars finish laying out (their height grows
-//   asynchronously and would otherwise leave a single-shot restore near the top).
-// - With `stickToEnd`: a new message in the current key sticks to the bottom only
-//   when you are already near the bottom (never yanks you up while reading history).
+type VirtualListKey = string | number | bigint;
+type VirtualListScrollBehavior = "auto" | "smooth" | "instant";
+
 export interface VirtualListProps<TItem> {
   ariaLabel: string;
+  adjustScrollOnItemResize?: boolean;
   class?: string;
   empty?: JSX.Element;
   estimateSize?: number | ((item: TItem, index: number) => number);
-  getItemKey?: (item: TItem, index: number) => string | number;
+  getItemKey?: (item: TItem, index: number) => VirtualListKey;
   items: readonly TItem[];
   overscan?: number;
-  stickToEnd?: boolean;
-  scrollKey?: string;
+  paddingEnd?: number;
+  paddingStart?: number;
+  scrollRef?: (element: HTMLDivElement | undefined) => void;
+  stickToEnd?: boolean | VirtualListScrollBehavior;
+  stickToEndThreshold?: number;
   children: (item: TItem, index: number) => JSX.Element;
-}
-
-const SCROLL_STORE_KEY = "mothership:chat-scroll-positions";
-const STICK_THRESHOLD_PX = 200;
-const AT_BOTTOM_PX = 48;
-const RESTORE_PIN_FRAMES = 12;
-
-interface ScrollPos {
-  top: number;
-  atBottom: boolean;
-}
-
-function loadScrollPositions(): Record<string, ScrollPos> {
-  try {
-    const raw = JSON.parse(localStorage.getItem(SCROLL_STORE_KEY) ?? "{}") as Record<
-      string,
-      unknown
-    >;
-    const out: Record<string, ScrollPos> = {};
-    for (const [key, value] of Object.entries(raw)) {
-      if (typeof value === "number") {
-        out[key] = { top: value, atBottom: false };
-      } else if (
-        value &&
-        typeof value === "object" &&
-        typeof (value as ScrollPos).top === "number"
-      ) {
-        out[key] = {
-          top: (value as ScrollPos).top,
-          atBottom: Boolean((value as ScrollPos).atBottom),
-        };
-      }
-    }
-    return out;
-  } catch {
-    return {};
-  }
 }
 
 export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
   let scrollElement: HTMLDivElement | undefined;
-  const positions = loadScrollPositions();
-  let restoring = false;
-  let persistTimer: number | undefined;
-  let pinRaf = 0;
-  let restoredForKey: string | undefined;
-  let lastCount = 0;
+  let pinnedToEnd = true;
+  let followEndFrame = 0;
 
-  const persistSoon = () => {
-    clearTimeout(persistTimer);
-    persistTimer = window.setTimeout(() => {
-      try {
-        localStorage.setItem(SCROLL_STORE_KEY, JSON.stringify(positions));
-      } catch {
-        /* localStorage unavailable — ignore */
-      }
-    }, 400);
-  };
+  onCleanup(() => {
+    cancelAnimationFrame(followEndFrame);
+    props.scrollRef?.(undefined);
+  });
 
-  const handleScroll = () => {
-    const key = props.scrollKey;
-    const element = scrollElement;
-    // Save only genuine user scrolls of the current, settled key: skip while
-    // restoring, skip other keys, and skip when there is nothing scrollable (the
-    // transient state right after a chat switch) so we never record a bogus 0.
-    if (!key || !element || restoring || key !== restoredForKey) return;
-    if (element.scrollHeight <= element.clientHeight + 4) return;
-    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
-    positions[key] = { top: element.scrollTop, atBottom: distance < AT_BOTTOM_PX };
-    persistSoon();
-  };
-
-  // Hold the target position across several frames so it survives async layout
-  // growth (markdown/avatars) and the content swap when switching chats.
-  const pinTo = (element: HTMLDivElement, target: ScrollPos | null) => {
-    cancelAnimationFrame(pinRaf);
-    restoring = true;
-    let frame = 0;
-    const step = () => {
-      if (!target || target.atBottom) {
-        element.scrollTop = element.scrollHeight;
-      } else {
-        element.scrollTop = target.top;
-      }
-      frame += 1;
-      if (frame < RESTORE_PIN_FRAMES) {
-        pinRaf = requestAnimationFrame(step);
-      } else {
-        restoring = false;
-      }
-    };
-    pinRaf = requestAnimationFrame(step);
-  };
-
-  const stickIfNearBottom = (element: HTMLDivElement) => {
-    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
-    if (distance < STICK_THRESHOLD_PX) {
-      element.scrollTop = element.scrollHeight;
-      requestAnimationFrame(() => {
-        element.scrollTop = element.scrollHeight;
-      });
+  // Solid's <For> is keyed by *object reference*. Callers that derive their items
+  // (e.g. a conversation timeline rebuilt from messages + tool calls) hand us a
+  // fresh array of fresh objects on every state change, so a naive <For> would
+  // dispose and recreate every row — re-instantiating each MessageRow and
+  // re-parsing each markdown body — even when only one row actually changed.
+  //
+  // `getItemKey` lets us keep identity stable: an incoming item that is
+  // shallow-equal to the one previously rendered under the same key is swapped for
+  // its previous reference. <For> then reuses the existing DOM for every unchanged
+  // row and only (re)builds the rows whose content really changed (e.g. the single
+  // message currently streaming). Without a key we fall back to the raw items.
+  let previousByKey = new Map<VirtualListKey, TItem>();
+  const stableItems = createMemo<readonly TItem[]>(() => {
+    const getKey = props.getItemKey;
+    const items = props.items;
+    if (!getKey) {
+      previousByKey = new Map();
+      return items;
     }
+
+    const nextByKey = new Map<VirtualListKey, TItem>();
+    const result = items.map((item, index) => {
+      const key = getKey(item, index);
+      const previous = previousByKey.get(key);
+      const stable =
+        previous !== undefined && shallowEqualItem(previous, item)
+          ? previous
+          : item;
+      nextByKey.set(key, stable);
+      return stable;
+    });
+    previousByKey = nextByKey;
+    return result;
+  });
+
+  const followOnAppend = () => {
+    if (!props.stickToEnd) {
+      return false;
+    }
+
+    return props.stickToEnd === true ? "auto" : props.stickToEnd;
   };
 
-  createEffect(() => {
-    const key = props.scrollKey;
-    const count = props.items.length;
-    const element = scrollElement;
-    if (!element) return;
+  const endThreshold = () => props.stickToEndThreshold ?? 1;
 
-    if (key != null) {
-      if (key !== restoredForKey) {
-        if (count === 0) {
-          lastCount = count;
-          return; // wait until this key has content to anchor against
-        }
-        restoredForKey = key;
-        lastCount = count;
-        pinTo(element, positions[key] ?? null);
-        return;
-      }
-
-      if (props.stickToEnd && count > lastCount && !restoring) {
-        requestAnimationFrame(() => stickIfNearBottom(element));
-      }
-      lastCount = count;
+  const updatePinnedToEnd = () => {
+    if (!props.stickToEnd || !scrollElement) {
+      pinnedToEnd = false;
       return;
     }
 
-    // Unkeyed (e.g. sidebar lists): optional stick-to-end only.
-    if (props.stickToEnd && count > lastCount && count > 0) {
-      requestAnimationFrame(() => stickIfNearBottom(element));
+    resetHorizontalScroll(scrollElement);
+    pinnedToEnd = distanceFromEnd(scrollElement) <= endThreshold();
+  };
+
+  const schedulePinnedEndScroll = (
+    instance: Virtualizer<HTMLDivElement, HTMLDivElement>,
+  ) => {
+    if (!props.stickToEnd || !pinnedToEnd || !scrollElement) {
+      return;
     }
-    lastCount = count;
+
+    if (distanceFromEnd(scrollElement) <= endThreshold()) {
+      return;
+    }
+
+    cancelAnimationFrame(followEndFrame);
+    followEndFrame = requestAnimationFrame(() => {
+      followEndFrame = 0;
+      if (!props.stickToEnd || !pinnedToEnd || !scrollElement) {
+        return;
+      }
+
+      instance.scrollToEnd({ behavior: followOnAppend() || "auto" });
+      pinnedToEnd = true;
+    });
+  };
+
+  const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
+    get count() {
+      return stableItems().length;
+    },
+    getScrollElement: () => scrollElement ?? null,
+    estimateSize: (index) => {
+      const estimate = props.estimateSize ?? 48;
+      if (typeof estimate === "number") {
+        return estimate;
+      }
+
+      return estimate(stableItems()[index]!, index);
+    },
+    getItemKey: (index) => {
+      const item = stableItems()[index];
+      return item && props.getItemKey ? props.getItemKey(item, index) : index;
+    },
+    get overscan() {
+      return props.overscan ?? 4;
+    },
+    get paddingEnd() {
+      return props.paddingEnd ?? 0;
+    },
+    get paddingStart() {
+      return props.paddingStart ?? 0;
+    },
+    get anchorTo() {
+      return props.stickToEnd ? "end" : "start";
+    },
+    get followOnAppend() {
+      return followOnAppend();
+    },
+    get scrollEndThreshold() {
+      return props.stickToEndThreshold ?? 1;
+    },
+    onChange: (instance) => {
+      schedulePinnedEndScroll(instance);
+    },
+    useAnimationFrameWithResizeObserver: true,
   });
 
+  createEffect(() => {
+    virtualizer.shouldAdjustScrollPositionOnItemSizeChange =
+      props.adjustScrollOnItemResize === false ? () => false : undefined;
+  });
+
+  const virtualItems = createMemo(() => virtualizer.getVirtualItems());
+  const windowOffset = createMemo(() => virtualItems()[0]?.start ?? 0);
+
+  const rowItem = (index: number) => stableItems()[index];
+  const rowIndex = (virtualIndex: number) => virtualIndex;
+
+  const measureRow = (element: HTMLDivElement) => {
+    virtualizer.measureElement(element);
+  };
+
+  const setScrollElement = (element: HTMLDivElement) => {
+    scrollElement = element;
+    resetHorizontalScroll(element);
+    updatePinnedToEnd();
+    props.scrollRef?.(element);
+  };
+
   onCleanup(() => {
-    cancelAnimationFrame(pinRaf);
-    clearTimeout(persistTimer);
+    scrollElement = undefined;
   });
 
   return (
     <div
-      ref={scrollElement}
+      ref={setScrollElement}
       class={`virtual-list ${props.class ?? ""}`}
       role="list"
       aria-label={props.ariaLabel}
-      onScroll={handleScroll}
+      onScroll={updatePinnedToEnd}
     >
-      <Show when={props.items.length > 0} fallback={props.empty}>
-        <For each={props.items}>
-          {(item, index) => (
-            <div class="virtual-list__row" role="listitem">
-              {props.children(item, index())}
-            </div>
-          )}
-        </For>
+      <Show when={stableItems().length > 0} fallback={props.empty}>
+        <div
+          class="virtual-list__spacer"
+          style={{ height: `${virtualizer.getTotalSize()}px` }}
+        >
+          <div
+            class="virtual-list__window"
+            style={{ transform: `translateY(${windowOffset()}px)` }}
+          >
+            <For each={virtualItems()}>
+              {(virtualItem) => (
+                <div
+                  ref={measureRow}
+                  class="virtual-list__row"
+                  data-index={virtualItem.index}
+                  role="listitem"
+                >
+                  {props.children(
+                    rowItem(virtualItem.index)!,
+                    rowIndex(virtualItem.index),
+                  )}
+                </div>
+              )}
+            </For>
+          </div>
+        </div>
       </Show>
     </div>
   );
+}
+
+function distanceFromEnd(element: HTMLDivElement): number {
+  return Math.max(
+    0,
+    element.scrollHeight - element.clientHeight - element.scrollTop,
+  );
+}
+
+function resetHorizontalScroll(element: HTMLDivElement) {
+  if (element.scrollLeft !== 0) {
+    element.scrollLeft = 0;
+  }
+}
+
+// Shallow structural equality for list items. Two items are treated as the same
+// row when every own field matches by reference, which is exactly the signal we
+// need: upstream state updates replace changed messages/tool calls with new
+// objects but leave untouched ones referentially stable.
+function shallowEqualItem(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) {
+    return true;
+  }
+  if (
+    typeof a !== "object" ||
+    typeof b !== "object" ||
+    a === null ||
+    b === null
+  ) {
+    return false;
+  }
+
+  const aRecord = a as Record<string, unknown>;
+  const bRecord = b as Record<string, unknown>;
+  const aKeys = Object.keys(aRecord);
+  if (aKeys.length !== Object.keys(bRecord).length) {
+    return false;
+  }
+
+  for (const key of aKeys) {
+    if (!Object.is(aRecord[key], bRecord[key])) {
+      return false;
+    }
+  }
+  return true;
 }
