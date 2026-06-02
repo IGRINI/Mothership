@@ -8,10 +8,12 @@ This **extends** [`EXECUTION_MODEL.md`](EXECUTION_MODEL.md) and [`PROCESS_SANDBO
 the supervisor, output policy, approval gate, leases and `ProcessSandbox` described
 there stay; this doc generalizes *what* runs through them.
 
-> **Status: design agreed; implementation in progress on `feat/typed-tool-layer`.**
-> Converged across two independent design passes + review against the as-built `crates/`.
-> Pure cores landed first: `tools/file_edit.rs` (`apply_edit`) and `tools/patch.rs`
-> (`parse_v4a`/`plan_patch`), both tested, not yet wired to tools.
+> **Status: IMPLEMENTED on `feat/typed-tool-layer`.** All four file tools
+> (`read_file`/`write_file`/`edit_file`/`apply_patch`) are wired end-to-end alongside
+> an unchanged `run_command`. `mothership-core`: 183 tests green; whole workspace
+> (incl. the Tauri app) builds clean. See "Known limitations / follow-ups" at the end.
+> Pure cores (`tools/file_edit.rs`, `tools/patch.rs`) were aligned to the canonical
+> Codex/Claude references before wiring.
 
 ## The spine (two ideas)
 
@@ -168,17 +170,40 @@ before Approve. Approval is a Core event routed to wherever the human is (incl. 
 
 ```text
 0. [DONE] pure cores: file_edit.rs (apply_edit), patch.rs (parse_v4a/plan_patch) + tests.
-1. Tool trait + ToolInvocation + registry/dispatcher; run_command becomes one tool
-   (behavior 1:1, existing tests pass, model sees no change).
-2. read_file        (read-only vertical slice; reuses spill; no approval friction)
-3. write_file       (builds mutation+diff-approval+atomic-write machinery)
-4. edit_file        (wire apply_edit; reuses write machinery)
-5. apply_patch      (wire plan_patch; batched approval; artifact snapshots)
-+  typed storage + capability policy + sensitive-path firewall fold in along the way.
+0b.[DONE] aligned both cores to canonical Codex/Claude behaviour (seek_sequence fuzzy,
+          EOF, @@-seek, quote/escape normalization) with fixtures from codex tests.
+1. [DONE] filesystem.rs: Workspace (path resolve + containment + sensitive-path policy)
+          + FileSystem port + StdFileSystem (atomic write = temp + fsync + rename).
+2. [DONE] read_file  (binary guard, cat -n line numbers, offset/limit, large-output spill).
+3. [DONE] write_file (create/overwrite, expectedSha256 conflict, BOM/EOL preserve, atomic).
+4. [DONE] edit_file  (wires apply_edit; atomic write; NotFound/Ambiguous as ok:false).
+5. [DONE] apply_patch (wires plan_patch; guard all paths; plan-level all-or-none; batched
+          approval; per-file apply).
++  [DONE] capability policy (read=allow / mutate=ask / outside+sensitive=deny) + sidecar
+          dispatch through the shared PendingToolApprovalGate; run_command 1:1.
 ```
 
-`run_command` stays working the entire time. This list extends the
-[`MIGRATION_PLAN.md`](MIGRATION_PLAN.md) checklist.
+Implementation note: rather than genericizing `ToolSupervisor` into one trait now, the
+file tools run through an additive `FileToolRunner` in the sidecar handler that reuses the
+existing approval gate + event sink; `run_command` keeps its supervisor path untouched.
+This list extends the [`MIGRATION_PLAN.md`](MIGRATION_PLAN.md) checklist.
+
+## Known limitations / follow-ups (as implemented)
+
+- **apply_patch atomicity is plan-level, not disk-level.** `plan_patch` is all-or-none
+  (a bad hunk / missing file / outside-workspace target aborts before any write), but a
+  rare *mid-apply IO error* (e.g. file 3 of 5) can leave earlier files written. True
+  multi-file rollback (snapshot old content to an artifact, restore on failure) is the
+  deferred enhancement from the design above.
+- **Typed storage deferred.** Tool events still persist via `chat_tool_events`
+  (`command_json` NULL for file tools); the `tool_calls`/`tool_events`/`tool_artifacts`
+  typed tables are not yet created.
+- **UI semantic cards deferred.** Events flow (the inline card shows the tool), but
+  per-tool rendering (read/write/edit/patch diffs) and the diff-before-approve card are
+  frontend follow-ups; the approval diff currently rides in the event `message`.
+- **scheduler.rs** still classifies all non-`run_command` tools as `Exclusive` (safe);
+  `read_file` could be `ParallelSafe`.
+- **`ToolSupervisor` not genericized.** File tools use a parallel runner (see note above).
 
 ## Decision log (so it isn't re-litigated)
 
