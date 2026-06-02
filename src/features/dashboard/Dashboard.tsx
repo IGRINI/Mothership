@@ -47,11 +47,13 @@ import {
   ProjectSnapshot,
   ReasoningConfig,
   ReasoningOption,
+  ToolArtifact,
   ToolCommand,
   ToolExecutionEvent,
   ToolExecutionEventKind,
   ToolExecutionRecord,
   ToolExecutionResult,
+  ToolKind,
   approveToolExecution,
   branchChatFromMessage,
   cancelChatRun,
@@ -70,6 +72,7 @@ import {
   setChatModel,
   setSelectedModel,
 } from "../../shared/api/mothership";
+import { ApprovalPreview, ToolCard } from "./ToolCards";
 import { VirtualList } from "../../shared/ui/VirtualList";
 import { startWindowDrag } from "../../shared/window-drag";
 import mothershipLogoUrl from "../../assets/mothership-logo-sm.png";
@@ -975,6 +978,15 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
           message: event.message ?? previous?.message,
           output,
           result: event.result ?? previous?.result,
+          // Typed-tool fields: keep the newest non-null value, never regress to
+          // undefined when a later event (e.g. an `output` chunk) omits them.
+          toolKind: event.toolKind ?? previous?.toolKind,
+          payload: event.payload ?? previous?.payload,
+          touchedPaths: mergeTouchedPaths(
+            previous?.touchedPaths,
+            event.touchedPaths,
+          ),
+          artifacts: mergeToolArtifacts(previous?.artifacts, event.artifacts),
           createdAt: previous?.createdAt ?? now,
           updatedAt: now,
         },
@@ -2375,6 +2387,10 @@ function InlineToolCall(props: {
   const canApprove = () => props.tool.kind === "permission_requested";
   const canCancel = () =>
     !canApprove() && !isTerminalToolKind(props.tool.kind);
+  // Prefer the typed semantic card whenever the backend supplied both a tool
+  // kind and a payload; otherwise fall back to the generic text rendering.
+  const hasSemanticCard = () =>
+    Boolean(props.tool.toolKind && props.tool.payload);
 
   return (
     <div class="inline-tool-call">
@@ -2402,25 +2418,41 @@ function InlineToolCall(props: {
 
       <Show when={props.expanded}>
         <div class="inline-tool-call__body">
-          <span class="inline-tool-call__label">
-            {toolCommandLabel(props.tool.command)}
-          </span>
-          <pre class="inline-tool-call__command">{command()}</pre>
+          <Show
+            when={hasSemanticCard()}
+            fallback={
+              <>
+                <span class="inline-tool-call__label">
+                  {toolCommandLabel(props.tool.command)}
+                </span>
+                <pre class="inline-tool-call__command">{command()}</pre>
 
-          <Show when={props.tool.message}>
-            <p class="inline-tool-call__message">{props.tool.message}</p>
+                <Show when={!canApprove() && props.tool.message}>
+                  <p class="inline-tool-call__message">{props.tool.message}</p>
+                </Show>
+
+                <Show when={shouldShowInlineToolOutput(props.tool, output())}>
+                  <pre
+                    classList={{
+                      "inline-tool-call__output": true,
+                      "inline-tool-call__output--scrollable":
+                        isOutputScrollable(),
+                    }}
+                    style={`--tool-output-lines: ${TOOL_OUTPUT_MAX_VISIBLE_LINES}`}
+                  >
+                    {output()}
+                  </pre>
+                </Show>
+              </>
+            }
+          >
+            <ToolCard tool={props.tool} />
           </Show>
 
-          <Show when={shouldShowInlineToolOutput(props.tool, output())}>
-            <pre
-              classList={{
-                "inline-tool-call__output": true,
-                "inline-tool-call__output--scrollable": isOutputScrollable(),
-              }}
-              style={`--tool-output-lines: ${TOOL_OUTPUT_MAX_VISIBLE_LINES}`}
-            >
-              {output()}
-            </pre>
+          {/* Show the pending change prominently before the human approves it,
+              in both the semantic and fallback paths. */}
+          <Show when={canApprove() && props.tool.message}>
+            {(message) => <ApprovalPreview message={message()} />}
           </Show>
 
           <Show when={canApprove() || canCancel()}>
@@ -3349,9 +3381,65 @@ function toolExecutionViewFromRecord(
     message: record.message,
     output: record.output,
     result: record.result,
+    toolKind: record.toolKind,
+    payload: record.payload,
+    touchedPaths: record.touchedPaths,
+    artifacts: record.artifacts,
     createdAt: timestampToMillis(record.createdAt),
     updatedAt: timestampToMillis(record.updatedAt),
   };
+}
+
+// Accumulate workspace-relative paths across events, preserving first-seen
+// order and dropping duplicates. Returns undefined when nothing is known yet.
+function mergeTouchedPaths(
+  previous: string[] | undefined,
+  incoming: string[] | undefined,
+): string[] | undefined {
+  if (!incoming || incoming.length === 0) {
+    return previous;
+  }
+  if (!previous || previous.length === 0) {
+    return [...incoming];
+  }
+
+  const merged = [...previous];
+  const seen = new Set(previous);
+  for (const path of incoming) {
+    if (!seen.has(path)) {
+      seen.add(path);
+      merged.push(path);
+    }
+  }
+  return merged;
+}
+
+// Accumulate artifacts across events, deduping by artifactId and letting a
+// later event replace an earlier artifact with the same id (e.g. a diff that
+// grew and spilled to a logRef).
+function mergeToolArtifacts(
+  previous: ToolArtifact[] | undefined,
+  incoming: ToolArtifact[] | undefined,
+): ToolArtifact[] | undefined {
+  if (!incoming || incoming.length === 0) {
+    return previous;
+  }
+  if (!previous || previous.length === 0) {
+    return [...incoming];
+  }
+
+  const merged = [...previous];
+  for (const artifact of incoming) {
+    const index = merged.findIndex(
+      (existing) => existing.artifactId === artifact.artifactId,
+    );
+    if (index === -1) {
+      merged.push(artifact);
+    } else {
+      merged[index] = artifact;
+    }
+  }
+  return merged;
 }
 
 function compareToolExecutions(
@@ -3690,6 +3778,10 @@ interface ToolExecutionView {
   message?: string | null;
   output: string;
   result?: ToolExecutionResult | null;
+  toolKind?: ToolKind;
+  payload?: Record<string, unknown> | null;
+  touchedPaths?: string[];
+  artifacts?: ToolArtifact[];
   createdAt: number;
   updatedAt: number;
 }

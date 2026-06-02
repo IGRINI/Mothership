@@ -183,6 +183,26 @@ export interface ToolApprovalAnswer {
 
 export type ToolOutputStream = "stdout" | "stderr";
 
+export type ToolKind =
+  | "run_command"
+  | "read_file"
+  | "write_file"
+  | "edit_file"
+  | "apply_patch"
+  | "list_files"
+  | "search_text";
+
+export interface ToolArtifact {
+  artifactId: string;
+  kind: string;
+  contentType: string;
+  preview: string;
+  logRef?: string | null;
+  sizeBytes: number;
+  sha256?: string | null;
+  truncated: boolean;
+}
+
 export type ToolExecutionStatus =
   | "completed"
   | "failed"
@@ -230,6 +250,10 @@ export interface ToolExecutionEvent {
   chunk?: string | null;
   message?: string | null;
   result?: ToolExecutionResult | null;
+  toolKind?: ToolKind;
+  payload?: Record<string, unknown> | null;
+  touchedPaths?: string[];
+  artifacts?: ToolArtifact[];
 }
 
 export interface ToolExecutionRecord {
@@ -243,6 +267,10 @@ export interface ToolExecutionRecord {
   message?: string | null;
   output: string;
   result?: ToolExecutionResult | null;
+  toolKind?: ToolKind;
+  payload?: Record<string, unknown> | null;
+  touchedPaths?: string[];
+  artifacts?: ToolArtifact[];
   createdAt: string;
   updatedAt: string;
 }

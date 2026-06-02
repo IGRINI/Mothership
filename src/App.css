@@ -2972,3 +2972,298 @@ kbd,
     min-width: min(100%, 72vw);
   }
 }
+
+/* --- Semantic tool cards -------------------------------------------------- */
+
+.tool-card-group {
+  display: grid;
+  gap: 8px;
+}
+
+.tool-card {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #1d2b3b;
+  border-radius: 8px;
+  padding: 9px 10px;
+  background: #060d15;
+}
+
+.tool-card__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tool-card__head svg {
+  flex: 0 0 auto;
+  color: #8d9bab;
+}
+
+.tool-card__title {
+  color: #c9d4df;
+  font-size: 12.5px;
+  font-weight: 760;
+}
+
+.tool-card__cmd,
+.tool-card__path,
+.tool-card__pattern {
+  min-width: 0;
+  overflow: hidden;
+  color: #74e69d;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-card__path {
+  color: #cbd6e3;
+}
+
+.tool-card__pattern {
+  color: #e4cda0;
+}
+
+.tool-card__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tool-card__chips:empty {
+  display: none;
+}
+
+.tool-card__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid #213245;
+  border-radius: 6px;
+  padding: 2px 7px;
+  background: #0c1722;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.tool-card__chip-key {
+  color: #7e8d9d;
+  font-weight: 700;
+  text-transform: lowercase;
+}
+
+.tool-card__chip-value {
+  color: #d4dfeb;
+}
+
+.tool-card__chip-value code,
+.tool-card__chip code {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+}
+
+.tool-card__pill {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.01em;
+}
+
+.tool-card__pill--ok {
+  border-color: rgb(74 221 134 / 35%);
+  background: rgb(74 221 134 / 12%);
+  color: #4add86;
+}
+
+.tool-card__pill--error {
+  border-color: rgb(255 155 155 / 35%);
+  background: rgb(255 155 155 / 12%);
+  color: #ff9b9b;
+}
+
+.tool-card__pill--warn {
+  border-color: rgb(228 170 67 / 35%);
+  background: rgb(228 170 67 / 12%);
+  color: #e4aa43;
+}
+
+.tool-card__pill--neutral {
+  border-color: #27394b;
+  background: #0c1722;
+  color: #aab7c6;
+}
+
+.tool-card__stream {
+  margin: 0;
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid #1d2b3b;
+  border-radius: 6px;
+  padding: 7px 9px;
+  background: #04090f;
+  color: #c4d0dd;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.45;
+  scrollbar-color: #33465b transparent;
+  scrollbar-width: thin;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tool-card__stream--err {
+  color: #ffb3b3;
+}
+
+.tool-card__files {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tool-card__files li code {
+  color: #cbd6e3;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  word-break: break-word;
+}
+
+/* --- Before-approval preview --------------------------------------------- */
+
+.tool-card__approval {
+  display: grid;
+  gap: 8px;
+  border: 1px solid rgb(228 170 67 / 35%);
+  border-radius: 8px;
+  padding: 9px 10px;
+  background: rgb(228 170 67 / 6%);
+}
+
+.tool-card__approval-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #e4aa43;
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.tool-card__approval-summary {
+  margin: 0;
+  color: #d4dfeb;
+  font-size: 12.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.tool-card__preview {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid #1d2b3b;
+  border-radius: 6px;
+  padding: 8px 9px;
+  background: #04090f;
+  color: #c4d0dd;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.45;
+  scrollbar-color: #33465b transparent;
+  scrollbar-width: thin;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* --- Unified diff card ---------------------------------------------------- */
+
+.tool-card__diff-wrap {
+  display: grid;
+  gap: 6px;
+}
+
+.tool-card__diff-head,
+.tool-card__diff-wrap > .tool-card__diff-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #8d9bab;
+  font-size: 11.5px;
+  font-weight: 750;
+}
+
+.tool-diff {
+  display: grid;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid #1d2b3b;
+  border-radius: 7px;
+  background: #04090f;
+}
+
+.tool-diff__body {
+  display: grid;
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  padding: 6px 0;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  scrollbar-color: #33465b transparent;
+  scrollbar-width: thin;
+}
+
+.tool-diff__line {
+  padding: 0 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tool-diff__line--add {
+  background: rgb(74 221 134 / 12%);
+  color: #8be6ad;
+}
+
+.tool-diff__line--remove {
+  background: rgb(255 123 123 / 12%);
+  color: #ff9b9b;
+}
+
+.tool-diff__line--hunk {
+  background: rgb(125 178 255 / 12%);
+  color: #8fbcff;
+}
+
+.tool-diff__line--meta {
+  color: #7e8d9d;
+}
+
+.tool-diff__line--context {
+  color: #b6c2d0;
+}
+
+.tool-diff__note {
+  border-top: 1px solid #1d2b3b;
+  padding: 5px 10px;
+  background: #0c1722;
+  color: #e4aa43;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.tool-diff__note code {
+  color: #cbd6e3;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 10.5px;
+  font-weight: 600;
+}
