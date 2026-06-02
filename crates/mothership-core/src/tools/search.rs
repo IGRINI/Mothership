@@ -54,6 +54,10 @@ const MAX_READ_FILE_BYTES: usize = 10 * 1024 * 1024;
 /// does not emit a multi-megabyte match line.
 const MAX_MATCH_LINE_BYTES: usize = 1024;
 
+/// How many partially-read (capped, > `MAX_READ_FILE_BYTES`) file paths
+/// `search_text` lists in `cappedFiles`; the total is reported as `cappedFileCount`.
+const MAX_CAPPED_FILES_REPORTED: usize = 50;
+
 /// Budget for the inline model text / event payload before results spill to the
 /// output store and the model gets a preview + `logRef` instead. Mirrors the
 /// conservative event budget used by the file tools.
@@ -182,7 +186,7 @@ pub fn list_files(
     let limit = input.limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
 
     let mut paths: Vec<String> = Vec::new();
-    let mut truncated = false;
+    let mut scan_truncated = false;
     let walker = build_walker(&root, include_ignored);
     for entry in walker {
         let Ok(entry) = entry else { continue };
@@ -202,14 +206,19 @@ pub fn list_files(
                 continue;
             }
         }
-        if paths.len() >= limit {
-            truncated = true;
+        // Collect up to the hard scan ceiling (bounds memory in a huge tree); we
+        // sort and apply `limit` AFTER the walk so `limit` yields a STABLE first-N
+        // of the sorted set, not whatever order the walker produced.
+        if paths.len() >= MAX_LIST_LIMIT {
+            scan_truncated = true;
             break;
         }
         paths.push(relative);
     }
 
     paths.sort();
+    let truncated = scan_truncated || paths.len() > limit;
+    paths.truncate(limit);
     let count = paths.len();
 
     let mut data = json!({
@@ -338,7 +347,13 @@ pub fn search_text(
         .min(MAX_SEARCH_MATCHES);
 
     let mut matches: Vec<TextMatch> = Vec::new();
-    let mut files_with_matches: usize = 0;
+    // Distinct matched paths — counted via a set so a file whose matches fill the
+    // buffer (and trigger the `break 'walk`) is still counted as a matched file.
+    let mut matched_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Files that exceeded the per-file read ceiling and were searched only up to the
+    // prefix (so a match past the cap may have been missed — surfaced as `partial`).
+    let mut capped_count: usize = 0;
+    let mut capped_files: Vec<String> = Vec::new();
     let mut truncated = false;
     let walker = build_walker(&root, include_ignored);
 
@@ -361,18 +376,25 @@ pub fn search_text(
 
         // Read bounded through the injected port; skip on IO error (e.g. a file
         // removed mid-walk) rather than aborting the whole search.
-        let Ok((bytes, _capped)) = fs.read_capped(entry.path(), MAX_READ_FILE_BYTES) else {
+        let Ok((bytes, capped)) = fs.read_capped(entry.path(), MAX_READ_FILE_BYTES) else {
             continue;
         };
         if looks_binary(&bytes) {
             continue;
         }
+        if capped {
+            capped_count += 1;
+            if capped_files.len() < MAX_CAPPED_FILES_REPORTED && !capped_files.contains(&relative) {
+                capped_files.push(relative.clone());
+            }
+        }
         let text = String::from_utf8_lossy(&bytes);
 
-        let mut file_matched = false;
         for (index, line) in text.lines().enumerate() {
             if regex.is_match(line) {
-                file_matched = true;
+                // Count the file the moment a line matches — BEFORE the max_matches
+                // break — so a file whose matches fill the buffer is still counted.
+                matched_paths.insert(relative.clone());
                 if matches.len() >= max_matches {
                     truncated = true;
                     break 'walk;
@@ -384,12 +406,11 @@ pub fn search_text(
                 });
             }
         }
-        if file_matched {
-            files_with_matches += 1;
-        }
     }
 
     let count = matches.len();
+    let files_with_matches = matched_paths.len();
+    let partial = capped_count > 0;
     let match_values: Vec<Value> = matches
         .iter()
         .map(|m| {
@@ -410,12 +431,24 @@ pub fn search_text(
         "filesWithMatches": files_with_matches,
         "truncated": truncated,
         "includeIgnored": include_ignored,
+        "partial": partial,
     });
     if let Some(glob) = &input.glob {
         data["glob"] = json!(glob);
     }
+    if partial {
+        data["readCeilingBytes"] = json!(MAX_READ_FILE_BYTES);
+        data["cappedFileCount"] = json!(capped_count);
+        data["cappedFiles"] = json!(capped_files);
+    }
 
-    let summary = format!("{count} match(es) in {files_with_matches} file(s)");
+    let mut summary = format!("{count} match(es) in {files_with_matches} file(s)");
+    if partial {
+        summary.push_str(&format!(
+            "; note: {capped_count} file(s) exceeded the {}-byte per-file search cap and were searched only up to that prefix (matches beyond it were not found — use run_command for a full search of very large files)",
+            MAX_READ_FILE_BYTES
+        ));
+    }
     let full_text = render_matches(&matches);
     if full_text.len() > MAX_RESULT_INLINE_BYTES {
         let preview = take_prefix_on_char_boundary(&full_text, MAX_RESULT_INLINE_BYTES);
@@ -797,6 +830,13 @@ mod tests {
         assert!(out.ok);
         assert_eq!(out.data["count"], 3);
         assert_eq!(out.data["truncated"], true);
+        // `limit` returns the STABLE first-N of the SORTED set (f0,f1,f2), not the
+        // walker's arbitrary first-N. (Regression: sort used to run AFTER the limit.)
+        assert!(out.model_text.contains("f0.txt"));
+        assert!(out.model_text.contains("f1.txt"));
+        assert!(out.model_text.contains("f2.txt"));
+        assert!(!out.model_text.contains("f3.txt"));
+        assert!(!out.model_text.contains("f9.txt"));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -957,6 +997,68 @@ mod tests {
         assert!(out.ok);
         assert_eq!(out.data["count"], 5);
         assert_eq!(out.data["truncated"], true);
+        // The single file is still counted though its matches filled the buffer and
+        // triggered the walk break (regression: filesWithMatches was 0 before the fix).
+        assert_eq!(out.data["filesWithMatches"], 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_text_flags_capped_files_as_partial() {
+        // A file that exceeds the per-file read ceiling is searched only up to its
+        // prefix; the result must honestly flag `partial` + list the capped file
+        // instead of silently returning a false negative for matches past the cap.
+        struct CappedFs;
+        impl FileSystem for CappedFs {
+            fn read(&self, _p: &Path) -> std::io::Result<Vec<u8>> {
+                Ok(b"hit here\n".to_vec())
+            }
+            fn read_capped(&self, _p: &Path, _max: usize) -> std::io::Result<(Vec<u8>, bool)> {
+                // Pretend the file is larger than the cap: prefix + capped=true.
+                Ok((b"hit here\n".to_vec(), true))
+            }
+            fn write_atomic(&self, _p: &Path, _b: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn metadata(&self, _p: &Path) -> std::io::Result<crate::tools::filesystem::FileMetadata> {
+                Ok(crate::tools::filesystem::FileMetadata {
+                    len: MAX_READ_FILE_BYTES as u64 + 1,
+                    is_dir: false,
+                })
+            }
+            fn exists(&self, _p: &Path) -> bool {
+                true
+            }
+            fn rename(&self, _f: &Path, _t: &Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_file(&self, _p: &Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn create_dir_all(&self, _p: &Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_dir(&self, _p: &Path) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (ws, dir) = temp_workspace("search_capped");
+        // A real file so the `ignore` walker discovers it; the double supplies the
+        // (pretend-capped) content.
+        fs::write(dir.join("big.txt"), b"placeholder").unwrap();
+        let out = search_text(&json!({ "pattern": "hit" }), &ws, &CappedFs, "tc", None).unwrap();
+        assert!(out.ok);
+        assert_eq!(out.data["count"], 1);
+        assert_eq!(out.data["partial"], true);
+        assert_eq!(out.data["cappedFileCount"], 1);
+        assert!(out.data["cappedFiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "big.txt"));
+        assert!(out.model_text.contains("per-file search cap"));
 
         let _ = fs::remove_dir_all(&dir);
     }
