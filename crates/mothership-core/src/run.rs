@@ -19,7 +19,7 @@ use crate::llm::{
 };
 use crate::prompt::runtime_prompt_bundle_for;
 use crate::provider_runtime::ProviderRuntimeManager;
-use crate::tools::default_tool_catalog;
+use crate::tools::{default_tool_catalog, CatalogPin};
 use crate::{Database, MothershipError, Result};
 
 const CHAT_CONTEXT_LIMIT: i64 = 80;
@@ -253,17 +253,32 @@ impl<'a> ChatRunService<'a> {
         // user model list, OAuth tokens, …) live in the app's shared credential
         // vault, keyed by provider, and are pushed to the adapter on spawn.
         let vault = FileCredentialVault::new(auth_store_path(database));
+        let tools = self
+            .tool_handler
+            .as_ref()
+            .map(|_| default_tool_catalog())
+            .unwrap_or_default();
+        // Catalog stability: pin the catalog's canonical bytes for the process and
+        // warn if they ever drift — a silent tool-definition change between
+        // rebuilds poisons the provider's prefix cache. When MCP/dynamic tools are
+        // merged into `tools`, this check should run on the merged set (the
+        // MCP-byte-pin attaches here).
+        if !tools.is_empty() {
+            static CATALOG_PIN: std::sync::OnceLock<CatalogPin> = std::sync::OnceLock::new();
+            if let Err(drift) = CATALOG_PIN
+                .get_or_init(|| CatalogPin::pin(&tools))
+                .check(&tools)
+            {
+                eprintln!("mothership-core: {drift}");
+            }
+        }
         let request = self.provider_pipeline.apply(LlmChatCompletionRequest {
             provider_id,
             model_id,
             reasoning: run.context.reasoning.clone(),
             prompt: runtime_prompt_bundle_for(project.as_ref(), runtime_kind),
             runtime_context: runtime_context_for(project.as_ref()),
-            tools: self
-                .tool_handler
-                .as_ref()
-                .map(|_| default_tool_catalog())
-                .unwrap_or_default(),
+            tools,
             messages,
         })?;
 

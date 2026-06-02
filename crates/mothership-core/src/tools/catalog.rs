@@ -6,7 +6,8 @@
 use std::collections::BTreeMap;
 
 use mothership_adapter_host::protocol::ToolDescriptor;
-use serde_json::json;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 pub const RUN_COMMAND_TOOL_ID: &str = "core.run_command";
 pub const RUN_COMMAND_TOOL_NAME: &str = "run_command";
@@ -35,6 +36,120 @@ pub fn default_tool_catalog() -> Vec<ToolDescriptor> {
         list_files_tool_descriptor(),
         search_text_tool_descriptor(),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Catalog stability
+// ---------------------------------------------------------------------------
+//
+// Providers prefix-cache the serialized tool catalog. If a tool definition
+// silently changes between rebuilds/reconnects, the cache is poisoned and every
+// request after the change pays a full re-encode (or, worse, the model sees a
+// different tool than it was primed on). These primitives give the catalog a
+// byte-stable canonical form, a fingerprint, and a session pin that detects
+// drift — including drift introduced when MCP/dynamic tools are merged in.
+
+/// Serialize a JSON value with object keys sorted recursively, producing a
+/// byte-identical representation regardless of the map's backing store
+/// (`BTreeMap` vs `preserve_order` `IndexMap`) or construction order.
+pub fn canonical_json(value: &Value) -> String {
+    serde_json::to_string(&sorted_value(value)).unwrap_or_default()
+}
+
+fn sorted_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                out.insert(key.clone(), sorted_value(&map[key]));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted_value).collect()),
+        other => other.clone(),
+    }
+}
+
+/// The canonical, byte-stable serialization of a tool catalog. Repeated calls
+/// with equal descriptors yield identical bytes — the property prefix caching on
+/// the provider side depends on. Ordered hand-built schemas are preserved (the
+/// shapes are unchanged; only the serialization is made deterministic).
+pub fn canonical_catalog_bytes(tools: &[ToolDescriptor]) -> String {
+    let value = serde_json::to_value(tools).unwrap_or(Value::Null);
+    canonical_json(&value)
+}
+
+/// A short, stable fingerprint (sha256 hex) of a catalog's canonical bytes.
+pub fn catalog_fingerprint(tools: &[ToolDescriptor]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_catalog_bytes(tools).as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// A session pin of a tool catalog: its canonical bytes + fingerprint, captured
+/// once. The runtime pins the catalog when a session starts and compares on every
+/// rebuild; a mismatch means a tool definition changed underneath the prefix
+/// cache. This is the MCP-byte-pin: when a bridge reconnects and re-advertises
+/// tools, [`CatalogPin::check`] catches a silent definition change.
+#[derive(Debug, Clone)]
+pub struct CatalogPin {
+    fingerprint: String,
+    bytes: String,
+}
+
+impl CatalogPin {
+    /// Pin the catalog as it is now.
+    pub fn pin(tools: &[ToolDescriptor]) -> Self {
+        Self {
+            fingerprint: catalog_fingerprint(tools),
+            bytes: canonical_catalog_bytes(tools),
+        }
+    }
+
+    /// The pinned fingerprint (sha256 hex).
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// The pinned canonical bytes (what should be re-sent verbatim on reconnect).
+    pub fn bytes(&self) -> &str {
+        &self.bytes
+    }
+
+    /// Compare the current catalog against the pin: `Ok(())` if byte-identical,
+    /// `Err(CatalogDrift)` describing the change otherwise.
+    pub fn check(&self, tools: &[ToolDescriptor]) -> std::result::Result<(), CatalogDrift> {
+        let current = catalog_fingerprint(tools);
+        if current == self.fingerprint {
+            Ok(())
+        } else {
+            Err(CatalogDrift {
+                pinned_fingerprint: self.fingerprint.clone(),
+                current_fingerprint: current,
+            })
+        }
+    }
+}
+
+/// Reported when a catalog's canonical bytes change after it was pinned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogDrift {
+    pub pinned_fingerprint: String,
+    pub current_fingerprint: String,
+}
+
+impl std::fmt::Display for CatalogDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let short = |hash: &str| hash.chars().take(12).collect::<String>();
+        write!(
+            f,
+            "tool catalog drifted after pinning (pinned {}, now {}) — provider prefix cache invalidated",
+            short(&self.pinned_fingerprint),
+            short(&self.current_fingerprint),
+        )
+    }
 }
 
 fn run_command_tool_descriptor() -> ToolDescriptor {
@@ -288,6 +403,49 @@ fn search_text_tool_descriptor() -> ToolDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_catalog_bytes_are_stable_across_calls() {
+        // Byte-for-byte identical on repeated serialization — the property the
+        // provider prefix cache relies on.
+        let a = canonical_catalog_bytes(&default_tool_catalog());
+        let b = canonical_catalog_bytes(&default_tool_catalog());
+        assert_eq!(a, b);
+        assert!(!a.is_empty());
+    }
+
+    #[test]
+    fn canonical_json_is_key_order_independent() {
+        // Two values that differ only in object-key insertion order serialize to
+        // identical canonical bytes.
+        let one = json!({ "b": 1, "a": { "y": 2, "x": 3 } });
+        let two = json!({ "a": { "x": 3, "y": 2 }, "b": 1 });
+        assert_eq!(canonical_json(&one), canonical_json(&two));
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_tool_changes() {
+        let base = default_tool_catalog();
+        let mut mutated = base.clone();
+        mutated[0].description.push_str(" (changed)");
+        assert_ne!(catalog_fingerprint(&base), catalog_fingerprint(&mutated));
+    }
+
+    #[test]
+    fn catalog_pin_detects_drift() {
+        let base = default_tool_catalog();
+        let pin = CatalogPin::pin(&base);
+        // Same catalog: no drift.
+        assert!(pin.check(&base).is_ok());
+        assert_eq!(pin.fingerprint(), catalog_fingerprint(&base));
+
+        // A reconnect that re-advertises a changed tool: drift is reported.
+        let mut drifted = base.clone();
+        drifted[1].description.push_str(" (silently changed on reconnect)");
+        let err = pin.check(&drifted).expect_err("drift must be detected");
+        assert_eq!(err.pinned_fingerprint, pin.fingerprint());
+        assert_ne!(err.current_fingerprint, pin.fingerprint());
+    }
 
     #[test]
     fn default_catalog_exposes_run_command() {
