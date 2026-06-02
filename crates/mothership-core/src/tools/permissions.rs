@@ -70,6 +70,42 @@ impl PendingToolApprovalGate {
         };
         sender.send(decision).is_ok()
     }
+
+    /// Await an approval decision for `tool_call_id` through the same pending
+    /// map that [`decide`](Self::decide) resolves. This is the entry point for
+    /// tools that are not modeled as a [`ToolExecutionRequest`] (the file
+    /// tools): the runner has already emitted a `PermissionRequested` event, so
+    /// here we only register the waiter keyed by `tool_call_id` and block until
+    /// the UI calls `decide` (or the chat is cancelled). Mirrors the body of the
+    /// [`ToolApprovalGate`] impl but takes a bare id instead of a request.
+    pub async fn request_decision(
+        &self,
+        tool_call_id: &str,
+        cancellation: &ToolCancellationToken,
+    ) -> ToolApprovalDecision {
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.contains_key(tool_call_id) {
+                return ToolApprovalDecision::Denied {
+                    reason: "approval is already pending for this tool call".to_string(),
+                };
+            }
+            pending.insert(tool_call_id.to_string(), sender);
+        }
+
+        let decision = tokio::select! {
+            decision = receiver => decision.unwrap_or(ToolApprovalDecision::Denied {
+                reason: "approval channel closed".to_string(),
+            }),
+            _ = cancellation.cancelled() => ToolApprovalDecision::Denied {
+                reason: "tool call was cancelled before approval".to_string(),
+            },
+        };
+
+        self.pending.lock().unwrap().remove(tool_call_id);
+        decision
+    }
 }
 
 #[async_trait::async_trait]

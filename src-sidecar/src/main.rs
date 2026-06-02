@@ -158,15 +158,19 @@ fn serve() -> anyhow::Result<()> {
     );
     let tool_approvals = PendingToolApprovalGate::new();
     let tool_repeat_guard = Arc::new(ToolRepeatGuard::default());
+    // Shared output store: the supervisor uses it to spill command output, and
+    // the file-tool runner reuses it to spill oversized read_file content.
+    let tool_output_store: Option<Arc<dyn mothership_core::ToolOutputStore>> =
+        db_path.parent().map(|parent| {
+            Arc::new(FileToolOutputStore::new(parent.join("tool-logs")))
+                as Arc<dyn mothership_core::ToolOutputStore>
+        });
     let tool_supervisor = Arc::new(
         ToolSupervisor::new(
             Arc::new(tool_runtime::ProcessSandboxToolAdapter::new(
                 process_sandbox::platform_sandbox(),
             )),
-            db_path.parent().map(|parent| {
-                Arc::new(FileToolOutputStore::new(parent.join("tool-logs")))
-                    as Arc<dyn mothership_core::ToolOutputStore>
-            }),
+            tool_output_store.clone(),
             ToolResourceLimits::default(),
         )
         .with_policy(
@@ -208,6 +212,7 @@ fn serve() -> anyhow::Result<()> {
                 let provider_manager = Arc::clone(&provider_manager);
                 let tool_supervisor = Arc::clone(&tool_supervisor);
                 let tool_approvals = Arc::clone(&tool_approvals);
+                let tool_output_store = tool_output_store.clone();
                 let tool_registry = Arc::clone(&tool_registry);
                 let async_runtime = Arc::clone(&async_runtime);
                 let chat_registry = Arc::clone(&chat_registry);
@@ -222,6 +227,7 @@ fn serve() -> anyhow::Result<()> {
                         provider_manager,
                         tool_supervisor,
                         tool_approvals,
+                        tool_output_store,
                         tool_registry,
                         async_runtime,
                         chat_registry,
@@ -403,6 +409,7 @@ fn handle_request(
     provider_manager: Arc<ProviderRuntimeManager>,
     tool_supervisor: Arc<ToolSupervisor>,
     tool_approvals: Arc<PendingToolApprovalGate>,
+    tool_output_store: Option<Arc<dyn mothership_core::ToolOutputStore>>,
     tool_registry: Arc<ToolExecutionRegistry>,
     async_runtime: Arc<tokio::runtime::Runtime>,
     chat_registry: Arc<ChatRunRegistry>,
@@ -429,6 +436,8 @@ fn handle_request(
             outbox,
             provider_manager,
             tool_supervisor,
+            tool_approvals,
+            tool_output_store,
             tool_registry,
             async_runtime,
             chat_registry,
@@ -449,6 +458,8 @@ fn handle_request(
             outbox,
             provider_manager,
             tool_supervisor,
+            tool_approvals,
+            tool_output_store,
             tool_registry,
             async_runtime,
             chat_registry,
@@ -464,6 +475,8 @@ fn handle_request(
             outbox,
             provider_manager,
             tool_supervisor,
+            tool_approvals,
+            tool_output_store,
             tool_registry,
             async_runtime,
             chat_registry,
@@ -479,6 +492,8 @@ fn handle_request(
             outbox,
             provider_manager,
             tool_supervisor,
+            tool_approvals,
+            tool_output_store,
             tool_registry,
             async_runtime,
             chat_registry,
@@ -819,6 +834,8 @@ fn run_chat_message(
     outbox: Outbox,
     provider_manager: Arc<ProviderRuntimeManager>,
     tool_supervisor: Arc<ToolSupervisor>,
+    tool_approvals: Arc<PendingToolApprovalGate>,
+    tool_output_store: Option<Arc<dyn mothership_core::ToolOutputStore>>,
     tool_registry: Arc<ToolExecutionRegistry>,
     async_runtime: Arc<tokio::runtime::Runtime>,
     chat_registry: Arc<ChatRunRegistry>,
@@ -843,6 +860,8 @@ fn run_chat_message(
                     async_runtime,
                     tool_sink,
                     project.map(|project| (project.id, PathBuf::from(project.path))),
+                    tool_approvals,
+                    tool_output_store,
                 ));
             let mut sink = ProtocolChatRunSink { outbox };
             ChatRunService::new(&database, provider_manager)

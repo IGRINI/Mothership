@@ -9,13 +9,18 @@ use std::thread;
 use std::time::Duration;
 
 use mothership_core::{
-    tool_batch_plan, ChatCancellationToken, LlmToolCallHandler, LlmToolCallRequest,
-    LlmToolCallResult, MothershipError, Result, SpawnedToolProcess, ToolBatchPlan,
-    ToolCancellationToken, ToolCommand, ToolExecutionEventSink, ToolExecutionRegistry,
-    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolOutputPolicy,
-    ToolProcessExit, ToolProcessSandbox, ToolProcessSpec, ToolSupervisor, RUN_COMMAND_TOOL_NAME,
+    classify_file_tool, file_tool_preview_diff, run_apply_patch_tool, run_edit_file_tool,
+    run_read_file_tool, run_write_file_tool, tool_batch_plan, ChatCancellationToken, FileTool,
+    FileToolOutcome,
+    FileToolSpill, LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResult, MothershipError,
+    PendingToolApprovalGate, Result, SpawnedToolProcess, StdFileSystem, ToolApprovalDecision,
+    ToolBatchPlan, ToolCancellationToken, ToolCommand, ToolExecutionEvent, ToolExecutionEventKind,
+    ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest, ToolExecutionResult,
+    ToolExecutionStatus, ToolOutputPolicy, ToolOutputStore, ToolPermissionAction, ToolProcessExit,
+    ToolProcessSandbox, ToolProcessSpec, ToolSupervisor, Workspace, RUN_COMMAND_TOOL_NAME,
 };
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::io::AsyncRead;
 
 const DEFAULT_TOOL_TIMEOUT_MS: u64 = 10 * 60 * 1000;
@@ -131,6 +136,9 @@ pub struct SidecarLlmToolHandler {
     runtime: Arc<tokio::runtime::Runtime>,
     sink: Arc<dyn ToolExecutionEventSink>,
     project: Option<ToolProjectContext>,
+    approvals: Arc<PendingToolApprovalGate>,
+    file_system: StdFileSystem,
+    output_store: Option<Arc<dyn ToolOutputStore>>,
 }
 
 #[derive(Clone)]
@@ -146,6 +154,8 @@ impl SidecarLlmToolHandler {
         runtime: Arc<tokio::runtime::Runtime>,
         sink: Arc<dyn ToolExecutionEventSink>,
         project: Option<(String, PathBuf)>,
+        approvals: Arc<PendingToolApprovalGate>,
+        output_store: Option<Arc<dyn ToolOutputStore>>,
     ) -> Self {
         Self {
             supervisor,
@@ -153,6 +163,9 @@ impl SidecarLlmToolHandler {
             runtime,
             sink,
             project: project.map(|(id, root)| ToolProjectContext { id, root }),
+            approvals,
+            file_system: StdFileSystem::new(),
+            output_store,
         }
     }
 }
@@ -165,9 +178,12 @@ impl LlmToolCallHandler for SidecarLlmToolHandler {
     ) -> LlmToolCallResult {
         match request.name.as_str() {
             RUN_COMMAND_TOOL_NAME => self.run_command(request, chat_cancellation),
-            other => LlmToolCallResult {
-                ok: false,
-                content: format!("unsupported tool `{other}`"),
+            other => match FileTool::from_name(other) {
+                Some(tool) => self.run_file_tool(tool, request, chat_cancellation),
+                None => LlmToolCallResult {
+                    ok: false,
+                    content: format!("unsupported tool `{other}`"),
+                },
             },
         }
     }
@@ -277,6 +293,387 @@ impl SidecarLlmToolHandler {
                 content: format!("tool supervisor failed: {error}"),
             },
         }
+    }
+}
+
+impl SidecarLlmToolHandler {
+    /// Execute one of the typed file tools (`read_file` / `write_file` /
+    /// `edit_file` / `apply_patch`). Mirrors `run_command`'s cross-cuts —
+    /// per-tool registry slot, chat-cancellation honoring, and the same
+    /// `PermissionRequested` → approval-gate → `PermissionDenied` flow — but the
+    /// "execute" step calls a pure Core handler instead of spawning a process.
+    /// Synthesizes a [`ToolExecutionResult`] (text in the stdout fields,
+    /// `command: None`) so existing event/persistence plumbing works unchanged.
+    fn run_file_tool(
+        &self,
+        tool: FileTool,
+        request: LlmToolCallRequest,
+        chat_cancellation: &ChatCancellationToken,
+    ) -> LlmToolCallResult {
+        let tool_call_id = request.tool_call_id.clone();
+        let run_id = request.run_id.clone();
+        let arguments = request.arguments.clone();
+
+        // File tools require a known project root to resolve + contain paths.
+        let Some(project) = self.project.clone() else {
+            return LlmToolCallResult {
+                ok: false,
+                content: "file tools require an active project; none is associated with this chat"
+                    .to_string(),
+            };
+        };
+        let project_id = Some(project.id.clone());
+
+        let workspace = match Workspace::new(&project.root) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                return LlmToolCallResult {
+                    ok: false,
+                    content: format!("project root is unavailable: {error}"),
+                };
+            }
+        };
+
+        // Per-tool-call cancellation slot, kept in sync with the chat token so a
+        // cancelled chat denies a pending approval and short-circuits execution.
+        let cancellation = ToolCancellationToken::default();
+        if chat_cancellation.is_cancelled() {
+            cancellation.cancel();
+        }
+        if !self.registry.register(&tool_call_id, cancellation.clone()) {
+            return LlmToolCallResult {
+                ok: false,
+                content: format!("tool call already active: {tool_call_id}"),
+            };
+        }
+
+        // Watch the chat token like `run_command` does, so a chat cancelled while
+        // the tool is awaiting approval (or running) flips the per-call token and
+        // unblocks `request_decision`.
+        let finished = Arc::new(AtomicBool::new(false));
+        let watcher_finished = Arc::clone(&finished);
+        let watcher_cancellation = cancellation.clone();
+        let watcher_chat_cancellation = chat_cancellation.clone();
+        let watcher = thread::spawn(move || {
+            while !watcher_finished.load(Ordering::SeqCst) {
+                if watcher_chat_cancellation.is_cancelled() {
+                    watcher_cancellation.cancel();
+                    return;
+                }
+                thread::sleep(CHAT_CANCEL_POLL_INTERVAL);
+            }
+        });
+
+        let result = self.run_file_tool_inner(
+            tool,
+            &arguments,
+            &workspace,
+            &tool_call_id,
+            &run_id,
+            &project_id,
+            &cancellation,
+            chat_cancellation,
+        );
+
+        finished.store(true, Ordering::SeqCst);
+        let _ = watcher.join();
+        self.registry.finish(&tool_call_id);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_file_tool_inner(
+        &self,
+        tool: FileTool,
+        arguments: &Value,
+        workspace: &Workspace,
+        tool_call_id: &str,
+        run_id: &Option<String>,
+        project_id: &Option<String>,
+        cancellation: &ToolCancellationToken,
+        chat_cancellation: &ChatCancellationToken,
+    ) -> LlmToolCallResult {
+        // Classify capability (intent + touched paths + allow/ask/deny).
+        let capability = match classify_file_tool(tool, arguments, workspace) {
+            Ok(capability) => capability,
+            Err(error) => {
+                return LlmToolCallResult {
+                    ok: false,
+                    content: error.to_string(),
+                };
+            }
+        };
+
+        match capability.action {
+            ToolPermissionAction::Deny => {
+                let result = synthesized_result(
+                    tool_call_id,
+                    ToolExecutionStatus::PermissionDenied,
+                    String::new(),
+                    Some(capability.summary.clone()),
+                );
+                self.emit_file_event(
+                    tool_call_id,
+                    run_id,
+                    project_id,
+                    ToolExecutionEventKind::PermissionDenied,
+                    Some(capability.summary.clone()),
+                    Some(result),
+                );
+                return LlmToolCallResult {
+                    ok: false,
+                    content: capability.summary,
+                };
+            }
+            ToolPermissionAction::Ask => {
+                // Surface the approval request (with a diff/summary preview) and
+                // block on the same gate the UI drives via `decide`.
+                let preview = self.build_preview(tool, arguments, workspace, &capability.summary);
+                self.emit_file_event(
+                    tool_call_id,
+                    run_id,
+                    project_id,
+                    ToolExecutionEventKind::PermissionRequested,
+                    Some(preview),
+                    None,
+                );
+                let decision = self
+                    .runtime
+                    .block_on(self.approvals.request_decision(tool_call_id, cancellation));
+                if let ToolApprovalDecision::Denied { reason } = decision {
+                    let result = synthesized_result(
+                        tool_call_id,
+                        ToolExecutionStatus::PermissionDenied,
+                        String::new(),
+                        Some(reason.clone()),
+                    );
+                    self.emit_file_event(
+                        tool_call_id,
+                        run_id,
+                        project_id,
+                        ToolExecutionEventKind::PermissionDenied,
+                        Some(reason.clone()),
+                        Some(result),
+                    );
+                    return LlmToolCallResult {
+                        ok: false,
+                        content: format!("tool call denied: {reason}"),
+                    };
+                }
+            }
+            ToolPermissionAction::Allow => {}
+        }
+
+        // A chat cancelled during approval (or before execution) is reported as
+        // a cancellation rather than running the side effect.
+        if cancellation.is_cancelled() || chat_cancellation.is_cancelled() {
+            let result = synthesized_result(
+                tool_call_id,
+                ToolExecutionStatus::Cancelled,
+                String::new(),
+                Some("tool call was cancelled".to_string()),
+            );
+            self.emit_file_event(
+                tool_call_id,
+                run_id,
+                project_id,
+                ToolExecutionEventKind::Cancelled,
+                Some("tool call was cancelled".to_string()),
+                Some(result),
+            );
+            return LlmToolCallResult {
+                ok: false,
+                content: "tool call was cancelled".to_string(),
+            };
+        }
+
+        self.emit_file_event(
+            tool_call_id,
+            run_id,
+            project_id,
+            ToolExecutionEventKind::Started,
+            Some(capability.summary.clone()),
+            None,
+        );
+
+        // Execute the pure handler through the injected filesystem port.
+        let spill = self.output_store.as_ref().map(|store| AsyncOutputStoreSpill {
+            store: Arc::clone(store),
+            runtime: Arc::clone(&self.runtime),
+        });
+        let outcome = match tool {
+            FileTool::Read => run_read_file_tool(
+                arguments,
+                workspace,
+                &self.file_system,
+                tool_call_id,
+                spill.as_ref().map(|spill| spill as &dyn FileToolSpill),
+            ),
+            FileTool::Write => run_write_file_tool(arguments, workspace, &self.file_system),
+            FileTool::Edit => run_edit_file_tool(arguments, workspace, &self.file_system),
+            FileTool::ApplyPatch => run_apply_patch_tool(arguments, workspace, &self.file_system),
+        };
+
+        match outcome {
+            Ok(outcome) => {
+                let status = if outcome.ok {
+                    ToolExecutionStatus::Completed
+                } else {
+                    ToolExecutionStatus::Failed
+                };
+                let model_text = file_outcome_text(&outcome);
+                let result = synthesized_result(
+                    tool_call_id,
+                    status,
+                    model_text.clone(),
+                    outcome.diff.clone(),
+                );
+                let kind = if outcome.ok {
+                    ToolExecutionEventKind::Completed
+                } else {
+                    ToolExecutionEventKind::Failed
+                };
+                self.emit_file_event(tool_call_id, run_id, project_id, kind, outcome.diff.clone(), Some(result));
+                LlmToolCallResult {
+                    ok: outcome.ok,
+                    content: truncate_for_model(model_text),
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let result = synthesized_result(
+                    tool_call_id,
+                    ToolExecutionStatus::Failed,
+                    String::new(),
+                    Some(message.clone()),
+                );
+                self.emit_file_event(
+                    tool_call_id,
+                    run_id,
+                    project_id,
+                    ToolExecutionEventKind::Failed,
+                    Some(message.clone()),
+                    Some(result),
+                );
+                LlmToolCallResult {
+                    ok: false,
+                    content: message,
+                }
+            }
+        }
+    }
+
+    /// Build the approval-card message: the capability summary, with a
+    /// side-effect-free diff preview appended for a mutating tool so the human
+    /// (or remote approver) sees what will change before approving. The diff is
+    /// computed by Core via a dry run (no writes); when it cannot be previewed
+    /// (file missing, edit would not match, patch would not apply) only the
+    /// summary is shown and the handler will report the precise failure.
+    fn build_preview(
+        &self,
+        tool: FileTool,
+        arguments: &Value,
+        workspace: &Workspace,
+        summary: &str,
+    ) -> String {
+        match file_tool_preview_diff(tool, arguments, workspace, &self.file_system) {
+            Some(diff) if !diff.is_empty() => format!("{summary}\n\n{diff}"),
+            _ => summary.to_string(),
+        }
+    }
+
+    fn emit_file_event(
+        &self,
+        tool_call_id: &str,
+        run_id: &Option<String>,
+        project_id: &Option<String>,
+        kind: ToolExecutionEventKind,
+        message: Option<String>,
+        result: Option<ToolExecutionResult>,
+    ) {
+        self.sink.emit(ToolExecutionEvent {
+            tool_call_id: tool_call_id.to_string(),
+            run_id: run_id.clone(),
+            project_id: project_id.clone(),
+            command: None,
+            kind,
+            stream: None,
+            chunk: None,
+            message,
+            result,
+        });
+    }
+}
+
+/// Bridge the async [`ToolOutputStore`] to the synchronous [`FileToolSpill`] the
+/// `read_file` handler expects: open a writer, append the full content as one
+/// stdout chunk, and finish to obtain the durable reference.
+struct AsyncOutputStoreSpill {
+    store: Arc<dyn ToolOutputStore>,
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+
+impl FileToolSpill for AsyncOutputStoreSpill {
+    fn spill(&self, tool_call_id: &str, content: &str) -> std::io::Result<String> {
+        let store = Arc::clone(&self.store);
+        let tool_call_id = tool_call_id.to_string();
+        let content = content.to_string();
+        self.runtime.block_on(async move {
+            let mut writer = store
+                .open(&tool_call_id)
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            writer
+                .append(
+                    mothership_core::ToolOutputStream::Stdout,
+                    content.as_bytes(),
+                )
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            writer
+                .finish()
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        })
+    }
+}
+
+/// Synthesize a [`ToolExecutionResult`] for a file tool: the model-facing text
+/// goes in `stdout_preview`/`stdout_tail`, there is no exit code, and `command`
+/// is `None` (set by the event builder). Reuses the existing result/event/persist
+/// path so file tools render through the same machinery as `run_command`.
+fn synthesized_result(
+    tool_call_id: &str,
+    status: ToolExecutionStatus,
+    stdout_text: String,
+    message: Option<String>,
+) -> ToolExecutionResult {
+    ToolExecutionResult {
+        tool_call_id: tool_call_id.to_string(),
+        status,
+        exit_code: None,
+        stdout_preview: stdout_text.clone(),
+        stderr_preview: String::new(),
+        stdout_tail: stdout_text,
+        stderr_tail: String::new(),
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        truncated_for_display: false,
+        truncated_for_agent: false,
+        log_ref: None,
+        message,
+    }
+}
+
+/// The text returned to the model for a file-tool outcome: the handler's
+/// `model_text`, with the diff appended for a mutating success so the model sees
+/// what changed.
+fn file_outcome_text(outcome: &FileToolOutcome) -> String {
+    match (&outcome.diff, outcome.ok) {
+        (Some(diff), true) if !diff.is_empty() => {
+            format!("{}\n\n{}", outcome.model_text, diff)
+        }
+        _ => outcome.model_text.clone(),
     }
 }
 

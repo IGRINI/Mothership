@@ -9,6 +9,8 @@
 mod cancellation;
 mod catalog;
 mod file_edit;
+mod file_tools;
+mod filesystem;
 mod output;
 mod patch;
 mod permissions;
@@ -21,7 +23,16 @@ mod supervisor;
 mod types;
 
 pub use cancellation::ToolCancellationToken;
-pub use catalog::{default_tool_catalog, RUN_COMMAND_TOOL_ID, RUN_COMMAND_TOOL_NAME};
+pub use catalog::{
+    default_tool_catalog, APPLY_PATCH_TOOL_ID, APPLY_PATCH_TOOL_NAME, EDIT_FILE_TOOL_ID,
+    EDIT_FILE_TOOL_NAME, READ_FILE_TOOL_ID, READ_FILE_TOOL_NAME, RUN_COMMAND_TOOL_ID,
+    RUN_COMMAND_TOOL_NAME, WRITE_FILE_TOOL_ID, WRITE_FILE_TOOL_NAME,
+};
+pub use file_tools::{
+    apply_patch, classify, edit_file, preview_diff, read_file, write_file, FileTool,
+    FileToolCapability, FileToolError, FileToolOutcome, FileToolSpill,
+};
+pub use filesystem::{FileMetadata, FileSystem, PathError, StdFileSystem, Workspace};
 pub use output::{FileToolOutputStore, ToolOutputStore};
 pub use permissions::{
     ConservativeCommandPermissionPolicy, PendingToolApprovalGate, StaticToolApprovalGate,
