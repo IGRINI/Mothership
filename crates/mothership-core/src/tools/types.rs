@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::pipeline::ToolKind;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -115,9 +118,10 @@ pub struct ToolExecutionResult {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolExecutionEventKind {
+    #[default]
     Queued,
     PermissionRequested,
     PermissionDenied,
@@ -131,7 +135,33 @@ pub enum ToolExecutionEventKind {
     LoopBlocked,
 }
 
+/// A durable artifact produced by a tool call — a diff, a captured output
+/// stream, search results. The full blob lives in the output store / on disk and
+/// is referenced by `log_ref`; only bounded metadata and a short preview are
+/// carried inline so the database and event stream never hold multi-megabyte
+/// payloads.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolArtifact {
+    /// Stable id within the tool call (e.g. "diff", "stdout", "results").
+    pub artifact_id: String,
+    /// What kind of artifact this is (diff / output / results / …).
+    pub kind: String,
+    /// MIME-ish content type ("text/x-diff", "text/plain", "application/json").
+    pub content_type: String,
+    /// A bounded, already-truncated preview of the content.
+    pub preview: String,
+    /// Durable reference to the full blob (output-store logRef or file path).
+    pub log_ref: Option<String>,
+    /// Total size of the full artifact in bytes.
+    pub size_bytes: u64,
+    /// SHA-256 of the full artifact, when known.
+    pub sha256: Option<String>,
+    /// True if `preview` is a truncated prefix of the full artifact.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionEvent {
     pub tool_call_id: String,
@@ -143,9 +173,23 @@ pub struct ToolExecutionEvent {
     pub chunk: Option<String>,
     pub message: Option<String>,
     pub result: Option<ToolExecutionResult>,
+    /// Typed kind of the tool, for typed storage + UI routing. `None` for legacy
+    /// emitters not yet updated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_kind: Option<ToolKind>,
+    /// Semantic, tool-specific payload (paths, counts, statuses, sha — never huge
+    /// content). Powers typed storage and UI semantic cards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+    /// Workspace-relative paths this call touched (for the call summary).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touched_paths: Vec<String>,
+    /// Durable artifacts (diff/output/results) — referenced, not inlined.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ToolArtifact>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionRecord {
     pub tool_call_id: String,
@@ -160,6 +204,15 @@ pub struct ToolExecutionRecord {
     pub result: Option<ToolExecutionResult>,
     pub created_at: String,
     pub updated_at: String,
+    /// Typed kind of the tool (from typed storage), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_kind: Option<ToolKind>,
+    /// Latest semantic payload for the call (from typed storage), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+    /// Durable artifacts for the call (from typed storage).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ToolArtifact>,
 }
 
 pub trait ToolExecutionEventSink: Send + Sync {
@@ -187,5 +240,12 @@ pub(crate) fn event(
         chunk: None,
         message: None,
         result: None,
+        // This helper builds events for the process executor; the typed payload +
+        // output artifact are synthesized from `command` + `result` at the storage
+        // layer, so the supervisor stays untouched.
+        tool_kind: Some(ToolKind::RunCommand),
+        payload: None,
+        touched_paths: Vec::new(),
+        artifacts: Vec::new(),
     }
 }

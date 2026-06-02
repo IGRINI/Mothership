@@ -14,8 +14,9 @@ use crate::{
     ChatMessagePartKind, ChatMessageRole, ChatMessageStatus, ChatRunContextSpec, ChatRunEvent,
     ChatRunEventKind, ChatThreadSummary, DashboardMetric, DashboardSnapshot, LlmChatMessage,
     LlmChatRole, MothershipError, ProjectSnapshot, ProjectSummary, Result, SelectedLlmModel,
-    SendChatMessageResult, SidecarStatus, ToolCommand, ToolExecutionEvent, ToolExecutionEventKind,
-    ToolExecutionRecord, ToolExecutionResult, ToolOutputStream, WorkspaceItem,
+    SendChatMessageResult, SidecarStatus, ToolArtifact, ToolCommand, ToolExecutionEvent,
+    ToolExecutionEventKind, ToolExecutionRecord, ToolExecutionResult, ToolKind, ToolOutputStream,
+    WorkspaceItem,
 };
 
 const WORKSPACE_LIMIT: i64 = 2_500;
@@ -383,6 +384,142 @@ impl Database {
             ],
         )?;
 
+        Ok(())
+    }
+
+    /// Persist a tool event into the typed storage (the source of truth), in
+    /// addition to the legacy `chat_tool_events` feed. Upserts the `tool_calls`
+    /// row, records a lifecycle `tool_events` row, and stores any artifacts.
+    ///
+    /// For `run_command`, the typed payload + output artifact are synthesized
+    /// from the event's `command` + `result` (so the supervisor stays untouched);
+    /// the typed file/search tools supply `payload` + `artifacts` directly.
+    /// Streaming `Output` events are skipped here — the legacy feed keeps the
+    /// full chunk stream — so only lifecycle transitions are recorded. Large
+    /// content (full diffs/output/results) is referenced via artifact `log_ref`,
+    /// never inlined into these rows.
+    pub fn record_typed_tool_event(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        event: &ToolExecutionEvent,
+    ) -> Result<()> {
+        // Only events carrying a typed kind drive typed storage; streaming output
+        // chunks are left to the legacy feed.
+        let Some(kind) = event.tool_kind else {
+            return Ok(());
+        };
+        if event.kind == ToolExecutionEventKind::Output {
+            return Ok(());
+        }
+        validate_identifier("chat_id", chat_id)?;
+        validate_identifier("message_id", message_id)?;
+        validate_identifier("tool_call_id", &event.tool_call_id)?;
+
+        let (payload, mut artifacts) = typed_payload_and_artifacts(event);
+        artifacts.extend(event.artifacts.iter().cloned());
+
+        let touched_paths_json = if event.touched_paths.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&event.touched_paths)?)
+        };
+        let payload_json = match &payload {
+            Some(value) => Some(serde_json::to_string(value)?),
+            None => None,
+        };
+        let artifact_refs = if artifacts.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(
+                &artifacts
+                    .iter()
+                    .map(|artifact| artifact.artifact_id.as_str())
+                    .collect::<Vec<_>>(),
+            )?)
+        };
+        let status = tool_call_status_for_event(event.kind);
+        let permission_state = permission_state_for_event(event.kind);
+        let summary = event.message.as_deref().map(truncate_summary);
+        let now = current_timestamp();
+        let completed_at = is_terminal_event(event.kind).then(|| now.clone());
+
+        let mut connection = self.connect()?;
+        let tx = connection.transaction()?;
+
+        // Upsert the call row: create on first sight, then refine in place.
+        tx.execute(
+            "INSERT OR IGNORE INTO tool_calls (
+                tool_call_id, chat_id, message_id, run_id, project_id,
+                tool_name, tool_kind, status, permission_state, started_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', 'auto', ?8)",
+            params![
+                event.tool_call_id.as_str(),
+                chat_id,
+                message_id,
+                event.run_id.as_deref(),
+                event.project_id.as_deref(),
+                kind.as_str(),
+                kind.as_str(),
+                now,
+            ],
+        )?;
+        tx.execute(
+            "UPDATE tool_calls SET
+                status = ?2,
+                permission_state = COALESCE(?3, permission_state),
+                summary = COALESCE(?4, summary),
+                touched_paths = COALESCE(?5, touched_paths),
+                payload_json = COALESCE(?6, payload_json),
+                completed_at = COALESCE(?7, completed_at)
+             WHERE tool_call_id = ?1",
+            params![
+                event.tool_call_id.as_str(),
+                status,
+                permission_state,
+                summary,
+                touched_paths_json,
+                payload_json,
+                completed_at,
+            ],
+        )?;
+
+        tx.execute(
+            "INSERT INTO tool_events (
+                tool_call_id, kind, message_preview, typed_payload_json, artifact_refs, occurred_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                event.tool_call_id.as_str(),
+                tool_event_kind_to_db(event.kind),
+                summary,
+                payload_json,
+                artifact_refs,
+                now,
+            ],
+        )?;
+
+        for artifact in &artifacts {
+            tx.execute(
+                "INSERT OR REPLACE INTO tool_artifacts (
+                    artifact_id, tool_call_id, artifact_kind, content_type,
+                    preview, log_ref, size_bytes, sha256, truncated, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    artifact.artifact_id.as_str(),
+                    event.tool_call_id.as_str(),
+                    artifact.kind.as_str(),
+                    artifact.content_type.as_str(),
+                    artifact.preview.as_str(),
+                    artifact.log_ref.as_deref(),
+                    artifact.size_bytes as i64,
+                    artifact.sha256.as_deref(),
+                    artifact.truncated as i64,
+                    now,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -1481,6 +1618,69 @@ fn migrate(connection: &Connection) -> Result<()> {
             model_id TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        -- Typed tool storage (source of truth for tool calls). The legacy
+        -- chat_tool_events stream is retained as a feed/fallback; these tables
+        -- carry the typed kind, semantic payload, and artifact references so the
+        -- UI can render semantic cards without parsing strings. Large content
+        -- (full diffs, output, search results) lives in artifacts via log_ref —
+        -- never inline in these rows.
+        CREATE TABLE IF NOT EXISTS tool_calls (
+            tool_call_id TEXT PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            run_id TEXT,
+            project_id TEXT,
+            tool_name TEXT NOT NULL,
+            tool_kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            permission_state TEXT NOT NULL,
+            summary TEXT,
+            touched_paths TEXT,
+            payload_json TEXT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE,
+            FOREIGN KEY(message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tool_calls_message
+            ON tool_calls (message_id);
+
+        CREATE INDEX IF NOT EXISTS idx_tool_calls_chat
+            ON tool_calls (chat_id);
+
+        CREATE TABLE IF NOT EXISTS tool_events (
+            id INTEGER PRIMARY KEY,
+            tool_call_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            message_preview TEXT,
+            typed_payload_json TEXT,
+            artifact_refs TEXT,
+            occurred_at TEXT NOT NULL,
+            FOREIGN KEY(tool_call_id) REFERENCES tool_calls(tool_call_id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tool_events_call
+            ON tool_events (tool_call_id, id);
+
+        CREATE TABLE IF NOT EXISTS tool_artifacts (
+            artifact_id TEXT NOT NULL,
+            tool_call_id TEXT NOT NULL,
+            artifact_kind TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            preview TEXT,
+            log_ref TEXT,
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            sha256 TEXT,
+            truncated INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tool_call_id, artifact_id),
+            FOREIGN KEY(tool_call_id) REFERENCES tool_calls(tool_call_id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tool_artifacts_call
+            ON tool_artifacts (tool_call_id);
         ",
     )?;
 
@@ -1538,6 +1738,11 @@ fn migrate(connection: &Connection) -> Result<()> {
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
         params![10_i64, current_timestamp()],
+    )?;
+    // v11: typed tool storage (tool_calls / tool_events / tool_artifacts).
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+        params![11_i64, current_timestamp()],
     )?;
 
     Ok(())
@@ -2167,12 +2372,32 @@ fn select_chat_tool_executions(
                     result: row.result.clone(),
                     created_at: row.occurred_at.clone(),
                     updated_at: row.occurred_at.clone(),
+                    // Enriched from the typed tables below (tool_kind / payload /
+                    // artifacts), once all legacy rows have been folded in.
+                    tool_kind: None,
+                    payload: None,
+                    artifacts: Vec::new(),
                 });
                 index
             }
         };
 
         apply_tool_event_row(&mut records[record_index], row);
+    }
+
+    // Enrich each record with typed storage (tool_kind / payload / artifacts) so
+    // a reloaded conversation renders semantic cards, not just text.
+    let tool_call_ids: Vec<&str> = records
+        .iter()
+        .map(|record| record.tool_call_id.as_str())
+        .collect();
+    let typed = select_typed_tool_data(connection, &tool_call_ids)?;
+    for record in &mut records {
+        if let Some((kind, payload, artifacts)) = typed.get(&record.tool_call_id) {
+            record.tool_kind = *kind;
+            record.payload = payload.clone();
+            record.artifacts = artifacts.clone();
+        }
     }
 
     Ok(records)
@@ -2777,6 +3002,170 @@ fn tool_output_stream_from_db(value: &str, column: usize) -> rusqlite::Result<To
     }
 }
 
+/// Build the typed payload + artifacts for a tool event. File/search tools carry
+/// their semantic payload on the event directly; `run_command` has it (and an
+/// output artifact) synthesized from `command` + `result` so the supervisor stays
+/// untouched.
+fn typed_payload_and_artifacts(
+    event: &ToolExecutionEvent,
+) -> (Option<serde_json::Value>, Vec<ToolArtifact>) {
+    if let Some(payload) = &event.payload {
+        return (Some(payload.clone()), Vec::new());
+    }
+
+    if event.tool_kind == Some(ToolKind::RunCommand) {
+        if let (Some(command), Some(result)) = (&event.command, &event.result) {
+            let payload = serde_json::json!({
+                "program": command.program,
+                "args": command.args,
+                "exitCode": result.exit_code,
+                "stdoutPreview": result.stdout_preview,
+                "stderrPreview": result.stderr_preview,
+                "stdoutBytes": result.stdout_bytes,
+                "stderrBytes": result.stderr_bytes,
+                "truncated": result.truncated_for_display,
+                "logRef": result.log_ref,
+            });
+            let mut artifacts = Vec::new();
+            if result.stdout_bytes > 0 || result.log_ref.is_some() {
+                artifacts.push(ToolArtifact {
+                    artifact_id: "stdout".to_string(),
+                    kind: "output".to_string(),
+                    content_type: "text/plain".to_string(),
+                    preview: result.stdout_preview.clone(),
+                    log_ref: result.log_ref.clone(),
+                    size_bytes: result.stdout_bytes as u64,
+                    sha256: None,
+                    truncated: result.truncated_for_display,
+                });
+            }
+            return (Some(payload), artifacts);
+        }
+    }
+
+    (None, Vec::new())
+}
+
+/// Map an event kind to the persisted `tool_calls.status`.
+fn tool_call_status_for_event(kind: ToolExecutionEventKind) -> &'static str {
+    match kind {
+        ToolExecutionEventKind::Queued => "queued",
+        ToolExecutionEventKind::PermissionRequested => "awaiting_approval",
+        ToolExecutionEventKind::PermissionDenied => "denied",
+        ToolExecutionEventKind::WaitingForResource => "waiting",
+        ToolExecutionEventKind::Started | ToolExecutionEventKind::Output => "running",
+        ToolExecutionEventKind::Completed => "completed",
+        ToolExecutionEventKind::Failed => "failed",
+        ToolExecutionEventKind::Cancelled => "cancelled",
+        ToolExecutionEventKind::TimedOut => "timed_out",
+        ToolExecutionEventKind::LoopBlocked => "blocked",
+    }
+}
+
+/// The permission-state transition implied by an event kind, or `None` to leave
+/// the stored value unchanged.
+fn permission_state_for_event(kind: ToolExecutionEventKind) -> Option<&'static str> {
+    match kind {
+        ToolExecutionEventKind::PermissionRequested => Some("requested"),
+        ToolExecutionEventKind::PermissionDenied => Some("denied"),
+        ToolExecutionEventKind::Started => Some("allowed"),
+        _ => None,
+    }
+}
+
+fn is_terminal_event(kind: ToolExecutionEventKind) -> bool {
+    matches!(
+        kind,
+        ToolExecutionEventKind::Completed
+            | ToolExecutionEventKind::Failed
+            | ToolExecutionEventKind::Cancelled
+            | ToolExecutionEventKind::TimedOut
+            | ToolExecutionEventKind::PermissionDenied
+            | ToolExecutionEventKind::LoopBlocked
+    )
+}
+
+/// Bound a per-call summary so the typed rows never carry a huge message (full
+/// diffs/output live in artifacts via `log_ref`, not here).
+fn truncate_summary(summary: &str) -> String {
+    const MAX_SUMMARY_BYTES: usize = 2 * 1024;
+    if summary.len() <= MAX_SUMMARY_BYTES {
+        return summary.to_string();
+    }
+    let mut end = MAX_SUMMARY_BYTES;
+    while end > 0 && !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = summary[..end].to_string();
+    bounded.push_str(" …[truncated]");
+    bounded
+}
+
+/// Read the typed data (tool_kind, latest payload, artifacts) for a set of tool
+/// calls, keyed by `tool_call_id`. Used to enrich the legacy read path so a
+/// reloaded conversation still renders semantic cards.
+#[allow(clippy::type_complexity)]
+fn select_typed_tool_data(
+    connection: &Connection,
+    tool_call_ids: &[&str],
+) -> Result<HashMap<String, (Option<ToolKind>, Option<serde_json::Value>, Vec<ToolArtifact>)>> {
+    let mut out: HashMap<String, (Option<ToolKind>, Option<serde_json::Value>, Vec<ToolArtifact>)> =
+        HashMap::new();
+    if tool_call_ids.is_empty() {
+        return Ok(out);
+    }
+
+    let placeholders = std::iter::repeat("?")
+        .take(tool_call_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let calls_sql = format!(
+        "SELECT tool_call_id, tool_kind, payload_json FROM tool_calls WHERE tool_call_id IN ({placeholders})"
+    );
+    let mut statement = connection.prepare(&calls_sql)?;
+    let rows = statement.query_map(params_from_iter(tool_call_ids.iter().copied()), |row| {
+        let id: String = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let payload_json: Option<String> = row.get(2)?;
+        Ok((id, kind, payload_json))
+    })?;
+    for row in rows {
+        let (id, kind, payload_json) = row?;
+        let payload = json_value::<serde_json::Value>(payload_json, 2)?;
+        out.insert(id, (ToolKind::from_name(&kind), payload, Vec::new()));
+    }
+
+    let artifacts_sql = format!(
+        "SELECT tool_call_id, artifact_id, artifact_kind, content_type, preview, log_ref, size_bytes, sha256, truncated
+         FROM tool_artifacts WHERE tool_call_id IN ({placeholders}) ORDER BY tool_call_id, artifact_id"
+    );
+    let mut statement = connection.prepare(&artifacts_sql)?;
+    let rows = statement.query_map(params_from_iter(tool_call_ids.iter().copied()), |row| {
+        let tool_call_id: String = row.get(0)?;
+        let artifact = ToolArtifact {
+            artifact_id: row.get(1)?,
+            kind: row.get(2)?,
+            content_type: row.get(3)?,
+            preview: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            log_ref: row.get(5)?,
+            size_bytes: row.get::<_, i64>(6)?.max(0) as u64,
+            sha256: row.get(7)?,
+            truncated: row.get::<_, i64>(8)? != 0,
+        };
+        Ok((tool_call_id, artifact))
+    })?;
+    for row in rows {
+        let (tool_call_id, artifact) = row?;
+        out.entry(tool_call_id)
+            .or_insert((None, None, Vec::new()))
+            .2
+            .push(artifact);
+    }
+
+    Ok(out)
+}
+
 fn json_string<T: serde::Serialize>(value: &Option<T>) -> Result<Option<String>> {
     value
         .as_ref()
@@ -3020,6 +3409,7 @@ mod tests {
                     chunk: None,
                     message: None,
                     result: None,
+                    ..Default::default()
                 },
             )
             .expect("record tool event");
@@ -3150,6 +3540,7 @@ mod tests {
                     chunk: None,
                     message: None,
                     result: None,
+                    ..Default::default()
                 },
             )
             .expect("record queued");
@@ -3167,6 +3558,7 @@ mod tests {
                     chunk: Some("E:\\Mothership\n".to_string()),
                     message: None,
                     result: None,
+                    ..Default::default()
                 },
             )
             .expect("record output");
@@ -3198,6 +3590,7 @@ mod tests {
                         log_ref: None,
                         message: None,
                     }),
+                    ..Default::default()
                 },
             )
             .expect("record completed");
@@ -3269,6 +3662,7 @@ mod tests {
                     chunk: None,
                     message: None,
                     result: None,
+                    ..Default::default()
                 },
             )
             .expect("record tool event");
@@ -3363,6 +3757,7 @@ mod tests {
                     chunk: None,
                     message: None,
                     result: None,
+                    ..Default::default()
                 },
             )
             .expect("record deleted tool event");
@@ -3447,6 +3842,7 @@ mod tests {
                     chunk: None,
                     message: None,
                     result: None,
+                    ..Default::default()
                 },
             )
             .expect("record source tool event");
@@ -3627,6 +4023,161 @@ mod tests {
         let restored = reopened.selected_llm_model().expect("selected model");
         assert_eq!(restored.provider_id, "some-adapter");
         assert_eq!(restored.model_id, "some-model");
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn typed_tool_storage_migration_creates_tables() {
+        let database_path = temp_database_path("typed_tool_tables");
+        let database = Database::open(database_path.clone()).expect("open database");
+        let connection = database.connect().expect("connect");
+        for table in ["tool_calls", "tool_events", "tool_artifacts"] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("query table");
+            assert_eq!(count, 1, "typed table `{table}` should exist");
+        }
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("query version");
+        assert!(version >= 11, "schema should be >= v11, got {version}");
+        drop(connection);
+        drop(database);
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn typed_tool_event_round_trips_payload_and_artifact() {
+        let database_path = temp_database_path("typed_tool_roundtrip");
+        let database = Database::open(database_path.clone()).expect("open database");
+        database
+            .set_selected_llm_model("openai", "test-model")
+            .expect("select model");
+        let project = create_project(&database, &database_path, "typed_roundtrip");
+        let run = database
+            .begin_chat_run(None, Some(&project.id), "edit a file", None)
+            .expect("begin run");
+
+        // Mirror the production sink: legacy feed + typed storage for one event.
+        let completed = ToolExecutionEvent {
+            tool_call_id: "tc_edit_1".to_string(),
+            run_id: Some(run.run_id.clone()),
+            project_id: Some(project.id.clone()),
+            command: None,
+            kind: ToolExecutionEventKind::Completed,
+            message: Some("modified a.txt".to_string()),
+            tool_kind: Some(ToolKind::EditFile),
+            payload: Some(serde_json::json!({
+                "path": "a.txt", "status": "modified", "sha256": "abc123"
+            })),
+            touched_paths: vec!["a.txt".to_string()],
+            artifacts: vec![ToolArtifact {
+                artifact_id: "diff".to_string(),
+                kind: "diff".to_string(),
+                content_type: "text/x-diff".to_string(),
+                preview: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
+                log_ref: Some("spill://full-diff".to_string()),
+                size_bytes: 4096,
+                sha256: None,
+                truncated: true,
+            }],
+            ..Default::default()
+        };
+        database
+            .record_chat_tool_execution_event(&run.chat.id, &run.assistant_message.id, &completed)
+            .expect("legacy feed");
+        database
+            .record_typed_tool_event(&run.chat.id, &run.assistant_message.id, &completed)
+            .expect("typed storage");
+
+        drop(database);
+        let reopened = Database::open(database_path.clone()).expect("reopen database");
+        let conversation = reopened.get_chat(&run.chat.id, 200).expect("restore");
+
+        assert_eq!(conversation.tool_executions.len(), 1);
+        let tool = &conversation.tool_executions[0];
+        assert_eq!(tool.tool_kind, Some(ToolKind::EditFile));
+        let payload = tool.payload.as_ref().expect("typed payload survives reload");
+        assert_eq!(payload["path"], "a.txt");
+        assert_eq!(payload["status"], "modified");
+        assert_eq!(tool.artifacts.len(), 1);
+        let artifact = &tool.artifacts[0];
+        assert_eq!(artifact.artifact_id, "diff");
+        assert_eq!(artifact.log_ref.as_deref(), Some("spill://full-diff"));
+        assert!(artifact.truncated);
+        assert_eq!(artifact.size_bytes, 4096);
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn run_command_typed_payload_is_synthesized_from_result() {
+        let database_path = temp_database_path("typed_run_command");
+        let database = Database::open(database_path.clone()).expect("open database");
+        database
+            .set_selected_llm_model("openai", "test-model")
+            .expect("select model");
+        let project = create_project(&database, &database_path, "typed_cmd");
+        let run = database
+            .begin_chat_run(None, Some(&project.id), "check status", None)
+            .expect("begin run");
+        let command = ToolCommand::new("git", ["status"]);
+
+        // run_command carries no explicit payload; the storage layer synthesizes
+        // it (and the output artifact) from command + result.
+        let completed = ToolExecutionEvent {
+            tool_call_id: "tc_cmd_1".to_string(),
+            run_id: Some(run.run_id.clone()),
+            project_id: Some(project.id.clone()),
+            command: Some(command.clone()),
+            kind: ToolExecutionEventKind::Completed,
+            result: Some(ToolExecutionResult {
+                tool_call_id: "tc_cmd_1".to_string(),
+                status: ToolExecutionStatus::Completed,
+                exit_code: Some(0),
+                stdout_preview: "nothing to commit\n".to_string(),
+                stderr_preview: String::new(),
+                stdout_tail: "nothing to commit\n".to_string(),
+                stderr_tail: String::new(),
+                stdout_bytes: 18,
+                stderr_bytes: 0,
+                truncated_for_display: false,
+                truncated_for_agent: false,
+                log_ref: Some("spill://stdout".to_string()),
+                message: None,
+            }),
+            tool_kind: Some(ToolKind::RunCommand),
+            ..Default::default()
+        };
+        database
+            .record_chat_tool_execution_event(&run.chat.id, &run.assistant_message.id, &completed)
+            .expect("legacy feed");
+        database
+            .record_typed_tool_event(&run.chat.id, &run.assistant_message.id, &completed)
+            .expect("typed storage");
+
+        drop(database);
+        let reopened = Database::open(database_path.clone()).expect("reopen");
+        let conversation = reopened.get_chat(&run.chat.id, 200).expect("restore");
+        let tool = &conversation.tool_executions[0];
+        assert_eq!(tool.tool_kind, Some(ToolKind::RunCommand));
+        let payload = tool.payload.as_ref().expect("synthesized payload");
+        assert_eq!(payload["program"], "git");
+        assert_eq!(payload["exitCode"], 0);
+        // The output is referenced as an artifact (logRef), never inlined.
+        assert_eq!(tool.artifacts.len(), 1);
+        assert_eq!(tool.artifacts[0].artifact_id, "stdout");
+        assert_eq!(
+            tool.artifacts[0].log_ref.as_deref(),
+            Some("spill://stdout")
+        );
 
         let _ = fs::remove_file(database_path);
     }

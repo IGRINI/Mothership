@@ -34,7 +34,7 @@ use mothership_core::{
     ToolApprovalDecision, ToolCancellationToken, ToolExecutionAccepted,
     ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionEventKind,
     ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest, ToolExecutionResult,
-    ToolExecutionStatus, ToolRepeatGuard, ToolResourceLimits, ToolSupervisor,
+    ToolExecutionStatus, ToolKind, ToolRepeatGuard, ToolResourceLimits, ToolSupervisor,
 };
 use sha2::{Digest, Sha256};
 
@@ -767,6 +767,12 @@ fn run_tool_command(
                 chunk: None,
                 message: Some(error.to_string()),
                 result: Some(failed),
+                // A run_command spawn failure; the typed payload is synthesized
+                // from command + result at the storage layer.
+                tool_kind: Some(ToolKind::RunCommand),
+                payload: None,
+                touched_paths: Vec::new(),
+                artifacts: Vec::new(),
             });
         }
         tool_registry.finish(&request.tool_call_id);
@@ -902,7 +908,9 @@ impl ToolExecutionEventSink for ProtocolToolExecutionSink {
         if let (Some(database), Some(chat_id), Some(message_id)) =
             (&self.database, &self.chat_id, &self.message_id)
         {
+            // Legacy feed (kept for fallback) + typed storage (source of truth).
             let _ = database.record_chat_tool_execution_event(chat_id, message_id, &event);
+            let _ = database.record_typed_tool_event(chat_id, message_id, &event);
         }
 
         let _ = self.outbox.send(ServerFrame::Event {

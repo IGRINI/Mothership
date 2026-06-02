@@ -128,6 +128,10 @@ pub(crate) async fn drain_stream(
                     chunk: Some(visible),
                     message: None,
                     result: None,
+                    tool_kind: None,
+                    payload: None,
+                    touched_paths: Vec::new(),
+                    artifacts: Vec::new(),
                 });
             }
         }
@@ -145,6 +149,10 @@ pub(crate) async fn drain_stream(
                 chunk: Some(visible),
                 message: None,
                 result: None,
+                tool_kind: None,
+                payload: None,
+                touched_paths: Vec::new(),
+                artifacts: Vec::new(),
             });
         }
     }

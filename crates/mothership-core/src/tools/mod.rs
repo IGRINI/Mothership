@@ -53,8 +53,8 @@ pub use resources::ToolResourceLimits;
 pub use scheduler::{tool_batch_plan, tool_concurrency, ToolBatchPlan, ToolConcurrency};
 pub use supervisor::ToolSupervisor;
 pub use types::{
-    NoopToolExecutionEventSink, ToolApprovalAnswer, ToolCommand, ToolExecutionAccepted,
-    ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionEventKind,
-    ToolExecutionEventSink, ToolExecutionRecord, ToolExecutionRequest, ToolExecutionResult,
-    ToolExecutionStatus, ToolOutputPolicy, ToolOutputStream,
+    NoopToolExecutionEventSink, ToolApprovalAnswer, ToolArtifact, ToolCommand,
+    ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
+    ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRecord, ToolExecutionRequest,
+    ToolExecutionResult, ToolExecutionStatus, ToolOutputPolicy, ToolOutputStream,
 };

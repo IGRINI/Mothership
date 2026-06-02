@@ -59,6 +59,7 @@ pub use tools::{
     FileToolSpill, NoopToolExecutionEventSink, PathError, PendingToolApprovalGate, StdFileSystem,
     MAX_TOOL_EVENT_BYTES,
     SpawnedToolProcess, StaticToolApprovalGate, ToolApprovalAnswer, ToolApprovalDecision,
+    ToolArtifact,
     ToolApprovalGate, ToolBatchPlan, ToolCallContext, ToolCancellationToken, ToolCommand,
     ToolConcurrency, ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
     ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRecord, ToolExecutionRegistry,

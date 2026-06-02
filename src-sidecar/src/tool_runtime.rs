@@ -15,7 +15,8 @@ use mothership_core::{
     FileToolOutcome,
     FileToolSpill, LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResult, MothershipError,
     PendingToolApprovalGate, Result, SpawnedToolProcess, StdFileSystem, ToolApprovalDecision,
-    ToolBatchPlan, ToolCallContext, ToolCancellationToken, ToolCommand, ToolExecutionEvent,
+    ToolArtifact, ToolBatchPlan, ToolCallContext, ToolCancellationToken, ToolCommand,
+    ToolExecutionEvent,
     ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest,
     ToolExecutionResult, ToolExecutionStatus, ToolExecutor, ToolKind, ToolOutputPolicy,
     ToolOutputStore, ToolPermissionAction, ToolProcessExit, ToolProcessSandbox, ToolProcessSpec,
@@ -451,12 +452,14 @@ impl FileToolExecutor {
                     Some(capability.summary.clone()),
                 );
                 self.emit_file_event(
+                    tool,
                     tool_call_id,
                     run_id,
                     project_id,
                     ToolExecutionEventKind::PermissionDenied,
                     Some(capability.summary.clone()),
                     Some(result),
+                    TypedEventExtras::default(),
                 );
                 return LlmToolCallResult {
                     ok: false,
@@ -468,12 +471,14 @@ impl FileToolExecutor {
                 // block on the same gate the UI drives via `decide`.
                 let preview = self.build_preview(tool, arguments, workspace, &capability.summary);
                 self.emit_file_event(
+                    tool,
                     tool_call_id,
                     run_id,
                     project_id,
                     ToolExecutionEventKind::PermissionRequested,
                     Some(preview),
                     None,
+                    TypedEventExtras::default(),
                 );
                 let decision = self
                     .runtime
@@ -486,12 +491,14 @@ impl FileToolExecutor {
                         Some(reason.clone()),
                     );
                     self.emit_file_event(
+                        tool,
                         tool_call_id,
                         run_id,
                         project_id,
                         ToolExecutionEventKind::PermissionDenied,
                         Some(reason.clone()),
                         Some(result),
+                        TypedEventExtras::default(),
                     );
                     return LlmToolCallResult {
                         ok: false,
@@ -512,12 +519,14 @@ impl FileToolExecutor {
                 Some("tool call was cancelled".to_string()),
             );
             self.emit_file_event(
+                tool,
                 tool_call_id,
                 run_id,
                 project_id,
                 ToolExecutionEventKind::Cancelled,
                 Some("tool call was cancelled".to_string()),
                 Some(result),
+                TypedEventExtras::default(),
             );
             return LlmToolCallResult {
                 ok: false,
@@ -526,12 +535,14 @@ impl FileToolExecutor {
         }
 
         self.emit_file_event(
+            tool,
             tool_call_id,
             run_id,
             project_id,
             ToolExecutionEventKind::Started,
             Some(capability.summary.clone()),
             None,
+            TypedEventExtras::default(),
         );
 
         // Execute the pure handler through the injected filesystem port.
@@ -584,6 +595,34 @@ impl FileToolExecutor {
                     tool_call_id,
                     spill.as_ref().map(|spill| spill as &dyn FileToolSpill),
                 );
+
+                // Typed extras for storage + UI: the semantic payload (the
+                // handler's own `data`), the paths touched, and a diff artifact
+                // (bounded preview + logRef to the full diff) when there is one.
+                let mut artifacts = Vec::new();
+                if let Some(diff_preview) = bounded.diff.clone() {
+                    let full_len = outcome
+                        .diff
+                        .as_deref()
+                        .map(str::len)
+                        .unwrap_or(diff_preview.len());
+                    artifacts.push(ToolArtifact {
+                        artifact_id: "diff".to_string(),
+                        kind: "diff".to_string(),
+                        content_type: "text/x-diff".to_string(),
+                        preview: diff_preview,
+                        log_ref: bounded.log_ref.clone(),
+                        size_bytes: full_len as u64,
+                        sha256: None,
+                        truncated: bounded.truncated,
+                    });
+                }
+                let extras = TypedEventExtras {
+                    payload: Some(outcome.data.clone()),
+                    touched_paths: touched_paths_from_data(&outcome.data),
+                    artifacts,
+                };
+
                 let mut result = synthesized_result(
                     tool_call_id,
                     status,
@@ -597,7 +636,16 @@ impl FileToolExecutor {
                 } else {
                     ToolExecutionEventKind::Failed
                 };
-                self.emit_file_event(tool_call_id, run_id, project_id, kind, bounded.diff, Some(result));
+                self.emit_file_event(
+                    tool,
+                    tool_call_id,
+                    run_id,
+                    project_id,
+                    kind,
+                    bounded.diff,
+                    Some(result),
+                    extras,
+                );
                 LlmToolCallResult {
                     ok: outcome.ok,
                     content: model_response,
@@ -612,12 +660,14 @@ impl FileToolExecutor {
                     Some(message.clone()),
                 );
                 self.emit_file_event(
+                    tool,
                     tool_call_id,
                     run_id,
                     project_id,
                     ToolExecutionEventKind::Failed,
                     Some(message.clone()),
                     Some(result),
+                    TypedEventExtras::default(),
                 );
                 LlmToolCallResult {
                     ok: false,
@@ -653,14 +703,17 @@ impl FileToolExecutor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_file_event(
         &self,
+        tool: FileTool,
         tool_call_id: &str,
         run_id: &Option<String>,
         project_id: &Option<String>,
         kind: ToolExecutionEventKind,
         message: Option<String>,
         result: Option<ToolExecutionResult>,
+        extras: TypedEventExtras,
     ) {
         self.sink.emit(ToolExecutionEvent {
             tool_call_id: tool_call_id.to_string(),
@@ -672,8 +725,45 @@ impl FileToolExecutor {
             chunk: None,
             message,
             result,
+            // Typed storage + UI routing: the kind is always known here, and the
+            // semantic payload / touched paths / artifacts are supplied by the
+            // terminal emit (default-empty for lifecycle transitions).
+            tool_kind: Some(ToolKind::from(tool)),
+            payload: extras.payload,
+            touched_paths: extras.touched_paths,
+            artifacts: extras.artifacts,
         });
     }
+}
+
+/// The typed extras a file-tool event may carry beyond the lifecycle basics:
+/// the semantic payload, the paths it touched, and any durable artifacts. Empty
+/// for lifecycle transitions; populated on the terminal completed/failed event.
+#[derive(Default)]
+struct TypedEventExtras {
+    payload: Option<Value>,
+    touched_paths: Vec<String>,
+    artifacts: Vec<ToolArtifact>,
+}
+
+/// Extract the workspace-relative paths a file-tool outcome touched, from its
+/// semantic `data` payload — a single `path`, and/or a `files` array (of strings
+/// or `{ "path": … }` objects, as `apply_patch` emits).
+fn touched_paths_from_data(data: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(path) = data.get("path").and_then(Value::as_str) {
+        paths.push(path.to_string());
+    }
+    if let Some(files) = data.get("files").and_then(Value::as_array) {
+        for file in files {
+            if let Some(path) = file.as_str() {
+                paths.push(path.to_string());
+            } else if let Some(path) = file.get("path").and_then(Value::as_str) {
+                paths.push(path.to_string());
+            }
+        }
+    }
+    paths
 }
 
 /// Bridge the async [`ToolOutputStore`] to the synchronous [`FileToolSpill`] the
