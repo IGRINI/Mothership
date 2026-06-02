@@ -61,8 +61,19 @@ export interface ChatThreadSummary {
   title: string;
   preview: string;
   messageCount: number;
+  /** Execution model for THIS chat's future runs (provider + model). Null means
+   * "use the global default-for-new-chats". Distinct from ChatMessage.providerId/
+   * modelId, which is the immutable attribution of an already-produced answer. */
+  providerId?: string | null;
+  modelId?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+/** Pushed by the core whenever a chat's metadata changes out of band (e.g. its
+ * model was changed on another client). Wire event: `chat-updated`. */
+export interface ChatUpdatedEvent {
+  chat: ChatThreadSummary;
 }
 
 export interface ChatMessage {
@@ -479,6 +490,30 @@ export function setActiveProject(projectId: string): Promise<ProjectSnapshot> {
   }
 
   return invoke<ProjectSnapshot>("set_active_project", { projectId });
+}
+
+/** Sets the execution model for a specific chat (persisted + synced across
+ * clients via the `chat-updated` event). Returns the updated chat summary. */
+export function setChatModel(
+  chatId: string,
+  providerId: string,
+  modelId: string,
+): Promise<ChatThreadSummary> {
+  if (!isTauriRuntime()) {
+    // Persist onto the preview chat (findPreviewChat returns the live store
+    // reference) so a later list/get/open reflects the model, mirroring the
+    // backend contract.
+    const chat = findPreviewChat(chatId);
+    chat.providerId = providerId;
+    chat.modelId = modelId;
+    return Promise.resolve(copyChat(chat));
+  }
+
+  return invoke<ChatThreadSummary>("set_chat_model", {
+    chatId,
+    providerId,
+    modelId,
+  });
 }
 
 export function listChats(

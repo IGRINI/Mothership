@@ -76,9 +76,11 @@ provider API           (HTTP / WS / SSE / внешний CLI)
 Исключение: self-managed upstream-agent adapters (например `claude-agent`) могут
 запускать SDK/CLI runtime провайдера как дочерний headless-процесс. Это не
 делает Claude Code владельцем Mothership Core: Core всё ещё хранит настройки,
-секреты, выбранную модель, chat history, cancellation и UI events. Но tools и
-agent loop внутри такого runtime считаются upstream-owned и не проходят через
-Mothership `ToolSupervisor`.
+секреты, выбранную модель, chat history, cancellation и UI events. Agent loop
+внутри такого runtime считается upstream-owned, но Core tools остаются
+Core-owned: адаптер может получить Mothership tool catalog и вызвать tool
+mid-turn через общий side-channel, чтобы execution, cancellation, audit trail и
+UI-синхронизация проходили через Mothership `ToolSupervisor`.
 
 ## Контракт core↔adapter
 
@@ -98,8 +100,9 @@ set_settings          { values }  текущие значения настрое
 get_auth_schema       схема авторизации
 get_auth_status       provider-agnostic статус после применения текущих settings
 authenticate          запустить свой auth-flow (например browser OAuth) сейчас
-chat_start            { model, messages, state?, tool_results?, extra_messages? }  один model round
+chat_start            { model, runtime_context, messages, tools, state?, tool_results?, extra_messages? }
 chat_cancel           отмена
+tool_result           результат mid-turn tool request от Core
 logout                ревокнуть/почистить свой credential перед забыванием в vault
 ```
 
@@ -114,6 +117,7 @@ settings_schema { fields }
 auth_schema     { auth }
 auth_status     { kind, account_label?, expires_at?, detail? }
 delta           { text }     потоковый кусок ответа
+tool_request    { tool_call_id, name, arguments }  mid-turn Core tool request
 chat_round_complete { state?, tool_calls[] }  конец model round
 error           { message }
 store_secret    { values }   side channel: сохранить секреты в общий vault (без id)
@@ -149,9 +153,11 @@ external_process  адаптер запускает и ведёт внешний
 Для `self_managed` adapters тот же `chat_start` используется как один запуск
 upstream agent runtime. Адаптер возвращает `chat_round_complete.state` как
 opaque provider state (например Claude session id), а `tool_calls` должен быть
-пустым. Core сохраняет state на уровне chat thread и передаёт его следующему
-запуску того же provider. Если пользователь редактирует старое сообщение и
-ветка истории обрезается, Core очищает provider state.
+пустым. Если upstream runtime умеет вызывать внешние tools (например через MCP),
+адаптер должен мостить эти вызовы через `tool_request`/`tool_result`, а не
+исполнять Mothership tools у себя. Core сохраняет state на уровне chat thread и
+передаёт его следующему запуску того же provider. Если пользователь редактирует
+старое сообщение и ветка истории обрезается, Core очищает provider state.
 
 `chat_start.runtime_context` несёт структурный project context (`projectRoot`,
 `projectId`, `projectName`). Self-managed адаптеры используют его для cwd/рабочей
@@ -245,15 +251,17 @@ UI send_chat_message
   -> ChatRunService.run
   -> SubprocessChatGateway -> adapter (single chat_start)
   -> adapter launches upstream headless agent process
+  -> optional adapter tool_request -> Core ToolSupervisor -> tool_result
   -> adapter streams delta and returns opaque state
   -> Core saves provider state on the chat
   -> SQLite deltas/status
   -> chat-run-event
 ```
 
-Core не передаёт Mothership tool catalog и не запускает `AgenticLoopPolicy` для
-`agent.runtime` adapters. Это осознанная граница: такие провайдеры уже имеют
-собственный agent loop.
+Core может передавать Mothership tool catalog в `self_managed` adapters, но не
+запускает для них `AgenticLoopPolicy`. Это осознанная граница: такие провайдеры
+уже имеют собственный agent loop, а tool execution всё равно может вернуться в
+Core через mid-turn side-channel.
 
 `ChatRunService` (`run.rs`):
 
@@ -276,10 +284,12 @@ Core не передаёт Mothership tool catalog и не запускает `A
 Важно: с точки зрения Core транспорт всегда `subprocess`
 (`LlmTransportKind::Subprocess`). Реальный транспорт (HTTP/WS/SSE) и выбор
 fallback — внутреннее дело адаптера, Core их не видит. Core владеет runtime
-prompt/tool catalog/agentic loop; адаптер только мапит generic round request в
-валидный для своего провайдера payload (для Codex — top-level `instructions`;
-для OpenRouter — обычный массив `messages`) и возвращает opaque continuation
-state.
+prompt/tool catalog/tool execution. Для `core_managed` providers Core также
+владеет agentic loop; для `self_managed` providers loop остаётся внутри
+адаптера/upstream runtime, а Core tools вызываются через `tool_request`.
+Адаптер только мапит generic round request в валидный для своего провайдера
+payload (для Codex — top-level `instructions`; для OpenRouter — обычный массив
+`messages`) и возвращает opaque continuation state.
 Ошибки provider/model/auth/transport не замалчиваются — run становится `failed`,
 UI получает ошибку.
 
@@ -360,9 +370,35 @@ OpenAI-совместимый HTTP-провайдер.
 - chat: SSE `POST {base}/chat/completions` с `Authorization: Bearer <api_key>`,
   парсинг `choices[0].delta.content`.
 
-## Anthropic adapter (планируемый)
+### Claude Agent SDK (`adapters/claude-agent`)
 
-Anthropic-адаптера в коде ещё нет. Когда он появится, это будет такой же
+Self-managed adapter поверх bundled `@anthropic-ai/claude-agent-sdk` CLI. Он
+запускает Claude Code runtime в headless `stream-json` режиме; Mothership Core
+остаётся владельцем выбора provider/model, credential vault, chat history,
+cancellation, UI events и Core tool execution.
+
+- provider id: `claude-agent`; auth schema: `api_key` с полем `oauth_token`
+  (пользователь вставляет Claude OAuth token);
+- модели: `ModelManagement::Server`, если токен настроен; adapter читает model
+  metadata через Claude Agent SDK control request. Без токена возвращается
+  fallback list, чтобы UI мог отрисовать провайдер;
+- runtime: `ProviderRuntimeKind::SelfManaged`; Core делает один `chat_start`,
+  adapter хранит opaque Claude session id в `chat_provider_state`;
+- смена модели через Mothership selected model сбрасывает Claude session state,
+  чтобы продолжение не шло старой моделью;
+- reasoning: adapter прокидывает supported effort в `--effort`;
+- project context: `chat_start.runtime_context.projectRoot` становится cwd для
+  Claude process;
+- tools: когда Core передал tool catalog, adapter поднимает per-run loopback MCP
+  bridge `mothership` и передаёт его Claude CLI через `--mcp-config`. Вызовы MCP
+  tools уходят обратно в adapter SDK `Context::request_tool`, затем в Core
+  `ToolSupervisor`, и возвращаются в Claude как MCP result. Сейчас Core catalog
+  содержит `run_command`, поэтому adapter также запрещает Claude built-in `Bash`
+  на таких запусках, чтобы команды шли через Mothership.
+
+## Raw Anthropic adapter (планируемый, не Claude Agent SDK)
+
+Raw Anthropic-адаптера в коде ещё нет. Когда он появится, это будет такой же
 subprocess-адаптер, как Codex (самодостаточный, владеет своим транспортом),
 с auth-схемой `oauth_token_paste`: пользователь сам получает OAuth-токен любым
 доступным ему способом и вставляет его; Mothership владеет refresh lifecycle

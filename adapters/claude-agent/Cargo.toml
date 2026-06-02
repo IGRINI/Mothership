@@ -8,6 +8,7 @@ license.workspace = true
 mothership-adapter-sdk = { path = "../../crates/mothership-adapter-sdk" }
 anyhow.workspace = true
 async-trait.workspace = true
+getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true }

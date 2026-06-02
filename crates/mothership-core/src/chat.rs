@@ -17,8 +17,24 @@ pub struct ChatThreadSummary {
     pub title: String,
     pub preview: String,
     pub message_count: i64,
+    /// Execution model for THIS chat's future runs. `None` => use the global
+    /// default-for-new-chats. Distinct from `ChatMessage.provider_id/model_id`,
+    /// which is the immutable attribution of an already-produced answer.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Pushed when a chat's metadata changes out of band (e.g. its model was set,
+/// possibly on another client). Wire event `chat_updated`; the host forwards it
+/// to the webview as `chat-updated`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatUpdatedEvent {
+    pub chat: ChatThreadSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

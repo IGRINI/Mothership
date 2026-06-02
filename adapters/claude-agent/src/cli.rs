@@ -4,12 +4,13 @@ use std::process::Stdio;
 
 use anyhow::{bail, Context as _};
 use mothership_adapter_sdk::protocol::{ReasoningConfig, ReasoningEffort};
-use mothership_adapter_sdk::{ChatRequest, ChatRoundOutcome, ChatSink};
+use mothership_adapter_sdk::{ChatRequest, ChatRoundOutcome, ChatSink, Context as AdapterContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+use crate::bridge::ToolBridgeServer;
 use crate::settings::ClaudeAgentSettings;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -165,6 +166,7 @@ pub(crate) async fn supported_models(
 pub(crate) async fn stream_chat(
     settings: &ClaudeAgentSettings,
     request: ChatRequest,
+    ctx: &AdapterContext,
     sink: &mut ChatSink,
 ) -> anyhow::Result<ChatRoundOutcome> {
     let executable = resolve_executable(settings)?;
@@ -182,8 +184,18 @@ pub(crate) async fn stream_chat(
     }
     let prompt = prompt_from_messages(&request.messages, state.session_id.is_some());
 
+    let tool_bridge = if request.tools.is_empty() {
+        None
+    } else {
+        Some(
+            ToolBridgeServer::start(request.tools.clone(), ctx.clone())
+                .await
+                .context("start Claude MCP bridge for Mothership tools")?,
+        )
+    };
+
     let mut command = claude_command(&executable, settings);
-    let disallowed_tools = HEADLESS_DISALLOWED_TOOLS.join(",");
+    let disallowed_tools = disallowed_tools_for_request(&request).join(",");
     command.args([
         "--print",
         "--input-format",
@@ -202,6 +214,11 @@ pub(crate) async fn stream_chat(
         "bypassPermissions",
         "--allow-dangerously-skip-permissions",
     ]);
+    if let Some(tool_bridge) = tool_bridge.as_ref() {
+        command
+            .arg("--mcp-config")
+            .arg(mcp_config_json(tool_bridge)?);
+    }
     command.arg("--model").arg(&request.model);
     if let Some(session_id) = state.session_id.as_deref() {
         command.arg("--resume").arg(session_id);
@@ -209,7 +226,7 @@ pub(crate) async fn stream_chat(
     if let Some(effort) = request.reasoning.as_ref().and_then(reasoning_effort) {
         command.arg("--effort").arg(effort);
     }
-    let instructions = request.prompt.rendered_text();
+    let instructions = adapter_instructions(request.prompt.rendered_text(), tool_bridge.is_some());
     if !instructions.trim().is_empty() {
         command.arg("--append-system-prompt").arg(instructions);
     }
@@ -262,6 +279,49 @@ pub(crate) async fn stream_chat(
         })?),
         tool_calls: Vec::new(),
     })
+}
+
+fn disallowed_tools_for_request(request: &ChatRequest) -> Vec<&'static str> {
+    let mut tools = HEADLESS_DISALLOWED_TOOLS.to_vec();
+    if request.tools.iter().any(|tool| tool.name == "run_command") {
+        tools.push("Bash");
+    }
+    tools
+}
+
+fn adapter_instructions(core_instructions: String, bridge_enabled: bool) -> String {
+    if !bridge_enabled {
+        return core_instructions;
+    }
+
+    let bridge_instructions = "When Mothership MCP tools are available, use them for local command execution. Prefer `mcp__mothership__run_command` over direct shell tools so Mothership can supervise cancellation, permissions, history, and output synchronization. Only fall back to provider-native tools when no Mothership tool can perform the task.";
+    if core_instructions.trim().is_empty() {
+        bridge_instructions.to_string()
+    } else {
+        format!("{core_instructions}\n\n{bridge_instructions}")
+    }
+}
+
+fn mcp_config_json(tool_bridge: &ToolBridgeServer) -> anyhow::Result<String> {
+    let adapter_exe = std::env::current_exe().context("resolve current adapter executable")?;
+    Ok(json!({
+        "mcpServers": {
+            "mothership": {
+                "type": "stdio",
+                "command": adapter_exe,
+                "args": [
+                    "mcp-bridge",
+                    "--port",
+                    tool_bridge.port().to_string(),
+                    "--token",
+                    tool_bridge.token(),
+                ],
+                "timeout": 1800000,
+                "alwaysLoad": true,
+            }
+        }
+    })
+    .to_string())
 }
 
 fn apply_runtime_context(command: &mut Command, request: &ChatRequest) -> anyhow::Result<()> {

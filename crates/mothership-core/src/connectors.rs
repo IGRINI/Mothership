@@ -248,11 +248,11 @@ impl ConnectorManager {
         })
     }
 
-    pub fn set_selected_model(
-        &self,
-        provider_id: &str,
-        model_id: &str,
-    ) -> Result<ConnectorSettingsSnapshot> {
+    /// Validates that a provider/model exists among the installed adapters,
+    /// WITHOUT mutating any persisted selection. Used by `set_selected_model`
+    /// (global default) and by per-chat model changes (which must NOT touch the
+    /// global default).
+    pub fn ensure_model_supported(&self, provider_id: &str, model_id: &str) -> Result<()> {
         let supported = {
             let state = self.state.lock().unwrap();
             state
@@ -268,6 +268,15 @@ impl ConnectorManager {
             )));
         }
 
+        Ok(())
+    }
+
+    pub fn set_selected_model(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<ConnectorSettingsSnapshot> {
+        self.ensure_model_supported(provider_id, model_id)?;
         self.database
             .set_selected_llm_model(provider_id, model_id)?;
         self.snapshot()

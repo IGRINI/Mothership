@@ -6,6 +6,7 @@
 //! This is how the core chats through any process-based provider (a normal HTTP
 //! adapter or one that drives an external CLI) without knowing which it is.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use mothership_adapter_host::protocol::{ChatMessage, ToolCallResponse, ToolCallResult};
@@ -15,7 +16,7 @@ use crate::adapter_pool::AdapterPool;
 use crate::auth::FileCredentialVault;
 use crate::llm::{
     LlmChatCompletionEventSink, LlmChatRole, LlmChatRound, LlmChatRoundGateway,
-    LlmChatRoundRequest, LlmToolCallRequest, LlmTransportKind,
+    LlmChatRoundRequest, LlmToolCallHandler, LlmToolCallRequest, LlmTransportKind,
 };
 use crate::{ChatCancellationToken, MothershipError, Result};
 
@@ -29,6 +30,7 @@ pub struct SubprocessChatGateway {
     entry: AdapterEntry,
     vault: FileCredentialVault,
     run_id: Option<String>,
+    tool_handler: Option<Arc<dyn LlmToolCallHandler>>,
 }
 
 impl SubprocessChatGateway {
@@ -38,11 +40,17 @@ impl SubprocessChatGateway {
             entry,
             vault,
             run_id: None,
+            tool_handler: None,
         }
     }
 
     pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
         self.run_id = Some(run_id.into());
+        self
+    }
+
+    pub fn with_tool_handler(mut self, handler: Arc<dyn LlmToolCallHandler>) -> Self {
+        self.tool_handler = Some(handler);
         self
     }
 }
@@ -55,6 +63,7 @@ impl LlmChatRoundGateway for SubprocessChatGateway {
         sink: &mut dyn LlmChatCompletionEventSink,
     ) -> Result<LlmChatRound> {
         sink.transport_selected(LlmTransportKind::Subprocess);
+        let sink = RefCell::new(sink);
 
         // Core owns the runtime prompt and tool catalog. The adapter receives
         // them as structured inputs and maps them to its provider-specific wire
@@ -96,8 +105,11 @@ impl LlmChatRoundGateway for SubprocessChatGateway {
         let runtime_context = request.runtime_context;
         let tools = request.tools;
         let state = request.state;
-        let cancellation = cancellation.clone();
+        let cancellation_for_watcher = cancellation.clone();
+        let cancellation_for_tools = cancellation.clone();
         let run_id = self.run_id.clone();
+        let tool_run_id = run_id.clone();
+        let tool_handler = self.tool_handler.clone();
         self.pool
             .with(&self.entry, &self.vault, |adapter| {
                 adapter.chat_round_cancellable(
@@ -110,8 +122,17 @@ impl LlmChatRoundGateway for SubprocessChatGateway {
                     state,
                     tool_results,
                     extra_messages,
-                    move || cancellation.is_cancelled(),
-                    |delta| sink.delta(delta),
+                    move || cancellation_for_watcher.is_cancelled(),
+                    |call| {
+                        sink.borrow_mut().before_tool_call(&call.tool_call_id);
+                        execute_mid_turn_tool(
+                            tool_handler.as_deref(),
+                            tool_run_id.clone(),
+                            call,
+                            &cancellation_for_tools,
+                        )
+                    },
+                    |delta| sink.borrow_mut().delta(delta),
                 )
             })
             .map(|round| LlmChatRound {
@@ -155,5 +176,34 @@ fn model_facing_tool_content(result: crate::LlmToolCallResult) -> String {
         "Tool call failed.".to_string()
     } else {
         format!("Tool call failed:\n{content}")
+    }
+}
+
+fn execute_mid_turn_tool(
+    handler: Option<&dyn LlmToolCallHandler>,
+    run_id: Option<String>,
+    call: mothership_adapter_host::protocol::ToolCallInvocation,
+    cancellation: &ChatCancellationToken,
+) -> ToolCallResult {
+    let Some(handler) = handler else {
+        return ToolCallResult {
+            ok: false,
+            content: "Mothership Core tool handler is not enabled for this run".to_string(),
+        };
+    };
+
+    let result = handler.handle_tool_call(
+        LlmToolCallRequest {
+            run_id,
+            tool_call_id: call.tool_call_id,
+            name: call.name,
+            arguments: call.arguments,
+        },
+        cancellation,
+    );
+
+    ToolCallResult {
+        ok: result.ok,
+        content: model_facing_tool_content(result),
     }
 }

@@ -290,6 +290,9 @@ fn forward_event(app: &AppHandle, event: CoreEvent) {
         CoreEvent::ConnectorSettings(connector_event) => {
             let _ = app.emit("connector-settings-event", connector_event);
         }
+        CoreEvent::ChatUpdated(chat_event) => {
+            let _ = app.emit("chat-updated", chat_event);
+        }
         CoreEvent::Unknown => {}
     }
 }

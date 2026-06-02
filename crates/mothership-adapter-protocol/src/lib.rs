@@ -21,7 +21,7 @@ use serde_json::Value;
 /// `initialize` and refuses an adapter that reports a different version, rather
 /// than mis-parsing a contract it doesn't understand. Bump on any incompatible
 /// change to `Request`/`Outbound`.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Host -> adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +88,15 @@ pub enum Request {
     ChatCancel {
         id: u64,
     },
+    /// Reply to an adapter-initiated mid-turn tool request. Self-managed
+    /// adapters use this to bridge their own agent runtimes (for example an
+    /// upstream CLI exposed through MCP) back into Mothership Core tools without
+    /// returning provider-specific tool calls at `ChatRoundComplete`.
+    ToolResult {
+        id: u64,
+        tool_call_id: String,
+        result: ToolCallResult,
+    },
     /// Ask the adapter to revoke / clean up its current auth (e.g. revoke an
     /// OAuth token server-side) before the host forgets the stored credential.
     /// Best-effort: the adapter acks even if revoke fails. Adapters with nothing
@@ -135,6 +144,15 @@ pub enum Outbound {
     Delta {
         id: u64,
         text: String,
+    },
+    /// Adapter -> host mid-turn tool request. The host executes the named Core
+    /// tool and replies with [`Request::ToolResult`] using the same request id
+    /// and `tool_call_id`.
+    ToolRequest {
+        id: u64,
+        tool_call_id: String,
+        name: String,
+        arguments: Value,
     },
     /// One provider model round has finished. If `tool_calls` is non-empty, Core
     /// owns the next decision: execute/queue/cancel those calls, then start a

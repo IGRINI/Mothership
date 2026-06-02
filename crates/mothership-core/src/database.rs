@@ -279,6 +279,8 @@ impl Database {
             title: "New chat".to_string(),
             preview: String::new(),
             message_count: 0,
+            provider_id: None,
+            model_id: None,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -443,11 +445,6 @@ impl Database {
         let content = validate_chat_message_content(content)?;
         let mut connection = self.connect()?;
         let selected_model = selected_llm_model(&connection)?;
-        if selected_model.model_id.trim().is_empty() {
-            return Err(MothershipError::InvalidRequest(
-                "no LLM model selected; connect a provider and choose a model first".to_string(),
-            ));
-        }
 
         let tx = connection.transaction()?;
         let now = current_timestamp();
@@ -479,6 +476,8 @@ impl Database {
                     title: derive_chat_title(content),
                     preview: String::new(),
                     message_count: 0,
+                    provider_id: None,
+                    model_id: None,
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 };
@@ -500,6 +499,18 @@ impl Database {
                 chat
             }
         };
+
+        // Resolve + freeze this chat's execution model (locking in the global
+        // default if the chat — including a brand-new one — has none yet); the
+        // assistant placeholder + run are attributed to it, immune to a later
+        // model switch.
+        let selected_model = chat_run_model(&chat, &selected_model);
+        if selected_model.model_id.trim().is_empty() {
+            return Err(MothershipError::InvalidRequest(
+                "no LLM model selected; connect a provider and choose a model first".to_string(),
+            ));
+        }
+        persist_chat_model(&tx, &chat.id, &selected_model.provider_id, &selected_model.model_id)?;
 
         let mut user_message = ChatMessage {
             id: generate_id("chat_message")?,
@@ -541,6 +552,8 @@ impl Database {
             title,
             preview: derive_chat_preview(content),
             message_count: chat.message_count + 2,
+            provider_id: Some(selected_model.provider_id.clone()),
+            model_id: Some(selected_model.model_id.clone()),
             created_at: chat.created_at,
             updated_at: now,
         };
@@ -590,14 +603,19 @@ impl Database {
         let content = validate_chat_message_content(content)?;
         let mut connection = self.connect()?;
         let selected_model = selected_llm_model(&connection)?;
+
+        let tx = connection.transaction()?;
+        let chat = select_chat_summary(&tx, chat_id)?;
+        // Resolve + freeze this chat's execution model (locking in the global
+        // default if the chat has none yet); the assistant placeholder + run are
+        // then attributed to it, immune to a later model switch.
+        let selected_model = chat_run_model(&chat, &selected_model);
         if selected_model.model_id.trim().is_empty() {
             return Err(MothershipError::InvalidRequest(
                 "no LLM model selected; connect a provider and choose a model first".to_string(),
             ));
         }
-
-        let tx = connection.transaction()?;
-        let chat = select_chat_summary(&tx, chat_id)?;
+        persist_chat_model(&tx, &chat.id, &selected_model.provider_id, &selected_model.model_id)?;
         let original_user_message = select_chat_message_by_id(&tx, message_id)?;
         if original_user_message.chat_id != chat_id {
             return Err(MothershipError::InvalidRequest(
@@ -678,6 +696,8 @@ impl Database {
             title,
             preview: derive_chat_preview(content),
             message_count,
+            provider_id: Some(selected_model.provider_id.clone()),
+            model_id: Some(selected_model.model_id.clone()),
             created_at: chat.created_at,
             updated_at: now,
         };
@@ -739,6 +759,10 @@ impl Database {
             title: branch_chat_title(&source_chat.title),
             preview: derive_chat_preview(&branch_point.content),
             message_count: source_messages.len() as i64,
+            // Branch chats inherit the source chat's execution model as the
+            // setting for their future runs (message attribution stays historical).
+            provider_id: source_chat.provider_id.clone(),
+            model_id: source_chat.model_id.clone(),
             created_at: now.clone(),
             updated_at: now,
         };
@@ -784,14 +808,19 @@ impl Database {
         validate_identifier("chat_id", chat_id)?;
         let mut connection = self.connect()?;
         let selected_model = selected_llm_model(&connection)?;
+
+        let tx = connection.transaction()?;
+        let chat = select_chat_summary(&tx, chat_id)?;
+        // Resolve + freeze this chat's execution model (locking in the global
+        // default if the chat has none yet); the assistant placeholder + run are
+        // then attributed to it, immune to a later model switch.
+        let selected_model = chat_run_model(&chat, &selected_model);
         if selected_model.model_id.trim().is_empty() {
             return Err(MothershipError::InvalidRequest(
                 "no LLM model selected; connect a provider and choose a model first".to_string(),
             ));
         }
-
-        let tx = connection.transaction()?;
-        let chat = select_chat_summary(&tx, chat_id)?;
+        persist_chat_model(&tx, &chat.id, &selected_model.provider_id, &selected_model.model_id)?;
 
         let assistant_message = select_last_message_by_role(&tx, chat_id, "assistant")?
             .ok_or_else(|| {
@@ -829,6 +858,8 @@ impl Database {
             title: chat.title,
             preview: chat.preview,
             message_count: chat.message_count + 1,
+            provider_id: Some(selected_model.provider_id.clone()),
+            model_id: Some(selected_model.model_id.clone()),
             created_at: chat.created_at,
             updated_at: now,
         };
@@ -852,14 +883,19 @@ impl Database {
         validate_identifier("chat_id", chat_id)?;
         let mut connection = self.connect()?;
         let selected_model = selected_llm_model(&connection)?;
+
+        let tx = connection.transaction()?;
+        let chat = select_chat_summary(&tx, chat_id)?;
+        // Resolve + freeze this chat's execution model (locking in the global
+        // default if the chat has none yet); the assistant placeholder + run are
+        // then attributed to it, immune to a later model switch.
+        let selected_model = chat_run_model(&chat, &selected_model);
         if selected_model.model_id.trim().is_empty() {
             return Err(MothershipError::InvalidRequest(
                 "no LLM model selected; connect a provider and choose a model first".to_string(),
             ));
         }
-
-        let tx = connection.transaction()?;
-        let chat = select_chat_summary(&tx, chat_id)?;
+        persist_chat_model(&tx, &chat.id, &selected_model.provider_id, &selected_model.model_id)?;
         let failed_assistant_message = select_last_message_by_role(&tx, chat_id, "assistant")?
             .ok_or_else(|| {
                 MothershipError::InvalidRequest("no assistant message to continue".to_string())
@@ -905,6 +941,8 @@ impl Database {
             title: chat.title,
             preview: derive_chat_preview(CONTINUE_CHAT_MESSAGE_CONTENT),
             message_count: chat.message_count + 2,
+            provider_id: Some(selected_model.provider_id.clone()),
+            model_id: Some(selected_model.model_id.clone()),
             created_at: chat.created_at,
             updated_at: now,
         };
@@ -921,6 +959,48 @@ impl Database {
                 reasoning: None,
             },
         })
+    }
+
+    /// Sets the execution model for a chat (used for its FUTURE runs). The
+    /// provider/model is validated against installed adapters at the connector
+    /// layer BEFORE this is called — this only persists. Clears any cached
+    /// provider session when the provider changes, since it belongs to the old
+    /// provider.
+    pub fn set_chat_model(
+        &self,
+        chat_id: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<ChatThreadSummary> {
+        validate_identifier("chat_id", chat_id)?;
+        validate_identifier("provider_id", provider_id)?;
+        validate_identifier("model_id", model_id)?;
+
+        let connection = self.connect()?;
+        let provider_changed = chat_model(&connection, chat_id)?
+            .map(|model| model.provider_id != provider_id)
+            .unwrap_or(true);
+
+        let changed = connection.execute(
+            "
+            UPDATE chats
+            SET chat_model_provider_id = ?2,
+                chat_model_id = ?3
+            WHERE id = ?1 AND archived = 0
+            ",
+            params![chat_id, provider_id, model_id],
+        )?;
+        if changed == 0 {
+            return Err(MothershipError::InvalidRequest(format!(
+                "chat not found: {chat_id}"
+            )));
+        }
+
+        if provider_changed {
+            clear_chat_provider_state(&connection, chat_id)?;
+        }
+
+        select_chat_summary(&connection, chat_id)
     }
 
     pub fn llm_chat_context(
@@ -1325,6 +1405,8 @@ fn migrate(connection: &Connection) -> Result<()> {
             archived INTEGER NOT NULL DEFAULT 0,
             provider_state_provider_id TEXT,
             provider_state_json TEXT,
+            chat_model_provider_id TEXT,
+            chat_model_id TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL
@@ -1431,6 +1513,8 @@ fn migrate(connection: &Connection) -> Result<()> {
     add_column_if_missing(connection, "chats", "project_id", "TEXT")?;
     add_column_if_missing(connection, "chats", "provider_state_provider_id", "TEXT")?;
     add_column_if_missing(connection, "chats", "provider_state_json", "TEXT")?;
+    add_column_if_missing(connection, "chats", "chat_model_provider_id", "TEXT")?;
+    add_column_if_missing(connection, "chats", "chat_model_id", "TEXT")?;
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_chats_project_updated_at ON chats (project_id, updated_at DESC)",
         [],
@@ -1698,7 +1782,8 @@ fn select_chat_summaries(
         validate_identifier("project_id", project_id)?;
         let mut statement = connection.prepare(
             "
-            SELECT id, project_id, title, preview, message_count, created_at, updated_at
+            SELECT id, project_id, title, preview, message_count, created_at, updated_at,
+                   chat_model_provider_id, chat_model_id
             FROM chats
             WHERE archived = 0 AND project_id = ?1
             ORDER BY updated_at DESC, rowid DESC
@@ -1715,7 +1800,8 @@ fn select_chat_summaries(
 
     let mut statement = connection.prepare(
         "
-        SELECT id, project_id, title, preview, message_count, created_at, updated_at
+        SELECT id, project_id, title, preview, message_count, created_at, updated_at,
+               chat_model_provider_id, chat_model_id
         FROM chats
         WHERE archived = 0
         ORDER BY updated_at DESC, rowid DESC
@@ -1729,11 +1815,71 @@ fn select_chat_summaries(
         .map_err(Into::into)
 }
 
+/// The model a run should use for a chat: the chat's own model if set, else the
+/// provided global fallback (default-for-new-chats).
+fn chat_run_model(chat: &ChatThreadSummary, fallback: &SelectedLlmModel) -> SelectedLlmModel {
+    match (chat.provider_id.as_deref(), chat.model_id.as_deref()) {
+        (Some(provider_id), Some(model_id)) if !model_id.trim().is_empty() => SelectedLlmModel {
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            updated_at: fallback.updated_at.clone(),
+        },
+        _ => fallback.clone(),
+    }
+}
+
+/// Persists a chat's execution model. Called at run start to lock in the
+/// resolved model, so reopening restores what the chat actually ran with rather
+/// than the then-current global default.
+fn persist_chat_model(
+    connection: &Connection,
+    chat_id: &str,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<()> {
+    connection.execute(
+        "UPDATE chats SET chat_model_provider_id = ?2, chat_model_id = ?3 WHERE id = ?1",
+        params![chat_id, provider_id, model_id],
+    )?;
+    Ok(())
+}
+
+/// Reads a chat's stored execution model, if it has one.
+fn chat_model(connection: &Connection, chat_id: &str) -> Result<Option<SelectedLlmModel>> {
+    let row = connection
+        .query_row(
+            "
+            SELECT chat_model_provider_id, chat_model_id, updated_at
+            FROM chats
+            WHERE id = ?1 AND archived = 0
+            ",
+            params![chat_id],
+            |row| {
+                let provider_id: Option<String> = row.get(0)?;
+                let model_id: Option<String> = row.get(1)?;
+                let updated_at: String = row.get(2)?;
+                Ok(match (provider_id, model_id) {
+                    (Some(provider_id), Some(model_id)) if !model_id.trim().is_empty() => {
+                        Some(SelectedLlmModel {
+                            provider_id,
+                            model_id,
+                            updated_at,
+                        })
+                    }
+                    _ => None,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row.flatten())
+}
+
 fn select_chat_summary(connection: &Connection, chat_id: &str) -> Result<ChatThreadSummary> {
     connection
         .query_row(
             "
-            SELECT id, project_id, title, preview, message_count, created_at, updated_at
+            SELECT id, project_id, title, preview, message_count, created_at, updated_at,
+                   chat_model_provider_id, chat_model_id
             FROM chats
             WHERE id = ?1 AND archived = 0
             ",
@@ -1747,8 +1893,8 @@ fn select_chat_summary(connection: &Connection, chat_id: &str) -> Result<ChatThr
 fn insert_chat_summary(connection: &Connection, chat: &ChatThreadSummary) -> Result<()> {
     connection.execute(
         "
-        INSERT INTO chats (id, project_id, title, preview, message_count, archived, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
+        INSERT INTO chats (id, project_id, title, preview, message_count, archived, chat_model_provider_id, chat_model_id, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9)
         ",
         params![
             chat.id,
@@ -1756,6 +1902,8 @@ fn insert_chat_summary(connection: &Connection, chat: &ChatThreadSummary) -> Res
             chat.title,
             chat.preview,
             chat.message_count,
+            chat.provider_id.as_deref(),
+            chat.model_id.as_deref(),
             chat.created_at,
             chat.updated_at
         ],
@@ -2449,6 +2597,8 @@ fn chat_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatThread
         title: row.get(2)?,
         preview: row.get(3)?,
         message_count: row.get(4)?,
+        provider_id: row.get(7)?,
+        model_id: row.get(8)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
     })

@@ -190,8 +190,18 @@ impl<'a> ChatRunService<'a> {
     ) -> Result<()> {
         let database = self.database;
 
-        let selected_model = database.selected_llm_model()?;
-        if selected_model.model_id.trim().is_empty() {
+        // Use the model FROZEN onto this run's assistant placeholder at start
+        // (begin_*_run resolved it from the chat's model, falling back to the
+        // global default). We deliberately do NOT re-read the global selection
+        // here: switching the chat/global model mid-run must not redirect an
+        // in-flight answer to a different provider.
+        let provider_id = run
+            .assistant_message
+            .provider_id
+            .clone()
+            .unwrap_or_default();
+        let model_id = run.assistant_message.model_id.clone().unwrap_or_default();
+        if model_id.trim().is_empty() {
             return Err(MothershipError::InvalidRequest(
                 "no LLM model selected; install a provider adapter and choose a model first"
                     .to_string(),
@@ -200,8 +210,7 @@ impl<'a> ChatRunService<'a> {
 
         // Every provider is a subprocess adapter. Find the one that owns this
         // model; the adapter handles its own transport and auth.
-        let entry =
-            find_trusted_adapter_entry(&plugins_store_path(database), &selected_model.provider_id)?;
+        let entry = find_trusted_adapter_entry(&plugins_store_path(database), &provider_id)?;
         let runtime_kind =
             ensure_adapter_can_run_chat(&entry).map_err(MothershipError::InvalidRequest)?;
 
@@ -221,7 +230,7 @@ impl<'a> ChatRunService<'a> {
         let cancellation = ChatCancellationToken::default();
         let already_cancelled = registry.register(
             &run.run_id,
-            selected_model.provider_id.clone(),
+            provider_id.clone(),
             cancellation.clone(),
         );
         if already_cancelled {
@@ -229,7 +238,7 @@ impl<'a> ChatRunService<'a> {
                 Arc::clone(&self.providers),
                 Arc::clone(&registry),
                 run.run_id.clone(),
-                selected_model.provider_id.clone(),
+                provider_id.clone(),
             );
         }
 
@@ -245,19 +254,16 @@ impl<'a> ChatRunService<'a> {
         // vault, keyed by provider, and are pushed to the adapter on spawn.
         let vault = FileCredentialVault::new(auth_store_path(database));
         let request = self.provider_pipeline.apply(LlmChatCompletionRequest {
-            provider_id: selected_model.provider_id,
-            model_id: selected_model.model_id,
+            provider_id,
+            model_id,
             reasoning: run.context.reasoning.clone(),
             prompt: runtime_prompt_bundle_for(project.as_ref(), runtime_kind),
             runtime_context: runtime_context_for(project.as_ref()),
-            tools: if runtime_kind == ProviderRuntimeKind::CoreManaged {
-                self.tool_handler
-                    .as_ref()
-                    .map(|_| default_tool_catalog())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            },
+            tools: self
+                .tool_handler
+                .as_ref()
+                .map(|_| default_tool_catalog())
+                .unwrap_or_default(),
             messages,
         })?;
 
@@ -308,6 +314,7 @@ impl<'a> ChatRunService<'a> {
                 vault.clone(),
                 Some(sink.run_id.to_string()),
                 round_request,
+                None,
                 cancellation,
                 sink,
             )?;
@@ -348,6 +355,7 @@ impl<'a> ChatRunService<'a> {
             vault,
             Some(sink.run_id.to_string()),
             final_request,
+            None,
             cancellation,
             sink,
         ) {
@@ -378,6 +386,7 @@ impl<'a> ChatRunService<'a> {
             vault,
             Some(sink.run_id.to_string()),
             round_request,
+            self.tool_handler.clone(),
             cancellation,
             sink,
         )?;

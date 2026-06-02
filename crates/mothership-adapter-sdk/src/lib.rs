@@ -25,16 +25,16 @@ pub mod sse;
 pub mod tools;
 pub mod ws;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 /// How often the runtime nudges the adapter's [`ProviderAdapter::on_idle`] while
 /// no request is in flight, so it can release idle resources (e.g. close a
@@ -44,7 +44,7 @@ const IDLE_TICK: Duration = Duration::from_secs(5);
 use protocol::{
     AuthKind, AuthStatus, ChatMessage, Model, ModelManagement, Outbound, PromptBundle,
     ReasoningConfig, Request, RuntimeContext, SettingsField, ToolCallInvocation, ToolCallResponse,
-    ToolDescriptor, PROTOCOL_VERSION,
+    ToolCallResult, ToolDescriptor, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Clone)]
@@ -187,13 +187,70 @@ impl CancellationToken {
 #[derive(Clone)]
 pub struct Context {
     outbox: mpsc::UnboundedSender<Outbound>,
+    chat_request_id: Option<u64>,
     cancellation: Option<CancellationToken>,
+    tool_responses: Arc<Mutex<HashMap<String, oneshot::Sender<ToolCallResult>>>>,
 }
 
 impl Context {
     /// Persist these values in the shared credential store (merged by the host).
     pub fn store_secret(&self, values: BTreeMap<String, String>) {
         let _ = self.outbox.send(Outbound::StoreSecret { values });
+    }
+
+    /// Ask Mothership Core to execute one of the tools supplied in
+    /// [`ChatRequest::tools`] and wait for the result. This is the generic
+    /// mid-turn bridge used by self-managed adapters: the adapter can expose the
+    /// tools through its own upstream mechanism (MCP, CLI callbacks, etc.) while
+    /// Core still owns supervision, permissions, history, and cancellation.
+    pub async fn request_tool(
+        &self,
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> ToolCallResult {
+        let Some(id) = self.chat_request_id else {
+            return failed_tool_result("tool requests are only available during chat_start");
+        };
+        if self.is_cancelled() {
+            return failed_tool_result("chat turn was cancelled before tool execution");
+        }
+
+        let tool_call_id = tool_call_id.into();
+        let name = name.into();
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut pending = self.tool_responses.lock().unwrap();
+            if pending.contains_key(&tool_call_id) {
+                return failed_tool_result(format!("duplicate tool call id `{tool_call_id}`"));
+            }
+            pending.insert(tool_call_id.clone(), sender);
+        }
+
+        if self
+            .outbox
+            .send(Outbound::ToolRequest {
+                id,
+                tool_call_id: tool_call_id.clone(),
+                name,
+                arguments,
+            })
+            .is_err()
+        {
+            self.tool_responses.lock().unwrap().remove(&tool_call_id);
+            return failed_tool_result("host disconnected before tool request was sent");
+        }
+
+        tokio::select! {
+            result = receiver => match result {
+                Ok(result) => result,
+                Err(_) => failed_tool_result("host dropped the tool response channel"),
+            },
+            _ = self.cancelled() => {
+                self.tool_responses.lock().unwrap().remove(&tool_call_id);
+                failed_tool_result("chat turn was cancelled while waiting for tool execution")
+            }
+        }
     }
 
     /// Returns true when the current chat turn has been cancelled. Non-chat
@@ -220,11 +277,22 @@ impl Context {
         self.cancellation.clone()
     }
 
-    fn with_cancellation(&self, cancellation: CancellationToken) -> Self {
+    fn with_chat(&self, chat_request_id: u64, cancellation: CancellationToken) -> Self {
         Self {
             outbox: self.outbox.clone(),
+            chat_request_id: Some(chat_request_id),
             cancellation: Some(cancellation),
+            tool_responses: Arc::clone(&self.tool_responses),
         }
+    }
+
+    fn resolve_tool_result(&self, tool_call_id: &str, result: ToolCallResult) -> bool {
+        self.tool_responses
+            .lock()
+            .unwrap()
+            .remove(tool_call_id)
+            .map(|sender| sender.send(result).is_ok())
+            .unwrap_or(false)
     }
 }
 
@@ -290,7 +358,9 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
 
     let ctx = Context {
         outbox: outbox.clone(),
+        chat_request_id: None,
         cancellation: None,
+        tool_responses: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // Read stdin on a dedicated task so the main loop can `select!` an idle timer
@@ -424,7 +494,7 @@ async fn run_chat_turn<A: ProviderAdapter>(
     request: ChatRequest,
 ) -> bool {
     let cancellation = CancellationToken::new();
-    let chat_ctx = ctx.with_cancellation(cancellation.clone());
+    let chat_ctx = ctx.with_chat(id, cancellation.clone());
     let mut sink = ChatSink {
         id,
         outbox: outbox.clone(),
@@ -464,10 +534,28 @@ async fn run_chat_turn<A: ProviderAdapter>(
                             send(outbox, Outbound::Ack { id: cancel_id });
                         }
                     }
+                    Request::ToolResult {
+                        id: result_id,
+                        tool_call_id,
+                        result,
+                    } if result_id == id => {
+                        if !chat_ctx.resolve_tool_result(&tool_call_id, result) {
+                            eprintln!(
+                                "adapter-sdk: received tool_result for unknown tool_call_id `{tool_call_id}`"
+                            );
+                        }
+                    }
                     request => pending.push_back(request),
                 }
             }
         }
+    }
+}
+
+fn failed_tool_result(message: impl Into<String>) -> ToolCallResult {
+    ToolCallResult {
+        ok: false,
+        content: message.into(),
     }
 }
 
@@ -556,6 +644,11 @@ async fn dispatch<A: ProviderAdapter>(
             anyhow::anyhow!("internal adapter runtime error: chat_start bypassed cancellable path"),
         ),
         Request::ChatCancel { id } => send(outbox, Outbound::Ack { id }),
+        Request::ToolResult { id, .. } => send_error(
+            outbox,
+            id,
+            anyhow::anyhow!("tool_result arrived without an active chat_start"),
+        ),
         Request::Logout { id } => match adapter.logout(ctx).await {
             Ok(()) => send(outbox, Outbound::Ack { id }),
             Err(error) => send_error(outbox, id, error),
@@ -577,6 +670,7 @@ fn send_error(outbox: &mpsc::UnboundedSender<Outbound>, id: u64, error: anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tokio::sync::oneshot;
 
     struct CancelAwareAdapter {
@@ -612,7 +706,9 @@ mod tests {
         let (outbox, mut frames) = mpsc::unbounded_channel();
         let ctx = Context {
             outbox: outbox.clone(),
+            chat_request_id: None,
             cancellation: None,
+            tool_responses: Arc::new(Mutex::new(HashMap::new())),
         };
         let (requests_tx, mut requests) = mpsc::unbounded_channel();
         let mut pending = VecDeque::new();
@@ -688,6 +784,115 @@ mod tests {
             Ok(Outbound::Delta { id: 7, text }) if text == "before"
         ));
         assert!(frames.try_recv().is_err());
+    }
+
+    struct ToolRequestingAdapter;
+
+    #[async_trait::async_trait]
+    impl ProviderAdapter for ToolRequestingAdapter {
+        fn identity(&self) -> (String, String) {
+            ("test".to_string(), "Test".to_string())
+        }
+
+        async fn chat(
+            &mut self,
+            _request: ChatRequest,
+            ctx: &Context,
+            sink: &mut ChatSink,
+        ) -> Result<ChatRoundOutcome> {
+            let result = ctx
+                .request_tool(
+                    "tool-1",
+                    "run_command",
+                    json!({
+                        "program": "echo",
+                        "args": ["hello"],
+                    }),
+                )
+                .await;
+            sink.delta(format!("tool result: {}", result.content));
+            Ok(ChatRoundOutcome::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_can_wait_for_mid_turn_tool_result() {
+        let (outbox, mut frames) = mpsc::unbounded_channel();
+        let ctx = Context {
+            outbox: outbox.clone(),
+            chat_request_id: None,
+            cancellation: None,
+            tool_responses: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let (requests_tx, mut requests) = mpsc::unbounded_channel();
+        let mut pending = VecDeque::new();
+        let mut adapter = ToolRequestingAdapter;
+
+        let run = run_chat_turn(
+            &mut adapter,
+            &ctx,
+            &outbox,
+            &mut requests,
+            &mut pending,
+            9,
+            ChatRequest {
+                model: "test-model".to_string(),
+                reasoning: None,
+                prompt: PromptBundle::default(),
+                runtime_context: RuntimeContext::default(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+                state: None,
+                tool_results: Vec::new(),
+                extra_messages: Vec::new(),
+            },
+        );
+        let host = async {
+            let frame = frames.recv().await.expect("tool request frame");
+            let Outbound::ToolRequest {
+                id,
+                tool_call_id,
+                name,
+                arguments,
+            } = frame
+            else {
+                panic!("expected tool request frame");
+            };
+            assert_eq!(id, 9);
+            assert_eq!(tool_call_id, "tool-1");
+            assert_eq!(name, "run_command");
+            assert_eq!(arguments["program"], "echo");
+            let result = Request::ToolResult {
+                id,
+                tool_call_id,
+                result: ToolCallResult {
+                    ok: true,
+                    content: "done".to_string(),
+                },
+            };
+            requests_tx
+                .send(serde_json::to_string(&result).expect("encode tool result"))
+                .expect("send tool result");
+        };
+
+        let (stdin_open, _) = tokio::join!(run, host);
+
+        assert!(stdin_open);
+        let mut emitted = Vec::new();
+        while let Ok(frame) = frames.try_recv() {
+            emitted.push(frame);
+        }
+        assert!(matches!(
+            emitted.as_slice(),
+            [
+                Outbound::Delta { id: 9, text },
+                Outbound::ChatRoundComplete {
+                    id: 9,
+                    state,
+                    tool_calls
+                },
+            ] if text == "tool result: done" && state.is_none() && tool_calls.is_empty()
+        ));
     }
 
     #[test]

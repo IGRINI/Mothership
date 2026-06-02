@@ -24,7 +24,7 @@ use crate::connectors::{
     AdapterSettingPatchValue, ConnectorSettingsEvent, ConnectorSettingsSnapshot,
 };
 use crate::{
-    ChatConversation, ChatRunCancellationResult, ChatRunEvent, ChatThreadSummary,
+    ChatConversation, ChatRunCancellationResult, ChatRunEvent, ChatThreadSummary, ChatUpdatedEvent,
     DashboardSnapshot, MothershipError, ProjectSnapshot, ReasoningConfig, SendChatMessageResult,
     SidecarStatus, ToolApprovalAnswer, ToolExecutionAccepted, ToolExecutionCancellationResult,
     ToolExecutionEvent, ToolExecutionRequest,
@@ -143,6 +143,11 @@ pub enum CoreRequest {
         provider_id: String,
         model_id: String,
     },
+    SetChatModel {
+        chat_id: String,
+        provider_id: String,
+        model_id: String,
+    },
     SaveAdapterSettings {
         provider_id: String,
         values: BTreeMap<String, AdapterSettingPatchValue>,
@@ -184,6 +189,8 @@ pub enum CoreResponse {
     Dashboard(DashboardSnapshot),
     ChatList(Vec<ChatThreadSummary>),
     Chat(ChatConversation),
+    /// Updated chat summary returned by `set_chat_model`.
+    ChatSummary(ChatThreadSummary),
     /// The synchronous half of sending a message: the persisted user + assistant
     /// placeholder. The streamed completion follows as `Event::ChatRun`s.
     ChatMessageStarted(SendChatMessageResult),
@@ -208,6 +215,7 @@ pub enum CoreEvent {
     ChatRun(ChatRunEvent),
     ToolExecution(ToolExecutionEvent),
     ConnectorSettings(ConnectorSettingsEvent),
+    ChatUpdated(ChatUpdatedEvent),
     #[serde(other)]
     Unknown,
 }

@@ -28,7 +28,7 @@ use mothership_core::ipc::{
 use mothership_core::{
     schedule_cancel_fallback, trusted_built_in_adapter_sha256, AdapterPool, AuthProcessRegistry,
     ChatRunCancellationResult, ChatRunEvent, ChatRunEventSink, ChatRunRegistry, ChatRunService,
-    ConnectorManager, ConnectorSettingsEvent, ConnectorSettingsEventKind,
+    ChatUpdatedEvent, ConnectorManager, ConnectorSettingsEvent, ConnectorSettingsEventKind,
     ConservativeCommandPermissionPolicy, Database, FileToolOutputStore, LlmToolCallHandler,
     PendingToolApprovalGate, ProviderRuntimeManager, SendChatMessageResult, ToolApprovalAnswer,
     ToolApprovalDecision, ToolCancellationToken, ToolExecutionAccepted,
@@ -614,6 +614,21 @@ fn compute(
             connector_manager.set_selected_model(&provider_id, &model_id)?,
             None,
         ),
+        CoreRequest::SetChatModel {
+            chat_id,
+            provider_id,
+            model_id,
+        } => {
+            // Validate the model exists among installed adapters WITHOUT mutating
+            // the global default (that's the whole point of per-chat).
+            connector_manager.ensure_model_supported(&provider_id, &model_id)?;
+            let chat = database.set_chat_model(&chat_id, &provider_id, &model_id)?;
+            RequestOutcome {
+                response: CoreResponse::ChatSummary(chat.clone()),
+                event: Some(CoreEvent::ChatUpdated(ChatUpdatedEvent { chat })),
+                connector_refresh: None,
+            }
+        }
         CoreRequest::SaveAdapterSettings {
             provider_id,
             values,

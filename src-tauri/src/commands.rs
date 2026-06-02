@@ -339,6 +339,25 @@ pub async fn set_selected_model(
 }
 
 #[tauri::command]
+pub async fn set_chat_model(
+    state: State<'_, AppState>,
+    chat_id: String,
+    provider_id: String,
+    model_id: String,
+) -> Result<ChatThreadSummary, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::SetChatModel {
+            chat_id,
+            provider_id,
+            model_id,
+        })
+        .await?;
+    expect_variant!(response, CoreResponse::ChatSummary)
+}
+
+#[tauri::command]
 pub async fn save_adapter_settings(
     state: State<'_, AppState>,
     provider_id: String,

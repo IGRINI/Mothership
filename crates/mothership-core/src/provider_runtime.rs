@@ -9,6 +9,7 @@ use crate::adapter_pool::AdapterPool;
 use crate::auth::FileCredentialVault;
 use crate::llm::{
     LlmChatCompletionEventSink, LlmChatRound, LlmChatRoundGateway, LlmChatRoundRequest,
+    LlmToolCallHandler,
 };
 use crate::subprocess_gateway::SubprocessChatGateway;
 use crate::{ChatCancellationToken, MothershipError, Result};
@@ -100,6 +101,7 @@ impl ProviderRuntimeManager {
         vault: FileCredentialVault,
         run_id: Option<String>,
         request: LlmChatRoundRequest,
+        tool_handler: Option<Arc<dyn LlmToolCallHandler>>,
         cancellation: &ChatCancellationToken,
         sink: &mut dyn LlmChatCompletionEventSink,
     ) -> Result<LlmChatRound> {
@@ -108,6 +110,9 @@ impl ProviderRuntimeManager {
         let mut gateway = SubprocessChatGateway::new(Arc::clone(&self.pool), entry, vault);
         if let Some(run_id) = run_id {
             gateway = gateway.with_run_id(run_id);
+        }
+        if let Some(tool_handler) = tool_handler {
+            gateway = gateway.with_tool_handler(tool_handler);
         }
         let result = gateway.complete_round(request, cancellation, sink);
 

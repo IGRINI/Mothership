@@ -6,6 +6,7 @@ use std::path::Path;
 
 use mothership_adapter_host::protocol::{
     AuthKind, ChatMessage, ModelManagement, PromptBundle, RuntimeContext, SettingsFieldKind,
+    ToolCallResult,
 };
 use mothership_adapter_host::Adapter;
 
@@ -59,6 +60,10 @@ fn echo_adapter_round_trip() {
             Vec::new(),
             Vec::new(),
             || false,
+            |call| ToolCallResult {
+                ok: false,
+                content: format!("unexpected tool request: {}", call.name),
+            },
             |delta| deltas.push(delta.to_string()),
         )
         .expect("chat round");

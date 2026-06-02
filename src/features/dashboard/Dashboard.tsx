@@ -38,6 +38,7 @@ import {
   ChatMessage,
   ChatMessagePart,
   ChatThreadSummary,
+  ChatUpdatedEvent,
   ConnectorSettingsEvent,
   ConnectorProviderSummary,
   ConnectorSettingsSnapshot,
@@ -66,6 +67,7 @@ import {
   pickProjectDirectory,
   retryChatMessage,
   sendChatMessage,
+  setChatModel,
   setSelectedModel,
 } from "../../shared/api/mothership";
 import { VirtualList } from "../../shared/ui/VirtualList";
@@ -126,6 +128,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   let unlistenChatRun: (() => void) | undefined;
   let unlistenConnectorSettings: (() => void) | undefined;
   let unlistenToolExecution: (() => void) | undefined;
+  let unlistenChatUpdated: (() => void) | undefined;
   let messageScrollElement: HTMLDivElement | undefined;
   let restoreScrollFrame = 0;
   let openChatRequestId = 0;
@@ -140,9 +143,18 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     const chatId = activeChatId();
     return chatId ? activeRunIds()[chatId] : undefined;
   };
-  const selectedModel = createMemo(() =>
-    selectedConnectorModel(connectorSettings()),
-  );
+  // The "current model" follows the ACTIVE CHAT (provider/model persisted on the
+  // chat), falling back to the global default-for-new-chats. This drives reasoning
+  // coercion and the header selectors, so opening a chat restores its model.
+  const selectedModel = createMemo(() => {
+    const chat = activeChat();
+    const settings = connectorSettings();
+    return connectorModelFor(
+      settings,
+      chat?.providerId ?? settings?.selectedModel.providerId,
+      chat?.modelId ?? settings?.selectedModel.modelId,
+    );
+  });
   const [reasoningOptionId, setReasoningOptionId] =
     createSignal<ReasoningOptionId>();
   const isChatRunning = () =>
@@ -193,6 +205,19 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         }
       });
 
+      void listen<ChatUpdatedEvent>("chat-updated", (event) => {
+        // A chat's metadata changed (e.g. its model was set, possibly on another
+        // client). Patch the summary in place — no reorder — so the active chat's
+        // model and the header selectors update reactively.
+        setChats((current) => mergeChatInPlace(current, event.payload.chat));
+      }).then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          unlistenChatUpdated = unlisten;
+        }
+      });
+
       onCleanup(() => {
         disposed = true;
       });
@@ -204,6 +229,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     unlistenChatRun?.();
     unlistenConnectorSettings?.();
     unlistenToolExecution?.();
+    unlistenChatUpdated?.();
   });
 
   async function loadProjectScope() {
@@ -636,8 +662,18 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   }
 
   async function handleSelectModel(providerId: string, modelId: string) {
+    const chatId = activeChatId();
     try {
-      setConnectorSettings(await setSelectedModel(providerId, modelId));
+      if (chatId) {
+        // Per-chat model: persisted on the chat and synced to other clients via
+        // the chat-updated event. We also patch the local summary in place so the
+        // selector reflects it immediately.
+        const chat = await setChatModel(chatId, providerId, modelId);
+        setChats((current) => mergeChatInPlace(current, chat));
+      } else {
+        // No active chat → set the global default applied to new chats.
+        setConnectorSettings(await setSelectedModel(providerId, modelId));
+      }
     } catch (caughtError) {
       setError(errorMessage(caughtError));
     }
@@ -1302,11 +1338,28 @@ function ConversationPane(props: {
     }
     return map;
   });
+  // The open chat owns its model (provider + model id); fall back to the global
+  // default-for-new-chats. The header selectors + status dot derive from this, so
+  // they reflect the open chat rather than a global setting.
+  const chatModel = createMemo(() => {
+    const chat = props.activeChat;
+    const settings = props.connectorSettings;
+    return {
+      providerId: chat?.providerId ?? settings?.selectedModel.providerId,
+      modelId: chat?.modelId ?? settings?.selectedModel.modelId,
+    };
+  });
   const activeProvider = createMemo(() =>
-    selectedConnectorProvider(props.connectorSettings),
+    connectorProviderFor(props.connectorSettings, chatModel().providerId),
   );
+  // Reasoning options must follow the OPEN CHAT's model, not the global one —
+  // otherwise the composer offers reasoning levels for the wrong model.
   const activeModel = createMemo(() =>
-    selectedConnectorModel(props.connectorSettings),
+    connectorModelFor(
+      props.connectorSettings,
+      chatModel().providerId,
+      chatModel().modelId,
+    ),
   );
 
   return (
@@ -1335,11 +1388,13 @@ function ConversationPane(props: {
         <div class="agent-status-chip">
           <Terminal size={16} />
           <ModelSelector
+            selected={chatModel()}
             settings={props.connectorSettings}
             onSelectModel={props.onSelectModel}
           />
           <ProviderStatusDot provider={activeProvider()} />
           <ProviderSelector
+            selected={chatModel()}
             settings={props.connectorSettings}
             onSelectModel={props.onSelectModel}
           />
@@ -1468,9 +1523,14 @@ function ConversationState(props: {
 
 function ModelSelector(props: {
   onSelectModel: (providerId: string, modelId: string) => void;
+  selected?: { providerId?: string | null; modelId?: string | null };
   settings?: ConnectorSettingsSnapshot;
 }) {
-  const activeProvider = () => selectedConnectorProvider(props.settings);
+  const activeProvider = () =>
+    connectorProviderFor(
+      props.settings,
+      props.selected?.providerId ?? props.settings?.selectedModel.providerId,
+    );
   const models = () => activeProvider()?.models ?? [];
   const isRefreshing = () => {
     const provider = activeProvider();
@@ -1502,9 +1562,12 @@ function ModelSelector(props: {
     );
   };
   const selectedValue = () => {
-    const selected = props.settings?.selectedModel;
-    return selected
-      ? modelOptionValue(selected.providerId, selected.modelId)
+    const providerId =
+      props.selected?.providerId ?? props.settings?.selectedModel.providerId;
+    const modelId =
+      props.selected?.modelId ?? props.settings?.selectedModel.modelId;
+    return providerId && modelId
+      ? modelOptionValue(providerId, modelId)
       : "";
   };
   const placeholder = () =>
@@ -1556,11 +1619,15 @@ function ProviderStatusDot(props: { provider?: ConnectorProviderSummary }) {
 
 function ProviderSelector(props: {
   onSelectModel: (providerId: string, modelId: string) => void;
+  selected?: { providerId?: string | null; modelId?: string | null };
   settings?: ConnectorSettingsSnapshot;
 }) {
   const providers = () => props.settings?.providers ?? [];
-  const selectedProviderId = () => props.settings?.selectedModel.providerId ?? "";
-  const activeProvider = () => selectedConnectorProvider(props.settings);
+  const currentProviderId = () =>
+    props.selected?.providerId ?? props.settings?.selectedModel.providerId;
+  const selectedProviderId = () => currentProviderId() ?? "";
+  const activeProvider = () =>
+    connectorProviderFor(props.settings, currentProviderId());
   const status = () => providerStatusSummary(activeProvider());
   const options = createMemo<SearchSelectOption[]>(() =>
     providers().map((provider) => {
@@ -1899,23 +1966,26 @@ interface ProviderStatusSummary {
   tooltip: string;
 }
 
-function selectedConnectorProvider(settings?: ConnectorSettingsSnapshot) {
-  const providerId = settings?.selectedModel.providerId;
+function connectorProviderFor(
+  settings: ConnectorSettingsSnapshot | undefined,
+  providerId: string | null | undefined,
+) {
   if (!providerId) {
     return undefined;
   }
-
   return settings?.providers.find((provider) => provider.id === providerId);
 }
 
-function selectedConnectorModel(settings?: ConnectorSettingsSnapshot) {
-  const selected = settings?.selectedModel;
-  if (!selected) {
+function connectorModelFor(
+  settings: ConnectorSettingsSnapshot | undefined,
+  providerId: string | null | undefined,
+  modelId: string | null | undefined,
+) {
+  if (!modelId) {
     return undefined;
   }
-
-  return selectedConnectorProvider(settings)?.models.find(
-    (model) => model.id === selected.modelId,
+  return connectorProviderFor(settings, providerId)?.models.find(
+    (model) => model.id === modelId,
   );
 }
 

@@ -31,7 +31,8 @@ pub use mothership_adapter_protocol as protocol;
 
 use protocol::{
     AuthKind, AuthStatus, ChatMessage, Model, ModelManagement, Outbound, PromptBundle, Request,
-    RuntimeContext, SettingsField, ToolCallInvocation, ToolCallResponse, ToolDescriptor,
+    RuntimeContext, SettingsField, ToolCallInvocation, ToolCallResponse, ToolCallResult,
+    ToolDescriptor,
 };
 
 /// Handler the host registers to persist secrets an adapter pushes via the
@@ -265,6 +266,7 @@ impl Adapter {
         tool_results: Vec<ToolCallResponse>,
         extra_messages: Vec<ChatMessage>,
         is_cancelled: impl Fn() -> bool + Send + 'static,
+        mut on_tool_request: impl FnMut(ToolCallInvocation) -> ToolCallResult,
         mut on_delta: impl FnMut(&str),
     ) -> Result<AdapterChatRound> {
         let id = self.next_id();
@@ -300,6 +302,23 @@ impl Adapter {
                 Ok(Outbound::Delta { id: got, text }) if got == id => {
                     full.push_str(&text);
                     on_delta(&text);
+                }
+                Ok(Outbound::ToolRequest {
+                    id: got,
+                    tool_call_id,
+                    name,
+                    arguments,
+                }) if got == id => {
+                    let result = on_tool_request(ToolCallInvocation {
+                        tool_call_id: tool_call_id.clone(),
+                        name,
+                        arguments,
+                    });
+                    self.send(&Request::ToolResult {
+                        id,
+                        tool_call_id,
+                        result,
+                    })?;
                 }
                 Ok(Outbound::ChatRoundComplete {
                     id: got,

@@ -62,12 +62,12 @@ impl ProviderAdapter for ClaudeAgentAdapter {
     async fn chat(
         &mut self,
         request: ChatRequest,
-        _ctx: &Context,
+        ctx: &Context,
         sink: &mut ChatSink,
     ) -> anyhow::Result<ChatRoundOutcome> {
         if !self.settings.has_oauth_token() {
             anyhow::bail!("missing Claude OAuth token (set it in adapter settings)");
         }
-        cli::stream_chat(&self.settings, request, sink).await
+        cli::stream_chat(&self.settings, request, ctx, sink).await
     }
 }

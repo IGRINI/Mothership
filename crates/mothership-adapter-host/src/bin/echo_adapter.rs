@@ -150,6 +150,7 @@ fn main() -> anyhow::Result<()> {
                 )?;
             }
             Request::ChatCancel { id } => emit(&mut stdout, &Outbound::Ack { id })?,
+            Request::ToolResult { id, .. } => emit(&mut stdout, &Outbound::Ack { id })?,
             Request::Logout { id } => emit(&mut stdout, &Outbound::Ack { id })?,
         }
     }

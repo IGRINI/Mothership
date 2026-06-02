@@ -53,6 +53,7 @@ pub fn run() {
             commands::save_adapter_settings,
             commands::send_chat_message,
             commands::set_active_project,
+            commands::set_chat_model,
             commands::set_selected_model,
         ])
         .build(tauri::generate_context!())

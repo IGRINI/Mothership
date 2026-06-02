@@ -25,7 +25,7 @@ pub use chat::{
     ChatCancellationToken, ChatConversation, ChatMessage, ChatMessagePart, ChatMessagePartKind,
     ChatMessageRole, ChatMessageStatus, ChatRunCancellationResult, ChatRunContext,
     ChatRunContextSpec, ChatRunEvent, ChatRunEventKind, ChatRunEventSink, ChatThreadSummary,
-    NoopChatRunEventSink, SendChatMessageResult,
+    ChatUpdatedEvent, NoopChatRunEventSink, SendChatMessageResult,
 };
 pub use connectors::{
     trusted_built_in_adapter_sha256, AdapterSettingPatchValue, AuthProcessRegistry,
