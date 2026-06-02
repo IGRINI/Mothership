@@ -730,6 +730,29 @@ pub fn edit_file(
         ));
     }
 
+    // Refuse to edit files larger than the read ceiling. Unlike read_file (prefix)
+    // and write_file (stream-hash + capped prefix), edit_file must load the WHOLE
+    // file to apply a content-addressed replacement, so an unbounded read here would
+    // reintroduce the memory problem. Check the size BEFORE reading and point at
+    // targeted alternatives. (If metadata is unavailable we fall through and let the
+    // read proceed.)
+    if let Ok(meta) = fs.metadata(&resolved) {
+        if meta.len > MAX_READ_FILE_BYTES as u64 {
+            return Ok(FileToolOutcome::failure(
+                format!(
+                    "`{}` is {} bytes, larger than the {}-byte edit ceiling; use apply_patch for a targeted change, or run_command for very large files",
+                    input.path, meta.len, MAX_READ_FILE_BYTES
+                ),
+                json!({
+                    "path": input.path,
+                    "status": "too_large",
+                    "size": meta.len,
+                    "editCeilingBytes": MAX_READ_FILE_BYTES,
+                }),
+            ));
+        }
+    }
+
     let bytes = fs.read(&resolved).map_err(|error| FileToolError::Io(error.to_string()))?;
     let old_sha = sha256_hex(&bytes);
     if let Some(expected) = &input.expected_sha256 {
@@ -1847,6 +1870,77 @@ mod tests {
     }
 
     // ---- edit_file --------------------------------------------------------
+
+    #[test]
+    fn edit_file_refuses_files_over_the_read_cap() {
+        // edit_file must load the WHOLE file to apply a content-addressed edit, so
+        // it refuses files larger than the read ceiling (mirroring read_file) rather
+        // than slurping them. A double whose `read`/`read_capped` panic proves the
+        // guard returns BEFORE any read.
+        struct OversizeFs {
+            len: u64,
+        }
+        impl FileSystem for OversizeFs {
+            fn read(&self, _p: &std::path::Path) -> std::io::Result<Vec<u8>> {
+                panic!("edit_file must refuse an oversize file before reading it");
+            }
+            fn read_capped(
+                &self,
+                _p: &std::path::Path,
+                _m: usize,
+            ) -> std::io::Result<(Vec<u8>, bool)> {
+                panic!("edit_file must not read an oversize file at all");
+            }
+            fn write_atomic(&self, _p: &std::path::Path, _b: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn metadata(&self, _p: &std::path::Path) -> std::io::Result<FileMetadata> {
+                Ok(FileMetadata {
+                    len: self.len,
+                    is_dir: false,
+                })
+            }
+            fn exists(&self, _p: &std::path::Path) -> bool {
+                true
+            }
+            fn rename(&self, _f: &std::path::Path, _t: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_file(&self, _p: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn create_dir_all(&self, _p: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_dir(&self, _p: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (ws, dir) = temp_workspace("edit_oversize");
+        // resolve_guarded canonicalizes against the real fs, so the path must exist
+        // on disk; the OversizeFs double supplies the (pretend) size.
+        fs::write(dir.join("big.rs"), b"placeholder").unwrap();
+        let fs = OversizeFs {
+            len: MAX_READ_FILE_BYTES as u64 + 1,
+        };
+
+        let out = edit_file(
+            &json!({ "path": "big.rs", "oldText": "a", "newText": "b" }),
+            &ws,
+            &fs,
+        )
+        .unwrap();
+        assert!(!out.ok);
+        assert_eq!(out.data["status"], "too_large");
+        assert!(
+            out.model_text.contains("apply_patch") && out.model_text.contains("run_command"),
+            "should point at targeted alternatives: {}",
+            out.model_text
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn edit_file_applies_unique_edit() {
