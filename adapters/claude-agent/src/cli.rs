@@ -287,12 +287,16 @@ pub(crate) async fn stream_chat(
 const MOTHERSHIP_FILE_TOOL_NAMES: &[&str] =
     &["read_file", "write_file", "edit_file", "apply_patch"];
 
-/// Claude's native file-MUTATION tools. We disable these when the supervised
-/// Mothership file tools are bridged, forcing Claude to mutate through the
-/// bridge. Native `Read` is intentionally NOT included: reads are lower-risk and
-/// leaving Claude's fast native reader available avoids round-tripping every file
-/// view through the bridge.
+/// Claude's native file-MUTATION tools. Disabled when the supervised Mothership
+/// file tools are bridged, so writes cannot bypass Mothership's
+/// approval/event/history pipeline.
 const NATIVE_FILE_MUTATION_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
+/// Claude's native file READER. Disabled when Mothership `read_file` is bridged so
+/// every read also flows through the typed tool (uniform history/capabilities),
+/// not just mutations — reads then go through `mcp__mothership__read_file`. Gated
+/// on `read_file` specifically so the model is never left without a read path.
+const NATIVE_FILE_READ_TOOLS: &[&str] = &["Read"];
 
 fn disallowed_tools_for_request(request: &ChatRequest) -> Vec<&'static str> {
     let mut tools = HEADLESS_DISALLOWED_TOOLS.to_vec();
@@ -301,13 +305,20 @@ fn disallowed_tools_for_request(request: &ChatRequest) -> Vec<&'static str> {
     }
     // When the Mothership file tools are present (and therefore bridged), disable
     // Claude's native file-mutation tools so file writes cannot bypass Mothership
-    // approvals/events/history. Reads stay native.
+    // approvals/events/history.
     if request
         .tools
         .iter()
         .any(|tool| MOTHERSHIP_FILE_TOOL_NAMES.contains(&tool.name.as_str()))
     {
         tools.extend_from_slice(NATIVE_FILE_MUTATION_TOOLS);
+    }
+    // Route reads through Mothership too: disable Claude's native reader when the
+    // Mothership `read_file` tool is bridged, so every read is captured in typed
+    // history/capabilities rather than skipping the pipeline. Gated on `read_file`
+    // itself so we never strip the model's only read path.
+    if request.tools.iter().any(|tool| tool.name == "read_file") {
+        tools.extend_from_slice(NATIVE_FILE_READ_TOOLS);
     }
     tools
 }
@@ -652,10 +663,24 @@ mod tests {
         }
         // Bash is also disabled because run_command is present.
         assert!(disallowed.contains(&"Bash"));
-        // Native `Read` stays enabled (reads are lower-risk).
+        // Native `Read` is disabled too (read_file is bridged), so reads also flow
+        // through Mothership for uniform history/capabilities.
+        assert!(
+            disallowed.contains(&"Read"),
+            "native Read must be disabled when read_file is bridged"
+        );
+    }
+
+    #[test]
+    fn keeps_native_read_when_read_file_not_bridged() {
+        // Mutation tools bridged but no read_file: native Read must stay enabled so
+        // the model is never left without any way to read a file.
+        let request = request_with_tools(&["run_command", "edit_file"]);
+        let disallowed = disallowed_tools_for_request(&request);
+        assert!(disallowed.contains(&"Edit"));
         assert!(
             !disallowed.contains(&"Read"),
-            "native Read must remain enabled"
+            "native Read must stay enabled when read_file is not bridged"
         );
     }
 
