@@ -13,18 +13,36 @@
 //! entire plan with `Err`. It never produces a partial plan and never mutates
 //! anything — applying the resulting `new_content` is the caller's job.
 //!
+//! # Relationship to the canonical OpenAI Codex `apply_patch`
+//!
+//! The grammar, the hunk-location algorithm (the escalating-tier fuzzy
+//! `seek_sequence`), the `@@` context-header seek, the `*** End of File` anchor,
+//! pure-addition placement, the trailing-empty-line retry, and the
+//! trailing-newline normalization are all ported from
+//! `codex-rs/apply-patch` so that patches a real Codex/GPT model emits are
+//! accepted and applied identically. On top of that canonical core we keep our
+//! own better properties:
+//!
+//! * typed [`PatchError`] / [`PlanError`] carrying **1-based line numbers**,
+//! * **all-or-none** [`plan_patch`] (never a partial plan),
+//! * an [`ExistsView`] overlay so duplicate targets and move collisions that
+//!   only exist mid-patch are detected,
+//! * CRLF tolerance, multi-file, and Add/Update/Delete/Move.
+//!
 //! # The V4A envelope grammar
 //!
 //! ```text
 //! *** Begin Patch
+//! *** Environment ID: <id>          (optional preamble; tolerated and ignored)
 //! *** Add File: <path>
-//! +<line>                          (every added line prefixed with '+')
+//! +<line>                           (every added line prefixed with '+')
 //! *** Update File: <path>
-//! *** Move to: <newpath>           (optional, only directly under Update)
-//! @@ <optional context header>     (zero or more hunks)
-//!  <context line>                  (leading single space)
+//! *** Move to: <newpath>            (optional, only directly under Update)
+//! @@ <optional context header>      (zero or more hunks; @@ may stack)
+//!  <context line>                   (leading single space)
 //! -<removed line>
 //! +<added line>
+//! *** End of File                   (optional; anchors the hunk at EOF)
 //! *** Delete File: <path>
 //! *** End Patch
 //! ```
@@ -32,6 +50,18 @@
 //! Multiple file sections may appear between `*** Begin Patch` and `*** End
 //! Patch`. CRLF and LF line endings are both accepted, and trailing whitespace
 //! on structural marker lines is tolerated.
+//!
+//! # Trailing-newline policy (matches Codex)
+//!
+//! We replicate Codex's normalization exactly. The current file content is split
+//! on `'\n'` and the trailing empty element produced by a final newline is
+//! dropped, so line counts match `diff`. After applying all hunks, if the last
+//! resulting line is not already empty we append one empty line before joining
+//! with `'\n'`. The practical consequence is that **an updated file is always
+//! newline-terminated** — even if the original had no final newline. This is the
+//! canonical Codex behavior and is intentional; it keeps results identical to a
+//! real `apply_patch`. (Add-file bodies are *not* forced to end with a newline;
+//! they reproduce the `+` lines verbatim, also matching Codex.)
 
 #![allow(dead_code)]
 
@@ -61,11 +91,28 @@ pub enum PatchOp {
 /// A contiguous group of changes within an `Update` section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hunk {
-    /// The text following `@@` on the hunk header, if a header was present.
-    /// `None` when the hunk had no `@@` line (e.g. a single leading hunk).
-    pub context_header: Option<String>,
+    /// The text following `@@` on the hunk header(s), if any were present, in
+    /// order. `None`/empty when the hunk had no `@@` line (e.g. a single leading
+    /// hunk). Multiple stacked `@@` lines (each narrowing the location) are
+    /// supported and are sought in order before the old block is located. The
+    /// canonical Codex format documents stacked `@@` lines; this is a strict
+    /// superset of Codex's parser, which keeps only a single context line.
+    pub context_headers: Vec<String>,
     /// The ordered body of the hunk.
     pub lines: Vec<HunkLine>,
+    /// True if the hunk was terminated by a `*** End of File` marker, meaning its
+    /// old block must be anchored at the end of the file (Codex searches the EOF
+    /// position first when this is set).
+    pub is_end_of_file: bool,
+}
+
+impl Hunk {
+    /// The single (or last) context header, for compatibility with callers that
+    /// expect Codex's one-context-line model. Returns the most specific (last)
+    /// `@@` header if any were present.
+    pub fn context_header(&self) -> Option<&str> {
+        self.context_headers.last().map(String::as_str)
+    }
 }
 
 /// One line inside a [`Hunk`].
@@ -106,6 +153,8 @@ pub enum PatchError {
     BadHunkLine { line: usize, detail: String },
     /// Content appeared after `*** End Patch`, or no file sections were found.
     Structure { line: usize, detail: String },
+    /// An `*** Environment ID:` preamble line was present but carried no id.
+    EmptyEnvironmentId { line: usize },
 }
 
 impl fmt::Display for PatchError {
@@ -133,6 +182,9 @@ impl fmt::Display for PatchError {
             PatchError::Structure { line, detail } => {
                 write!(f, "line {line}: {detail}")
             }
+            PatchError::EmptyEnvironmentId { line } => {
+                write!(f, "line {line}: `*** Environment ID:` must not be empty")
+            }
         }
     }
 }
@@ -149,6 +201,8 @@ const ADD_FILE: &str = "*** Add File:";
 const UPDATE_FILE: &str = "*** Update File:";
 const DELETE_FILE: &str = "*** Delete File:";
 const MOVE_TO: &str = "*** Move to:";
+const END_OF_FILE: &str = "*** End of File";
+const ENVIRONMENT_ID: &str = "*** Environment ID:";
 
 /// Strip a single trailing `\r` (so the parser is CRLF-tolerant after we split
 /// on `\n`).
@@ -157,8 +211,9 @@ fn strip_cr(line: &str) -> &str {
 }
 
 /// True if `line` is exactly the bare `marker`, ignoring trailing whitespace.
-/// Used for the standalone `*** Begin Patch` / `*** End Patch` markers, which
-/// carry no value and so may have arbitrary trailing whitespace.
+/// Used for the standalone `*** Begin Patch` / `*** End Patch` / `*** End of
+/// File` markers, which carry no value and so may have arbitrary trailing
+/// whitespace.
 ///
 /// We never trim *leading* whitespace: a marker must start at column 0.
 fn is_bare_marker(line: &str, marker: &str) -> bool {
@@ -172,16 +227,24 @@ fn marker_value<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
     line.strip_prefix(marker).map(str::trim)
 }
 
-/// True if a CR-stripped line is any `***` structural marker. Used to detect the
-/// end of a file body / hunk region. Trailing whitespace is tolerated for the
-/// bare markers.
+/// True if a CR-stripped line is any `***` structural marker that terminates a
+/// file body / hunk region. `*** End of File` is included so it cleanly ends a
+/// hunk body. Trailing whitespace is tolerated for the bare markers.
 fn is_section_marker(line: &str) -> bool {
     is_bare_marker(line, BEGIN_PATCH)
         || is_bare_marker(line, END_PATCH)
+        || is_bare_marker(line, END_OF_FILE)
         || line.starts_with(ADD_FILE)
         || line.starts_with(UPDATE_FILE)
         || line.starts_with(DELETE_FILE)
         || line.starts_with(MOVE_TO)
+}
+
+/// True if a CR-stripped line is a git-style "no newline at end of file"
+/// annotation. Such lines are emitted by some diff tools and carry no content;
+/// like git/codex we skip them wherever they appear inside a body.
+fn is_no_newline_marker(line: &str) -> bool {
+    line.trim_start().starts_with("\\ No newline at end of file")
 }
 
 // ---------------------------------------------------------------------------
@@ -191,8 +254,10 @@ fn is_section_marker(line: &str) -> bool {
 /// Parse a V4A patch envelope into a list of [`PatchOp`].
 ///
 /// Accepts both LF and CRLF line endings and tolerates trailing whitespace on
-/// structural markers. Returns a [`PatchError`] (with a 1-based line number
-/// where one applies) on malformed input. Never panics.
+/// structural markers. Recognizes the optional `*** Environment ID:` preamble
+/// (which is consumed and ignored) and the `*** End of File` hunk terminator.
+/// Returns a [`PatchError`] (with a 1-based line number where one applies) on
+/// malformed input. Never panics.
 pub fn parse_v4a(patch: &str) -> Result<Vec<PatchOp>, PatchError> {
     // Split on '\n'; `strip_cr` handles the trailing '\r' of CRLF. We keep blank
     // lines because they are meaningful inside hunks / file bodies.
@@ -208,6 +273,18 @@ pub fn parse_v4a(patch: &str) -> Result<Vec<PatchOp>, PatchError> {
         return Err(PatchError::MissingBegin);
     }
     idx += 1; // consume Begin Patch
+
+    // Optional `*** Environment ID:` preamble, immediately after Begin Patch.
+    // Codex tolerates this remote-execution marker; we accept and discard it but
+    // still reject an empty id (matching Codex's validation).
+    if idx < lines.len() {
+        if let Some(id) = marker_value(lines[idx], ENVIRONMENT_ID) {
+            if id.is_empty() {
+                return Err(PatchError::EmptyEnvironmentId { line: idx + 1 });
+            }
+            idx += 1;
+        }
+    }
 
     let mut ops: Vec<PatchOp> = Vec::new();
     let mut saw_end = false;
@@ -313,13 +390,18 @@ pub fn parse_v4a(patch: &str) -> Result<Vec<PatchOp>, PatchError> {
 
 /// Parse the body of an `*** Add File:` section: a run of `+`-prefixed lines
 /// terminated by the next `***` marker (or end of input). `*idx` is advanced to
-/// the terminating marker (or past the end).
+/// the terminating marker (or past the end). A git-style `\ No newline at end of
+/// file` annotation is tolerated and skipped.
 fn parse_add_body(lines: &[&str], idx: &mut usize) -> Result<String, PatchError> {
     let mut body: Vec<&str> = Vec::new();
     while *idx < lines.len() {
         let line = lines[*idx];
         if is_section_marker(line) {
             break;
+        }
+        if is_no_newline_marker(line) {
+            *idx += 1;
+            continue;
         }
         let lineno = *idx + 1;
         match line.strip_prefix('+') {
@@ -371,10 +453,37 @@ fn parse_update_body(
 
     let mut hunks: Vec<Hunk> = Vec::new();
     let mut current: Option<Hunk> = None;
+    // True once the open hunk has any body line. A `@@` line seen *before* any
+    // body line stacks onto the current hunk's headers; a `@@` seen *after* body
+    // content opens a new hunk.
+    let mut current_has_body = false;
 
     while *idx < lines.len() {
         let line = lines[*idx];
         let lineno = *idx + 1;
+
+        // `*** End of File` terminates the *current* hunk (anchoring it at EOF)
+        // and continues; any other section marker ends the whole update body.
+        if is_bare_marker(line, END_OF_FILE) {
+            if let Some(h) = current.as_mut() {
+                h.is_end_of_file = true;
+            } else {
+                // An EOF marker with no preceding hunk content opens an empty,
+                // EOF-anchored hunk (harmless; planning will treat it as such).
+                current = Some(Hunk {
+                    context_headers: Vec::new(),
+                    lines: Vec::new(),
+                    is_end_of_file: true,
+                });
+            }
+            *idx += 1;
+            // Flush the EOF-terminated hunk so a following `@@` starts fresh.
+            if let Some(h) = current.take() {
+                hunks.push(h);
+            }
+            current_has_body = false;
+            continue;
+        }
 
         if is_section_marker(line) {
             // A second `*** Move to:` (or a Move after hunk content) is invalid.
@@ -384,20 +493,40 @@ fn parse_update_body(
             break;
         }
 
+        // A git-style "no newline" annotation carries no content; skip it.
+        if is_no_newline_marker(line) {
+            *idx += 1;
+            continue;
+        }
+
         // Hunk header.
         if let Some(rest) = line.strip_prefix("@@") {
-            if let Some(h) = current.take() {
-                hunks.push(h);
-            }
             let header = rest.trim();
-            current = Some(Hunk {
-                context_header: if header.is_empty() {
-                    None
-                } else {
-                    Some(header.to_string())
-                },
-                lines: Vec::new(),
-            });
+            match current.as_mut() {
+                // Stacked `@@` lines (no body in between) narrow the same hunk.
+                Some(h) if !current_has_body => {
+                    if !header.is_empty() {
+                        h.context_headers.push(header.to_string());
+                    }
+                }
+                // Either no open hunk, or the open hunk already has body lines:
+                // start a new hunk.
+                _ => {
+                    if let Some(h) = current.take() {
+                        hunks.push(h);
+                    }
+                    let mut headers = Vec::new();
+                    if !header.is_empty() {
+                        headers.push(header.to_string());
+                    }
+                    current = Some(Hunk {
+                        context_headers: headers,
+                        lines: Vec::new(),
+                        is_end_of_file: false,
+                    });
+                    current_has_body = false;
+                }
+            }
             *idx += 1;
             continue;
         }
@@ -405,8 +534,9 @@ fn parse_update_body(
         // A body line implicitly opens a leading (header-less) hunk if none is
         // open yet.
         let hunk = current.get_or_insert_with(|| Hunk {
-            context_header: None,
+            context_headers: Vec::new(),
             lines: Vec::new(),
+            is_end_of_file: false,
         });
 
         // Classify the body line by its first byte.
@@ -428,6 +558,7 @@ fn parse_update_body(
                 });
             }
         }
+        current_has_body = true;
         *idx += 1;
     }
 
@@ -540,8 +671,9 @@ pub enum PlanError {
     },
     /// The same path was targeted by more than one op in a single patch.
     DuplicatePath { path: String },
-    /// A hunk contained no `-`/` ` lines to anchor against, so it cannot be
-    /// located deterministically in a non-empty file.
+    /// A hunk contained no `-`/` ` lines to anchor against *and* nothing pinned a
+    /// location (no `@@` header, not end-of-file, file not empty), so it cannot
+    /// be located deterministically.
     EmptyHunk { path: String, hunk_index: usize },
 }
 
@@ -689,104 +821,195 @@ struct AppliedUpdate {
     removed: usize,
 }
 
+/// A single scheduled edit: replace `old_len` lines starting at `start` with
+/// `new_lines`. Mirrors Codex's `(start_index, old_len, new_lines)` triple.
+struct Replacement {
+    start: usize,
+    old_len: usize,
+    new_lines: Vec<String>,
+}
+
 /// Apply every hunk of an `Update` to `current`, in order, returning the new
 /// content and counts. Errors if any hunk fails to match.
+///
+/// This mirrors the canonical Codex algorithm
+/// (`compute_replacements` + `apply_replacements` +
+/// `derive_new_contents_from_chunks`): we compute the set of replacements
+/// (locating each hunk forward from a running cursor, honoring `@@` headers and
+/// the EOF anchor, with the trailing-empty-line retry), then apply them in
+/// descending index order so earlier edits do not shift later ones.
 fn apply_hunks(path: &str, current: &str, hunks: &[Hunk]) -> Result<AppliedUpdate, PlanError> {
-    // Work on a line view of the current content. We must round-trip exactly, so
-    // we track whether the original ended with a trailing newline and rebuild it.
-    let had_trailing_newline = current.ends_with('\n');
-    let normalized = current.strip_suffix('\n').unwrap_or(current);
-    // An empty file (`""`) has zero lines; a file that is just "\n" has one
-    // empty line. `split('\n')` on "" yields [""], so special-case the empty
-    // file to an empty slice.
-    let current_lines: Vec<String> = if normalized.is_empty() && !had_trailing_newline {
-        Vec::new()
-    } else {
-        normalized.split('\n').map(|s| s.to_string()).collect()
-    };
+    // Split into lines exactly as Codex does: split on '\n' and drop the trailing
+    // empty element produced by a final newline, so line counts match `diff` and
+    // an EOF-anchored search lands correctly.
+    let mut original_lines: Vec<String> = current.split('\n').map(String::from).collect();
+    if original_lines.last().is_some_and(String::is_empty) {
+        original_lines.pop();
+    }
 
-    let mut out: Vec<String> = Vec::new();
-    let mut cursor = 0usize; // index into current_lines already emitted
+    let mut replacements: Vec<Replacement> = Vec::new();
+    let mut cursor = 0usize; // line index to continue searching from
     let mut added = 0usize;
     let mut removed = 0usize;
 
     for (hunk_index, hunk) in hunks.iter().enumerate() {
-        // The "old" side of the hunk = context + removed lines, in order.
-        let old: Vec<&String> = hunk
+        // 1. Seek each stacked `@@` context header forward from the cursor and
+        //    advance past it. This disambiguates a block that repeats and mirrors
+        //    Codex's lib.rs (which seeks the single context line then sets
+        //    line_index = idx + 1). Multiple headers are sought in order.
+        for header in &hunk.context_headers {
+            let want = vec![header.clone()];
+            match seek_sequence(&original_lines, &want, cursor, /*eof*/ false) {
+                Some(idx) => cursor = idx + 1,
+                None => {
+                    return Err(PlanError::HunkNoMatch {
+                        path: path.to_string(),
+                        hunk_index,
+                        detail: format!("could not find context header {header:?}"),
+                    });
+                }
+            }
+        }
+
+        // 2. Build the old side (context + removed, in order) and the new side
+        //    (context + added, in order), tracking per-line add/remove counts.
+        let old_lines: Vec<String> = hunk
             .lines
             .iter()
             .filter_map(|l| match l {
-                HunkLine::Context(s) | HunkLine::Removed(s) => Some(s),
+                HunkLine::Context(s) | HunkLine::Removed(s) => Some(s.clone()),
                 HunkLine::Added(_) => None,
             })
             .collect();
+        let new_lines: Vec<String> = hunk
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                HunkLine::Context(s) | HunkLine::Added(s) => Some(s.clone()),
+                HunkLine::Removed(_) => None,
+            })
+            .collect();
+        let hunk_added = hunk
+            .lines
+            .iter()
+            .filter(|l| matches!(l, HunkLine::Added(_)))
+            .count();
+        let hunk_removed = hunk
+            .lines
+            .iter()
+            .filter(|l| matches!(l, HunkLine::Removed(_)))
+            .count();
 
-        if old.is_empty() {
-            // No anchor. If the file is empty we can append the additions; on a
-            // non-empty file an anchorless hunk is ambiguous and rejected.
-            if current_lines.is_empty() {
-                for l in &hunk.lines {
-                    if let HunkLine::Added(s) = l {
-                        out.push(s.clone());
-                        added += 1;
-                    }
-                }
-                continue;
+        if old_lines.is_empty() {
+            // Pure addition (no old anchor lines).
+            //
+            // * If a `@@` header pinned a location, insert right after it (this is
+            //   our improvement over Codex, which always inserts at EOF; the
+            //   header already advanced `cursor`). This makes additions land where
+            //   the patch indicated.
+            // * Otherwise insert at end-of-file, just before a trailing empty line
+            //   if one exists — exactly Codex's behavior.
+            //
+            // Either way the additions must exist somewhere; an anchorless,
+            // header-less, EOF-less, empty-side hunk against content with no
+            // insertion target is only ambiguous if there is genuinely nowhere to
+            // put it. We always have a target (the file end), so this never fails.
+            let insertion_idx = if !hunk.context_headers.is_empty() {
+                cursor
+            } else if original_lines.last().is_some_and(String::is_empty) {
+                original_lines.len() - 1
+            } else {
+                original_lines.len()
+            };
+            // A genuinely empty hunk (no headers, no body, not even an EOF marker)
+            // that targets a non-empty file with no pinned location is rejected as
+            // ambiguous, preserving our stricter contract.
+            if hunk.lines.is_empty()
+                && hunk.context_headers.is_empty()
+                && !hunk.is_end_of_file
+                && !original_lines.is_empty()
+            {
+                return Err(PlanError::EmptyHunk {
+                    path: path.to_string(),
+                    hunk_index,
+                });
             }
-            return Err(PlanError::EmptyHunk {
-                path: path.to_string(),
-                hunk_index,
+            added += hunk_added;
+            replacements.push(Replacement {
+                start: insertion_idx,
+                old_len: 0,
+                new_lines,
             });
+            // Only a header-pinned pure addition advances the cursor (so a
+            // following hunk continues after the inserted block). A header-less
+            // addition is scheduled at EOF and must NOT move the cursor — Codex
+            // leaves `line_index` untouched here, and the sort + reverse-apply
+            // reorders the EOF insertion relative to later replacements.
+            if !hunk.context_headers.is_empty() {
+                cursor = insertion_idx;
+            }
+            continue;
         }
 
-        // Find `old` as a contiguous block at or after `cursor`.
-        let match_at = find_subslice(&current_lines, &old, cursor).ok_or_else(|| {
-            PlanError::HunkNoMatch {
-                path: path.to_string(),
-                hunk_index,
-                detail: format!(
-                    "could not locate the {} context/removed line(s) starting near line {}",
-                    old.len(),
-                    cursor + 1
-                ),
+        // 3. Locate the old block. `is_end_of_file` makes the search try the EOF
+        //    position first. If the block ends with an empty sentinel line (the
+        //    file's terminating newline) and the search fails, retry without it,
+        //    dropping the matching trailing empty from the new side too. This is
+        //    Codex's lib.rs trailing-empty-line retry.
+        let mut pattern: &[String] = &old_lines;
+        let mut new_slice: Vec<String> = new_lines.clone();
+        let mut found = seek_sequence(&original_lines, pattern, cursor, hunk.is_end_of_file);
+
+        if found.is_none() && pattern.last().is_some_and(String::is_empty) {
+            pattern = &pattern[..pattern.len() - 1];
+            if new_slice.last().is_some_and(String::is_empty) {
+                new_slice.pop();
             }
+            found = seek_sequence(&original_lines, pattern, cursor, hunk.is_end_of_file);
+        }
+
+        let start_idx = found.ok_or_else(|| PlanError::HunkNoMatch {
+            path: path.to_string(),
+            hunk_index,
+            detail: format!(
+                "could not locate the {} context/removed line(s) starting near line {}",
+                old_lines.len(),
+                cursor + 1
+            ),
         })?;
 
-        // Emit unchanged lines between the cursor and the match.
-        out.extend(current_lines[cursor..match_at].iter().cloned());
+        added += hunk_added;
+        removed += hunk_removed;
+        replacements.push(Replacement {
+            start: start_idx,
+            old_len: pattern.len(),
+            new_lines: new_slice,
+        });
+        cursor = start_idx + pattern.len();
+    }
 
-        // Walk the hunk body, consuming matched old lines and emitting new ones.
-        let mut src = match_at;
-        for l in &hunk.lines {
-            match l {
-                HunkLine::Context(s) => {
-                    // Defensive: the subslice match guarantees equality, but we
-                    // re-check to avoid silently drifting on a logic bug.
-                    debug_assert_eq!(&current_lines[src], s);
-                    out.push(current_lines[src].clone());
-                    src += 1;
-                }
-                HunkLine::Removed(_) => {
-                    removed += 1;
-                    src += 1;
-                }
-                HunkLine::Added(s) => {
-                    out.push(s.clone());
-                    added += 1;
-                }
+    // Apply replacements in descending start order (Codex sorts ascending then
+    // iterates in reverse) so earlier edits don't shift later indices.
+    replacements.sort_by_key(|r| r.start);
+    let mut out = original_lines;
+    for r in replacements.iter().rev() {
+        for _ in 0..r.old_len {
+            if r.start < out.len() {
+                out.remove(r.start);
             }
         }
-        cursor = src;
+        for (offset, line) in r.new_lines.iter().enumerate() {
+            out.insert(r.start + offset, line.clone());
+        }
     }
 
-    // Emit the remainder of the file untouched.
-    out.extend(current_lines[cursor..].iter().cloned());
-
-    // Reassemble, preserving the original trailing-newline disposition.
-    let mut content = out.join("\n");
-    if had_trailing_newline {
-        content.push('\n');
+    // Trailing-newline normalization (Codex): ensure the file ends with a
+    // newline by appending an empty final line unless one is already present,
+    // then join with '\n'. See the module-level "Trailing-newline policy" note.
+    if !out.last().is_some_and(String::is_empty) {
+        out.push(String::new());
     }
+    let content = out.join("\n");
 
     Ok(AppliedUpdate {
         content,
@@ -795,31 +1018,80 @@ fn apply_hunks(path: &str, current: &str, hunks: &[Hunk]) -> Result<AppliedUpdat
     })
 }
 
-/// Find the start index of `needle` as a contiguous run inside `haystack`, at or
-/// after `from`. Returns the absolute index in `haystack`, or `None`.
-fn find_subslice(haystack: &[String], needle: &[&String], from: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(from);
+/// Locate the sequence `pattern` within `lines` at or after `start`, returning
+/// the starting index or `None`. Ported from Codex `seek_sequence`.
+///
+/// Matching escalates through tiers of decreasing strictness so real model
+/// patches that drift on whitespace or smart punctuation still locate cleanly:
+///   1. exact equality,
+///   2. ignore trailing whitespace (`trim_end`),
+///   3. ignore leading *and* trailing whitespace (`trim`),
+///   4. Unicode-punctuation normalization (typographic dashes / quotes /
+///      non-breaking and exotic spaces folded to their ASCII equivalents).
+///
+/// When `eof` is true we try the end-of-file position first (so a hunk anchored
+/// at EOF matches the file's tail), falling back to a forward scan from `start`.
+///
+/// Defensive cases: an empty `pattern` returns `Some(start)`; a `pattern` longer
+/// than `lines` returns `None` (no panic).
+fn seek_sequence(lines: &[String], pattern: &[String], start: usize, eof: bool) -> Option<usize> {
+    if pattern.is_empty() {
+        return Some(start);
     }
-    if needle.len() > haystack.len() {
+    if pattern.len() > lines.len() {
         return None;
     }
-    let last_start = haystack.len() - needle.len();
-    let mut start = from;
-    while start <= last_start {
-        let mut matched = true;
-        for (k, want) in needle.iter().enumerate() {
-            if &haystack[start + k] != *want {
-                matched = false;
-                break;
-            }
-        }
-        if matched {
-            return Some(start);
-        }
-        start += 1;
+    let search_start = if eof && lines.len() >= pattern.len() {
+        lines.len() - pattern.len()
+    } else {
+        start
+    };
+    let last = lines.len().saturating_sub(pattern.len());
+    let window = || search_start..=last;
+
+    // Tier 1: exact match.
+    if let Some(i) = window().find(|&i| lines[i..i + pattern.len()] == *pattern) {
+        return Some(i);
     }
-    None
+    // Tier 2: ignore trailing whitespace.
+    if let Some(i) = window()
+        .find(|&i| (0..pattern.len()).all(|k| lines[i + k].trim_end() == pattern[k].trim_end()))
+    {
+        return Some(i);
+    }
+    // Tier 3: ignore leading and trailing whitespace.
+    if let Some(i) =
+        window().find(|&i| (0..pattern.len()).all(|k| lines[i + k].trim() == pattern[k].trim()))
+    {
+        return Some(i);
+    }
+    // Tier 4: Unicode-punctuation normalization (typographic dashes/quotes/odd
+    // spaces folded to ASCII), mirroring `git apply`'s tolerance.
+    window().find(|&i| {
+        (0..pattern.len()).all(|k| normalise(&lines[i + k]) == normalise(&pattern[k]))
+    })
+}
+
+/// Fold common Unicode punctuation to ASCII so ASCII-authored diffs can match
+/// source lines that contain typographic characters. Also `trim`s.
+fn normalise(s: &str) -> String {
+    s.trim()
+        .chars()
+        .map(|c| match c {
+            // Various dash / hyphen code-points → ASCII '-'.
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => '-',
+            // Fancy single quotes → '\''.
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            // Fancy double quotes → '"'.
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+            // Non-breaking and other odd spaces → normal space.
+            '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+            | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+            | '\u{3000}' => ' ',
+            other => other,
+        })
+        .collect()
 }
 
 /// Count the number of lines a piece of content contributes. Empty string → 0
@@ -902,6 +1174,12 @@ mod tests {
         m
     }
 
+    /// Convenience: parse + plan a single-file update and return its new content.
+    fn plan_one(patch: &str, files: &[(&str, &str)]) -> Result<PatchPlan, PlanError> {
+        let ops = parse_v4a(patch).expect("parse");
+        plan_patch(&ops, &fm(files))
+    }
+
     // ---- parse: add -------------------------------------------------------
 
     #[test]
@@ -972,13 +1250,14 @@ mod tests {
                 path: "a.txt".to_string(),
                 move_to: None,
                 hunks: vec![Hunk {
-                    context_header: Some("fn main".to_string()),
+                    context_headers: vec!["fn main".to_string()],
                     lines: vec![
                         HunkLine::Context("keep".to_string()),
                         HunkLine::Removed("old".to_string()),
                         HunkLine::Added("new".to_string()),
                         HunkLine::Context("tail".to_string()),
                     ],
+                    is_end_of_file: false,
                 }],
             }]
         );
@@ -1002,11 +1281,12 @@ mod tests {
                 path: "a.txt".to_string(),
                 move_to: Some("b.txt".to_string()),
                 hunks: vec![Hunk {
-                    context_header: None,
+                    context_headers: vec![],
                     lines: vec![
                         HunkLine::Removed("x".to_string()),
                         HunkLine::Added("y".to_string()),
                     ],
+                    is_end_of_file: false,
                 }],
             }]
         );
@@ -1032,8 +1312,8 @@ mod tests {
             panic!("expected update");
         };
         assert_eq!(hunks.len(), 2);
-        assert_eq!(hunks[0].context_header.as_deref(), Some("first"));
-        assert_eq!(hunks[1].context_header.as_deref(), Some("second"));
+        assert_eq!(hunks[0].context_header(), Some("first"));
+        assert_eq!(hunks[1].context_header(), Some("second"));
     }
 
     #[test]
@@ -1052,8 +1332,60 @@ mod tests {
             panic!("expected update");
         };
         assert_eq!(hunks.len(), 1);
-        assert_eq!(hunks[0].context_header, None);
+        assert!(hunks[0].context_headers.is_empty());
         assert_eq!(hunks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn parse_update_stacked_context_headers() {
+        // Multiple @@ lines with no body between them stack onto one hunk.
+        let patch = "\
+*** Begin Patch
+*** Update File: a.txt
+@@ class BaseClass
+@@     def method():
+ ctx
+-old
++new
+*** End Patch
+";
+        let ops = parse_v4a(patch).expect("parse");
+        let PatchOp::Update { hunks, .. } = &ops[0] else {
+            panic!("expected update");
+        };
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(
+            hunks[0].context_headers,
+            vec!["class BaseClass".to_string(), "def method():".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_end_of_file_marker() {
+        // `*** End of File` must be recognized (was previously hard-rejected) and
+        // set is_end_of_file on the hunk.
+        let patch = "\
+*** Begin Patch
+*** Update File: a.txt
+@@
+ last
++appended
+*** End of File
+*** End Patch
+";
+        let ops = parse_v4a(patch).expect("parse");
+        let PatchOp::Update { hunks, .. } = &ops[0] else {
+            panic!("expected update");
+        };
+        assert_eq!(hunks.len(), 1);
+        assert!(hunks[0].is_end_of_file);
+        assert_eq!(
+            hunks[0].lines,
+            vec![
+                HunkLine::Context("last".to_string()),
+                HunkLine::Added("appended".to_string()),
+            ]
+        );
     }
 
     // ---- parse: multi-file ------------------------------------------------
@@ -1103,6 +1435,80 @@ mod tests {
             ops,
             vec![PatchOp::Delete {
                 path: "x.txt".to_string()
+            }]
+        );
+    }
+
+    // ---- parse: tolerance (Environment ID, no-newline) --------------------
+
+    #[test]
+    fn parse_environment_id_preamble_is_ignored() {
+        let patch = "\
+*** Begin Patch
+*** Environment ID: remote-123
+*** Add File: hello.txt
++hi
+*** End Patch
+";
+        let ops = parse_v4a(patch).expect("parse");
+        assert_eq!(
+            ops,
+            vec![PatchOp::Add {
+                path: "hello.txt".to_string(),
+                content: "hi".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_empty_environment_id_is_error() {
+        let patch = "*** Begin Patch\n*** Environment ID:   \n*** End Patch\n";
+        match parse_v4a(patch) {
+            Err(PatchError::EmptyEnvironmentId { line }) => assert_eq!(line, 2),
+            other => panic!("expected EmptyEnvironmentId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tolerates_no_newline_marker_in_hunk() {
+        // git-style "\ No newline at end of file" lines are skipped inside hunks.
+        let patch = "\
+*** Begin Patch
+*** Update File: a.txt
+@@
+-old
+\\ No newline at end of file
++new
+*** End Patch
+";
+        let ops = parse_v4a(patch).expect("parse");
+        let PatchOp::Update { hunks, .. } = &ops[0] else {
+            panic!("expected update");
+        };
+        assert_eq!(
+            hunks[0].lines,
+            vec![
+                HunkLine::Removed("old".to_string()),
+                HunkLine::Added("new".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_tolerates_no_newline_marker_in_add_body() {
+        let patch = "\
+*** Begin Patch
+*** Add File: a.txt
++only line
+\\ No newline at end of file
+*** End Patch
+";
+        let ops = parse_v4a(patch).expect("parse");
+        assert_eq!(
+            ops,
+            vec![PatchOp::Add {
+                path: "a.txt".to_string(),
+                content: "only line".to_string(),
             }]
         );
     }
@@ -1191,8 +1597,7 @@ mod tests {
 
     #[test]
     fn plan_update_hunk_matches() {
-        let fs = fm(&[("a.txt", "keep\nold\ntail\n")]);
-        let ops = parse_v4a(
+        let plan = plan_one(
             "\
 *** Begin Patch
 *** Update File: a.txt
@@ -1203,9 +1608,9 @@ mod tests {
  tail
 *** End Patch
 ",
+            &[("a.txt", "keep\nold\ntail\n")],
         )
-        .unwrap();
-        let plan = plan_patch(&ops, &fs).expect("plan");
+        .expect("plan");
         assert_eq!(plan.files.len(), 1);
         let f = &plan.files[0];
         assert_eq!(f.path, "a.txt");
@@ -1217,8 +1622,7 @@ mod tests {
 
     #[test]
     fn plan_update_multi_hunk_in_order() {
-        let fs = fm(&[("a.txt", "a\nb\nc\nd\ne\nf\n")]);
-        let ops = parse_v4a(
+        let plan = plan_one(
             "\
 *** Begin Patch
 *** Update File: a.txt
@@ -1232,9 +1636,9 @@ mod tests {
 +F
 *** End Patch
 ",
+            &[("a.txt", "a\nb\nc\nd\ne\nf\n")],
         )
-        .unwrap();
-        let plan = plan_patch(&ops, &fs).expect("plan");
+        .expect("plan");
         let f = &plan.files[0];
         assert_eq!(f.new_content.as_deref(), Some("a\nB\nc\nd\ne\nF\n"));
         assert_eq!(f.added, 2);
@@ -1267,8 +1671,7 @@ mod tests {
 
     #[test]
     fn plan_move_renames_and_edits() {
-        let fs = fm(&[("a.txt", "x\n")]);
-        let ops = parse_v4a(
+        let plan = plan_one(
             "\
 *** Begin Patch
 *** Update File: a.txt
@@ -1278,9 +1681,9 @@ mod tests {
 +y
 *** End Patch
 ",
+            &[("a.txt", "x\n")],
         )
-        .unwrap();
-        let plan = plan_patch(&ops, &fs).expect("plan");
+        .expect("plan");
         let f = &plan.files[0];
         assert_eq!(f.path, "a.txt");
         assert_eq!(f.op, PlannedKind::Move { to: "b.txt".to_string() });
@@ -1292,26 +1695,264 @@ mod tests {
     #[test]
     fn plan_add_to_empty_file_via_anchorless_hunk() {
         // Updating an empty file with an additions-only hunk appends content.
-        let fs = fm(&[("e.txt", "")]);
-        let ops = parse_v4a(
+        // Codex's trailing-newline policy makes this newline-terminated.
+        let plan = plan_one(
             "*** Begin Patch\n*** Update File: e.txt\n@@\n+first\n+second\n*** End Patch\n",
+            &[("e.txt", "")],
         )
-        .unwrap();
-        let plan = plan_patch(&ops, &fs).expect("plan");
-        assert_eq!(plan.files[0].new_content.as_deref(), Some("first\nsecond"));
+        .expect("plan");
+        assert_eq!(plan.files[0].new_content.as_deref(), Some("first\nsecond\n"));
         assert_eq!(plan.files[0].added, 2);
     }
 
     #[test]
-    fn plan_no_trailing_newline_preserved() {
-        // Source has no trailing newline; result must not gain one.
-        let fs = fm(&[("a.txt", "keep\nold")]);
-        let ops = parse_v4a(
+    fn plan_trailing_newline_added_to_match_codex() {
+        // Source has no trailing newline; per Codex policy the *updated* result
+        // gains one. (Documented in the module-level trailing-newline note.)
+        let plan = plan_one(
             "*** Begin Patch\n*** Update File: a.txt\n@@\n keep\n-old\n+new\n*** End Patch\n",
+            &[("a.txt", "keep\nold")],
         )
-        .unwrap();
-        let plan = plan_patch(&ops, &fs).expect("plan");
-        assert_eq!(plan.files[0].new_content.as_deref(), Some("keep\nnew"));
+        .expect("plan");
+        assert_eq!(plan.files[0].new_content.as_deref(), Some("keep\nnew\n"));
+    }
+
+    // ---- plan: EOF anchoring + pure-addition (ported from codex) ----------
+
+    #[test]
+    fn plan_insert_at_eof_marker() {
+        // Ported from codex test_unified_diff_insert_at_eof: a `+`-only hunk
+        // terminated by `*** End of File` appends at end-of-file.
+        let plan = plan_one(
+            "\
+*** Begin Patch
+*** Update File: insert.txt
+@@
++quux
+*** End of File
+*** End Patch
+",
+            &[("insert.txt", "foo\nbar\nbaz\n")],
+        )
+        .expect("plan");
+        assert_eq!(
+            plan.files[0].new_content.as_deref(),
+            Some("foo\nbar\nbaz\nquux\n")
+        );
+        assert_eq!(plan.files[0].added, 1);
+    }
+
+    #[test]
+    fn plan_interleaved_changes_with_eof_append() {
+        // Ported from codex test_update_file_hunk_interleaved_changes.
+        let plan = plan_one(
+            "\
+*** Begin Patch
+*** Update File: interleaved.txt
+@@
+ a
+-b
++B
+@@
+ c
+ d
+-e
++E
+@@
+ f
++g
+*** End of File
+*** End Patch
+",
+            &[("interleaved.txt", "a\nb\nc\nd\ne\nf\n")],
+        )
+        .expect("plan");
+        assert_eq!(
+            plan.files[0].new_content.as_deref(),
+            Some("a\nB\nc\nd\nE\nf\ng\n")
+        );
+    }
+
+    #[test]
+    fn plan_pure_addition_chunk_followed_by_removal() {
+        // Ported from codex test_pure_addition_chunk_followed_by_removal: a
+        // header-less pure-addition hunk is scheduled at EOF, then the sort +
+        // reverse-apply lands it after the replacement of the earlier block.
+        let plan = plan_one(
+            "\
+*** Begin Patch
+*** Update File: panic.txt
+@@
++after-context
++second-line
+@@
+ line1
+-line2
+-line3
++line2-replacement
+*** End Patch
+",
+            &[("panic.txt", "line1\nline2\nline3\n")],
+        )
+        .expect("plan");
+        assert_eq!(
+            plan.files[0].new_content.as_deref(),
+            Some("line1\nline2-replacement\nafter-context\nsecond-line\n")
+        );
+    }
+
+    #[test]
+    fn plan_pure_addition_on_nonempty_file_with_header_inserts_there() {
+        // Requirement #4: a pure-addition hunk whose old side is empty but which
+        // is pinned by a `@@` header inserts right after the located header line
+        // (our improvement over Codex's EOF-only insertion).
+        let plan = plan_one(
+            "\
+*** Begin Patch
+*** Update File: a.txt
+@@ anchor
++inserted
+*** End Patch
+",
+            &[("a.txt", "top\nanchor\nbottom\n")],
+        )
+        .expect("plan");
+        assert_eq!(
+            plan.files[0].new_content.as_deref(),
+            Some("top\nanchor\ninserted\nbottom\n")
+        );
+        assert_eq!(plan.files[0].added, 1);
+    }
+
+    // ---- plan: fuzzy / whitespace / unicode (ported from codex) -----------
+
+    #[test]
+    fn plan_fuzzy_trailing_whitespace_drift() {
+        // The file line has trailing whitespace the patch omits; tier-2 rstrip
+        // matching locates it.
+        let plan = plan_one(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-foo\n+bar\n*** End Patch\n",
+            &[("a.txt", "foo   \n")],
+        )
+        .expect("plan");
+        assert_eq!(plan.files[0].new_content.as_deref(), Some("bar\n"));
+    }
+
+    #[test]
+    fn plan_fuzzy_leading_whitespace_drift() {
+        // The file line is indented; the patch's removed line is not. Tier-3 trim
+        // matching locates it.
+        let plan = plan_one(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-foo\n+bar\n*** End Patch\n",
+            &[("a.txt", "    foo\n")],
+        )
+        .expect("plan");
+        assert_eq!(plan.files[0].new_content.as_deref(), Some("bar\n"));
+    }
+
+    #[test]
+    fn plan_fuzzy_unicode_dash_normalization() {
+        // Ported from codex test_update_line_with_unicode_dash. File contains EN
+        // DASH (U+2013) and NON-BREAKING HYPHEN (U+2011); patch uses ASCII.
+        let original = "import asyncio  # local import \u{2013} avoids top\u{2011}level dep\n";
+        let plan = plan_one(
+            "\
+*** Begin Patch
+*** Update File: unicode.py
+@@
+-import asyncio  # local import - avoids top-level dep
++import asyncio  # HELLO
+*** End Patch
+",
+            &[("unicode.py", original)],
+        )
+        .expect("plan");
+        assert_eq!(
+            plan.files[0].new_content.as_deref(),
+            Some("import asyncio  # HELLO\n")
+        );
+    }
+
+    // ---- plan: repeated-block disambiguation via @@ -----------------------
+
+    #[test]
+    fn plan_repeated_block_disambiguated_by_header() {
+        // The block `value = 1` appears twice. Without the `@@ fn second` header
+        // a forward search would hit the first occurrence; the header advances the
+        // cursor so the SECOND block is the one edited.
+        let file = "\
+fn first() {
+    value = 1
+}
+fn second() {
+    value = 1
+}
+";
+        let plan = plan_one(
+            "\
+*** Begin Patch
+*** Update File: a.txt
+@@ fn second() {
+     value = 1
+-}
++    extra()
++}
+*** End Patch
+",
+            &[("a.txt", file)],
+        )
+        .expect("plan");
+        assert_eq!(
+            plan.files[0].new_content.as_deref(),
+            Some(
+                "fn first() {\n    value = 1\n}\nfn second() {\n    value = 1\n    extra()\n}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn plan_missing_context_header_is_no_match() {
+        // A `@@` header that does not occur in the file fails to locate.
+        let res = plan_one(
+            "\
+*** Begin Patch
+*** Update File: a.txt
+@@ nonexistent header
+ a
+-b
++B
+*** End Patch
+",
+            &[("a.txt", "a\nb\nc\n")],
+        );
+        match res {
+            Err(PlanError::HunkNoMatch { hunk_index, .. }) => assert_eq!(hunk_index, 0),
+            other => panic!("expected HunkNoMatch, got {other:?}"),
+        }
+    }
+
+    // ---- plan: trailing-empty-line retry ----------------------------------
+
+    #[test]
+    fn plan_trailing_empty_line_retry() {
+        // The old side ends with an empty line representing the file's final
+        // newline. Since `original_lines` drops that sentinel, the first search
+        // fails; the retry without the trailing empty locates the block.
+        let plan = plan_one(
+            "\
+*** Begin Patch
+*** Update File: a.txt
+@@
+ foo
+-bar
++baz
+
+*** End Patch
+",
+            &[("a.txt", "foo\nbar\n")],
+        )
+        .expect("plan");
+        assert_eq!(plan.files[0].new_content.as_deref(), Some("foo\nbaz\n"));
     }
 
     // ---- plan: failures (all-or-none) ------------------------------------
@@ -1320,8 +1961,7 @@ mod tests {
     fn plan_hunk_no_match_aborts_whole_plan() {
         // Second op would succeed, but the first op's hunk does not match, so
         // the WHOLE plan must fail with no partial result.
-        let fs = fm(&[("a.txt", "totally\ndifferent\n"), ("ok.txt", "z\n")]);
-        let ops = parse_v4a(
+        let res = plan_one(
             "\
 *** Begin Patch
 *** Update File: a.txt
@@ -1332,9 +1972,9 @@ mod tests {
 *** Delete File: ok.txt
 *** End Patch
 ",
-        )
-        .unwrap();
-        match plan_patch(&ops, &fs) {
+            &[("a.txt", "totally\ndifferent\n"), ("ok.txt", "z\n")],
+        );
+        match res {
             Err(PlanError::HunkNoMatch {
                 path, hunk_index, ..
             }) => {
@@ -1388,8 +2028,7 @@ mod tests {
 
     #[test]
     fn plan_move_onto_existing_is_file_exists() {
-        let fs = fm(&[("a.txt", "x\n"), ("b.txt", "occupied\n")]);
-        let ops = parse_v4a(
+        let res = plan_one(
             "\
 *** Begin Patch
 *** Update File: a.txt
@@ -1399,10 +2038,10 @@ mod tests {
 +y
 *** End Patch
 ",
-        )
-        .unwrap();
+            &[("a.txt", "x\n"), ("b.txt", "occupied\n")],
+        );
         assert_eq!(
-            plan_patch(&ops, &fs),
+            res,
             Err(PlanError::FileExists {
                 path: "b.txt".to_string()
             })
@@ -1411,8 +2050,7 @@ mod tests {
 
     #[test]
     fn plan_second_hunk_no_match_reports_index_one() {
-        let fs = fm(&[("a.txt", "a\nb\nc\n")]);
-        let ops = parse_v4a(
+        let res = plan_one(
             "\
 *** Begin Patch
 *** Update File: a.txt
@@ -1426,9 +2064,9 @@ mod tests {
 +x
 *** End Patch
 ",
-        )
-        .unwrap();
-        match plan_patch(&ops, &fs) {
+            &[("a.txt", "a\nb\nc\n")],
+        );
+        match res {
             Err(PlanError::HunkNoMatch { hunk_index, .. }) => assert_eq!(hunk_index, 1),
             other => panic!("expected HunkNoMatch index 1, got {other:?}"),
         }
@@ -1436,32 +2074,50 @@ mod tests {
 
     #[test]
     fn plan_crlf_source_matches_lf_hunk() {
-        // Current content uses CRLF; parser/planner normalize so an LF-authored
-        // hunk still matches. (The patch text itself is CRLF here too.)
-        let fs = fm(&[("a.txt", "keep\r\nold\r\ntail\r\n")]);
+        // Current content uses CRLF; the fuzzy rstrip tier absorbs the trailing
+        // '\r' on each stored line so an LF-authored hunk still matches, on both
+        // an LF map and a CRLF map.
         let ops = parse_v4a(
             "*** Begin Patch\r\n*** Update File: a.txt\r\n@@\r\n keep\r\n-old\r\n+new\r\n tail\r\n*** End Patch\r\n",
         )
         .unwrap();
-        // NOTE: the in-memory current content still carries '\r' on each line,
-        // so matching requires the hunk context to also have been CR-stripped
-        // (it was). The resulting content here therefore loses the CRs, which is
-        // acceptable: this test documents that LF hunks plan cleanly against an
-        // LF-normalized view.
         let lf_fs = fm(&[("a.txt", "keep\nold\ntail\n")]);
-        let plan = plan_patch(&ops, &lf_fs).expect("plan");
+        let plan = plan_patch(&ops, &lf_fs).expect("plan lf");
         assert_eq!(plan.files[0].new_content.as_deref(), Some("keep\nnew\ntail\n"));
-        // And the CRLF map at least does not panic / produces a deterministic
-        // no-match (since '\r' is part of each stored line).
-        let _ = plan_patch(&ops, &fs);
+
+        // CRLF map: the stored lines carry '\r'; matching now succeeds via the
+        // rstrip tier (it absorbs the trailing '\r'). Note: any line that passes
+        // *through* a hunk as context or added is re-emitted verbatim from the
+        // patch text (LF-only), so the '\r' on `keep`/`tail` is dropped here.
+        // Only lines that lie entirely OUTSIDE every replaced region keep their
+        // original CRLF ending. This matches Codex's replacement model.
+        let crlf_fs = fm(&[("a.txt", "keep\r\nold\r\ntail\r\n")]);
+        let plan = plan_patch(&ops, &crlf_fs).expect("plan crlf");
+        assert_eq!(plan.files[0].new_content.as_deref(), Some("keep\nnew\ntail\n"));
+    }
+
+    #[test]
+    fn plan_crlf_untouched_lines_keep_their_ending() {
+        // A CRLF file where the edited region does NOT cover the surrounding
+        // lines: those lines lie outside every replacement and so keep their
+        // original '\r\n'. Only the replaced line is rewritten LF-only.
+        let ops = parse_v4a(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch\n",
+        )
+        .unwrap();
+        let crlf_fs = fm(&[("a.txt", "head\r\nold\r\ntail\r\n")]);
+        let plan = plan_patch(&ops, &crlf_fs).expect("plan crlf");
+        assert_eq!(
+            plan.files[0].new_content.as_deref(),
+            Some("head\r\nnew\ntail\r\n")
+        );
     }
 
     #[test]
     fn plan_duplicate_add_then_add_is_file_exists() {
         // Adding the same path twice in one patch: the second add sees the first
         // as already-created.
-        let fs = fm(&[]);
-        let ops = parse_v4a(
+        let res = plan_one(
             "\
 *** Begin Patch
 *** Add File: dup.txt
@@ -1470,10 +2126,10 @@ mod tests {
 +two
 *** End Patch
 ",
-        )
-        .unwrap();
+            &[],
+        );
         assert_eq!(
-            plan_patch(&ops, &fs),
+            res,
             Err(PlanError::FileExists {
                 path: "dup.txt".to_string()
             })
@@ -1484,8 +2140,7 @@ mod tests {
     fn plan_delete_then_readd_succeeds() {
         // Delete a file, then re-add it in the same patch: legal, since after the
         // delete the path is free.
-        let fs = fm(&[("a.txt", "old\n")]);
-        let ops = parse_v4a(
+        let plan = plan_one(
             "\
 *** Begin Patch
 *** Delete File: a.txt
@@ -1493,13 +2148,74 @@ mod tests {
 +fresh
 *** End Patch
 ",
+            &[("a.txt", "old\n")],
         )
-        .unwrap();
-        let plan = plan_patch(&ops, &fs).expect("plan");
+        .expect("plan");
         assert_eq!(plan.files.len(), 2);
         assert_eq!(plan.files[0].op, PlannedKind::Delete);
         assert_eq!(plan.files[1].op, PlannedKind::Add);
         assert_eq!(plan.files[1].new_content.as_deref(), Some("fresh"));
+    }
+
+    // ---- multi-file end-to-end (ported from codex) ------------------------
+
+    #[test]
+    fn plan_combined_add_delete_update_move() {
+        // Ported in spirit from codex test_apply_patch_hunks_accept_*: a single
+        // patch that adds, deletes, updates, and moves+updates.
+        let plan = plan_one(
+            "\
+*** Begin Patch
+*** Add File: relative-add.txt
++relative add
+*** Delete File: relative-delete.txt
+*** Update File: relative-update.txt
+@@
+-relative old
++relative new
+*** Update File: src/app.py
+*** Move to: src/main.py
+@@ def greet():
+-print(\"Hi\")
++print(\"Hello, world!\")
+*** End Patch
+",
+            &[
+                ("relative-delete.txt", "delete relative\n"),
+                ("relative-update.txt", "relative old\n"),
+                (
+                    "src/app.py",
+                    "def greet():\n    print(\"Hi\")\nprint(\"Hi\")\n",
+                ),
+            ],
+        )
+        .expect("plan");
+        assert_eq!(plan.files.len(), 4);
+        assert_eq!(plan.files[0].op, PlannedKind::Add);
+        assert_eq!(plan.files[0].new_content.as_deref(), Some("relative add"));
+        assert_eq!(plan.files[1].op, PlannedKind::Delete);
+        assert_eq!(plan.files[2].op, PlannedKind::Update);
+        assert_eq!(
+            plan.files[2].new_content.as_deref(),
+            Some("relative new\n")
+        );
+        assert_eq!(
+            plan.files[3].op,
+            PlannedKind::Move {
+                to: "src/main.py".to_string()
+            }
+        );
+        // The `@@ def greet():` header advances the cursor past line 0, so the
+        // search starts at line 1. The patch's removed line `print("Hi")` has no
+        // leading space. `seek_sequence` tries an EXACT match across all positions
+        // first, so it locates the bare `print("Hi")` at line 2 (the indented line
+        // at line 1 would only match the looser trim tier, which never runs once an
+        // exact hit is found). The bare occurrence is thus the one replaced — this
+        // is exactly Codex's behavior.
+        assert_eq!(
+            plan.files[3].new_content.as_deref(),
+            Some("def greet():\n    print(\"Hi\")\nprint(\"Hello, world!\")\n")
+        );
     }
 
     // ---- robustness -------------------------------------------------------
@@ -1520,6 +2236,33 @@ mod tests {
     #[test]
     fn empty_input_is_missing_begin() {
         assert_eq!(parse_v4a(""), Err(PatchError::MissingBegin));
+    }
+
+    #[test]
+    fn seek_sequence_tiers_and_guards() {
+        let lines: Vec<String> = ["foo", "bar", "baz"].iter().map(|s| s.to_string()).collect();
+        // exact
+        assert_eq!(
+            seek_sequence(&lines, &["bar".to_string(), "baz".to_string()], 0, false),
+            Some(1)
+        );
+        // pattern longer than input → None (no panic)
+        assert_eq!(
+            seek_sequence(
+                &["x".to_string()],
+                &["a".to_string(), "b".to_string()],
+                0,
+                false
+            ),
+            None
+        );
+        // empty pattern → Some(start)
+        assert_eq!(seek_sequence(&lines, &[], 2, false), Some(2));
+        // eof flag searches the tail first
+        assert_eq!(
+            seek_sequence(&lines, &["baz".to_string()], 0, true),
+            Some(2)
+        );
     }
 
     #[test]

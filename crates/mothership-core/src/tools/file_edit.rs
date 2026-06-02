@@ -8,6 +8,20 @@
 //!
 //! ## Matching strategy (strict, not aggressive fuzzy)
 //!
+//! Each stage runs only when the previous ones fail to find any match, and every
+//! stage enforces the same uniqueness rule: a unique match unless `replace_all`
+//! is set. None of these stages performs similarity/Levenshtein/block-anchor
+//! fuzzing — a clearly different string never matches.
+//!
+//! 0. **Trailing-newline absorption on deletion (deletion-only).** When
+//!    `new_text` is empty and `old_text` does not end with `\n` but
+//!    `old_text + "\n"` occurs in the file, the deletion target becomes
+//!    `old_text + "\n"` so the line terminator is removed too and no orphan
+//!    blank line is left behind. This is still an *exact* match (just of the
+//!    newline-extended target), so it is preferred over matching `old_text`
+//!    alone — otherwise the feature could never engage. If `old_text + "\n"` is
+//!    absent, the normal pipeline below runs with `old_text` unchanged. This
+//!    mirrors Claude's `applyEditToFile`.
 //! 1. **Exact.** Count verbatim occurrences of `old_text` in `content`.
 //!    - `replace_all = false`: exactly one match is replaced; zero matches fall
 //!      through to stage 2; more than one is [`EditError::Ambiguous`].
@@ -20,8 +34,21 @@
 //!    indent); a clearly different string still does not match. The same
 //!    uniqueness rules as stage 1 apply, and the *original* matched span is what
 //!    gets replaced (the normalized form is never written back).
+//! 3. **Curly ↔ straight quote-normalized.** `old_text` is compared to the file
+//!    after folding typographic quotes to ASCII on *both* sides
+//!    (`U+2018`/`U+2019` → `'`, `U+201C`/`U+201D` → `"`). When this is the only
+//!    difference, the *original* span is replaced, and `new_text`'s quotes are
+//!    rewritten to match the quote *style* actually present in the matched span
+//!    (style-preserving writeback): if the file used curly quotes, straight
+//!    quotes in `new_text` are curled; if the file used straight quotes, curly
+//!    quotes in `new_text` are straightened.
+//! 4. **Literal escape-sequence normalized.** When `old_text` contains the
+//!    two-character sequences `\n` / `\t` (backslash-n / backslash-t) where the
+//!    file has a real newline / tab — i.e. a model emitted the escapes
+//!    literally — the unescaped needle is matched against the file and the
+//!    *original* (real-character) span is replaced.
 //!
-//! If neither stage matches, the result is [`EditError::NotFound`]. If
+//! If no stage matches, the result is [`EditError::NotFound`]. If
 //! `old_text == new_text` the result is [`EditError::NoChange`] regardless of
 //! how many times the text occurs.
 //!
@@ -59,6 +86,18 @@ pub enum EditStrategy {
     /// `old_text` was found only after normalizing per-line leading/trailing
     /// whitespace (indentation drift); the original span was still replaced.
     WhitespaceNormalized,
+    /// `old_text` matched only after folding curly/typographic quotes to ASCII
+    /// on both sides; the original span was replaced and `new_text`'s quotes
+    /// were rewritten to match the quote style present in the matched span.
+    QuoteNormalized,
+    /// `old_text` matched only after unescaping literal `\n` / `\t` two-character
+    /// sequences in `old_text` to a real newline / tab; the original
+    /// (real-character) span was replaced.
+    EscapeNormalized,
+    /// A pure deletion (`new_text` is empty) where `old_text` did not end in a
+    /// newline but `old_text + "\n"` matched; the trailing newline was deleted
+    /// along with `old_text`.
+    TrailingNewline,
 }
 
 /// Why an edit could not be applied.
@@ -92,8 +131,10 @@ impl std::error::Error for EditError {}
 /// Apply a string replacement to `content`.
 ///
 /// See the [module documentation](self) for the full matching semantics. In
-/// short: try an exact match first, then a narrow whitespace/indentation
-/// normalized fallback, requiring a unique match unless `replace_all` is set.
+/// short: try an exact match first, then progressively narrower deterministic
+/// normalizations (whitespace/indentation, curly-quote style, literal escape
+/// sequences), requiring a unique match unless `replace_all` is set. None of
+/// these stages is a fuzzy/similarity match.
 ///
 /// `content` is treated verbatim — line endings and BOM are preserved.
 pub fn apply_edit(
@@ -104,6 +145,27 @@ pub fn apply_edit(
 ) -> Result<EditApplied, EditError> {
     if old_text == new_text {
         return Err(EditError::NoChange);
+    }
+
+    // Trailing-newline absorption on a pure deletion (Claude's `applyEditToFile`
+    // behavior). When deleting text that does not itself end in a newline, the
+    // intent is to remove the whole line including its terminator — otherwise an
+    // orphan blank line is left behind. This is still an *exact* match (of
+    // `old_text + "\n"`), not a fuzzy one, so it runs before the other stages:
+    // matching `old_text` alone would leave the newline and defeat the purpose.
+    // If `old_text + "\n"` is absent, we fall through to the normal pipeline.
+    if new_text.is_empty() && !old_text.is_empty() && !old_text.ends_with('\n') {
+        let with_newline = format!("{old_text}\n");
+        let trailing_spans = find_exact(content, &with_newline);
+        if !trailing_spans.is_empty() {
+            let decided = decide(content, &trailing_spans, replace_all)?;
+            return Ok(build_result(
+                content,
+                decided,
+                new_text,
+                EditStrategy::TrailingNewline,
+            ));
+        }
     }
 
     // Stage 1: exact substring matching.
@@ -151,7 +213,59 @@ pub fn apply_edit(
         };
     }
 
+    // Stage 3: curly <-> straight quote-normalized matching. The replacement
+    // text is computed per span so the file's quote *style* is preserved in the
+    // writeback, which is why this stage cannot reuse `build_result`.
+    let quote_spans = find_quote_normalized(content, old_text);
+    if !quote_spans.is_empty() {
+        let decided = decide(content, &quote_spans, replace_all)?;
+        return Ok(build_result_quote_preserving(
+            content,
+            decided,
+            new_text,
+        ));
+    }
+
+    // Stage 4: literal escape-sequence normalization. A model emitted `\n`/`\t`
+    // as two literal characters where the file has the real control character;
+    // unescape the needle and match the real-character span. `new_text` is
+    // written back verbatim.
+    let escape_spans = find_escape_normalized(content, old_text);
+    if !escape_spans.is_empty() {
+        let decided = decide(content, &escape_spans, replace_all)?;
+        return Ok(build_result(
+            content,
+            decided,
+            new_text,
+            EditStrategy::EscapeNormalized,
+        ));
+    }
+
     Err(EditError::NotFound)
+}
+
+/// Apply the shared uniqueness rule to a set of candidate spans: with
+/// `replace_all` set, all spans are accepted; otherwise exactly one span is
+/// required (zero is impossible here — callers only invoke this with a non-empty
+/// set) and more than one is [`EditError::Ambiguous`].
+///
+/// On success the accepted spans are returned so the caller can build the
+/// result; this keeps each stage's accept/ambiguity logic identical.
+fn decide<'a>(
+    content: &str,
+    spans: &'a [Span],
+    replace_all: bool,
+) -> Result<&'a [Span], EditError> {
+    if replace_all {
+        return Ok(spans);
+    }
+    match spans.len() {
+        1 => Ok(spans),
+        count => Err(EditError::Ambiguous {
+            count,
+            snippets: snippets_for(content, spans),
+        }),
+    }
 }
 
 /// A matched span in `content`, expressed as a byte range `[start, end)`.
@@ -308,6 +422,262 @@ fn normalized_nonblank_lines(text: &str) -> Vec<&str> {
         .collect()
 }
 
+// --- Stage 3: curly <-> straight quote normalization -----------------------
+
+/// Left single typographic quote (U+2018), folded to ASCII `'`.
+const LEFT_SINGLE_QUOTE: char = '\u{2018}';
+/// Right single typographic quote (U+2019), folded to ASCII `'`.
+const RIGHT_SINGLE_QUOTE: char = '\u{2019}';
+/// Left double typographic quote (U+201C), folded to ASCII `"`.
+const LEFT_DOUBLE_QUOTE: char = '\u{201C}';
+/// Right double typographic quote (U+201D), folded to ASCII `"`.
+const RIGHT_DOUBLE_QUOTE: char = '\u{201D}';
+
+/// Fold the four curly/typographic quote characters to their ASCII equivalents.
+/// Every other character is left untouched. Used to compare `old_text` against
+/// the file when the only difference is quote *style*.
+fn fold_quotes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        out.push(fold_quote_char(ch));
+    }
+    out
+}
+
+/// Map a single character to its quote-folded form (curly quote -> ASCII), or
+/// return it unchanged.
+fn fold_quote_char(ch: char) -> char {
+    match ch {
+        LEFT_SINGLE_QUOTE | RIGHT_SINGLE_QUOTE => '\'',
+        LEFT_DOUBLE_QUOTE | RIGHT_DOUBLE_QUOTE => '"',
+        other => other,
+    }
+}
+
+/// Whether `text` contains any of the four curly/typographic quote characters.
+fn contains_curly_quote(text: &str) -> bool {
+    text.chars().any(|ch| {
+        matches!(
+            ch,
+            LEFT_SINGLE_QUOTE | RIGHT_SINGLE_QUOTE | LEFT_DOUBLE_QUOTE | RIGHT_DOUBLE_QUOTE
+        )
+    })
+}
+
+/// Fold `content`'s quotes to ASCII while recording, for every byte offset in
+/// the folded string, the corresponding byte offset in the *original*
+/// `content`. The returned `orig_at` has length `folded.len() + 1`; for any
+/// folded offset that is a char boundary, `orig_at[offset]` is the original
+/// byte offset of the character starting there (and `orig_at[folded.len()]`
+/// equals `content.len()`). This lets a match found in the folded string be
+/// mapped back to an exact original byte span.
+fn fold_quotes_with_map(content: &str) -> (String, Vec<usize>) {
+    let mut folded = String::with_capacity(content.len());
+    // One entry per folded byte, plus a trailing sentinel.
+    let mut orig_at: Vec<usize> = Vec::with_capacity(content.len() + 1);
+    let mut buf = [0u8; 4];
+    for (orig_off, ch) in content.char_indices() {
+        let folded_ch = fold_quote_char(ch);
+        let encoded = folded_ch.encode_utf8(&mut buf);
+        for _ in 0..encoded.len() {
+            // Every byte of this folded char maps back to where the source char
+            // began; the char boundary we care about (its first byte) therefore
+            // resolves to `orig_off`, and the next char's first byte resolves to
+            // that char's own start, so end offsets land correctly too.
+            orig_at.push(orig_off);
+        }
+        folded.push_str(encoded);
+    }
+    orig_at.push(content.len());
+    (folded, orig_at)
+}
+
+/// Find spans in `content` that match `old_text` only after curly/straight quote
+/// folding. Returns an empty vector when an exact match would already have
+/// succeeded (the caller runs stage 1 first) or when neither side contains any
+/// quote at all, so this stage never fires spuriously on quote-free text.
+///
+/// The returned spans are *original* byte ranges (the curly-quoted text as it
+/// appears in the file), so the writeback replaces exactly those bytes.
+fn find_quote_normalized(content: &str, old_text: &str) -> Vec<Span> {
+    if old_text.is_empty() {
+        return Vec::new();
+    }
+
+    let folded_needle = fold_quotes(old_text);
+    // If folding changed nothing on either side there is no quote drift to
+    // reconcile, so this stage has nothing to add over the exact stage.
+    let needle_has_curly = folded_needle != old_text;
+    if !needle_has_curly && !contains_curly_quote(content) {
+        return Vec::new();
+    }
+
+    let (folded_content, orig_at) = fold_quotes_with_map(content);
+    let folded_spans = find_exact(&folded_content, &folded_needle);
+
+    folded_spans
+        .into_iter()
+        .map(|s| Span {
+            start: orig_at[s.start],
+            end: orig_at[s.end],
+        })
+        .collect()
+}
+
+/// Rewrite the quote *style* of `new_text` to match the matched original span.
+///
+/// For each quote family (double, then single) independently: if the matched
+/// span uses curly quotes of that family, straight quotes of that family in
+/// `new_text` are curled (open/close heuristic, with contraction handling for
+/// single quotes); if the span uses straight quotes of that family, curly quotes
+/// in `new_text` are straightened; if the span has no quote of that family, that
+/// family is left untouched. This is symmetric, so it preserves the file's
+/// typography whether the model sent straight quotes into a curly-quoted file or
+/// vice versa.
+fn preserve_quote_style(actual_old: &str, new_text: &str) -> String {
+    let span_has_curly_double =
+        actual_old.contains(LEFT_DOUBLE_QUOTE) || actual_old.contains(RIGHT_DOUBLE_QUOTE);
+    let span_has_straight_double = actual_old.contains('"');
+    let span_has_curly_single =
+        actual_old.contains(LEFT_SINGLE_QUOTE) || actual_old.contains(RIGHT_SINGLE_QUOTE);
+    let span_has_straight_single = actual_old.contains('\'');
+
+    let chars: Vec<char> = new_text.chars().collect();
+    let mut out = String::with_capacity(new_text.len());
+    for (i, &ch) in chars.iter().enumerate() {
+        match ch {
+            '"' if span_has_curly_double => {
+                out.push(if is_opening_context(&chars, i) {
+                    LEFT_DOUBLE_QUOTE
+                } else {
+                    RIGHT_DOUBLE_QUOTE
+                });
+            }
+            LEFT_DOUBLE_QUOTE | RIGHT_DOUBLE_QUOTE
+                if span_has_straight_double && !span_has_curly_double =>
+            {
+                out.push('"');
+            }
+            '\'' if span_has_curly_single => {
+                out.push(curly_single_for(&chars, i));
+            }
+            LEFT_SINGLE_QUOTE | RIGHT_SINGLE_QUOTE
+                if span_has_straight_single && !span_has_curly_single =>
+            {
+                out.push('\'');
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Choose the curly single quote for a straight `'` at index `i`: a `'` between
+/// two letters is treated as a contraction apostrophe (right single quote);
+/// otherwise the open/close heuristic decides.
+fn curly_single_for(chars: &[char], i: usize) -> char {
+    let prev_is_letter = i
+        .checked_sub(1)
+        .and_then(|p| chars.get(p))
+        .is_some_and(|c| c.is_alphabetic());
+    let next_is_letter = chars.get(i + 1).is_some_and(|c| c.is_alphabetic());
+    if prev_is_letter && next_is_letter {
+        RIGHT_SINGLE_QUOTE
+    } else if is_opening_context(chars, i) {
+        LEFT_SINGLE_QUOTE
+    } else {
+        RIGHT_SINGLE_QUOTE
+    }
+}
+
+/// Whether the character at `index` should be treated as an *opening* quote: it
+/// is opening at the start of the text or when preceded by whitespace or an
+/// opening bracket / dash. Mirrors Claude's `isOpeningContext` heuristic.
+fn is_opening_context(chars: &[char], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    matches!(
+        chars[index - 1],
+        ' ' | '\t' | '\n' | '\r' | '(' | '[' | '{' | '\u{2014}' | '\u{2013}'
+    )
+}
+
+// --- Stage 4: literal escape-sequence normalization ------------------------
+
+/// Find spans in `content` that match `old_text` after unescaping the literal
+/// two-character sequences `\n` / `\t` (backslash-n / backslash-t) to a real
+/// newline / tab. Returns an empty vector unless `old_text` actually contains
+/// one of those sequences (so this stage never duplicates the exact stage). The
+/// returned spans are real-character byte ranges in `content`.
+fn find_escape_normalized(content: &str, old_text: &str) -> Vec<Span> {
+    let Some(unescaped) = unescape_n_t(old_text) else {
+        return Vec::new();
+    };
+    if unescaped.is_empty() {
+        return Vec::new();
+    }
+    find_exact(content, &unescaped)
+}
+
+/// Unescape only the literal `\n` and `\t` two-character sequences in `text`,
+/// returning `None` when `text` contains neither (so the caller can cheaply skip
+/// the stage). A trailing lone backslash and any other backslash escape are left
+/// verbatim, keeping the transform narrow and deterministic.
+fn unescape_n_t(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut found = false;
+    // `\n`/`\t` are ASCII, so scanning bytes is safe on UTF-8 and never splits a
+    // multibyte char (no multibyte byte equals the ASCII backslash).
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'n' => {
+                    out.push('\n');
+                    found = true;
+                    i += 2;
+                    continue;
+                }
+                b't' => {
+                    out.push('\t');
+                    found = true;
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        // Copy this byte's whole char verbatim. `i` is on a char boundary here:
+        // either the previous iteration consumed a full `\n`/`\t` pair (ASCII)
+        // or it advanced by a full char below.
+        let ch_len = utf8_char_len(bytes[i]);
+        out.push_str(&text[i..i + ch_len]);
+        i += ch_len;
+    }
+    if found {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Length in bytes of the UTF-8 character whose leading byte is `b`. `b` is
+/// assumed to be a valid UTF-8 leading byte (it always is when iterating a
+/// `&str` at char boundaries).
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
 /// Build the new content and diff by replacing every `span` (assumed sorted and
 /// non-overlapping) with `new_text`.
 fn build_result(
@@ -332,6 +702,42 @@ fn build_result(
         new_content,
         occurrences: spans.len(),
         strategy,
+        diff,
+    }
+}
+
+/// Build the result for the quote-normalized stage. Each `span` is replaced with
+/// a *style-preserved* rendering of `new_text` derived from that span's own
+/// original quote style, so differently-quoted matches under `replace_all` each
+/// keep their own typography. The diff shows the first span's change.
+fn build_result_quote_preserving(
+    content: &str,
+    spans: &[Span],
+    new_text: &str,
+) -> EditApplied {
+    let mut new_content = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    let mut first_replacement: Option<String> = None;
+    for span in spans {
+        let actual_old = &content[span.start..span.end];
+        let replacement = preserve_quote_style(actual_old, new_text);
+        new_content.push_str(&content[cursor..span.start]);
+        new_content.push_str(&replacement);
+        cursor = span.end;
+        if first_replacement.is_none() {
+            first_replacement = Some(replacement);
+        }
+    }
+    new_content.push_str(&content[cursor..]);
+
+    let first = spans.first().copied().unwrap_or(Span { start: 0, end: 0 });
+    let first_replacement = first_replacement.unwrap_or_default();
+    let diff = render_diff(&content[first.start..first.end], &first_replacement);
+
+    EditApplied {
+        new_content,
+        occurrences: spans.len(),
+        strategy: EditStrategy::QuoteNormalized,
         diff,
     }
 }
@@ -778,5 +1184,375 @@ mod tests {
         let old = "open()\nDIFFERENT()\nclose()";
         let err = apply_edit(content, old, "x", false).unwrap_err();
         assert_eq!(err, EditError::NotFound);
+    }
+
+    // --- Stage 3: curly <-> straight quote normalization -------------------
+
+    // Convenience handles for the typographic quotes used across these tests.
+    const LSQUO: char = '\u{2018}';
+    const RSQUO: char = '\u{2019}';
+    const LDQUO: char = '\u{201C}';
+    const RDQUO: char = '\u{201D}';
+
+    #[test]
+    fn quote_normalized_file_curly_model_straight_double() {
+        // File has curly double quotes; model sent straight quotes. It must match
+        // via stage 3 and the writeback must KEEP the file's curly style.
+        let content = format!("let msg = {LDQUO}hello{RDQUO};\n");
+        let res = applied(&content, "let msg = \"hello\";", "let msg = \"world\";", false);
+        assert_eq!(res.strategy, EditStrategy::QuoteNormalized);
+        assert_eq!(res.occurrences, 1);
+        let expected = format!("let msg = {LDQUO}world{RDQUO};\n");
+        assert_eq!(res.new_content, expected);
+    }
+
+    #[test]
+    fn quote_normalized_file_straight_model_curly_double() {
+        // Vice versa: file has straight quotes, model sent curly quotes. Match via
+        // stage 3 and the writeback must straighten new_text to keep file style.
+        let content = "let msg = \"hello\";\n";
+        let old = format!("let msg = {LDQUO}hello{RDQUO};");
+        let new = format!("let msg = {LDQUO}world{RDQUO};");
+        let res = applied(content, &old, &new, false);
+        assert_eq!(res.strategy, EditStrategy::QuoteNormalized);
+        assert_eq!(res.new_content, "let msg = \"world\";\n");
+    }
+
+    #[test]
+    fn quote_normalized_single_quotes_curly_file() {
+        // Curly single quotes in the file, straight in the model output.
+        let content = format!("name = {LSQUO}Ada{RSQUO}\n");
+        let res = applied(&content, "name = 'Ada'", "name = 'Grace'", false);
+        assert_eq!(res.strategy, EditStrategy::QuoteNormalized);
+        // Opening quote stays a LEFT single curly, closing stays RIGHT.
+        let expected = format!("name = {LSQUO}Grace{RSQUO}\n");
+        assert_eq!(res.new_content, expected);
+    }
+
+    #[test]
+    fn quote_normalized_preserves_contraction_apostrophe() {
+        // The matched span uses a curly apostrophe inside a contraction. When we
+        // curl new_text, an apostrophe between two letters must become a RIGHT
+        // single quote (not a LEFT opening quote).
+        let content = format!("s = {LSQUO}don{RSQUO}t{RSQUO}\n");
+        // Model sent straight quotes for the same text.
+        let old = "s = 'don't'";
+        let new = "s = 'won't'";
+        let res = applied(&content, old, new, false);
+        assert_eq!(res.strategy, EditStrategy::QuoteNormalized);
+        // Opening -> LEFT, the contraction apostrophe -> RIGHT, closing -> RIGHT.
+        let expected = format!("s = {LSQUO}won{RSQUO}t{RSQUO}\n");
+        assert_eq!(res.new_content, expected);
+    }
+
+    #[test]
+    fn quote_normalized_multibyte_span_maps_to_original_bytes() {
+        // Curly quotes are 3 bytes each; ensure the original byte span is mapped
+        // correctly even with multibyte content around it.
+        let content = format!("世界 = {LDQUO}café{RDQUO} 🌍\n");
+        let res = applied(&content, "世界 = \"café\" 🌍", "世界 = \"thé\" 🌍", false);
+        assert_eq!(res.strategy, EditStrategy::QuoteNormalized);
+        let expected = format!("世界 = {LDQUO}thé{RDQUO} 🌍\n");
+        assert_eq!(res.new_content, expected);
+    }
+
+    #[test]
+    fn quote_normalized_respects_uniqueness() {
+        // Two curly-quoted matches; straight-quoted needle is ambiguous without
+        // replace_all (uniqueness must still be enforced in stage 3).
+        let content = format!("a = {LDQUO}x{RDQUO}\nb = {LDQUO}x{RDQUO}\n");
+        let err = apply_edit(&content, "= \"x\"", "= \"y\"", false).unwrap_err();
+        match err {
+            EditError::Ambiguous { count, .. } => assert_eq!(count, 2),
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quote_normalized_replace_all_preserves_each_span_style() {
+        // replace_all over two curly-quoted spans. Stage 3 handles both (neither
+        // is an exact substring of the straight needle), and the per-span
+        // writeback keeps each one's curly style. A mix of curly + straight could
+        // not reach stage 3 for the straight span, since the exact stage would
+        // claim it first — so both spans here are curly by design.
+        let content = format!("a = {LDQUO}x{RDQUO}\nb = {LDQUO}x{RDQUO}\n");
+        let res = applied(&content, "= \"x\"", "= \"y\"", true);
+        assert_eq!(res.strategy, EditStrategy::QuoteNormalized);
+        assert_eq!(res.occurrences, 2);
+        let expected = format!("a = {LDQUO}y{RDQUO}\nb = {LDQUO}y{RDQUO}\n");
+        assert_eq!(res.new_content, expected);
+    }
+
+    #[test]
+    fn quote_normalized_does_not_fire_when_no_quotes_involved() {
+        // Quote-free, clearly different text must NOT be rescued by stage 3.
+        let content = "let total = compute_sum(values);\n";
+        let err = apply_edit(content, "let total = compute_average(values);", "x", false)
+            .unwrap_err();
+        assert_eq!(err, EditError::NotFound);
+    }
+
+    #[test]
+    fn quote_normalized_does_not_match_different_text_with_quotes() {
+        // Same quote shape but a genuinely different identifier inside the quotes
+        // must still NOT match — folding quotes does not relax the rest.
+        let content = format!("msg = {LDQUO}hello{RDQUO}\n");
+        let err = apply_edit(&content, "msg = \"goodbye\"", "x", false).unwrap_err();
+        assert_eq!(err, EditError::NotFound);
+    }
+
+    #[test]
+    fn quote_normalized_leaves_new_text_quotes_when_span_has_no_quote_family() {
+        // The matched span has curly DOUBLE quotes but no single quotes; a single
+        // quote (apostrophe) in new_text must be left untouched.
+        let content = format!("v = {LDQUO}a{RDQUO}\n");
+        let res = applied(&content, "v = \"a\"", "v = \"it's\"", false);
+        assert_eq!(res.strategy, EditStrategy::QuoteNormalized);
+        // Double quotes curled to match the file; the apostrophe stays straight
+        // because the span had no single-quote family to mirror.
+        let expected = format!("v = {LDQUO}it's{RDQUO}\n");
+        assert_eq!(res.new_content, expected);
+    }
+
+    // --- Stage 4: literal escape-sequence normalization --------------------
+
+    #[test]
+    fn escape_normalized_literal_newline_in_old_text() {
+        // Model emitted "\n" as two literal characters where the file has a real
+        // newline. Stage 4 unescapes and matches the real-character span.
+        let content = "line one\nline two\n";
+        let old = "line one\\nline two"; // backslash-n, not a real newline
+        let res = applied(content, old, "single line", false);
+        assert_eq!(res.strategy, EditStrategy::EscapeNormalized);
+        assert_eq!(res.occurrences, 1);
+        assert_eq!(res.new_content, "single line\n");
+    }
+
+    #[test]
+    fn escape_normalized_literal_tab_in_old_text() {
+        // Literal "\t" where the file has a real tab character.
+        let content = "key\tvalue\n";
+        let old = "key\\tvalue"; // backslash-t
+        let res = applied(content, old, "key = value", false);
+        assert_eq!(res.strategy, EditStrategy::EscapeNormalized);
+        assert_eq!(res.new_content, "key = value\n");
+    }
+
+    #[test]
+    fn escape_normalized_mixed_newline_and_tab() {
+        let content = "a\n\tb\n";
+        let old = "a\\n\\tb"; // \n then \t, both literal
+        let res = applied(content, old, "done", false);
+        assert_eq!(res.strategy, EditStrategy::EscapeNormalized);
+        assert_eq!(res.new_content, "done\n");
+    }
+
+    #[test]
+    fn escape_normalized_new_text_written_verbatim_with_real_escapes() {
+        // The replacement text may itself contain real newlines; it is written
+        // back verbatim (no unescaping of new_text).
+        let content = "x\ny\n";
+        let old = "x\\ny"; // matches the real "x\ny"
+        let new = "p\nq"; // real newline in the replacement
+        let res = applied(content, old, new, false);
+        assert_eq!(res.strategy, EditStrategy::EscapeNormalized);
+        assert_eq!(res.new_content, "p\nq\n");
+    }
+
+    #[test]
+    fn escape_normalized_respects_uniqueness() {
+        let content = "a\nb\nc\na\nb\nc\n";
+        let old = "a\\nb"; // unescapes to "a\nb", which occurs twice
+        let err = apply_edit(content, old, "z", false).unwrap_err();
+        match err {
+            EditError::Ambiguous { count, .. } => assert_eq!(count, 2),
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn escape_normalized_does_not_fire_without_literal_escapes() {
+        // old_text has no backslash escapes, so stage 4 never runs and a genuine
+        // mismatch stays NotFound (no fuzzy rescue).
+        let content = "alpha\nbeta\n";
+        let err = apply_edit(content, "alpha beta gamma", "x", false).unwrap_err();
+        assert_eq!(err, EditError::NotFound);
+    }
+
+    #[test]
+    fn escape_normalized_does_not_match_when_real_chars_absent() {
+        // old_text uses "\n" but the file has the literal two characters, NOT a
+        // real newline. Stage 1 already matches the literal form, so stage 4 must
+        // not produce a different (wrong) interpretation. Here the exact stage
+        // wins because the file literally contains backslash-n.
+        let content = "a\\nb\n"; // file literally contains backslash, n
+        let res = applied(content, "a\\nb", "c", false);
+        assert_eq!(res.strategy, EditStrategy::Exact);
+        assert_eq!(res.new_content, "c\n");
+    }
+
+    #[test]
+    fn escape_normalized_multibyte_safe() {
+        // Real newline between multibyte content; literal "\n" in old_text.
+        let content = "café\nثعلب\n";
+        let old = "café\\nثعلب";
+        let res = applied(content, old, "ok", false);
+        assert_eq!(res.strategy, EditStrategy::EscapeNormalized);
+        assert_eq!(res.new_content, "ok\n");
+    }
+
+    // --- Trailing-newline absorption on deletion (deletion-preference) -----
+
+    #[test]
+    fn trailing_newline_absorbed_on_pure_deletion() {
+        // Deleting a whole line: new_text empty, old_text has no trailing newline,
+        // but old_text + "\n" matches. The newline is removed too, leaving no
+        // orphan blank line.
+        let content = "keep\nremove me\nkeep too\n";
+        let res = applied(content, "remove me", "", false);
+        assert_eq!(res.strategy, EditStrategy::TrailingNewline);
+        assert_eq!(res.occurrences, 1);
+        assert_eq!(res.new_content, "keep\nkeep too\n");
+    }
+
+    #[test]
+    fn trailing_newline_not_used_when_new_text_nonempty() {
+        // Replacement (not deletion): the trailing-newline stage must not engage;
+        // an exact substring replacement keeps the newline.
+        let content = "keep\nremove me\nkeep too\n";
+        let res = applied(content, "remove me", "kept", false);
+        assert_eq!(res.strategy, EditStrategy::Exact);
+        assert_eq!(res.new_content, "keep\nkept\nkeep too\n");
+    }
+
+    #[test]
+    fn trailing_newline_deletion_exact_wins_when_old_text_has_newline() {
+        // old_text already ends in "\n", so the dedicated trailing stage is not
+        // needed; exact deletion handles it and removes exactly that span.
+        let content = "keep\nremove me\nkeep too\n";
+        let res = applied(content, "remove me\n", "", false);
+        assert_eq!(res.strategy, EditStrategy::Exact);
+        assert_eq!(res.new_content, "keep\nkeep too\n");
+    }
+
+    #[test]
+    fn trailing_newline_respects_uniqueness() {
+        // The line appears twice; deletion without replace_all is ambiguous.
+        let content = "dup\nmid\ndup\n";
+        let err = apply_edit(content, "dup", "", false).unwrap_err();
+        match err {
+            EditError::Ambiguous { count, .. } => assert_eq!(count, 2),
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trailing_newline_replace_all_deletes_all_with_newlines() {
+        let content = "dup\nmid\ndup\n";
+        let res = applied(content, "dup", "", true);
+        assert_eq!(res.strategy, EditStrategy::TrailingNewline);
+        assert_eq!(res.occurrences, 2);
+        assert_eq!(res.new_content, "mid\n");
+    }
+
+    #[test]
+    fn trailing_newline_absorption_skipped_when_no_newline_after_match() {
+        // old_text occurs at end of file with no trailing newline, and there is
+        // no "old_text + \n" anywhere. The trailing-newline preference is skipped
+        // (its target is absent) and exact deletion of the substring takes over.
+        let content = "alpha tail";
+        let res = applied(content, "tail", "", false);
+        assert_eq!(res.strategy, EditStrategy::Exact);
+        assert_eq!(res.new_content, "alpha ");
+    }
+
+    #[test]
+    fn trailing_newline_does_not_match_different_text() {
+        // A genuinely absent line must not be deleted by the trailing-newline
+        // stage (no fuzzy rescue on deletions either).
+        let content = "one\ntwo\n";
+        let err = apply_edit(content, "three", "", false).unwrap_err();
+        assert_eq!(err, EditError::NotFound);
+    }
+
+    // --- Cross-stage ordering / negative fuzz guards -----------------------
+
+    #[test]
+    fn stage_ordering_exact_beats_quote_and_escape() {
+        // When an exact match exists, none of the new stages should be consulted.
+        let content = "value = \"plain\";\n";
+        let res = applied(content, "\"plain\"", "\"PLAIN\"", false);
+        assert_eq!(res.strategy, EditStrategy::Exact);
+        assert_eq!(res.new_content, "value = \"PLAIN\";\n");
+    }
+
+    #[test]
+    fn no_new_stage_turns_a_clear_mismatch_into_a_match() {
+        // A string that differs in more than quotes/escapes/trailing-newline must
+        // remain NotFound across ALL stages (the central anti-fuzz guarantee).
+        let content = format!("greeting = {LDQUO}hello there{RDQUO}\n");
+        // Different words AND quote style AND a literal escape: still no match.
+        let err =
+            apply_edit(&content, "greeting = \"farewell\\nfriend\"", "x", false).unwrap_err();
+        assert_eq!(err, EditError::NotFound);
+    }
+
+    #[test]
+    fn new_stages_preserve_crlf_surroundings() {
+        // Quote-normalized match inside CRLF content: surrounding CRLFs intact.
+        let content = format!("a\r\nmsg = {LDQUO}hi{RDQUO}\r\nb\r\n");
+        let res = applied(&content, "msg = \"hi\"", "msg = \"bye\"", false);
+        assert_eq!(res.strategy, EditStrategy::QuoteNormalized);
+        let expected = format!("a\r\nmsg = {LDQUO}bye{RDQUO}\r\nb\r\n");
+        assert_eq!(res.new_content, expected);
+        assert!(res.new_content.contains("\r\n"));
+    }
+
+    #[test]
+    fn quote_normalized_bom_preserved() {
+        let content = format!("\u{FEFF}t = {LDQUO}a{RDQUO}\n");
+        let res = applied(&content, "t = \"a\"", "t = \"b\"", false);
+        assert!(res.new_content.starts_with('\u{FEFF}'));
+        let expected = format!("\u{FEFF}t = {LDQUO}b{RDQUO}\n");
+        assert_eq!(res.new_content, expected);
+    }
+
+    #[test]
+    fn no_change_guard_precedes_new_stages() {
+        // old == new is a no-op regardless of quotes/escapes being present.
+        let content = format!("x = {LDQUO}a{RDQUO}\n");
+        let old = format!("x = {LDQUO}a{RDQUO}");
+        let err = apply_edit(&content, &old, &old, false).unwrap_err();
+        assert_eq!(err, EditError::NoChange);
+    }
+
+    #[test]
+    fn unescape_n_t_helper_only_touches_n_and_t() {
+        // Direct unit check: only \n and \t are unescaped; \r, \", \\ are left
+        // verbatim, and a string with no \n/\t yields None.
+        assert_eq!(unescape_n_t("a\\nb").as_deref(), Some("a\nb"));
+        assert_eq!(unescape_n_t("a\\tb").as_deref(), Some("a\tb"));
+        assert_eq!(unescape_n_t("plain text"), None);
+        assert_eq!(unescape_n_t("a\\rb"), None); // \r not in scope
+        assert_eq!(unescape_n_t("a\\\"b"), None); // escaped quote not in scope
+    }
+
+    #[test]
+    fn fold_quotes_with_map_round_trips_offsets() {
+        // The offset map must point every folded char boundary back to the
+        // original char start, including across multibyte content.
+        let content = format!("a{LDQUO}世{RDQUO}b");
+        let (folded, orig_at) = fold_quotes_with_map(&content);
+        assert_eq!(folded, "a\"世\"b");
+        // For each char boundary in the folded string, the mapped original slice
+        // must itself be valid (no panic) and the whole map ends at content.len().
+        assert_eq!(*orig_at.last().unwrap(), content.len());
+        let mut folded_pos = 0;
+        for fch in folded.chars() {
+            let orig = orig_at[folded_pos];
+            // Slicing the original at the mapped offset must land on a boundary.
+            assert!(content.is_char_boundary(orig));
+            folded_pos += fch.len_utf8();
+        }
     }
 }
