@@ -25,7 +25,10 @@ async-trait = "0.1"
 base64 = "0.22"
 futures-util = "0.3"
 getrandom = "0.2"
+globset = "0.4"
+ignore = "0.4"
 process-wrap = { version = "9.1", features = ["tokio1"] }
+regex = "1"
 reqwest = { version = "0.13.3", features = ["blocking", "form", "json"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

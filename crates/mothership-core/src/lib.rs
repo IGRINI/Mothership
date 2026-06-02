@@ -51,8 +51,9 @@ pub use run::{schedule_cancel_fallback, ChatRunRegistry, ChatRunService};
 pub use subprocess_gateway::SubprocessChatGateway;
 pub use tools::{
     apply_patch as run_apply_patch_tool, classify as classify_file_tool,
-    edit_file as run_edit_file_tool, preview_diff as file_tool_preview_diff,
-    read_file as run_read_file_tool, tool_batch_plan, write_file as run_write_file_tool,
+    edit_file as run_edit_file_tool, list_files as run_list_files_tool,
+    preview_diff as file_tool_preview_diff, read_file as run_read_file_tool,
+    search_text as run_search_text_tool, tool_batch_plan, write_file as run_write_file_tool,
     ConservativeCommandPermissionPolicy, FileMetadata,
     FileSystem, FileTool, FileToolCapability, FileToolError, FileToolOutcome, FileToolOutputStore,
     FileToolSpill, NoopToolExecutionEventSink, PathError, PendingToolApprovalGate, StdFileSystem,
@@ -65,6 +66,6 @@ pub use tools::{
     ToolOutputStore, ToolOutputStream, ToolPermissionAction, ToolPermissionEvaluation,
     ToolPermissionPolicy, ToolProcessExit, ToolProcessSandbox, ToolProcessSpec, ToolRepeatBlock,
     ToolRepeatGuard, ToolRepeatGuardConfig, ToolResourceLimits, ToolSupervisor, Workspace,
-    APPLY_PATCH_TOOL_NAME, EDIT_FILE_TOOL_NAME, READ_FILE_TOOL_NAME, RUN_COMMAND_TOOL_NAME,
-    WRITE_FILE_TOOL_NAME,
+    APPLY_PATCH_TOOL_NAME, EDIT_FILE_TOOL_NAME, LIST_FILES_TOOL_NAME, READ_FILE_TOOL_NAME,
+    RUN_COMMAND_TOOL_NAME, SEARCH_TEXT_TOOL_NAME, WRITE_FILE_TOOL_NAME,
 };

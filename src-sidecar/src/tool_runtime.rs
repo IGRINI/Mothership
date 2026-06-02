@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use mothership_core::{
     classify_file_tool, file_tool_preview_diff, run_apply_patch_tool, run_edit_file_tool,
-    run_read_file_tool, run_write_file_tool, tool_batch_plan, ChatCancellationToken, FileTool,
+    run_list_files_tool, run_read_file_tool, run_search_text_tool, run_write_file_tool,
+    tool_batch_plan, ChatCancellationToken, FileTool,
     FileToolOutcome,
     FileToolSpill, LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResult, MothershipError,
     PendingToolApprovalGate, Result, SpawnedToolProcess, StdFileSystem, ToolApprovalDecision,
@@ -513,6 +514,20 @@ impl SidecarLlmToolHandler {
             FileTool::Write => run_write_file_tool(arguments, workspace, &self.file_system),
             FileTool::Edit => run_edit_file_tool(arguments, workspace, &self.file_system),
             FileTool::ApplyPatch => run_apply_patch_tool(arguments, workspace, &self.file_system),
+            // Read-only search tools: spill large results like read_file does.
+            FileTool::ListFiles => run_list_files_tool(
+                arguments,
+                workspace,
+                tool_call_id,
+                spill.as_ref().map(|spill| spill as &dyn FileToolSpill),
+            ),
+            FileTool::SearchText => run_search_text_tool(
+                arguments,
+                workspace,
+                &self.file_system,
+                tool_call_id,
+                spill.as_ref().map(|spill| spill as &dyn FileToolSpill),
+            ),
         };
 
         match outcome {

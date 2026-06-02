@@ -78,7 +78,7 @@ pub struct FileToolOutcome {
 }
 
 impl FileToolOutcome {
-    fn failure(model_text: impl Into<String>, data: Value) -> Self {
+    pub(super) fn failure(model_text: impl Into<String>, data: Value) -> Self {
         Self {
             ok: false,
             model_text: model_text.into(),
@@ -183,13 +183,17 @@ pub struct ApplyPatchInput {
     pub patch: String,
 }
 
-/// The file tools, identified by name, used for classification.
+/// The file tools, identified by name, used for classification. Includes the two
+/// read-only search tools (`list_files`/`search_text`), which share the same
+/// classify/dispatch plumbing but always resolve to a read `Allow`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileTool {
     Read,
     Write,
     Edit,
     ApplyPatch,
+    ListFiles,
+    SearchText,
 }
 
 impl FileTool {
@@ -200,6 +204,8 @@ impl FileTool {
             super::catalog::WRITE_FILE_TOOL_NAME => Some(FileTool::Write),
             super::catalog::EDIT_FILE_TOOL_NAME => Some(FileTool::Edit),
             super::catalog::APPLY_PATCH_TOOL_NAME => Some(FileTool::ApplyPatch),
+            super::catalog::LIST_FILES_TOOL_NAME => Some(FileTool::ListFiles),
+            super::catalog::SEARCH_TEXT_TOOL_NAME => Some(FileTool::SearchText),
             _ => None,
         }
     }
@@ -280,6 +286,11 @@ pub fn classify(
                 Err(reason) => Ok(deny(reason, touched)),
             }
         }
+        // Read-only search tools: classification (read `Allow` within the
+        // workspace, `Deny` for an escaping/sensitive `dir`) lives in the search
+        // module alongside the handlers.
+        FileTool::ListFiles => super::search::classify_list_files(arguments, workspace),
+        FileTool::SearchText => super::search::classify_search_text(arguments, workspace),
     }
 }
 
@@ -297,7 +308,8 @@ pub fn preview_diff(
     fs: &dyn FileSystem,
 ) -> Option<String> {
     match tool {
-        FileTool::Read => None,
+        // Read-only tools have nothing to preview before approval.
+        FileTool::Read | FileTool::ListFiles | FileTool::SearchText => None,
         FileTool::Write => {
             let input: WriteFileInput = parse_args(arguments).ok()?;
             let resolved = resolve_guarded(workspace, &input.path).ok()?;

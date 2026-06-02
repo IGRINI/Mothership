@@ -19,18 +19,23 @@ mod registry;
 mod repeat_guard;
 mod resources;
 mod scheduler;
+mod search;
 mod supervisor;
 mod types;
 
 pub use cancellation::ToolCancellationToken;
 pub use catalog::{
     default_tool_catalog, APPLY_PATCH_TOOL_ID, APPLY_PATCH_TOOL_NAME, EDIT_FILE_TOOL_ID,
-    EDIT_FILE_TOOL_NAME, READ_FILE_TOOL_ID, READ_FILE_TOOL_NAME, RUN_COMMAND_TOOL_ID,
-    RUN_COMMAND_TOOL_NAME, WRITE_FILE_TOOL_ID, WRITE_FILE_TOOL_NAME,
+    EDIT_FILE_TOOL_NAME, LIST_FILES_TOOL_ID, LIST_FILES_TOOL_NAME, READ_FILE_TOOL_ID,
+    READ_FILE_TOOL_NAME, RUN_COMMAND_TOOL_ID, RUN_COMMAND_TOOL_NAME, SEARCH_TEXT_TOOL_ID,
+    SEARCH_TEXT_TOOL_NAME, WRITE_FILE_TOOL_ID, WRITE_FILE_TOOL_NAME,
 };
 pub use file_tools::{
     apply_patch, classify, edit_file, preview_diff, read_file, write_file, FileTool,
     FileToolCapability, FileToolError, FileToolOutcome, FileToolSpill, MAX_TOOL_EVENT_BYTES,
+};
+pub use search::{
+    classify_list_files, classify_search_text, list_files, search_text,
 };
 pub use filesystem::{FileMetadata, FileSystem, PathError, StdFileSystem, Workspace};
 pub use output::{FileToolOutputStore, ToolOutputStore};

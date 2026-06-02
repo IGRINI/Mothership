@@ -298,6 +298,14 @@ const NATIVE_FILE_MUTATION_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "Not
 /// on `read_file` specifically so the model is never left without a read path.
 const NATIVE_FILE_READ_TOOLS: &[&str] = &["Read"];
 
+/// Claude's native search tools. Disabled only when BOTH typed search tools
+/// (`list_files` AND `search_text`) are bridged, so the model has a full typed
+/// replacement for file discovery (`Glob` → `list_files`) and content search
+/// (`Grep` → `search_text`) before either native tool is removed. If only one is
+/// present, the native pair stays enabled so the model is never left without a
+/// search path.
+const NATIVE_SEARCH_TOOLS: &[&str] = &["Glob", "Grep"];
+
 fn disallowed_tools_for_request(request: &ChatRequest) -> Vec<&'static str> {
     let mut tools = HEADLESS_DISALLOWED_TOOLS.to_vec();
     if request.tools.iter().any(|tool| tool.name == "run_command") {
@@ -320,6 +328,15 @@ fn disallowed_tools_for_request(request: &ChatRequest) -> Vec<&'static str> {
     if request.tools.iter().any(|tool| tool.name == "read_file") {
         tools.extend_from_slice(NATIVE_FILE_READ_TOOLS);
     }
+    // Route file discovery + content search through Mothership: disable Claude's
+    // native `Glob`/`Grep` only when BOTH typed search tools are bridged (a full
+    // typed replacement). With only one present, leave the native pair enabled so
+    // the model always has a working search path.
+    let has_list_files = request.tools.iter().any(|tool| tool.name == "list_files");
+    let has_search_text = request.tools.iter().any(|tool| tool.name == "search_text");
+    if has_list_files && has_search_text {
+        tools.extend_from_slice(NATIVE_SEARCH_TOOLS);
+    }
     tools
 }
 
@@ -328,7 +345,7 @@ fn adapter_instructions(core_instructions: String, bridge_enabled: bool) -> Stri
         return core_instructions;
     }
 
-    let bridge_instructions = "When Mothership MCP tools are available, use them for local command execution and all file changes. Prefer `mcp__mothership__run_command` over direct shell tools, and prefer the Mothership file tools (`mcp__mothership__read_file`, `mcp__mothership__write_file`, `mcp__mothership__edit_file`, `mcp__mothership__apply_patch`) over native file tools, so Mothership can supervise cancellation, permissions, history, and output synchronization. Only fall back to provider-native tools when no Mothership tool can perform the task.";
+    let bridge_instructions = "When Mothership MCP tools are available, use them for local command execution and all file changes. Prefer `mcp__mothership__run_command` over direct shell tools, prefer the Mothership file tools (`mcp__mothership__read_file`, `mcp__mothership__write_file`, `mcp__mothership__edit_file`, `mcp__mothership__apply_patch`) over native file tools, and prefer the Mothership search tools (`mcp__mothership__list_files`, `mcp__mothership__search_text`) over native file discovery and content search, so Mothership can supervise cancellation, permissions, history, and output synchronization. Only fall back to provider-native tools when no Mothership tool can perform the task.";
     if core_instructions.trim().is_empty() {
         bridge_instructions.to_string()
     } else {
@@ -710,5 +727,56 @@ mod tests {
         assert!(disallowed.contains(&"Write"));
         // No run_command here, so Bash stays enabled.
         assert!(!disallowed.contains(&"Bash"));
+    }
+
+    #[test]
+    fn disallows_native_search_tools_only_when_both_search_tools_present() {
+        // Both typed search tools bridged: native Glob/Grep are a full typed
+        // replacement and must be disabled.
+        let request = request_with_tools(&["list_files", "search_text"]);
+        let disallowed = disallowed_tools_for_request(&request);
+        for native in NATIVE_SEARCH_TOOLS {
+            assert!(
+                disallowed.contains(native),
+                "expected `{native}` to be disallowed when both search tools are bridged"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_native_search_tools_when_only_one_search_tool_present() {
+        // Only list_files bridged: native search must stay enabled (no full
+        // replacement).
+        let request = request_with_tools(&["list_files"]);
+        let disallowed = disallowed_tools_for_request(&request);
+        for native in NATIVE_SEARCH_TOOLS {
+            assert!(
+                !disallowed.contains(native),
+                "`{native}` must stay enabled when only one search tool is bridged"
+            );
+        }
+
+        // Only search_text bridged: same.
+        let request = request_with_tools(&["search_text"]);
+        let disallowed = disallowed_tools_for_request(&request);
+        for native in NATIVE_SEARCH_TOOLS {
+            assert!(
+                !disallowed.contains(native),
+                "`{native}` must stay enabled when only one search tool is bridged"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_native_search_tools_when_no_search_tools_present() {
+        // No typed search tools: native Glob/Grep stay enabled.
+        let request = request_with_tools(&["run_command", "read_file"]);
+        let disallowed = disallowed_tools_for_request(&request);
+        for native in NATIVE_SEARCH_TOOLS {
+            assert!(
+                !disallowed.contains(native),
+                "`{native}` must stay enabled when no search tools are present"
+            );
+        }
     }
 }

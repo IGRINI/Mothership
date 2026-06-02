@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::LlmToolCallRequest;
 
-use super::catalog::RUN_COMMAND_TOOL_NAME;
+use super::catalog::{LIST_FILES_TOOL_NAME, RUN_COMMAND_TOOL_NAME, SEARCH_TEXT_TOOL_NAME};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ToolBatchPlan {
@@ -37,6 +37,14 @@ pub fn tool_batch_plan(requests: &[LlmToolCallRequest]) -> ToolBatchPlan {
 }
 
 pub fn tool_concurrency(request: &LlmToolCallRequest) -> ToolConcurrency {
+    // The read-only search tools never mutate state, so a batch of them (or a mix
+    // with read-only commands) is always safe to run concurrently. `read_file` is
+    // intentionally NOT included here yet — its parallel-safety is a separate
+    // follow-up.
+    if request.name == LIST_FILES_TOOL_NAME || request.name == SEARCH_TEXT_TOOL_NAME {
+        return ToolConcurrency::ParallelSafe;
+    }
+
     if request.name != RUN_COMMAND_TOOL_NAME {
         return ToolConcurrency::Exclusive;
     }
@@ -137,6 +145,36 @@ mod tests {
         ];
 
         assert_eq!(tool_batch_plan(&requests), ToolBatchPlan::Sequential);
+    }
+
+    #[test]
+    fn search_tools_are_parallel_safe() {
+        // The read-only search tools are parallel-safe on their own and alongside
+        // read-only commands.
+        assert_eq!(
+            tool_concurrency(&search_request("c1", LIST_FILES_TOOL_NAME)),
+            ToolConcurrency::ParallelSafe
+        );
+        assert_eq!(
+            tool_concurrency(&search_request("c2", SEARCH_TEXT_TOOL_NAME)),
+            ToolConcurrency::ParallelSafe
+        );
+
+        let requests = vec![
+            search_request("c1", LIST_FILES_TOOL_NAME),
+            search_request("c2", SEARCH_TEXT_TOOL_NAME),
+            run_command_request("c3", "git", &["status"]),
+        ];
+        assert_eq!(tool_batch_plan(&requests), ToolBatchPlan::Parallel);
+    }
+
+    fn search_request(id: &str, name: &str) -> LlmToolCallRequest {
+        LlmToolCallRequest {
+            run_id: Some("run".to_string()),
+            tool_call_id: id.to_string(),
+            name: name.to_string(),
+            arguments: serde_json::json!({ "pattern": "x" }),
+        }
     }
 
     fn run_command_request(id: &str, program: &str, args: &[&str]) -> LlmToolCallRequest {
