@@ -92,7 +92,7 @@ fn read_file_tool_descriptor() -> ToolDescriptor {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 10485760,
-                    "description": "Optional cap on inlined bytes (up to 10 MiB) before the content spills to a reference. The raw read is hard-bounded to 10 MiB regardless; page large files with startLine/limit."
+                    "description": "Optional cap on how many INLINE bytes are returned (up to 10 MiB) before the content spills to a reference. Independently, the raw read off disk is hard-capped at 10 MiB: startLine/limit page only WITHIN that read window, not past the 10 MiB cap. For ranges in a file larger than 10 MiB, use run_command (e.g. sed/Get-Content)."
                 }
             },
             "required": ["path"],

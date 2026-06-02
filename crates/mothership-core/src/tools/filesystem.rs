@@ -29,6 +29,8 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 /// A canonicalized project root and the path policy enforced against it.
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -342,6 +344,17 @@ pub trait FileSystem: Send + Sync {
             Ok((bytes, false))
         }
     }
+    /// Hex-encoded SHA-256 of the **whole** file at `path`, computed without
+    /// holding the file in memory. `write_file` uses this for its conflict /
+    /// "exists" check over a possibly-huge existing file, so it must hash the
+    /// full bytes (unlike [`FileSystem::read_capped`], which deliberately stops
+    /// at a prefix). The default implementation hashes the bytes returned by
+    /// [`FileSystem::read`]; the [`StdFileSystem`] override streams the file
+    /// through the hasher in fixed-size chunks so memory stays bounded.
+    fn hash_file_sha256(&self, path: &Path) -> io::Result<String> {
+        let bytes = self.read(path)?;
+        Ok(hex_sha256(&Sha256::digest(&bytes)))
+    }
     /// Atomically write `bytes` to `path`, replacing any existing file.
     fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;
     /// Stat the path.
@@ -387,6 +400,24 @@ impl FileSystem for StdFileSystem {
             buf.truncate(max);
         }
         Ok((buf, truncated))
+    }
+
+    fn hash_file_sha256(&self, path: &Path) -> io::Result<String> {
+        use std::io::Read as _;
+        let mut file = fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        // Stream the file through the hasher in fixed-size chunks so a huge file
+        // is fully hashed without ever buffering more than `CHUNK` bytes.
+        const CHUNK: usize = 64 * 1024;
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            let read = file.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buf[..read]);
+        }
+        Ok(hex_sha256(&hasher.finalize()))
     }
 
     fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -467,6 +498,15 @@ fn unique_temp_path(parent: &Path, target: &Path) -> PathBuf {
         .unwrap_or(0);
     let pid = std::process::id();
     parent.join(format!(".{stem}.{pid}.{nanos}.mtmp"))
+}
+
+/// Hex-encode a SHA-256 digest (the raw 32-byte output of the hasher).
+fn hex_sha256(digest: &[u8]) -> String {
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -599,6 +639,39 @@ mod tests {
         let (bytes, truncated) = fs_port.read_capped(&small, 1024).unwrap();
         assert!(!truncated);
         assert_eq!(bytes, b"hello");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hash_file_sha256_streams_full_file_and_matches_known_digest() {
+        let dir = unique_temp_dir("hash_stream");
+        let fs_port = StdFileSystem::new();
+
+        // A file larger than the 64 KiB streaming chunk so multiple update()
+        // calls are exercised; the streamed hash must equal the one-shot hash of
+        // the same bytes (i.e. the WHOLE file, not a prefix).
+        let target = dir.join("big.bin");
+        let body = vec![b'q'; 64 * 1024 * 3 + 17];
+        fs::write(&target, &body).unwrap();
+
+        let expected = {
+            let mut out = String::new();
+            for byte in Sha256::digest(&body) {
+                out.push_str(&format!("{byte:02x}"));
+            }
+            out
+        };
+        let streamed = fs_port.hash_file_sha256(&target).unwrap();
+        assert_eq!(streamed, expected, "streamed hash must cover the whole file");
+
+        // Empty file hashes to the well-known empty SHA-256.
+        let empty = dir.join("empty.bin");
+        fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            fs_port.hash_file_sha256(&empty).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

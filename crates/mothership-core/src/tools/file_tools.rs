@@ -469,10 +469,16 @@ pub fn read_file(
     }
     if bytes_truncated {
         // The file exceeded the read ceiling; only a prefix was loaded, so the
-        // sha and line view describe that prefix, not the whole file.
+        // sha and line view describe that prefix, not the whole file. Annotate the
+        // data so `totalLines` is not mistaken for the whole-file total: the lines
+        // counted here are only those in the read prefix, and the read was capped
+        // at `read_ceiling` bytes. Content past the cap is NOT reachable via
+        // startLine/limit here — those page WITHIN this prefix only.
         data["bytesTruncated"] = json!(true);
         data["truncated"] = json!(true);
         data["readCeilingBytes"] = json!(read_ceiling);
+        data["cappedAtBytes"] = json!(read_ceiling);
+        data["linesAreFromCappedPrefix"] = json!(true);
     }
 
     if numbered.len() > max_bytes {
@@ -497,11 +503,9 @@ pub fn read_file(
             model_text.push_str(&format!("full content: {log_ref}\n"));
         }
         if bytes_truncated {
-            model_text.push_str(&format!(
-                "(file exceeds the {read_ceiling}-byte read ceiling; only the leading bytes were read)\n"
-            ));
+            model_text.push_str(&capped_window_note(read_ceiling));
         }
-        model_text.push_str(&format!("(total lines: {total_lines})\n"));
+        model_text.push_str(&format!("(total lines in read window: {total_lines})\n"));
         return Ok(FileToolOutcome {
             ok: true,
             model_text,
@@ -512,12 +516,23 @@ pub fn read_file(
     }
 
     // The rendered view fits the byte budget, but the file itself may have been
-    // size-capped off disk; tell the model so it can page for the remainder.
+    // size-capped off disk. Tell the model the truth: startLine/limit page WITHIN
+    // this read window only — they do NOT reach content past the cap. For ranges
+    // beyond the cap in very large files, run_command is the tool.
     let mut model_text = numbered;
     if bytes_truncated {
-        model_text.push_str(&format!(
-            "\n... file exceeds the {read_ceiling}-byte read ceiling; only the leading bytes were read. Use startLine/limit to page further ...\n"
-        ));
+        model_text.push_str(&capped_window_note(read_ceiling));
+
+        // If the requested start fell at/after the last line available in the
+        // (capped) window, the model asked for content that is not in the read
+        // window. Say so plainly rather than returning a silent empty body — and
+        // do not pretend the lines exist past the cap.
+        if start_idx >= total_lines {
+            data["startBeyondWindow"] = json!(true);
+            model_text.push_str(&format!(
+                "(requested startLine {start_line} is beyond the {total_lines} line(s) in this read window; lines past the {read_ceiling}-byte cap are not readable here — use run_command for ranges in very large files)\n"
+            ));
+        }
     }
 
     Ok(FileToolOutcome {
@@ -558,17 +573,23 @@ pub fn write_file(
         ));
     }
 
-    let old_bytes = if existed {
-        Some(fs.read(&resolved).map_err(|error| FileToolError::Io(error.to_string()))?)
+    // For an existing file, hash the WHOLE file by streaming it through the
+    // hasher (bounded memory) rather than slurping it into a `Vec` — a write over
+    // a multi-gigabyte file must not load it just to compute a conflict sha. The
+    // BOM/EOL base + diff are derived separately from a bounded prefix below.
+    let old_sha = if existed {
+        Some(
+            fs.hash_file_sha256(&resolved)
+                .map_err(|error| FileToolError::Io(error.to_string()))?,
+        )
     } else {
         None
     };
 
     if existed {
-        let old = old_bytes.as_deref().unwrap_or_default();
-        let old_sha = sha256_hex(old);
+        let old_sha = old_sha.as_deref().unwrap_or_default();
         if let Some(expected) = &input.expected_sha256 {
-            if !expected.eq_ignore_ascii_case(&old_sha) {
+            if !expected.eq_ignore_ascii_case(old_sha) {
                 return Ok(FileToolOutcome::failure(
                     format!(
                         "`{}` changed on disk (expected sha256 {expected}, found {old_sha}); not written",
@@ -593,11 +614,33 @@ pub fn write_file(
         }
     }
 
+    // Read a BOUNDED prefix of the existing file for BOM/EOL detection and the
+    // diff base. A huge old file is never fully loaded; `old_truncated` records
+    // whether the prefix is the whole file (false) or just its leading bytes
+    // (true). When truncated, the prefix is NOT a faithful diff base, so we emit
+    // a summary instead of a misleading partial line diff below. `old_size` is
+    // captured here, BEFORE the overwrite, so the summary can report the old
+    // length (stat fails -> `>cap`).
+    let (old_text, old_truncated, old_size) = if existed {
+        let (bytes, truncated) = fs
+            .read_capped(&resolved, MAX_READ_FILE_BYTES)
+            .map_err(|error| FileToolError::Io(error.to_string()))?;
+        let size = fs
+            .metadata(&resolved)
+            .map(|meta| meta.len.to_string())
+            .unwrap_or_else(|_| ">cap".to_string());
+        (
+            Some(String::from_utf8_lossy(&bytes).into_owned()),
+            truncated,
+            Some(size),
+        )
+    } else {
+        (None, false, None)
+    };
+
     // Preserve BOM + EOL style of the existing file so a full overwrite does not
-    // silently reformat line endings.
-    let old_text = old_bytes
-        .as_deref()
-        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+    // silently reformat line endings. (Derived from the bounded prefix, which is
+    // sufficient: a file's leading bytes carry its BOM and dominant EOL style.)
     let final_text = match &old_text {
         Some(old) => match_bom_and_eol(old, &input.content),
         None => input.content.clone(),
@@ -608,7 +651,19 @@ pub fn write_file(
         .map_err(|error| FileToolError::Io(error.to_string()))?;
 
     let new_sha = sha256_hex(final_bytes);
-    let diff = render_full_diff(old_text.as_deref().unwrap_or(""), &final_text);
+    // Diff: a faithful full line diff only when the old prefix WAS the whole file
+    // (not truncated). If the old file exceeded the cap, rendering a diff over the
+    // partial prefix would be misleading, so emit a concise summary instead. New
+    // files have no old content and always get a full diff (against empty).
+    let diff = if old_truncated {
+        let old_size = old_size.as_deref().unwrap_or(">cap");
+        let old_sha_text = old_sha.as_deref().unwrap_or("");
+        format!(
+            "[existing file was large ({old_size} bytes, sha {old_sha_text}); replaced wholesale — full line diff omitted]"
+        )
+    } else {
+        render_full_diff(old_text.as_deref().unwrap_or(""), &final_text)
+    };
     let status = if existed { "modified" } else { "created" };
     let model_text = format!(
         "{status} {} ({} bytes, sha256 {new_sha})",
@@ -1246,6 +1301,18 @@ fn render_numbered(selected: &[(usize, &str)]) -> String {
     out
 }
 
+/// The honest truncation note appended when the raw read hit `read_ceiling`.
+/// Crucially it does NOT claim `startLine`/`limit` can page past the cap (they
+/// only page within the bytes that were read); it points the model at
+/// `run_command` for targeted ranges in a file larger than the ceiling.
+fn capped_window_note(read_ceiling: usize) -> String {
+    format!(
+        "\n... file exceeds the {read_ceiling}-byte read ceiling; only the leading bytes were read. \
+startLine/limit page within this window only — for content beyond the cap use run_command \
+(e.g. `sed -n 'A,Bp' <file>` or PowerShell `Get-Content <file> -TotalCount N`) to read targeted ranges ...\n"
+    )
+}
+
 /// Take the longest prefix of `text` not exceeding `max_bytes`, ending on a
 /// char boundary so the preview is always valid UTF-8.
 fn take_prefix_on_char_boundary(text: &str, max_bytes: usize) -> String {
@@ -1560,6 +1627,174 @@ mod tests {
         assert!(out.ok);
         let written = fs::read(dir.join("a.txt")).unwrap();
         assert_eq!(written, "\u{FEFF}alpha\r\nbeta\r\n".as_bytes());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- write_file bounded old-file read (round-3 Fix B) ----------------
+
+    /// A FileSystem double backed by an in-memory `old` buffer that PANICS if
+    /// `read` (the full slurp) is ever called. `read_capped` returns a bounded
+    /// prefix and `hash_file_sha256` streams the buffer through a real hasher.
+    /// Used to prove `write_file` no longer slurps the whole old file: it must use
+    /// `read_capped` + `hash_file_sha256` only. `write_atomic` records the bytes
+    /// written so the test can verify the new content.
+    struct NoFullReadFs {
+        old: Vec<u8>,
+        prefix_cap: usize,
+        written: std::sync::Mutex<Option<Vec<u8>>>,
+    }
+    impl NoFullReadFs {
+        fn new(old: Vec<u8>, prefix_cap: usize) -> Self {
+            Self {
+                old,
+                prefix_cap,
+                written: std::sync::Mutex::new(None),
+            }
+        }
+    }
+    impl FileSystem for NoFullReadFs {
+        fn read(&self, _p: &std::path::Path) -> std::io::Result<Vec<u8>> {
+            panic!("write_file must not slurp the whole old file via read()");
+        }
+        fn read_capped(
+            &self,
+            _p: &std::path::Path,
+            max: usize,
+        ) -> std::io::Result<(Vec<u8>, bool)> {
+            // Hand back at most `min(max, prefix_cap)` bytes; report truncation
+            // whenever the real file is longer than what we return.
+            let give = max.min(self.prefix_cap).min(self.old.len());
+            let truncated = self.old.len() > give;
+            Ok((self.old[..give].to_vec(), truncated))
+        }
+        fn hash_file_sha256(&self, _p: &std::path::Path) -> std::io::Result<String> {
+            // Real, full-file hash over the stored buffer (delegating to the same
+            // hex sha used by the production path).
+            Ok(sha256_hex(&self.old))
+        }
+        fn write_atomic(&self, _p: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+            *self.written.lock().unwrap() = Some(bytes.to_vec());
+            Ok(())
+        }
+        fn metadata(&self, _p: &std::path::Path) -> std::io::Result<FileMetadata> {
+            Ok(FileMetadata { len: self.old.len() as u64, is_dir: false })
+        }
+        fn exists(&self, _p: &std::path::Path) -> bool {
+            true
+        }
+        fn rename(&self, _f: &std::path::Path, _t: &std::path::Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_file(&self, _p: &std::path::Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn create_dir_all(&self, _p: &std::path::Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_dir(&self, _p: &std::path::Path) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_file_overwrite_does_not_slurp_old_file_and_summarizes_large_diff() {
+        let (ws, dir) = temp_workspace("write_no_slurp");
+        fs::write(dir.join("big.txt"), b"placeholder").unwrap();
+        // A "large" old file: bigger than our small prefix cap so the diff base is
+        // truncated and the summary path is taken. `read()` panicking proves
+        // write_file never slurps it.
+        let old = vec![b'x'; 4096];
+        let fs = NoFullReadFs::new(old, 256);
+
+        let out = write_file(
+            &json!({ "path": "big.txt", "content": "brand new content\n", "overwrite": true }),
+            &ws,
+            &fs,
+        )
+        .unwrap();
+        assert!(out.ok, "{}", out.model_text);
+        assert_eq!(out.data["status"], "modified");
+        // The new bytes were written.
+        assert_eq!(
+            fs.written.lock().unwrap().clone().unwrap(),
+            b"brand new content\n"
+        );
+        // The diff is the concise summary (NOT a full line diff over the prefix).
+        let diff = out.diff.as_deref().unwrap();
+        assert!(
+            diff.contains("full line diff omitted"),
+            "large overwrite must emit a summary diff, got: {diff}"
+        );
+        assert!(diff.contains("replaced wholesale"));
+        // It must NOT contain a hunk header (that would be the full diff path).
+        assert!(!diff.contains("@@ -1,"), "summary diff must not be a line diff: {diff}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_conflict_detected_via_streamed_hash() {
+        let (ws, dir) = temp_workspace("write_streamed_sha");
+        fs::write(dir.join("f.txt"), b"placeholder").unwrap();
+        let old = b"the original contents\n".to_vec();
+        let correct = sha256_hex(&old);
+
+        // Wrong expectedSha256 -> conflict, detected via the streamed hash, with no
+        // write performed.
+        let fs = NoFullReadFs::new(old.clone(), 8);
+        let out = write_file(
+            &json!({
+                "path": "f.txt",
+                "content": "replacement\n",
+                "expectedSha256": "00ff",
+            }),
+            &ws,
+            &fs,
+        )
+        .unwrap();
+        assert!(!out.ok);
+        assert_eq!(out.data["status"], "conflict");
+        assert_eq!(out.data["actualSha256"], correct);
+        assert!(fs.written.lock().unwrap().is_none(), "conflict must not write");
+
+        // Correct expectedSha256 -> write proceeds.
+        let fs = NoFullReadFs::new(old, 8);
+        let out = write_file(
+            &json!({
+                "path": "f.txt",
+                "content": "replacement\n",
+                "expectedSha256": correct,
+            }),
+            &ws,
+            &fs,
+        )
+        .unwrap();
+        assert!(out.ok, "{}", out.model_text);
+        assert_eq!(fs.written.lock().unwrap().clone().unwrap(), b"replacement\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_small_overwrite_still_produces_full_diff() {
+        let (ws, dir) = temp_workspace("write_small_diff");
+        let fs = StdFileSystem::new();
+        fs::write(dir.join("a.txt"), b"old\n").unwrap();
+
+        let out = write_file(
+            &json!({ "path": "a.txt", "content": "new\n", "overwrite": true }),
+            &ws,
+            &fs,
+        )
+        .unwrap();
+        assert!(out.ok);
+        let diff = out.diff.as_deref().unwrap();
+        // Small (sub-cap) overwrite keeps the real line diff.
+        assert!(diff.contains("@@ -1,"), "small overwrite should keep a full diff: {diff}");
+        assert!(diff.contains("-old"));
+        assert!(diff.contains("+new"));
+        assert!(!diff.contains("full line diff omitted"));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2050,6 +2285,127 @@ mod tests {
         assert_eq!(out.data["truncated"], true);
         assert_eq!(out.data["bytesTruncated"], true);
         assert!(out.model_text.contains("read ceiling"));
+        // Honest paging text: it must NOT promise startLine/limit reaches content
+        // past the cap, and it must point at run_command for out-of-window ranges.
+        assert!(
+            !out.model_text.contains("page further"),
+            "must not over-promise paging past the cap: {}",
+            out.model_text
+        );
+        assert!(
+            out.model_text.contains("run_command"),
+            "must point to run_command for ranges beyond the cap: {}",
+            out.model_text
+        );
+        // The line count is annotated as coming from the capped prefix only.
+        assert_eq!(out.data["linesAreFromCappedPrefix"], true);
+        assert_eq!(out.data["cappedAtBytes"], MAX_READ_FILE_BYTES);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A FileSystem double that pretends a file is larger than the cap but whose
+    /// readable prefix is a small, multi-line, byte-budget-fitting body. This
+    /// drives `read_file`'s NON-spill truncated branch (the rendered view fits
+    /// `maxBytes`, yet `bytesTruncated` is true) so the honest paging note and the
+    /// "startLine beyond window" note can be asserted directly.
+    struct TruncatedPrefixFs {
+        prefix: Vec<u8>,
+        total_len: usize,
+    }
+    impl FileSystem for TruncatedPrefixFs {
+        fn read(&self, _p: &std::path::Path) -> std::io::Result<Vec<u8>> {
+            panic!("read_file must use read_capped, not read, for a large file");
+        }
+        fn read_capped(
+            &self,
+            _p: &std::path::Path,
+            _max: usize,
+        ) -> std::io::Result<(Vec<u8>, bool)> {
+            // The prefix always fits `max` (it is tiny); report truncation because
+            // the underlying file is `total_len` > the prefix length.
+            Ok((self.prefix.clone(), self.total_len > self.prefix.len()))
+        }
+        fn write_atomic(&self, _p: &std::path::Path, _b: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn metadata(&self, _p: &std::path::Path) -> std::io::Result<FileMetadata> {
+            Ok(FileMetadata { len: self.total_len as u64, is_dir: false })
+        }
+        fn exists(&self, _p: &std::path::Path) -> bool {
+            true
+        }
+        fn rename(&self, _f: &std::path::Path, _t: &std::path::Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_file(&self, _p: &std::path::Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn create_dir_all(&self, _p: &std::path::Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_dir(&self, _p: &std::path::Path) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn read_file_truncated_but_fitting_view_states_paging_is_window_only() {
+        let (ws, dir) = temp_workspace("read_trunc_fit");
+        fs::write(dir.join("big.txt"), b"placeholder").unwrap();
+        let fs = TruncatedPrefixFs {
+            prefix: b"l1\nl2\nl3\n".to_vec(),
+            total_len: MAX_READ_FILE_BYTES + 1, // pretend the file is past the cap
+        };
+
+        let out = read_file(&json!({ "path": "big.txt" }), &ws, &fs, "tc_tf", None).unwrap();
+        assert!(out.ok);
+        // The small prefix renders inline (non-spill branch) yet truncation is set.
+        assert!(out.data.get("logRef").is_none(), "small prefix should not spill");
+        assert_eq!(out.data["bytesTruncated"], true);
+        assert!(out.model_text.contains("l1"));
+        assert!(out.model_text.contains("l3"));
+        // Honest note: not the old misleading "page further"; mentions window-only
+        // paging and run_command.
+        assert!(
+            !out.model_text.contains("page further"),
+            "must not say 'page further': {}",
+            out.model_text
+        );
+        assert!(out.model_text.contains("within this window only"));
+        assert!(out.model_text.contains("run_command"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_start_beyond_truncated_window_returns_explanatory_note() {
+        let (ws, dir) = temp_workspace("read_start_beyond");
+        fs::write(dir.join("big.txt"), b"placeholder").unwrap();
+        // Prefix has 3 lines; the file is (pretended) larger than the cap.
+        let fs = TruncatedPrefixFs {
+            prefix: b"l1\nl2\nl3\n".to_vec(),
+            total_len: MAX_READ_FILE_BYTES + 1,
+        };
+
+        // Ask to start at line 9999, far past the 3 lines available in the window.
+        let out = read_file(
+            &json!({ "path": "big.txt", "startLine": 9999 }),
+            &ws,
+            &fs,
+            "tc_sb",
+            None,
+        )
+        .unwrap();
+        // Still ok:true with an explanatory body — we do not pretend lines exist.
+        assert!(out.ok);
+        assert_eq!(out.data["startBeyondWindow"], true);
+        assert!(
+            out.model_text.contains("beyond the 3 line(s) in this read window"),
+            "should explain the requested start is past the window: {}",
+            out.model_text
+        );
+        assert!(out.model_text.contains("run_command"));
 
         let _ = fs::remove_dir_all(&dir);
     }
