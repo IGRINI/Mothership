@@ -8,6 +8,7 @@
 
 mod cancellation;
 mod catalog;
+mod credential_guard;
 mod file_edit;
 mod file_tools;
 mod filesystem;
@@ -25,6 +26,10 @@ mod supervisor;
 mod types;
 
 pub use cancellation::ToolCancellationToken;
+pub use credential_guard::{
+    default_credential_guard, redact_event, CredentialGuard, NoopCredentialGuard,
+    PatternCredentialGuard,
+};
 pub use catalog::{
     default_tool_catalog, APPLY_PATCH_TOOL_ID, APPLY_PATCH_TOOL_NAME, EDIT_FILE_TOOL_ID,
     EDIT_FILE_TOOL_NAME, LIST_FILES_TOOL_ID, LIST_FILES_TOOL_NAME, READ_FILE_TOOL_ID,

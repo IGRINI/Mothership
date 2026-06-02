@@ -26,7 +26,8 @@ use mothership_core::ipc::{
     ClientFrame, CoreError, CoreEvent, CoreRequest, CoreResponse, ServerFrame, PROTOCOL_VERSION,
 };
 use mothership_core::{
-    schedule_cancel_fallback, trusted_built_in_adapter_sha256, AdapterPool, AuthProcessRegistry,
+    default_credential_guard, redact_event, schedule_cancel_fallback,
+    trusted_built_in_adapter_sha256, AdapterPool, AuthProcessRegistry,
     ChatRunCancellationResult, ChatRunEvent, ChatRunEventSink, ChatRunRegistry, ChatRunService,
     ChatUpdatedEvent, ConnectorManager, ConnectorSettingsEvent, ConnectorSettingsEventKind,
     ConservativeCommandPermissionPolicy, Database, FileToolOutputStore, LlmToolCallHandler,
@@ -905,6 +906,11 @@ struct ProtocolToolExecutionSink {
 
 impl ToolExecutionEventSink for ProtocolToolExecutionSink {
     fn emit(&self, event: ToolExecutionEvent) {
+        // Credential firewall: scrub obvious secrets from tool output before it is
+        // persisted or shown. This is the single chokepoint for everything stored
+        // and pushed to the UI, so redacting here covers both.
+        let event = redact_event(default_credential_guard(), &event);
+
         if let (Some(database), Some(chat_id), Some(message_id)) =
             (&self.database, &self.chat_id, &self.message_id)
         {

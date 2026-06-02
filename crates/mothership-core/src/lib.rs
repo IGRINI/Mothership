@@ -51,10 +51,11 @@ pub use run::{schedule_cancel_fallback, ChatRunRegistry, ChatRunService};
 pub use subprocess_gateway::SubprocessChatGateway;
 pub use tools::{
     apply_patch as run_apply_patch_tool, classify as classify_file_tool,
-    edit_file as run_edit_file_tool, list_files as run_list_files_tool,
-    preview_diff as file_tool_preview_diff, read_file as run_read_file_tool,
+    default_credential_guard, edit_file as run_edit_file_tool, list_files as run_list_files_tool,
+    preview_diff as file_tool_preview_diff, read_file as run_read_file_tool, redact_event,
     search_text as run_search_text_tool, tool_batch_plan, write_file as run_write_file_tool,
-    ConservativeCommandPermissionPolicy, FileMetadata,
+    ConservativeCommandPermissionPolicy, CredentialGuard, FileMetadata, NoopCredentialGuard,
+    PatternCredentialGuard,
     FileSystem, FileTool, FileToolCapability, FileToolError, FileToolOutcome, FileToolOutputStore,
     FileToolSpill, NoopToolExecutionEventSink, PathError, PendingToolApprovalGate, StdFileSystem,
     MAX_TOOL_EVENT_BYTES,
