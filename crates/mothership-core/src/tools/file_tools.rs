@@ -21,7 +21,7 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -293,10 +293,13 @@ pub fn preview_diff(
         FileTool::Write => {
             let input: WriteFileInput = parse_args(arguments).ok()?;
             let resolved = resolve_guarded(workspace, &input.path).ok()?;
+            // Cap the old-file read: previewing a write over a huge existing file
+            // must not load the whole file just to render a diff. The preview is
+            // bounded again downstream before it reaches the event/UI.
             let old = if fs.exists(&resolved) {
-                fs.read(&resolved)
+                fs.read_capped(&resolved, MAX_READ_FILE_BYTES)
                     .ok()
-                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .map(|(bytes, _truncated)| String::from_utf8_lossy(&bytes).into_owned())
             } else {
                 None
             };
@@ -309,7 +312,10 @@ pub fn preview_diff(
         FileTool::Edit => {
             let input: EditFileInput = parse_args(arguments).ok()?;
             let resolved = resolve_guarded(workspace, &input.path).ok()?;
-            let bytes = fs.read(&resolved).ok()?;
+            // Cap the read for the same reason as the Write branch: a preview must
+            // not slurp a huge file. `apply_edit` only matches `old_text` for the
+            // diff, so a capped prefix is sufficient for the approval card.
+            let (bytes, _truncated) = fs.read_capped(&resolved, MAX_READ_FILE_BYTES).ok()?;
             let content = String::from_utf8_lossy(&bytes).into_owned();
             let replace_all = input.replace_all.unwrap_or(false);
             apply_edit(&content, &input.old_text, &input.new_text, replace_all)
@@ -383,14 +389,15 @@ pub fn read_file(
         Err(reason) => return Ok(path_failure(&input.path, reason)),
     };
 
-    // Gate on size first: cap the read at MAX_READ_FILE_BYTES so a huge file is
-    // never fully loaded. The byte budget is widened to the caller's `maxBytes`
-    // request when it asks for more than the default ceiling, so an explicit
-    // large read still works up to the hard limit. The sha is computed over the
-    // bytes actually read; when the read was capped that is a prefix hash, which
-    // we surface via `bytesTruncated`.
-    let requested_max = input.max_bytes.unwrap_or(DEFAULT_READ_MAX_BYTES);
-    let read_ceiling = requested_max.max(MAX_READ_FILE_BYTES);
+    // Gate on size first: the RAW read off disk is always hard-bounded to
+    // MAX_READ_FILE_BYTES so a huge file is never fully loaded — the caller's
+    // `maxBytes` must NOT be able to widen this raw read (otherwise a request for
+    // 500 MB would slurp 500 MB into memory). The model's `maxBytes` only governs
+    // how much of the read content is rendered inline (computed below, clamped
+    // down to the same ceiling). The sha is computed over the bytes actually
+    // read; when the read was capped that is a prefix hash, which we surface via
+    // `bytesTruncated`.
+    let read_ceiling = MAX_READ_FILE_BYTES;
     let (bytes, bytes_truncated) = fs
         .read_capped(&resolved, read_ceiling)
         .map_err(|error| FileToolError::Io(error.to_string()))?;
@@ -437,7 +444,14 @@ pub fn read_file(
         .collect();
 
     let numbered = render_numbered(&selected);
-    let max_bytes = requested_max;
+    // The model's requested inline cap, clamped DOWN to the hard ceiling: a model
+    // cannot ask to inline more than the raw read could ever produce. Content
+    // beyond this still spills via `logRef` (read up to the ceiling, render up to
+    // `max_bytes`, spill the rest).
+    let max_bytes = input
+        .max_bytes
+        .unwrap_or(DEFAULT_READ_MAX_BYTES)
+        .min(MAX_READ_FILE_BYTES);
 
     let end_line = selected.last().map(|(n, _)| *n).unwrap_or(start_idx);
     let mut data = json!({
@@ -928,29 +942,53 @@ struct PathSnapshot {
     prior: Option<Vec<u8>>,
 }
 
+/// The prior on-disk state needed to roll a partially-applied patch back: the
+/// per-file snapshots plus the directories that did NOT exist before the apply
+/// but will be created by it (so a rollback can remove the orphan dirs the write
+/// path's `create_dir_all` left behind).
+struct PatchSnapshot {
+    files: Vec<PathSnapshot>,
+    /// Workspace directories that did not exist pre-apply and would be created by
+    /// writing the plan's files. Deduped; removed deepest-first on rollback.
+    created_dirs: Vec<PathBuf>,
+}
+
 /// Capture the prior state of every path a plan will write, move, or delete
 /// (including a move's destination), so the apply step can be rolled back to a
 /// clean state on any mid-apply failure. Reads through the [`FileSystem`] port.
+/// Also records the directories the apply would create (ancestors of each
+/// written/created/move-destination path that do not yet exist, up to but not
+/// including the workspace root) so rollback can remove the orphans.
 fn capture_snapshot(
     workspace: &Workspace,
     fs: &dyn FileSystem,
     plan: &PatchPlan,
-) -> Result<Vec<PathSnapshot>, FileToolError> {
+) -> Result<PatchSnapshot, FileToolError> {
     let mut paths: Vec<PathBuf> = Vec::new();
+    // Destinations whose parent directories may need to be created: every Add /
+    // Update target and every Move destination. (A Delete only removes a file and
+    // never creates a directory.)
+    let mut write_targets: Vec<PathBuf> = Vec::new();
     for file in &plan.files {
         let source = resolve_for_apply(workspace, &file.path)?;
+        if matches!(file.op, PlannedKind::Add | PlannedKind::Update) && !write_targets.contains(&source) {
+            write_targets.push(source.clone());
+        }
         if !paths.contains(&source) {
             paths.push(source);
         }
         if let PlannedKind::Move { to } = &file.op {
             let dest = resolve_for_apply(workspace, to)?;
+            if !write_targets.contains(&dest) {
+                write_targets.push(dest.clone());
+            }
             if !paths.contains(&dest) {
                 paths.push(dest);
             }
         }
     }
 
-    let mut snapshot = Vec::with_capacity(paths.len());
+    let mut files = Vec::with_capacity(paths.len());
     for path in paths {
         let prior = if fs.exists(&path) {
             Some(
@@ -960,18 +998,63 @@ fn capture_snapshot(
         } else {
             None
         };
-        snapshot.push(PathSnapshot { path, prior });
+        files.push(PathSnapshot { path, prior });
     }
-    Ok(snapshot)
+
+    let created_dirs = collect_created_dirs(workspace, fs, &write_targets);
+    Ok(PatchSnapshot { files, created_dirs })
 }
 
-/// Restore every path in `snapshot` to its captured state: rewrite the prior
-/// bytes for files that existed, and delete files that did not exist before.
-/// Best-effort across all entries — the first error is remembered and returned
-/// after attempting the rest, so one stuck path does not strand the others.
-fn restore_snapshot(fs: &dyn FileSystem, snapshot: &[PathSnapshot]) -> Result<(), FileToolError> {
+/// Compute the set of directories that do not currently exist but will be created
+/// by writing `write_targets`. For each target, walk its ancestor directories up
+/// the tree, stopping BEFORE the workspace root (the root and any pre-existing
+/// directory are never recorded). Deduped; order is irrelevant here because the
+/// caller removes them deepest-first.
+fn collect_created_dirs(
+    workspace: &Workspace,
+    fs: &dyn FileSystem,
+    write_targets: &[PathBuf],
+) -> Vec<PathBuf> {
+    let root = workspace.root();
+    let mut created: Vec<PathBuf> = Vec::new();
+    for target in write_targets {
+        // Ancestors of the file: its parent dir and upward. `ancestors()` yields
+        // the path itself first, so skip it (we want directories, not the file).
+        for ancestor in target.ancestors().skip(1) {
+            // Stop once we reach the workspace root or climb to/above it: the root
+            // and everything outside it must never be removed.
+            if ancestor == root || !path_below_root(root, ancestor) {
+                break;
+            }
+            if fs.exists(ancestor) {
+                // This dir (and therefore all of its ancestors) already exists;
+                // nothing above it can be newly created either.
+                break;
+            }
+            let dir = ancestor.to_path_buf();
+            if !created.contains(&dir) {
+                created.push(dir);
+            }
+        }
+    }
+    created
+}
+
+/// Whether `candidate` is strictly inside `root` (a descendant, not the root
+/// itself). Used to stop the ancestor walk at the workspace boundary.
+fn path_below_root(root: &Path, candidate: &Path) -> bool {
+    candidate != root && candidate.starts_with(root)
+}
+
+/// Restore the captured pre-apply state: first rewrite/delete files, then remove
+/// any directories the apply newly created (deepest-first). File restoration is
+/// best-effort (the first error is remembered and returned after attempting the
+/// rest, so one stuck path does not strand the others). Directory removal ignores
+/// errors entirely — a dir left non-empty by something else stays, which is the
+/// safe outcome.
+fn restore_snapshot(fs: &dyn FileSystem, snapshot: &PatchSnapshot) -> Result<(), FileToolError> {
     let mut first_error: Option<FileToolError> = None;
-    for entry in snapshot {
+    for entry in &snapshot.files {
         let result = match &entry.prior {
             Some(bytes) => fs.write_atomic(&entry.path, bytes),
             None => {
@@ -988,6 +1071,17 @@ fn restore_snapshot(fs: &dyn FileSystem, snapshot: &[PathSnapshot]) -> Result<()
             }
         }
     }
+
+    // Remove newly-created directories deepest-first (longest path first) so a
+    // child is gone before its parent is attempted. `remove_dir` only deletes an
+    // EMPTY dir; errors (including a dir left non-empty by an unrelated file) are
+    // ignored so rollback never blows away pre-existing content.
+    let mut dirs: Vec<&PathBuf> = snapshot.created_dirs.iter().collect();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.as_os_str().len()));
+    for dir in dirs {
+        let _ = fs.remove_dir(dir);
+    }
+
     match first_error {
         Some(error) => Err(error),
         None => Ok(()),
@@ -1750,6 +1844,9 @@ mod tests {
         fn create_dir_all(&self, path: &std::path::Path) -> std::io::Result<()> {
             self.inner.create_dir_all(path)
         }
+        fn remove_dir(&self, path: &std::path::Path) -> std::io::Result<()> {
+            self.inner.remove_dir(path)
+        }
     }
 
     #[test]
@@ -1788,6 +1885,75 @@ mod tests {
             "first file must be rolled back"
         );
         assert_eq!(fs::read(dir.join("b.txt")).unwrap(), b"keep\nbee\ntail\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_patch_rollback_removes_newly_created_directories() {
+        let (ws, dir) = temp_workspace("patch_rollback_dirs");
+        // First Add creates `newdir/sub/file.txt` (write #1, succeeds and makes
+        // the two nested directories). The second Add's write (#2) is forced to
+        // fail, triggering rollback. After rollback the created file AND the two
+        // directories it brought into being must be gone — disk shape == before.
+        let fs = FailOnNthWrite::new(2);
+
+        let patch = "\
+*** Begin Patch
+*** Add File: newdir/sub/file.txt
++hello
+*** Add File: other.txt
++world
+*** End Patch
+";
+        let out = apply_patch(&json!({ "patch": patch }), &ws, &fs).unwrap();
+        assert!(!out.ok, "a mid-apply write failure must be reported");
+        assert_eq!(out.data["status"], "apply_error");
+
+        // The created file is gone, and so are the orphan directories.
+        assert!(!dir.join("newdir/sub/file.txt").exists(), "created file must be removed");
+        assert!(!dir.join("newdir/sub").exists(), "newdir/sub must be removed on rollback");
+        assert!(!dir.join("newdir").exists(), "newdir must be removed on rollback");
+        // The second target was never written.
+        assert!(!dir.join("other.txt").exists());
+        // The workspace root itself survives.
+        assert!(dir.exists(), "workspace root must never be removed");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_patch_rollback_keeps_preexisting_directories() {
+        let (ws, dir) = temp_workspace("patch_rollback_keepdir");
+        // `existing/` is a PRE-EXISTING directory (with an unrelated file in it).
+        // A patch adds `existing/new.txt` (write #1) then fails on the second
+        // write (#2). Rollback must remove the newly-added file but must NOT
+        // remove `existing/` — it predated the patch and still holds `keep.txt`.
+        fs::create_dir_all(dir.join("existing")).unwrap();
+        fs::write(dir.join("existing/keep.txt"), b"keep me\n").unwrap();
+        let fs = FailOnNthWrite::new(2);
+
+        let patch = "\
+*** Begin Patch
+*** Add File: existing/new.txt
++added
+*** Add File: other.txt
++world
+*** End Patch
+";
+        let out = apply_patch(&json!({ "patch": patch }), &ws, &fs).unwrap();
+        assert!(!out.ok);
+        assert_eq!(out.data["status"], "apply_error");
+
+        // The newly-added file is rolled back, but the pre-existing directory and
+        // its prior content are untouched.
+        assert!(!dir.join("existing/new.txt").exists(), "added file must be removed");
+        assert!(dir.join("existing").exists(), "pre-existing dir must NOT be removed");
+        assert_eq!(
+            fs::read(dir.join("existing/keep.txt")).unwrap(),
+            b"keep me\n",
+            "pre-existing content must survive rollback"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1866,6 +2032,9 @@ mod tests {
             fn create_dir_all(&self, _p: &std::path::Path) -> std::io::Result<()> {
                 Ok(())
             }
+            fn remove_dir(&self, _p: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
         }
 
         let (ws, dir) = temp_workspace("read_ceiling");
@@ -1896,6 +2065,107 @@ mod tests {
         assert!(out.ok, "lossy text is still shown");
         assert_eq!(out.data["lossy"], true);
         assert!(out.model_text.contains("readable ascii"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_maxbytes_cannot_widen_the_raw_read() {
+        // A model passing an enormous `maxBytes` must NOT widen the raw read off
+        // disk: the raw read is hard-bounded to MAX_READ_FILE_BYTES. This double
+        // records the `max` it was handed by `read_capped`.
+        struct RecordingCapFs {
+            last_max: std::sync::atomic::AtomicUsize,
+        }
+        impl FileSystem for RecordingCapFs {
+            fn read(&self, _p: &std::path::Path) -> std::io::Result<Vec<u8>> {
+                panic!("read_file must use read_capped, not read");
+            }
+            fn read_capped(
+                &self,
+                _p: &std::path::Path,
+                max: usize,
+            ) -> std::io::Result<(Vec<u8>, bool)> {
+                self.last_max
+                    .store(max, std::sync::atomic::Ordering::SeqCst);
+                // Hand back a tiny file that fits within any cap.
+                Ok((b"alpha\nbeta\n".to_vec(), false))
+            }
+            fn write_atomic(&self, _p: &std::path::Path, _b: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn metadata(&self, _p: &std::path::Path) -> std::io::Result<FileMetadata> {
+                Ok(FileMetadata { len: 11, is_dir: false })
+            }
+            fn exists(&self, _p: &std::path::Path) -> bool {
+                true
+            }
+            fn rename(&self, _f: &std::path::Path, _t: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_file(&self, _p: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn create_dir_all(&self, _p: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_dir(&self, _p: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (ws, dir) = temp_workspace("read_no_widen");
+        fs::write(dir.join("f.txt"), b"placeholder").unwrap();
+        let fs = RecordingCapFs {
+            last_max: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        // A wildly oversized maxBytes must be clamped: the raw read uses the hard
+        // ceiling, not 500 MB.
+        let out = read_file(
+            &json!({ "path": "f.txt", "maxBytes": 500_000_000usize }),
+            &ws,
+            &fs,
+            "tc_no_widen",
+            None,
+        )
+        .unwrap();
+        assert!(out.ok);
+        assert_eq!(
+            fs.last_max.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_READ_FILE_BYTES,
+            "the raw read must be capped at MAX_READ_FILE_BYTES, not the model's maxBytes"
+        );
+        // The small content is still shown normally (no truncation).
+        assert_eq!(out.data["truncated"], false);
+        assert!(out.model_text.contains("alpha"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_rendered_cap_is_clamped_to_ceiling() {
+        // The rendered inline cap (max_bytes) is also clamped DOWN to the hard
+        // ceiling. With a small file and a huge maxBytes, the whole file renders
+        // inline (it is far below the clamped cap) and nothing spills.
+        let (ws, dir) = temp_workspace("read_clamp");
+        let fs = StdFileSystem::new();
+        fs::write(dir.join("s.txt"), b"one\ntwo\nthree\n").unwrap();
+
+        let out = read_file(
+            &json!({ "path": "s.txt", "maxBytes": 999_999_999usize }),
+            &ws,
+            &fs,
+            "tc_clamp",
+            None,
+        )
+        .unwrap();
+        assert!(out.ok);
+        assert_eq!(out.data["truncated"], false);
+        assert!(out.model_text.contains("one"));
+        assert!(out.model_text.contains("three"));
+        // No spill reference: the content fit inline.
+        assert!(out.data.get("logRef").is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }

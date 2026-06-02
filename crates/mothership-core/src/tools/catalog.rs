@@ -91,7 +91,8 @@ fn read_file_tool_descriptor() -> ToolDescriptor {
                 "maxBytes": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional cap on inlined bytes before the content spills to a reference."
+                    "maximum": 10485760,
+                    "description": "Optional cap on inlined bytes (up to 10 MiB) before the content spills to a reference. The raw read is hard-bounded to 10 MiB regardless; page large files with startLine/limit."
                 }
             },
             "required": ["path"],

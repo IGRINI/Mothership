@@ -354,6 +354,10 @@ pub trait FileSystem: Send + Sync {
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     /// Create a directory and all missing parents.
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
+    /// Remove a single, **empty** directory. Errors if the directory is
+    /// non-empty (the safe behavior used by patch rollback: a directory left
+    /// non-empty by something else is kept rather than blown away).
+    fn remove_dir(&self, path: &Path) -> io::Result<()>;
 }
 
 /// `std::fs`-backed [`FileSystem`] with an atomic, same-directory write.
@@ -440,6 +444,12 @@ impl FileSystem for StdFileSystem {
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         fs::create_dir_all(path)
+    }
+
+    fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        // `remove_dir` (not `remove_dir_all`) only removes an empty directory and
+        // errors otherwise — exactly the safe rollback semantics we want.
+        fs::remove_dir(path)
     }
 }
 
@@ -623,6 +633,9 @@ mod tests {
                 Ok(())
             }
             fn create_dir_all(&self, _path: &Path) -> io::Result<()> {
+                Ok(())
+            }
+            fn remove_dir(&self, _path: &Path) -> io::Result<()> {
                 Ok(())
             }
         }

@@ -582,6 +582,13 @@ impl SidecarLlmToolHandler {
     /// computed by Core via a dry run (no writes); when it cannot be previewed
     /// (file missing, edit would not match, patch would not apply) only the
     /// summary is shown and the handler will report the precise failure.
+    ///
+    /// The preview is bounded to [`MAX_TOOL_EVENT_BYTES`] before it is returned:
+    /// it flows into the `PermissionRequested` event message, which is persisted
+    /// and pushed to the UI, so an enormous diff (e.g. overwriting a multi-MB
+    /// file) must not push megabytes through the event store. When the diff
+    /// portion overflows the budget it is truncated on a char boundary with a
+    /// marker noting the full size (the full change still applies on approval).
     fn build_preview(
         &self,
         tool: FileTool,
@@ -590,7 +597,7 @@ impl SidecarLlmToolHandler {
         summary: &str,
     ) -> String {
         match file_tool_preview_diff(tool, arguments, workspace, &self.file_system) {
-            Some(diff) if !diff.is_empty() => format!("{summary}\n\n{diff}"),
+            Some(diff) if !diff.is_empty() => bound_preview(summary, &diff),
             _ => summary.to_string(),
         }
     }
@@ -766,6 +773,25 @@ fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     text[..end].to_string()
+}
+
+/// Compose an approval-preview message (`{summary}\n\n{diff}`) and bound the diff
+/// portion to [`MAX_TOOL_EVENT_BYTES`]. The `PermissionRequested` event message
+/// is persisted and rendered, so an oversized preview diff must be truncated
+/// before it leaves Core's preview path. The (small) summary is always kept; only
+/// the diff is truncated, on a char boundary, with a marker stating how much was
+/// shown of the full size so the approver knows the full change still applies.
+fn bound_preview(summary: &str, diff: &str) -> String {
+    if diff.len() <= MAX_TOOL_EVENT_BYTES {
+        return format!("{summary}\n\n{diff}");
+    }
+    let full = diff.len();
+    let mut bounded = truncate_on_char_boundary(diff, MAX_TOOL_EVENT_BYTES);
+    let shown = bounded.len();
+    bounded.push_str(&format!(
+        "\n[preview truncated: showing {shown} of {full} bytes — approve to apply the full change]"
+    ));
+    format!("{summary}\n\n{bounded}")
 }
 
 #[derive(Debug, Deserialize)]
@@ -1042,6 +1068,38 @@ mod tests {
         assert!(bounded.log_ref.is_none(), "small diff must not spill");
         assert!(bounded.diff.unwrap().contains("+new"));
         assert!(spill.captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bound_preview_truncates_large_diff_with_marker() {
+        // A preview diff far larger than the event budget (as a write over a huge
+        // file would produce) must be bounded before it reaches the persisted
+        // PermissionRequested message.
+        let big_diff = "+".repeat(MAX_TOOL_EVENT_BYTES * 4);
+        let full = big_diff.len();
+
+        let preview = bound_preview("write big.txt", &big_diff);
+
+        assert!(
+            preview.len() <= MAX_TOOL_EVENT_BYTES + 256,
+            "preview must be bounded near the event budget, got {} bytes",
+            preview.len()
+        );
+        assert!(preview.starts_with("write big.txt"));
+        assert!(preview.contains("preview truncated"));
+        assert!(
+            preview.contains(&full.to_string()),
+            "the marker must report the full byte size"
+        );
+        assert!(preview.contains("approve to apply the full change"));
+    }
+
+    #[test]
+    fn bound_preview_passes_small_diff_through_unchanged() {
+        let diff = "@@ -1,1 +1,1 @@\n-old\n+new\n";
+        let preview = bound_preview("write a.txt", diff);
+        assert_eq!(preview, format!("write a.txt\n\n{diff}"));
+        assert!(!preview.contains("preview truncated"));
     }
 
     #[cfg(windows)]
