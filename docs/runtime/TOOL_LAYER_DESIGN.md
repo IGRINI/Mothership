@@ -8,12 +8,14 @@ This **extends** [`EXECUTION_MODEL.md`](EXECUTION_MODEL.md) and [`PROCESS_SANDBO
 the supervisor, output policy, approval gate, leases and `ProcessSandbox` described
 there stay; this doc generalizes *what* runs through them.
 
-> **Status: IMPLEMENTED on `feat/typed-tool-layer`.** All four file tools
-> (`read_file`/`write_file`/`edit_file`/`apply_patch`) are wired end-to-end alongside
-> an unchanged `run_command`. `mothership-core`: 183 tests green; whole workspace
-> (incl. the Tauri app) builds clean. See "Known limitations / follow-ups" at the end.
-> Pure cores (`tools/file_edit.rs`, `tools/patch.rs`) were aligned to the canonical
-> Codex/Claude references before wiring.
+> **Status: IMPLEMENTED + review-hardened on `feat/typed-tool-layer`.** All four file
+> tools (`read_file`/`write_file`/`edit_file`/`apply_patch`) are wired end-to-end
+> alongside an unchanged `run_command`, and survived 4 review rounds. `mothership-core`:
+> 207 tests green; whole workspace (incl. the Tauri app) builds clean. Pure cores
+> (`tools/file_edit.rs`, `tools/patch.rs`) were aligned to the canonical Codex/Claude
+> implementations before wiring. **The "As shipped — final invariants" section below is
+> the source of truth; the "starting line" and "(todo)" notes are historical design
+> context.**
 
 ## The spine (two ideas)
 
@@ -59,18 +61,23 @@ repeat-guard, resource leases, cancellation, event sink.
 
 ## Target shape
 
+As-shipped layout (the planned `invocation.rs`/`dispatcher.rs`/`effects.rs` were NOT
+created — dispatch landed as an additive `FileToolRunner` in the sidecar handler, and
+outcomes are a `FileToolOutcome` struct rather than a separate `effects.rs`):
+
 ```text
 crates/mothership-core/src/tools/
-  catalog.rs       // ToolSpec/ToolDescriptor, schemas, exposure, stable ordering (exists)
+  catalog.rs       // ToolDescriptor schemas for all 5 tools (LANDED)
   file_edit.rs     // pure apply_edit matcher (LANDED)
-  patch.rs         // pure parse_v4a + plan_patch (LANDED)
-  invocation.rs    // ToolInvocation, ToolName, ToolInput, ToolOutcome (todo)
-  dispatcher.rs    // pipeline: validate -> resolve path -> permission/approval
-                   //           -> execute -> emit events -> persist -> compact result (todo)
-  permissions.rs   // capability-based policy engine (allow/ask/deny + context) (extend)
-  filesystem.rs    // FileSystem port + project path resolver (todo)
-  file_tools.rs    // read_file / write_file / edit_file / apply_patch handlers (todo)
-  effects.rs       // FileEffect, DiffSummary, ArtifactRef (todo)
+  patch.rs         // pure parse_v4a + plan_patch + apply rollback helpers (LANDED)
+  filesystem.rs    // Workspace (resolve+containment+sensitive+Windows compare)
+                   //   + FileSystem port + StdFileSystem (LANDED)
+  file_tools.rs    // read_file/write_file/edit_file/apply_patch handlers,
+                   //   FileToolOutcome, capability classify, preview_diff (LANDED)
+  permissions.rs   // PendingToolApprovalGate + request_decision(tool_call_id) (LANDED)
+src-sidecar/src/tool_runtime.rs
+  FileToolRunner   // dispatch 4 tools: classify -> approval(event) -> execute
+                   //   -> bounded events; run_command path unchanged (LANDED)
 ```
 
 **Generic invocation.** The existing `LlmToolCallRequest{ run_id, tool_call_id, name,
@@ -118,9 +125,9 @@ unit-test against an in-memory FS.
 - Input: `{ path, content, create?, overwrite?, expectedSha256? }`.
 - Carries the base mutation machinery (built here first, reused by edit/apply_patch):
   read old -> diff -> check sha -> approval(diff) -> **atomic write** -> effect/audit -> result.
-- **Atomic write**: temp file beside target -> fsync where possible -> rename. On Windows
-  use `ReplaceFile`/`MoveFileEx(MOVEFILE_REPLACE_EXISTING)` — naive `fs::rename` over an
-  existing target fails on Windows.
+- **Atomic write**: temp file beside target -> fsync where possible -> `std::fs::rename`
+  (which replaces an existing dest on all platforms incl. Windows — no `ReplaceFile`/
+  `MoveFileEx` needed). Old file is stream-hashed (never slurped); diff summarized when large.
 - Overwrite of an existing file: `expectedSha256` effectively required; if missing and the
   file exists, treat as full-overwrite → ask with explicit warning. Mismatch → conflict, do not write.
 - Result: `{ path, created|modified, bytes, +N/-N, sha256 }`.
@@ -138,7 +145,8 @@ unit-test against an in-memory FS.
 - Input: `{ patch }` — strict V4A grammar: add / update / delete / move, multi-file.
 - **`plan_patch` is the dry-run + content check**: all hunks must match current content;
   any failure → abort whole patch, write nothing (all-or-none).
-- Apply all-or-none. Snapshot old content to a blob/artifact before applying (future undo/revert).
+- Apply all-or-none **on disk**: snapshot prior bytes/existence of every touched path + the
+  dirs it will create; on any mid-apply IO error, restore files and remove created dirs.
 - One batched approval showing the file list + unified diff. Delete/move → higher-risk.
 - Dry-run *is* the content check — do not bolt a redundant `expectedSha256` onto apply_patch.
 
@@ -181,6 +189,18 @@ before Approve. Approval is a Core event routed to wherever the human is (incl. 
           approval; per-file apply).
 +  [DONE] capability policy (read=allow / mutate=ask / outside+sensitive=deny) + sidecar
           dispatch through the shared PendingToolApprovalGate; run_command 1:1.
+6. [DONE] review hardening (4 rounds): non-UTF-8 refusal; apply_patch snapshot+rollback
+          incl. created dirs; bounded event/approval-preview payloads + spill; read_file
+          hard cap + honest paging; write_file stream-hash + bounded/summary diff (old AND
+          new); edit_file >10 MiB guard; Windows path compare; Claude native Read/Write/
+          Edit/MultiEdit/NotebookEdit routing.
+
+=== file-tool stage CLOSED here ===
+
+7. [NEXT] typed search: Mothership `list_files` + `search_text` tools, THEN disable
+          Claude-native `Glob`/`Grep` once the typed replacement exists.
+8. [later] scheduler: read_file -> ParallelSafe (small standalone follow-up, not bundled).
+9. [later] typed DB storage (tool_calls/tool_events/tool_artifacts) + UI semantic cards.
 ```
 
 Implementation note: rather than genericizing `ToolSupervisor` into one trait now, the
@@ -188,22 +208,51 @@ file tools run through an additive `FileToolRunner` in the sidecar handler that 
 existing approval gate + event sink; `run_command` keeps its supervisor path untouched.
 This list extends the [`MIGRATION_PLAN.md`](MIGRATION_PLAN.md) checklist.
 
-## Known limitations / follow-ups (as implemented)
+## As shipped — final invariants (source of truth)
 
-- **apply_patch atomicity is plan-level, not disk-level.** `plan_patch` is all-or-none
-  (a bad hunk / missing file / outside-workspace target aborts before any write), but a
-  rare *mid-apply IO error* (e.g. file 3 of 5) can leave earlier files written. True
-  multi-file rollback (snapshot old content to an artifact, restore on failure) is the
-  deferred enhancement from the design above.
-- **Typed storage deferred.** Tool events still persist via `chat_tool_events`
-  (`command_json` NULL for file tools); the `tool_calls`/`tool_events`/`tool_artifacts`
-  typed tables are not yet created.
-- **UI semantic cards deferred.** Events flow (the inline card shows the tool), but
-  per-tool rendering (read/write/edit/patch diffs) and the diff-before-approve card are
-  frontend follow-ups; the approval diff currently rides in the event `message`.
-- **scheduler.rs** still classifies all non-`run_command` tools as `Exclusive` (safe);
-  `read_file` could be `ParallelSafe`.
-- **`ToolSupervisor` not genericized.** File tools use a parallel runner (see note above).
+These hold on `feat/typed-tool-layer` as of the 4th review round. They supersede any
+"limitation" wording elsewhere in this doc.
+
+- **UTF-8 safety (no data loss).** `edit_file` / `apply_patch` use *strict* `from_utf8`
+  and REFUSE non-UTF-8 content (no lossy U+FFFD rewrite of e.g. cp1251 files). `write_file`
+  is a full overwrite of model-supplied (valid) content. `read_file` may lossily *display*
+  text but flags `lossy`/`linesAreFromCappedPrefix` and never writes.
+- **Bounded memory, everywhere.** `read_file` hard-caps the raw read at 10 MiB
+  (`MAX_READ_FILE_BYTES`); `maxBytes` only governs inline render (clamped down, schema
+  `maximum`). `write_file` stream-hashes the old file (never slurps it), reads only a
+  capped prefix for BOM/EOL+diff, and emits a *summary* diff when old+new > 1 MiB
+  (`MAX_DIFF_INPUT_BYTES`) — covers both large-old and large-new. `edit_file` refuses files
+  > 10 MiB (`status: too_large`, points to `apply_patch`/`run_command`), since it must load
+  the whole file to apply a content-addressed edit.
+- **read_file paging is honest.** `startLine`/`limit` page *within* the 10 MiB window only;
+  the tool does NOT pretend to page past the cap — it points to `run_command` (`sed -n` /
+  `Get-Content`) for ranges in larger files.
+- **apply_patch is all-or-none on disk.** `plan_patch` is the dry-run content check; apply
+  snapshots prior bytes/existence of every touched path AND the directories it will create,
+  and on any mid-apply IO error restores files + removes newly-created dirs (deepest-first).
+- **Bounded events/DB/approval.** Diff/result text persisted/streamed and the
+  PermissionRequested *preview* diff are bounded to `MAX_TOOL_EVENT_BYTES` (64 KiB), spilling
+  the full diff to a `logRef`. `expectedSha256` gives optimistic-concurrency conflict checks.
+- **Claude adapter routing.** When the Mothership file tools are bridged (as
+  `mcp__mothership__*`), the Claude-agent adapter disables Claude's native `Write`/`Edit`/
+  `MultiEdit`/`NotebookEdit` (gated on a Mothership file tool present) AND native `Read`
+  (gated on `read_file` present, so the model is never left without a read path) — so
+  reads+writes flow through the typed pipeline. `Bash` is disabled when `run_command` is present.
+
+## Deferred (NOT defects — scope, stage considered closed without them)
+
+- **Typed search is the next stage** (see Build order): add Mothership `list_files` +
+  `search_text`, THEN disable Claude-native `Glob`/`Grep` (kept enabled for now — disabling
+  without a typed replacement would degrade search to `run_command`).
+- **Typed storage** (`tool_calls`/`tool_events`/`tool_artifacts`) — events still via
+  `chat_tool_events` (`command_json` NULL for file tools).
+- **UI semantic cards** + diff-before-approve card — frontend; approval diff currently rides
+  (bounded) in the event `message`.
+- **`scheduler.rs`** classifies non-`run_command` tools `Exclusive`; `read_file` →
+  `ParallelSafe` is a small standalone follow-up (do NOT bundle with typed search).
+- **`ToolSupervisor` not genericized** — file tools use an additive `FileToolRunner`
+  (deliberate, to avoid destabilizing `run_command`).
+- Optional later policy: a sanity ceiling on `write_file.content` size.
 
 ## Decision log (so it isn't re-litigated)
 
@@ -218,7 +267,12 @@ This list extends the [`MIGRATION_PLAN.md`](MIGRATION_PLAN.md) checklist.
 | `expectedSha256` on every mutation incl. apply_patch | **Refined** | Required-ish for write_file overwrite; recommended for edit_file; **redundant for apply_patch** (`plan_patch` all-hunks-match is the content check). |
 | Per-adapter hardcoded tool schemas | **Rejected (already fixed)** | Core `catalog.rs` owns schemas; adapters only convert format. |
 | read_file streams any file | **Rejected** | Binary guard: detect + refuse with size + hint; large text spills (preview+tail+contentRef). |
-| Naive `fs::rename` for atomic write | **Rejected on Windows** | Use `ReplaceFile`/`MoveFileEx(MOVEFILE_REPLACE_EXISTING)`; plain rename over an existing target fails on Windows. |
+| Atomic write needs `ReplaceFile`/`MoveFileEx` on Windows | **Corrected** | `std::fs::rename` already REPLACES an existing dest on all platforms incl. Windows (verified). `StdFileSystem::write_atomic` = temp-in-same-dir + fsync + `fs::rename`. |
+| read_file streaming line-reader to page past the 10 MiB cap | **Rejected → honest cap** | Inline-reading >10 MiB through the model is an anti-pattern; `run_command` (sed/Get-Content) covers ranges in huge files. read_file caps + tells the truth instead of faking paging. |
+| `edit_file` reads any-size file | **Rejected → >10 MiB guard** | edit_file must load the whole file (content-addressed edit); refuse >10 MiB and point at `apply_patch`/`run_command`. Mirrors the read_file ceiling. |
+| `write_file` full diff regardless of size | **Rejected → bounded** | Summary diff when old+new > 1 MiB (`MAX_DIFF_INPUT_BYTES`) — covers large-NEW content too, not just large-old. No schema cap on `content` (legit large writes; the diff was the real cost). |
+| apply_patch rollback covers files only | **Rejected → files + dirs** | Snapshot also records dirs the apply will create; rollback removes them deepest-first (empty-only). True "disk as before". |
+| Disable Claude-native `Glob`/`Grep` now | **Deferred** | No typed search replacement yet; disabling would degrade search to `run_command`. Disable only after `list_files`/`search_text` land. Native `Read`/`Write`/`Edit`/`MultiEdit`/`NotebookEdit` ARE disabled when the Mothership file tools are bridged. |
 
 ## Open questions
 
