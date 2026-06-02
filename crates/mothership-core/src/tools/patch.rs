@@ -248,6 +248,86 @@ fn is_no_newline_marker(line: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Heredoc envelope
+// ---------------------------------------------------------------------------
+
+/// If `patch` is wrapped in a shell heredoc envelope, return the inner patch
+/// body; otherwise return `patch` unchanged.
+///
+/// Models frequently emit the patch the way the Codex CLI is invoked, e.g.
+///
+/// ```text
+/// apply_patch <<'EOF'        <<'EOF'        <<"EOF"        <<EOF
+/// *** Begin Patch            ...            ...            ...
+/// ...                        EOF            EOF            EOF
+/// *** End Patch
+/// EOF
+/// ```
+///
+/// The wrapper is stripped only when the body genuinely contains both
+/// `*** Begin Patch` and `*** End Patch`, so a real patch is never mistaken for
+/// a heredoc. A malformed wrapper (no terminator, mismatched quotes) is left
+/// untouched on purpose — it then surfaces as a normal parse error rather than a
+/// guessed result. We never aggressively repair a broken heredoc.
+fn strip_heredoc_envelope(patch: &str) -> &str {
+    // Skip leading blank lines, then require the first real line to be a heredoc
+    // opener (`[apply_patch ]<<['"]?DELIM['"]?`).
+    let trimmed = patch.trim_start_matches(['\r', '\n']);
+    let Some((first_line, body)) = trimmed.split_once('\n') else {
+        return patch;
+    };
+    let Some(delimiter) = heredoc_delimiter(strip_cr(first_line)) else {
+        return patch;
+    };
+
+    // The heredoc terminator is a line equal to the delimiter at column 0 (no
+    // leading whitespace). Patch content lines are always prefixed (`+`/`-`/
+    // space) or are `*** `/`@@` markers, so a bare column-0 delimiter can only be
+    // the terminator — never patch content.
+    let mut offset = 0usize;
+    for line in body.split_inclusive('\n') {
+        let content = strip_cr(line.strip_suffix('\n').unwrap_or(line));
+        let is_terminator =
+            !content.starts_with(|c: char| c.is_whitespace()) && content.trim_end() == delimiter;
+        if is_terminator {
+            let inner = &body[..offset];
+            return if inner.contains(BEGIN_PATCH) && inner.contains(END_PATCH) {
+                inner
+            } else {
+                patch
+            };
+        }
+        offset += line.len();
+    }
+
+    // No terminator found: leave the input untouched so the heredoc opener
+    // surfaces as a normal `MissingBegin` parse error.
+    patch
+}
+
+/// Extract the heredoc delimiter token from an opener line, or `None` if the
+/// line is not a recognized heredoc opener. Accepts an optional leading
+/// `apply_patch` command and optional single/double quotes around the token.
+fn heredoc_delimiter(opener: &str) -> Option<&str> {
+    let opener = opener.trim();
+    let (before, after) = opener.split_once("<<")?;
+    let before = before.trim();
+    if !before.is_empty() && before != "apply_patch" {
+        return None;
+    }
+    let token = after.trim();
+    let token = token
+        .strip_prefix('\'')
+        .and_then(|t| t.strip_suffix('\''))
+        .or_else(|| token.strip_prefix('"').and_then(|t| t.strip_suffix('"')))
+        .unwrap_or(token);
+    if token.is_empty() || !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(token)
+}
+
+// ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
 
@@ -256,9 +336,16 @@ fn is_no_newline_marker(line: &str) -> bool {
 /// Accepts both LF and CRLF line endings and tolerates trailing whitespace on
 /// structural markers. Recognizes the optional `*** Environment ID:` preamble
 /// (which is consumed and ignored) and the `*** End of File` hunk terminator.
-/// Returns a [`PatchError`] (with a 1-based line number where one applies) on
-/// malformed input. Never panics.
+/// Also tolerates a shell heredoc wrapper around the patch (e.g.
+/// `apply_patch <<'EOF' … EOF`), stripping it only when the body contains a
+/// complete patch. Returns a [`PatchError`] (with a 1-based line number where
+/// one applies) on malformed input. Never panics.
 pub fn parse_v4a(patch: &str) -> Result<Vec<PatchOp>, PatchError> {
+    // Some models wrap the patch in a shell heredoc, mimicking the Codex CLI's
+    // `apply_patch <<'EOF' … EOF`. Strip that envelope first; a malformed wrapper
+    // is left intact so it surfaces as a normal parse error (we never guess).
+    let patch = strip_heredoc_envelope(patch);
+
     // Split on '\n'; `strip_cr` handles the trailing '\r' of CRLF. We keep blank
     // lines because they are meaningful inside hunks / file bodies.
     let raw_lines: Vec<&str> = patch.split('\n').collect();
@@ -1029,8 +1116,11 @@ fn apply_hunks(path: &str, current: &str, hunks: &[Hunk]) -> Result<AppliedUpdat
 ///   4. Unicode-punctuation normalization (typographic dashes / quotes /
 ///      non-breaking and exotic spaces folded to their ASCII equivalents).
 ///
-/// When `eof` is true we try the end-of-file position first (so a hunk anchored
-/// at EOF matches the file's tail), falling back to a forward scan from `start`.
+/// When `eof` is true the search is anchored to the file's tail: only the final
+/// candidate position (`lines.len() - pattern.len()`) is probed — through every
+/// tier — so a hunk marked end-of-file matches the file's end and nowhere else.
+/// There is no fallback to a forward scan in that case. Otherwise the scan runs
+/// forward from `start`. (This mirrors Codex's `seek_sequence`.)
 ///
 /// Defensive cases: an empty `pattern` returns `Some(start)`; a `pattern` longer
 /// than `lines` returns `None` (no panic).
@@ -1163,6 +1253,61 @@ impl<'a> ExistsView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- heredoc envelope --------------------------------------------------
+
+    #[test]
+    fn plain_patch_without_heredoc_still_parses() {
+        let ops = parse_v4a("*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch\n").unwrap();
+        assert_eq!(ops.len(), 1);
+    }
+
+    #[test]
+    fn quoted_heredoc_wrapper_is_stripped() {
+        let single =
+            "<<'EOF'\n*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\nEOF\n";
+        assert_eq!(parse_v4a(single).unwrap().len(), 1);
+
+        let double =
+            "<<\"EOF\"\n*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\nEOF\n";
+        assert_eq!(parse_v4a(double).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bare_and_command_heredoc_wrappers_are_stripped() {
+        // `<<EOF` (no quotes)
+        let bare = "<<EOF\n*** Begin Patch\n*** Delete File: x.txt\n*** End Patch\nEOF\n";
+        assert_eq!(parse_v4a(bare).unwrap().len(), 1);
+
+        // `apply_patch <<'PATCH'` — Codex CLI form with a custom delimiter.
+        let cmd = "apply_patch <<'PATCH'\n*** Begin Patch\n*** Delete File: x.txt\n*** End Patch\nPATCH\n";
+        assert_eq!(parse_v4a(cmd).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mismatched_heredoc_is_left_as_parse_error() {
+        // Opener present but no terminator line equal to the delimiter → not
+        // stripped → first line is not `*** Begin Patch` → MissingBegin. We never
+        // guess at a broken wrapper.
+        let patch =
+            "<<'EOF'\n*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch\nWRONGDELIM\n";
+        assert!(matches!(parse_v4a(patch), Err(PatchError::MissingBegin)));
+    }
+
+    #[test]
+    fn heredoc_with_environment_id_still_parses() {
+        let patch = "apply_patch <<'EOF'\n*** Begin Patch\n*** Environment ID: abc123\n*** Add File: a.txt\n+x\n*** End Patch\nEOF\n";
+        assert_eq!(parse_v4a(patch).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn heredoc_terminator_is_not_confused_with_indented_content() {
+        // A context/added line that merely contains the delimiter word is not a
+        // terminator (content lines are prefixed / indented, never column 0).
+        let patch = "<<EOF\n*** Begin Patch\n*** Add File: s.sh\n+echo EOF\n+ EOF\n*** End Patch\nEOF\n";
+        let ops = parse_v4a(patch).unwrap();
+        assert_eq!(ops.len(), 1);
+    }
 
     // ---- helpers ----------------------------------------------------------
 
