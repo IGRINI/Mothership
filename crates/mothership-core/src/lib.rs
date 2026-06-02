@@ -56,6 +56,7 @@ pub use tools::{
     ConservativeCommandPermissionPolicy, FileMetadata,
     FileSystem, FileTool, FileToolCapability, FileToolError, FileToolOutcome, FileToolOutputStore,
     FileToolSpill, NoopToolExecutionEventSink, PathError, PendingToolApprovalGate, StdFileSystem,
+    MAX_TOOL_EVENT_BYTES,
     SpawnedToolProcess, StaticToolApprovalGate, ToolApprovalAnswer, ToolApprovalDecision,
     ToolApprovalGate, ToolBatchPlan, ToolCancellationToken, ToolCommand, ToolConcurrency,
     ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,

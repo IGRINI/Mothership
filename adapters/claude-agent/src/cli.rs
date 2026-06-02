@@ -281,10 +281,33 @@ pub(crate) async fn stream_chat(
     })
 }
 
+/// Mothership file tools that, when bridged to Claude (as `mcp__mothership__*`),
+/// must supersede Claude's native file-mutation tools so every file change flows
+/// through Mothership's approval/event/history pipeline rather than skipping it.
+const MOTHERSHIP_FILE_TOOL_NAMES: &[&str] =
+    &["read_file", "write_file", "edit_file", "apply_patch"];
+
+/// Claude's native file-MUTATION tools. We disable these when the supervised
+/// Mothership file tools are bridged, forcing Claude to mutate through the
+/// bridge. Native `Read` is intentionally NOT included: reads are lower-risk and
+/// leaving Claude's fast native reader available avoids round-tripping every file
+/// view through the bridge.
+const NATIVE_FILE_MUTATION_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
 fn disallowed_tools_for_request(request: &ChatRequest) -> Vec<&'static str> {
     let mut tools = HEADLESS_DISALLOWED_TOOLS.to_vec();
     if request.tools.iter().any(|tool| tool.name == "run_command") {
         tools.push("Bash");
+    }
+    // When the Mothership file tools are present (and therefore bridged), disable
+    // Claude's native file-mutation tools so file writes cannot bypass Mothership
+    // approvals/events/history. Reads stay native.
+    if request
+        .tools
+        .iter()
+        .any(|tool| MOTHERSHIP_FILE_TOOL_NAMES.contains(&tool.name.as_str()))
+    {
+        tools.extend_from_slice(NATIVE_FILE_MUTATION_TOOLS);
     }
     tools
 }
@@ -294,7 +317,7 @@ fn adapter_instructions(core_instructions: String, bridge_enabled: bool) -> Stri
         return core_instructions;
     }
 
-    let bridge_instructions = "When Mothership MCP tools are available, use them for local command execution. Prefer `mcp__mothership__run_command` over direct shell tools so Mothership can supervise cancellation, permissions, history, and output synchronization. Only fall back to provider-native tools when no Mothership tool can perform the task.";
+    let bridge_instructions = "When Mothership MCP tools are available, use them for local command execution and all file changes. Prefer `mcp__mothership__run_command` over direct shell tools, and prefer the Mothership file tools (`mcp__mothership__read_file`, `mcp__mothership__write_file`, `mcp__mothership__edit_file`, `mcp__mothership__apply_patch`) over native file tools, so Mothership can supervise cancellation, permissions, history, and output synchronization. Only fall back to provider-native tools when no Mothership tool can perform the task.";
     if core_instructions.trim().is_empty() {
         bridge_instructions.to_string()
     } else {
@@ -576,4 +599,91 @@ fn workspace_node_modules_binary() -> Option<PathBuf> {
     std::env::current_dir()
         .ok()
         .map(|cwd| cwd.join("node_modules").join(package).join(binary))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mothership_adapter_sdk::protocol::ToolDescriptor;
+
+    fn tool(name: &str) -> ToolDescriptor {
+        ToolDescriptor {
+            id: format!("core.{name}"),
+            name: name.to_string(),
+            description: String::new(),
+            parameters: json!({}),
+            strict: false,
+            annotations: BTreeMap::new(),
+        }
+    }
+
+    fn request_with_tools(names: &[&str]) -> ChatRequest {
+        ChatRequest {
+            model: "claude".to_string(),
+            reasoning: None,
+            prompt: Default::default(),
+            runtime_context: Default::default(),
+            messages: Vec::new(),
+            tools: names.iter().map(|name| tool(name)).collect(),
+            state: None,
+            tool_results: Vec::new(),
+            extra_messages: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn disallows_native_file_mutation_tools_when_file_tools_present() {
+        // With the Mothership file tools bridged, Claude's native file-mutation
+        // tools must be disabled so writes cannot bypass Mothership supervision.
+        let request = request_with_tools(&[
+            "run_command",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+        ]);
+        let disallowed = disallowed_tools_for_request(&request);
+
+        for native in NATIVE_FILE_MUTATION_TOOLS {
+            assert!(
+                disallowed.contains(native),
+                "expected `{native}` to be disallowed when file tools are bridged"
+            );
+        }
+        // Bash is also disabled because run_command is present.
+        assert!(disallowed.contains(&"Bash"));
+        // Native `Read` stays enabled (reads are lower-risk).
+        assert!(
+            !disallowed.contains(&"Read"),
+            "native Read must remain enabled"
+        );
+    }
+
+    #[test]
+    fn keeps_native_file_tools_when_no_mothership_file_tools() {
+        // If only run_command is offered (no bridged file tools), native file
+        // tools must stay enabled so Claude can still edit.
+        let request = request_with_tools(&["run_command"]);
+        let disallowed = disallowed_tools_for_request(&request);
+
+        for native in NATIVE_FILE_MUTATION_TOOLS {
+            assert!(
+                !disallowed.contains(native),
+                "`{native}` must stay enabled when no Mothership file tools are present"
+            );
+        }
+        assert!(disallowed.contains(&"Bash"));
+    }
+
+    #[test]
+    fn presence_of_any_single_file_tool_triggers_native_disable() {
+        // Even one bridged Mothership file tool is enough to supersede the native
+        // mutation tools.
+        let request = request_with_tools(&["edit_file"]);
+        let disallowed = disallowed_tools_for_request(&request);
+        assert!(disallowed.contains(&"Edit"));
+        assert!(disallowed.contains(&"Write"));
+        // No run_command here, so Bash stays enabled.
+        assert!(!disallowed.contains(&"Bash"));
+    }
 }

@@ -115,8 +115,15 @@ impl Workspace {
 
         // Lexically normalize so `..` segments are resolved without touching the
         // filesystem (this catches `../../etc/passwd` before any IO).
+        //
+        // Containment is checked with a platform-aware comparison rather than a
+        // raw `starts_with`: on Windows a canonicalized verbatim root
+        // (`\\?\E:\proj`) must still contain a normal `E:\proj\src\x.rs` input,
+        // and the match must be case-insensitive. `path_contains` strips the
+        // verbatim prefixes, folds case (on Windows), and normalizes separators
+        // on both sides.
         let normalized = lexically_normalize(&joined);
-        if !normalized.starts_with(&self.root) {
+        if !path_contains(&self.root, &normalized) {
             return Err(PathError::OutsideWorkspace { path: display });
         }
 
@@ -126,7 +133,7 @@ impl Workspace {
         // form and its nearest existing ancestor stay inside the root.
         let canonical_prefix = canonicalize_existing_prefix(&normalized);
         if let Some(prefix) = canonical_prefix {
-            if !prefix.starts_with(&self.root) {
+            if !path_contains(&self.root, &prefix) {
                 return Err(PathError::OutsideWorkspace { path: display });
             }
         }
@@ -214,6 +221,52 @@ fn is_sensitive_component(name: &str) -> bool {
     false
 }
 
+/// Whether `candidate` is `root` itself or lives inside it, using a
+/// platform-aware string comparison so a canonicalized verbatim Windows root
+/// (`\\?\E:\proj`) still contains a normal `E:\proj\...` input and the match is
+/// case-insensitive on Windows. Mirrors the sidecar's `run_command` cwd
+/// containment (`normalize_for_compare`/`path_within`) but additionally strips
+/// the `\\?\` / `\\?\UNC\` verbatim prefixes that `fs::canonicalize` produces on
+/// Windows, since the root is canonicalized but tool-supplied inputs are not.
+fn path_contains(root: &Path, candidate: &Path) -> bool {
+    let root = normalize_for_compare(root);
+    let candidate = normalize_for_compare(candidate);
+    if candidate == root {
+        return true;
+    }
+    // `root` ends without a trailing slash; require the next char in `candidate`
+    // to be a separator so `E:/proj` does not falsely contain `E:/project`.
+    match candidate.strip_prefix(&root) {
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    }
+}
+
+/// Normalize a path to a comparable string: drop a `\\?\` / `\\?\UNC\` verbatim
+/// prefix, replace `\` with `/`, and (on Windows) fold ASCII case so paths that
+/// differ only by case or separator style compare equal.
+fn normalize_for_compare(path: &Path) -> String {
+    let mut text = path.to_string_lossy().replace('\\', "/");
+    // Strip Windows verbatim prefixes left by canonicalization. `\\?\UNC\` maps a
+    // UNC share; re-add the leading `//` so the share path stays absolute.
+    if let Some(rest) = text.strip_prefix("//?/UNC/") {
+        text = format!("//{rest}");
+    } else if let Some(rest) = text.strip_prefix("//?/") {
+        text = rest.to_string();
+    }
+    // Drop a single trailing separator so `E:/proj/` compares equal to `E:/proj`.
+    while text.len() > 1 && text.ends_with('/') {
+        text.pop();
+    }
+
+    #[cfg(windows)]
+    {
+        text.make_ascii_lowercase();
+    }
+
+    text
+}
+
 /// Lexically normalize a path: collapse `.` and resolve `..` against earlier
 /// `Normal` components, without consulting the filesystem. The root/prefix
 /// components are preserved so an absolute path stays absolute.
@@ -272,6 +325,23 @@ pub struct FileMetadata {
 pub trait FileSystem: Send + Sync {
     /// Read the entire file as bytes.
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
+    /// Read at most `max` bytes from `path`, returning the bytes read and whether
+    /// the file had more than `max` bytes (i.e. the read was truncated). This lets
+    /// `read_file` bound its allocation up front for a huge file instead of
+    /// reading the whole thing and capping afterwards. The default implementation
+    /// reads the whole file via [`FileSystem::read`] and then truncates; the
+    /// [`StdFileSystem`] override streams through a capped reader so it never
+    /// allocates the full file.
+    fn read_capped(&self, path: &Path, max: usize) -> io::Result<(Vec<u8>, bool)> {
+        let bytes = self.read(path)?;
+        if bytes.len() > max {
+            let mut capped = bytes;
+            capped.truncate(max);
+            Ok((capped, true))
+        } else {
+            Ok((bytes, false))
+        }
+    }
     /// Atomically write `bytes` to `path`, replacing any existing file.
     fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;
     /// Stat the path.
@@ -299,6 +369,20 @@ impl StdFileSystem {
 impl FileSystem for StdFileSystem {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         fs::read(path)
+    }
+
+    fn read_capped(&self, path: &Path, max: usize) -> io::Result<(Vec<u8>, bool)> {
+        use std::io::Read as _;
+        let file = fs::File::open(path)?;
+        // Read up to `max + 1` bytes: the extra byte (if present) tells us the
+        // file was longer than `max` without us ever buffering the whole thing.
+        let mut buf = Vec::new();
+        file.take(max as u64 + 1).read_to_end(&mut buf)?;
+        let truncated = buf.len() > max;
+        if truncated {
+            buf.truncate(max);
+        }
+        Ok((buf, truncated))
     }
 
     fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -484,6 +568,124 @@ mod tests {
         assert!(!meta.is_dir);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_capped_truncates_large_file_without_reading_all() {
+        let dir = unique_temp_dir("read_capped");
+        let fs_port = StdFileSystem::new();
+        let target = dir.join("big.bin");
+        // 1 MiB on disk; we cap the read at 1 KiB.
+        let big = vec![b'a'; 1024 * 1024];
+        fs::write(&target, &big).unwrap();
+
+        let (bytes, truncated) = fs_port.read_capped(&target, 1024).unwrap();
+        assert!(truncated, "read should report truncation");
+        assert_eq!(bytes.len(), 1024, "read must be capped to `max`");
+
+        // A small file is returned whole and not flagged truncated.
+        let small = dir.join("small.bin");
+        fs::write(&small, b"hello").unwrap();
+        let (bytes, truncated) = fs_port.read_capped(&small, 1024).unwrap();
+        assert!(!truncated);
+        assert_eq!(bytes, b"hello");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_read_capped_matches_std_override() {
+        // The default trait impl (read-then-truncate) must agree with the
+        // StdFileSystem streaming override on the observable result.
+        struct DefaultReadFs {
+            bytes: Vec<u8>,
+        }
+        impl FileSystem for DefaultReadFs {
+            fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+                Ok(self.bytes.clone())
+            }
+            fn write_atomic(&self, _path: &Path, _bytes: &[u8]) -> io::Result<()> {
+                Ok(())
+            }
+            fn metadata(&self, _path: &Path) -> io::Result<FileMetadata> {
+                Ok(FileMetadata {
+                    len: self.bytes.len() as u64,
+                    is_dir: false,
+                })
+            }
+            fn exists(&self, _path: &Path) -> bool {
+                true
+            }
+            fn rename(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+                Ok(())
+            }
+            fn remove_file(&self, _path: &Path) -> io::Result<()> {
+                Ok(())
+            }
+            fn create_dir_all(&self, _path: &Path) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let fs_port = DefaultReadFs {
+            bytes: vec![b'z'; 5000],
+        };
+        let (bytes, truncated) = fs_port.read_capped(Path::new("x"), 1000).unwrap();
+        assert!(truncated);
+        assert_eq!(bytes.len(), 1000);
+    }
+
+    #[test]
+    fn path_contains_handles_verbatim_and_separators() {
+        // Verbatim Windows root must contain a plain input (and vice-versa);
+        // separators and (on Windows) case must not matter.
+        assert!(path_contains(
+            Path::new(r"\\?\E:\proj"),
+            Path::new(r"E:\proj\src\x.rs")
+        ));
+        assert!(path_contains(Path::new("/home/u/proj"), Path::new("/home/u/proj/src")));
+        // The root itself is contained.
+        assert!(path_contains(Path::new("/a/b"), Path::new("/a/b")));
+        // A sibling that merely shares a prefix is NOT contained.
+        assert!(!path_contains(Path::new("/a/proj"), Path::new("/a/project")));
+        // A genuine escape is rejected.
+        assert!(!path_contains(Path::new("/a/proj"), Path::new("/a/other")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_contains_is_case_insensitive_on_windows() {
+        assert!(path_contains(
+            Path::new(r"\\?\E:\Proj"),
+            Path::new(r"e:\proj\SRC\x.rs")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_passes_when_root_is_verbatim_and_input_is_plain() {
+        // Build a workspace whose root is a verbatim path (as `fs::canonicalize`
+        // produces on Windows), then resolve a plain absolute input inside it.
+        let dir = unique_temp_dir("verbatim_root");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        let canonical = fs::canonicalize(&dir).unwrap();
+        assert!(
+            canonical.to_string_lossy().starts_with(r"\\?\"),
+            "expected a verbatim canonical root on Windows, got {canonical:?}"
+        );
+        let ws = Workspace::from_canonical_root(canonical);
+
+        // A non-verbatim absolute path to a file inside the workspace must resolve.
+        let plain_input = dir.join("src").join("x.rs");
+        let resolved = ws.resolve(&plain_input).expect("resolve plain input");
+        assert!(path_contains(ws.root(), &resolved));
+
+        // A genuine escape is still rejected.
+        let outside = unique_temp_dir("verbatim_outside");
+        assert!(ws.resolve(outside.join("y.rs")).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]

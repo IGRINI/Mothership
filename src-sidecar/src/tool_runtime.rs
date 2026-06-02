@@ -17,7 +17,8 @@ use mothership_core::{
     ToolBatchPlan, ToolCancellationToken, ToolCommand, ToolExecutionEvent, ToolExecutionEventKind,
     ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest, ToolExecutionResult,
     ToolExecutionStatus, ToolOutputPolicy, ToolOutputStore, ToolPermissionAction, ToolProcessExit,
-    ToolProcessSandbox, ToolProcessSpec, ToolSupervisor, Workspace, RUN_COMMAND_TOOL_NAME,
+    ToolProcessSandbox, ToolProcessSpec, ToolSupervisor, Workspace, MAX_TOOL_EVENT_BYTES,
+    RUN_COMMAND_TOOL_NAME,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -521,22 +522,34 @@ impl SidecarLlmToolHandler {
                 } else {
                     ToolExecutionStatus::Failed
                 };
-                let model_text = file_outcome_text(&outcome);
-                let result = synthesized_result(
+                // The model gets the full (160 KiB-capped) text. The event/DB
+                // payload is bounded separately to MAX_TOOL_EVENT_BYTES so a huge
+                // overwrite's diff cannot push megabytes into persistence/UI; the
+                // full diff is spilled to the output store (when available) and a
+                // logRef is attached to the stored result instead.
+                let model_response = truncate_for_model(file_outcome_text(&outcome));
+                let bounded = bound_event_payload(
+                    &outcome,
+                    tool_call_id,
+                    spill.as_ref().map(|spill| spill as &dyn FileToolSpill),
+                );
+                let mut result = synthesized_result(
                     tool_call_id,
                     status,
-                    model_text.clone(),
-                    outcome.diff.clone(),
+                    bounded.result_text,
+                    bounded.diff.clone(),
                 );
+                result.log_ref = bounded.log_ref;
+                result.truncated_for_display = bounded.truncated;
                 let kind = if outcome.ok {
                     ToolExecutionEventKind::Completed
                 } else {
                     ToolExecutionEventKind::Failed
                 };
-                self.emit_file_event(tool_call_id, run_id, project_id, kind, outcome.diff.clone(), Some(result));
+                self.emit_file_event(tool_call_id, run_id, project_id, kind, bounded.diff, Some(result));
                 LlmToolCallResult {
                     ok: outcome.ok,
-                    content: truncate_for_model(model_text),
+                    content: model_response,
                 }
             }
             Err(error) => {
@@ -675,6 +688,84 @@ fn file_outcome_text(outcome: &FileToolOutcome) -> String {
         }
         _ => outcome.model_text.clone(),
     }
+}
+
+/// What goes into the persisted [`ToolExecutionResult`] / event for a file tool,
+/// after bounding to [`MAX_TOOL_EVENT_BYTES`] so the database/UI never receive a
+/// multi-megabyte diff. The full diff is written to the output store (when one is
+/// available) and referenced via `log_ref`.
+struct BoundedEventPayload {
+    /// Bounded text for the result's stdout fields (summary + bounded diff).
+    result_text: String,
+    /// Bounded diff for the event message, or `None` when there is no diff.
+    diff: Option<String>,
+    /// Reference to the spilled full diff, when it was spilled.
+    log_ref: Option<String>,
+    /// Whether anything was truncated relative to the full payload.
+    truncated: bool,
+}
+
+/// Bound the event/DB payload for a file-tool outcome. The model-facing response
+/// is bounded separately by the caller; this only shapes what is stored and
+/// streamed to the UI. When the diff exceeds the budget it is truncated with a
+/// marker and (if a spill sink is present) the full diff is persisted and a
+/// `logRef` is returned so the full content stays retrievable.
+fn bound_event_payload(
+    outcome: &FileToolOutcome,
+    tool_call_id: &str,
+    spill: Option<&dyn FileToolSpill>,
+) -> BoundedEventPayload {
+    let full_diff = outcome
+        .diff
+        .as_deref()
+        .filter(|diff| !diff.is_empty() && outcome.ok);
+
+    let Some(full_diff) = full_diff else {
+        // No diff to bound; the summary alone is already small.
+        return BoundedEventPayload {
+            result_text: outcome.model_text.clone(),
+            diff: None,
+            log_ref: None,
+            truncated: false,
+        };
+    };
+
+    if full_diff.len() <= MAX_TOOL_EVENT_BYTES {
+        return BoundedEventPayload {
+            result_text: format!("{}\n\n{}", outcome.model_text, full_diff),
+            diff: Some(full_diff.to_string()),
+            log_ref: None,
+            truncated: false,
+        };
+    }
+
+    // Oversized diff: spill the full diff (best effort) and keep only a bounded
+    // prefix in the event/result.
+    let log_ref = spill.and_then(|spill| spill.spill(tool_call_id, full_diff).ok());
+    let mut bounded_diff = truncate_on_char_boundary(full_diff, MAX_TOOL_EVENT_BYTES);
+    bounded_diff.push_str("\n... diff truncated for storage ...\n");
+    if let Some(log_ref) = &log_ref {
+        bounded_diff.push_str(&format!("full diff: {log_ref}\n"));
+    }
+    BoundedEventPayload {
+        result_text: format!("{}\n\n{}", outcome.model_text, bounded_diff),
+        diff: Some(bounded_diff),
+        log_ref,
+        truncated: true,
+    }
+}
+
+/// Take the longest prefix of `text` not exceeding `max_bytes` that ends on a
+/// char boundary, so the truncated diff is always valid UTF-8.
+fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -877,9 +968,81 @@ impl SpawnedToolProcess for SpawnedProcessAdapter {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
     use std::time::Duration;
 
+    use serde_json::json;
+
     use super::*;
+
+    /// A [`FileToolSpill`] that records what it was asked to spill and returns a
+    /// fixed reference, so tests can assert the full (untruncated) diff was sent
+    /// to the output store.
+    #[derive(Default)]
+    struct RecordingSpill {
+        captured: Mutex<Vec<String>>,
+    }
+
+    impl FileToolSpill for RecordingSpill {
+        fn spill(&self, _tool_call_id: &str, content: &str) -> std::io::Result<String> {
+            self.captured.lock().unwrap().push(content.to_string());
+            Ok("spill://full-diff".to_string())
+        }
+    }
+
+    fn outcome_with_diff(diff: String) -> FileToolOutcome {
+        FileToolOutcome {
+            ok: true,
+            model_text: "modified big.txt (1 bytes, sha256 abcd)".to_string(),
+            data: json!({ "status": "modified" }),
+            sha256: Some("abcd".to_string()),
+            diff: Some(diff),
+        }
+    }
+
+    #[test]
+    fn bounded_event_payload_truncates_large_diff_and_spills_full() {
+        // A diff far larger than MAX_TOOL_EVENT_BYTES must be truncated for the
+        // event/result and the full diff written to the spill with a logRef.
+        let big_diff = "+".repeat(MAX_TOOL_EVENT_BYTES * 3);
+        let outcome = outcome_with_diff(big_diff.clone());
+        let spill = RecordingSpill::default();
+
+        let bounded = bound_event_payload(&outcome, "tc_big", Some(&spill));
+
+        assert!(bounded.truncated, "oversized diff must be flagged truncated");
+        let event_diff = bounded.diff.expect("diff present");
+        assert!(
+            event_diff.len() < big_diff.len(),
+            "event diff must be smaller than the full diff"
+        );
+        assert!(
+            event_diff.len() <= MAX_TOOL_EVENT_BYTES + 256,
+            "event diff must be bounded near the budget, got {} bytes",
+            event_diff.len()
+        );
+        assert!(event_diff.contains("diff truncated for storage"));
+        assert_eq!(bounded.log_ref.as_deref(), Some("spill://full-diff"));
+        // The result text must also be bounded (not carry the full diff).
+        assert!(bounded.result_text.len() < big_diff.len());
+        // The FULL diff reached the spill untouched.
+        let captured = spill.captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].len(), big_diff.len());
+    }
+
+    #[test]
+    fn bounded_event_payload_passes_small_diff_through() {
+        let outcome = outcome_with_diff("@@ -1,1 +1,1 @@\n-old\n+new\n".to_string());
+        let spill = RecordingSpill::default();
+
+        let bounded = bound_event_payload(&outcome, "tc_small", Some(&spill));
+
+        assert!(!bounded.truncated);
+        assert!(bounded.log_ref.is_none(), "small diff must not spill");
+        assert!(bounded.diff.unwrap().contains("+new"));
+        assert!(spill.captured.lock().unwrap().is_empty());
+    }
 
     #[cfg(windows)]
     #[test]

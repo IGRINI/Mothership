@@ -30,7 +30,7 @@ pub use catalog::{
 };
 pub use file_tools::{
     apply_patch, classify, edit_file, preview_diff, read_file, write_file, FileTool,
-    FileToolCapability, FileToolError, FileToolOutcome, FileToolSpill,
+    FileToolCapability, FileToolError, FileToolOutcome, FileToolSpill, MAX_TOOL_EVENT_BYTES,
 };
 pub use filesystem::{FileMetadata, FileSystem, PathError, StdFileSystem, Workspace};
 pub use output::{FileToolOutputStore, ToolOutputStore};

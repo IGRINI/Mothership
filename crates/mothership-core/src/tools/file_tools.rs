@@ -29,13 +29,25 @@ use sha2::{Digest, Sha256};
 
 use super::file_edit::{apply_edit, EditError};
 use super::filesystem::{FileSystem, PathError, Workspace};
-use super::patch::{parse_v4a, plan_patch, FileMap, PlannedFile, PlannedKind};
+use super::patch::{parse_v4a, plan_patch, FileMap, PatchPlan, PlannedFile, PlannedKind};
 use super::permissions::ToolPermissionAction;
 
 /// Default cap on how many bytes of file content are inlined into the model
 /// result before the read spills to the output store. Mirrors the conservative
 /// preview budget used for command output.
 const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
+
+/// Hard ceiling on how many bytes `read_file` will load off disk in a single
+/// call. A file larger than this is read only up to the ceiling (and reported as
+/// truncated) so a multi-gigabyte file cannot be slurped into memory; callers
+/// that need more can page with `startLine`/`limit`.
+const MAX_READ_FILE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Cap on the diff / synthesized result text that a mutating tool puts into the
+/// persisted execution event and `ToolExecutionResult` (UI/DB). The model-facing
+/// response has its own, larger budget; this only bounds what is stored/streamed
+/// so a huge overwrite cannot push megabytes into the event store.
+pub const MAX_TOOL_EVENT_BYTES: usize = 64 * 1024;
 
 /// Number of leading bytes sampled for the binary-content heuristic.
 const BINARY_SNIFF_BYTES: usize = 4096;
@@ -371,7 +383,17 @@ pub fn read_file(
         Err(reason) => return Ok(path_failure(&input.path, reason)),
     };
 
-    let bytes = fs.read(&resolved).map_err(|error| FileToolError::Io(error.to_string()))?;
+    // Gate on size first: cap the read at MAX_READ_FILE_BYTES so a huge file is
+    // never fully loaded. The byte budget is widened to the caller's `maxBytes`
+    // request when it asks for more than the default ceiling, so an explicit
+    // large read still works up to the hard limit. The sha is computed over the
+    // bytes actually read; when the read was capped that is a prefix hash, which
+    // we surface via `bytesTruncated`.
+    let requested_max = input.max_bytes.unwrap_or(DEFAULT_READ_MAX_BYTES);
+    let read_ceiling = requested_max.max(MAX_READ_FILE_BYTES);
+    let (bytes, bytes_truncated) = fs
+        .read_capped(&resolved, read_ceiling)
+        .map_err(|error| FileToolError::Io(error.to_string()))?;
     let sha = sha256_hex(&bytes);
 
     if looks_binary(&bytes) {
@@ -394,7 +416,11 @@ pub fn read_file(
     }
 
     // Lossy decode is safe here: the binary guard already rejected NUL-bearing /
-    // mostly-non-text payloads, so this only ever touches genuine text.
+    // mostly-non-text payloads, so this only ever touches genuine text. We still
+    // record whether a strict decode would have failed so the model/UI know the
+    // shown text was lossily decoded (e.g. a Windows-1251 file that slipped past
+    // the binary heuristic) — the display still happens, just flagged.
+    let lossy = std::str::from_utf8(&bytes).is_err();
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let all_lines: Vec<&str> = split_keep_lines(&text);
     let total_lines = all_lines.len();
@@ -411,7 +437,7 @@ pub fn read_file(
         .collect();
 
     let numbered = render_numbered(&selected);
-    let max_bytes = input.max_bytes.unwrap_or(DEFAULT_READ_MAX_BYTES);
+    let max_bytes = requested_max;
 
     let end_line = selected.last().map(|(n, _)| *n).unwrap_or(start_idx);
     let mut data = json!({
@@ -422,6 +448,18 @@ pub fn read_file(
         "endLine": end_line,
         "truncated": false,
     });
+    if lossy {
+        // The shown text was lossily decoded (invalid UTF-8 bytes → U+FFFD).
+        data["lossy"] = json!(true);
+        data["encoding"] = json!("lossy-utf8");
+    }
+    if bytes_truncated {
+        // The file exceeded the read ceiling; only a prefix was loaded, so the
+        // sha and line view describe that prefix, not the whole file.
+        data["bytesTruncated"] = json!(true);
+        data["truncated"] = json!(true);
+        data["readCeilingBytes"] = json!(read_ceiling);
+    }
 
     if numbered.len() > max_bytes {
         // Oversized: spill the full numbered view (when a sink is available) and
@@ -444,6 +482,11 @@ pub fn read_file(
         if let Some(log_ref) = &log_ref {
             model_text.push_str(&format!("full content: {log_ref}\n"));
         }
+        if bytes_truncated {
+            model_text.push_str(&format!(
+                "(file exceeds the {read_ceiling}-byte read ceiling; only the leading bytes were read)\n"
+            ));
+        }
         model_text.push_str(&format!("(total lines: {total_lines})\n"));
         return Ok(FileToolOutcome {
             ok: true,
@@ -454,9 +497,18 @@ pub fn read_file(
         });
     }
 
+    // The rendered view fits the byte budget, but the file itself may have been
+    // size-capped off disk; tell the model so it can page for the remainder.
+    let mut model_text = numbered;
+    if bytes_truncated {
+        model_text.push_str(&format!(
+            "\n... file exceeds the {read_ceiling}-byte read ceiling; only the leading bytes were read. Use startLine/limit to page further ...\n"
+        ));
+    }
+
     Ok(FileToolOutcome {
         ok: true,
-        model_text: numbered,
+        model_text,
         data,
         sha256: Some(sha),
         diff: None,
@@ -609,7 +661,21 @@ pub fn edit_file(
         }
     }
 
-    let content = String::from_utf8_lossy(&bytes).into_owned();
+    // Mutating tools must REFUSE non-UTF-8 content: `apply_edit` rewrites the
+    // whole file, so a lossy decode would replace every invalid byte with U+FFFD
+    // across the entire file (silent data loss), not just the edited span.
+    let content = match std::str::from_utf8(&bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => {
+            return Ok(FileToolOutcome::failure(
+                format!(
+                    "`{}` is not valid UTF-8; refusing to edit to avoid corrupting non-UTF-8 bytes",
+                    input.path
+                ),
+                json!({ "path": input.path, "status": "not_utf8" }),
+            ));
+        }
+    };
     let replace_all = input.replace_all.unwrap_or(false);
     match apply_edit(&content, &input.old_text, &input.new_text, replace_all) {
         Ok(applied) => {
@@ -701,6 +767,34 @@ pub fn apply_patch(
         ));
     }
 
+    // Refuse the whole patch up front if any file it must read (an Update source
+    // or a Delete target) exists but is not valid UTF-8. The planner + apply
+    // rewrite the full file from a lossy decode, which would replace every
+    // non-UTF-8 byte with U+FFFD — silent corruption. We abort with no writes
+    // rather than corrupt. (Add destinations are written wholesale from the
+    // patch body, so they are not checked here.)
+    for path in must_exist_paths(&ops) {
+        let Ok(resolved) = workspace.resolve(&path) else {
+            // Resolution already passed guard_paths above; a failure here is a
+            // race and is handled by the planner/apply step.
+            continue;
+        };
+        if !fs.exists(&resolved) {
+            continue;
+        }
+        let bytes = fs
+            .read(&resolved)
+            .map_err(|error| FileToolError::Io(error.to_string()))?;
+        if std::str::from_utf8(&bytes).is_err() {
+            return Ok(FileToolOutcome::failure(
+                format!(
+                    "`{path}` is not valid UTF-8; refusing to apply the patch to avoid corrupting non-UTF-8 bytes"
+                ),
+                json!({ "status": "not_utf8", "path": path }),
+            ));
+        }
+    }
+
     // Build a read-only FileMap over the workspace so plan_patch can verify every
     // hunk against current on-disk content.
     let file_map = WorkspaceFileMap::new(workspace, fs);
@@ -714,12 +808,40 @@ pub fn apply_patch(
         }
     };
 
-    // Apply the plan. plan_patch is all-or-none at the planning stage; we apply
-    // in op order. (A mid-apply IO error is surfaced as Err — see note below.)
-    let mut applied_files = Vec::with_capacity(plan.files.len());
+    // Snapshot the prior state of every path the plan will write/move/delete
+    // (and, for a move, the destination too) so we can make the apply step
+    // all-or-none on disk: plan_patch is all-or-none at the *planning* stage, but
+    // a mid-apply IO error (e.g. a later write fails) would otherwise leave
+    // earlier files changed. We capture, apply, and on ANY error restore every
+    // touched path to its captured state and report failure with no net change.
+    let snapshot = match capture_snapshot(workspace, fs, &plan) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return Ok(FileToolOutcome::failure(
+                format!("could not read current file state before applying patch: {error}"),
+                json!({ "status": "io_error", "detail": error.to_string() }),
+            ));
+        }
+    };
+
     let mut combined_diff = String::new();
+    let mut applied_files = Vec::with_capacity(plan.files.len());
     for file in &plan.files {
-        apply_planned_file(workspace, fs, file)?;
+        if let Err(error) = apply_planned_file(workspace, fs, file) {
+            // Roll back everything captured, then report. A rollback failure is
+            // appended so the operator knows the disk may be partially restored.
+            let rollback = restore_snapshot(fs, &snapshot);
+            let mut detail = error.to_string();
+            if let Err(rollback_error) = rollback {
+                detail = format!(
+                    "{detail}; rollback also failed and the workspace may be partially modified: {rollback_error}"
+                );
+            }
+            return Ok(FileToolOutcome::failure(
+                format!("patch failed while applying `{}`: {detail}", file.path),
+                json!({ "status": "apply_error", "path": file.path, "detail": detail }),
+            ));
+        }
         let op = planned_kind_name(&file.op);
         if !combined_diff.is_empty() {
             combined_diff.push('\n');
@@ -797,6 +919,97 @@ fn planned_kind_name(kind: &PlannedKind) -> &'static str {
     }
 }
 
+/// The prior on-disk state of a single path before a patch is applied: either
+/// the bytes it held, or that it did not exist. Used to roll a partially-applied
+/// patch back to its pre-apply state.
+struct PathSnapshot {
+    path: PathBuf,
+    /// `Some(bytes)` if the file existed; `None` if it did not.
+    prior: Option<Vec<u8>>,
+}
+
+/// Capture the prior state of every path a plan will write, move, or delete
+/// (including a move's destination), so the apply step can be rolled back to a
+/// clean state on any mid-apply failure. Reads through the [`FileSystem`] port.
+fn capture_snapshot(
+    workspace: &Workspace,
+    fs: &dyn FileSystem,
+    plan: &PatchPlan,
+) -> Result<Vec<PathSnapshot>, FileToolError> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for file in &plan.files {
+        let source = resolve_for_apply(workspace, &file.path)?;
+        if !paths.contains(&source) {
+            paths.push(source);
+        }
+        if let PlannedKind::Move { to } = &file.op {
+            let dest = resolve_for_apply(workspace, to)?;
+            if !paths.contains(&dest) {
+                paths.push(dest);
+            }
+        }
+    }
+
+    let mut snapshot = Vec::with_capacity(paths.len());
+    for path in paths {
+        let prior = if fs.exists(&path) {
+            Some(
+                fs.read(&path)
+                    .map_err(|error| FileToolError::Io(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        snapshot.push(PathSnapshot { path, prior });
+    }
+    Ok(snapshot)
+}
+
+/// Restore every path in `snapshot` to its captured state: rewrite the prior
+/// bytes for files that existed, and delete files that did not exist before.
+/// Best-effort across all entries — the first error is remembered and returned
+/// after attempting the rest, so one stuck path does not strand the others.
+fn restore_snapshot(fs: &dyn FileSystem, snapshot: &[PathSnapshot]) -> Result<(), FileToolError> {
+    let mut first_error: Option<FileToolError> = None;
+    for entry in snapshot {
+        let result = match &entry.prior {
+            Some(bytes) => fs.write_atomic(&entry.path, bytes),
+            None => {
+                if fs.exists(&entry.path) {
+                    fs.remove_file(&entry.path)
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        if let Err(error) = result {
+            if first_error.is_none() {
+                first_error = Some(FileToolError::Io(error.to_string()));
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// The patch paths that MUST already exist for the patch to apply: the source
+/// of every Update and the target of every Delete. (An Add destination need not
+/// pre-exist; a Move destination must NOT pre-exist.) Used for the up-front
+/// UTF-8 refusal check.
+fn must_exist_paths(ops: &[super::patch::PatchOp]) -> Vec<String> {
+    use super::patch::PatchOp;
+    let mut paths = Vec::new();
+    for op in ops {
+        match op {
+            PatchOp::Update { path, .. } | PatchOp::Delete { path } => paths.push(path.clone()),
+            PatchOp::Add { .. } => {}
+        }
+    }
+    paths
+}
+
 /// Resolve a path during apply. The path already passed `guard_paths`, so this
 /// only converts a resolution error into a [`FileToolError`] for the rare race
 /// where the tree changed between guard and apply.
@@ -829,7 +1042,12 @@ impl FileMap for WorkspaceFileMap<'_> {
     fn read(&self, path: &str) -> Option<String> {
         let resolved = self.resolved(path)?;
         let bytes = self.fs.read(&resolved).ok()?;
-        Some(String::from_utf8_lossy(&bytes).into_owned())
+        // Strict decode: a mutating patch rewrites the whole file, so a lossy
+        // decode here would corrupt non-UTF-8 bytes. `apply_patch` already aborts
+        // up front when a must-exist file is invalid UTF-8, so reaching this with
+        // invalid bytes is a race; surfacing it as `None` (looks missing) is the
+        // safe fallback — the planner reports it as a clean failure with no write.
+        std::str::from_utf8(&bytes).ok().map(str::to_string)
     }
 
     fn exists(&self, path: &str) -> bool {
@@ -1028,7 +1246,7 @@ fn render_full_diff(old: &str, new: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::filesystem::StdFileSystem;
+    use crate::tools::filesystem::{FileMetadata, StdFileSystem};
     use std::fs;
 
     fn temp_workspace(label: &str) -> (Workspace, PathBuf) {
@@ -1405,6 +1623,279 @@ mod tests {
         let out = apply_patch(&json!({ "patch": "not a patch" }), &ws, &fs).unwrap();
         assert!(!out.ok);
         assert_eq!(out.data["status"], "parse_error");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- non-UTF-8 safety (P1a) -------------------------------------------
+
+    #[test]
+    fn edit_file_refuses_non_utf8_and_leaves_file_unchanged() {
+        let (ws, dir) = temp_workspace("edit_non_utf8");
+        let fs = StdFileSystem::new();
+        // 0xFF/0xFE are not valid UTF-8 lead bytes; the rest is plain ASCII so it
+        // sails past the binary heuristic (no NUL, mostly printable).
+        let original: &[u8] = b"\xff\xfe valid ascii line\n";
+        fs::write(dir.join("cp.txt"), original).unwrap();
+
+        let out = edit_file(
+            &json!({ "path": "cp.txt", "oldText": "valid ascii line", "newText": "changed" }),
+            &ws,
+            &fs,
+        )
+        .unwrap();
+        assert!(!out.ok, "non-UTF-8 edit must be refused");
+        assert_eq!(out.data["status"], "not_utf8");
+        // The file must be byte-for-byte unchanged (no lossy rewrite).
+        assert_eq!(fs::read(dir.join("cp.txt")).unwrap(), original);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_file_valid_utf8_still_works() {
+        let (ws, dir) = temp_workspace("edit_utf8_ok");
+        let fs = StdFileSystem::new();
+        // Multi-byte UTF-8 must edit fine.
+        fs::write(dir.join("u.txt"), "café\nmore\n".as_bytes()).unwrap();
+
+        let out = edit_file(
+            &json!({ "path": "u.txt", "oldText": "more", "newText": "même" }),
+            &ws,
+            &fs,
+        )
+        .unwrap();
+        assert!(out.ok, "{}", out.model_text);
+        assert_eq!(fs::read(dir.join("u.txt")).unwrap(), "café\nmême\n".as_bytes());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_patch_aborts_on_non_utf8_touched_file_with_no_writes() {
+        let (ws, dir) = temp_workspace("patch_non_utf8");
+        let fs = StdFileSystem::new();
+        let bad: &[u8] = b"\xff\xfe keep this\n";
+        fs::write(dir.join("bad.txt"), bad).unwrap();
+
+        // Update the non-UTF-8 file. The up-front UTF-8 check must abort the whole
+        // patch before any write happens.
+        let patch = "\
+*** Begin Patch
+*** Add File: fresh.txt
++brand new
+*** Update File: bad.txt
+@@
+-keep this
++changed
+*** End Patch
+";
+        let out = apply_patch(&json!({ "patch": patch }), &ws, &fs).unwrap();
+        assert!(!out.ok, "patch touching a non-UTF-8 file must abort");
+        assert_eq!(out.data["status"], "not_utf8");
+        // No writes: the bad file is untouched AND the Add target was not created.
+        assert_eq!(fs::read(dir.join("bad.txt")).unwrap(), bad);
+        assert!(!dir.join("fresh.txt").exists(), "no file should have been written");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- apply_patch on-disk rollback (P2b) -------------------------------
+
+    /// A [`FileSystem`] decorator over [`StdFileSystem`] that lets the first
+    /// `write_atomic` succeed and forces the Nth (1-based) write to fail, so we
+    /// can exercise the mid-apply rollback path deterministically.
+    struct FailOnNthWrite {
+        inner: StdFileSystem,
+        writes: std::sync::atomic::AtomicUsize,
+        fail_on: usize,
+    }
+
+    impl FailOnNthWrite {
+        fn new(fail_on: usize) -> Self {
+            Self {
+                inner: StdFileSystem::new(),
+                writes: std::sync::atomic::AtomicUsize::new(0),
+                fail_on,
+            }
+        }
+    }
+
+    impl FileSystem for FailOnNthWrite {
+        fn read(&self, path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+            self.inner.read(path)
+        }
+        fn write_atomic(&self, path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+            let n = self
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if n == self.fail_on {
+                return Err(std::io::Error::other("injected write failure"));
+            }
+            self.inner.write_atomic(path, bytes)
+        }
+        fn metadata(&self, path: &std::path::Path) -> std::io::Result<FileMetadata> {
+            self.inner.metadata(path)
+        }
+        fn exists(&self, path: &std::path::Path) -> bool {
+            self.inner.exists(path)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn remove_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn create_dir_all(&self, path: &std::path::Path) -> std::io::Result<()> {
+            self.inner.create_dir_all(path)
+        }
+    }
+
+    #[test]
+    fn apply_patch_rolls_back_first_file_when_second_write_fails() {
+        let (ws, dir) = temp_workspace("patch_rollback");
+        // Two updates; the plan applies them in op order. Fail the SECOND
+        // write_atomic so the first file has already been changed on disk.
+        fs::write(dir.join("a.txt"), b"keep\nold\ntail\n").unwrap();
+        fs::write(dir.join("b.txt"), b"keep\nbee\ntail\n").unwrap();
+        let fs = FailOnNthWrite::new(2);
+
+        let patch = "\
+*** Begin Patch
+*** Update File: a.txt
+@@
+ keep
+-old
++new
+ tail
+*** Update File: b.txt
+@@
+ keep
+-bee
++wasp
+ tail
+*** End Patch
+";
+        let out = apply_patch(&json!({ "patch": patch }), &ws, &fs).unwrap();
+        assert!(!out.ok, "a mid-apply write failure must be reported");
+        assert_eq!(out.data["status"], "apply_error");
+        // The first file must be RESTORED to its original content (rollback),
+        // and the second must be unchanged too — disk identical to pre-apply.
+        assert_eq!(
+            fs::read(dir.join("a.txt")).unwrap(),
+            b"keep\nold\ntail\n",
+            "first file must be rolled back"
+        );
+        assert_eq!(fs::read(dir.join("b.txt")).unwrap(), b"keep\nbee\ntail\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_patch_happy_path_applies_all_files() {
+        let (ws, dir) = temp_workspace("patch_happy_all");
+        let fs = StdFileSystem::new();
+        fs::write(dir.join("a.txt"), b"keep\nold\ntail\n").unwrap();
+        fs::write(dir.join("b.txt"), b"keep\nbee\ntail\n").unwrap();
+
+        let patch = "\
+*** Begin Patch
+*** Update File: a.txt
+@@
+ keep
+-old
++new
+ tail
+*** Update File: b.txt
+@@
+ keep
+-bee
++wasp
+ tail
+*** End Patch
+";
+        let out = apply_patch(&json!({ "patch": patch }), &ws, &fs).unwrap();
+        assert!(out.ok, "{}", out.model_text);
+        assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"keep\nnew\ntail\n");
+        assert_eq!(fs::read(dir.join("b.txt")).unwrap(), b"keep\nwasp\ntail\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- read_file size ceiling (P2c) -------------------------------------
+
+    #[test]
+    fn read_file_caps_oversized_read_and_reports_truncation() {
+        // A FileSystem double that would PANIC if asked for the whole file via
+        // `read`, proving read_file gates on the capped read instead of slurping.
+        struct CappedOnlyFs {
+            len: usize,
+        }
+        impl FileSystem for CappedOnlyFs {
+            fn read(&self, _path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+                panic!("read_file must use read_capped, not read, for a huge file");
+            }
+            fn read_capped(
+                &self,
+                _path: &std::path::Path,
+                max: usize,
+            ) -> std::io::Result<(Vec<u8>, bool)> {
+                // Pretend the file is `self.len` bytes of 'a'; hand back only `max`.
+                let give = max.min(self.len);
+                Ok((vec![b'a'; give], self.len > max))
+            }
+            fn write_atomic(&self, _p: &std::path::Path, _b: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn metadata(&self, _p: &std::path::Path) -> std::io::Result<FileMetadata> {
+                Ok(FileMetadata {
+                    len: self.len as u64,
+                    is_dir: false,
+                })
+            }
+            fn exists(&self, _p: &std::path::Path) -> bool {
+                true
+            }
+            fn rename(&self, _f: &std::path::Path, _t: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_file(&self, _p: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn create_dir_all(&self, _p: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (ws, dir) = temp_workspace("read_ceiling");
+        // Resolve needs the path to exist on disk for the parent containment
+        // check; create a tiny placeholder (the double ignores its content).
+        fs::write(dir.join("huge.txt"), b"placeholder").unwrap();
+        let fs = CappedOnlyFs {
+            len: MAX_READ_FILE_BYTES + 5_000_000,
+        };
+
+        let out = read_file(&json!({ "path": "huge.txt" }), &ws, &fs, "tc_cap", None).unwrap();
+        assert!(out.ok);
+        assert_eq!(out.data["truncated"], true);
+        assert_eq!(out.data["bytesTruncated"], true);
+        assert!(out.model_text.contains("read ceiling"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_flags_lossy_decode_but_still_shows_text() {
+        let (ws, dir) = temp_workspace("read_lossy");
+        let fs = StdFileSystem::new();
+        // Non-UTF-8 bytes that pass the binary heuristic (no NUL, mostly text).
+        fs::write(dir.join("cp.txt"), b"\xff\xfe readable ascii\n").unwrap();
+
+        let out = read_file(&json!({ "path": "cp.txt" }), &ws, &fs, "tc_lossy", None).unwrap();
+        assert!(out.ok, "lossy text is still shown");
+        assert_eq!(out.data["lossy"], true);
+        assert!(out.model_text.contains("readable ascii"));
 
         let _ = fs::remove_dir_all(&dir);
     }
