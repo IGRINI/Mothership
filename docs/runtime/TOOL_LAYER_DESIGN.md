@@ -251,20 +251,59 @@ These hold on `feat/typed-tool-layer` as of the 4th review round. They supersede
   `filesWithMatches` counts distinct matched files even when truncated. `list_files` likewise
   sets `truncated` and sorts the full candidate set *before* applying `limit` (stable first-N).
 
+## Tool Layer vNext — shipped (Phases 0–6)
+
+A second series on `feat/typed-tool-layer` extended the typed layer into a unified pipeline,
+typed storage, semantic UI, catalog stability, and a credential firewall.
+
+- **Phase 0 — cleanups.** `read_file` → `ParallelSafe`; `apply_patch` tolerates a shell heredoc
+  wrapper (`<<'EOF' … EOF` / `apply_patch <<'PATCH'`, stripped only when the body holds a
+  complete patch, no aggressive repair); `seek_sequence` EOF doc corrected; search-honesty
+  invariant documented.
+- **Phase 1 — unified pipeline.** Core `tools/pipeline.rs`: `ToolKind` (the typed routing
+  vocabulary), `ToolCallContext`, the `ToolExecutor` trait. The sidecar dispatches every call
+  through one path owning the shared cross-cuts (cancellation slot, registry slot,
+  chat-cancel watcher), routing by kind to `CommandToolExecutor` (wraps the UNCHANGED
+  `ToolSupervisor`) or `FileToolExecutor` (the typed handlers). Logic moved, not rewritten;
+  supervisor intact. (Non-goals honored: no single process+in-process executor.)
+- **Phase 2+3 — typed storage + payloads.** Tables `tool_calls` / `tool_events` /
+  `tool_artifacts` (migration v11), the source of truth alongside the retained
+  `chat_tool_events` feed. `ToolExecutionEvent`/`Record` carry `tool_kind` / `payload` /
+  `touched_paths` / `artifacts`. File/search tools attach their semantic `data` + a bounded
+  diff artifact (full diff via `log_ref`); `run_command`'s payload + output artifact are
+  synthesized from command+result at the storage layer (supervisor untouched). Large content
+  is always referenced via `log_ref`, never inlined. The read path enriches records from the
+  typed tables so a reloaded conversation still renders cards. No schema cap on
+  `write_file.content`.
+- **Phase 4 — semantic UI.** Per-tool semantic cards (SolidJS `ToolCards.tsx`) keyed on
+  `toolKind`, a colored diff card, and a before-approval diff preview above Approve/Deny. Full
+  text fallback when a typed payload is absent.
+- **Phase 5 — catalog stability.** `canonical_json` / `canonical_catalog_bytes` /
+  `catalog_fingerprint` (byte-stable, key-sorted) + `CatalogPin` drift detection (the
+  MCP-byte-pin). Pinned per process in `run.rs`; warns on drift; documented attach point for
+  merged MCP/dynamic tools.
+- **Phase 6 — credential firewall foundation.** `CredentialGuard` + `PatternCredentialGuard`
+  (PEM keys, cloud/provider tokens, bearer headers, `key=value` secrets) applied at the event
+  sink — the single chokepoint for everything persisted + shown. Model-facing *result* text is
+  intentionally not yet redacted (the model needs real file contents; known-secret files are
+  already path-blocked); the trait is the seam for policy-driven model-visible redaction later.
+
 ## Deferred (NOT defects — scope, stage considered closed without them)
 
 - **Typed search — DONE.** Native `list_files`/`search_text` (read-only, `ParallelSafe`) ship
   alongside the file tools; Claude-native `Glob`/`Grep` are disabled when both typed search
   tools are bridged. No shell/`rg` — `ignore`+`regex`+`globset` crates.
-- **Typed storage** (`tool_calls`/`tool_events`/`tool_artifacts`) — events still via
-  `chat_tool_events` (`command_json` NULL for file tools).
-- **UI semantic cards** + diff-before-approve card — frontend; approval diff currently rides
-  (bounded) in the event `message`.
+- **Typed storage — DONE.** `tool_calls`/`tool_events`/`tool_artifacts` (v11); legacy
+  `chat_tool_events` retained as fallback feed.
+- **UI semantic cards — DONE.** Per-tool cards + diff-before-approve; text fallback retained.
 - **`scheduler.rs` read_file ParallelSafe — DONE.** `read_file`/`list_files`/`search_text`
   are `ParallelSafe` (read-only); other non-`run_command` tools remain `Exclusive`.
-- **`ToolSupervisor` not genericized** — file tools use an additive `FileToolRunner`
-  (deliberate, to avoid destabilizing `run_command`).
-- Optional later policy: a sanity ceiling on `write_file.content` size.
+- **`ToolSupervisor` not genericized** — `run_command` keeps its own lifecycle; the unified
+  pipeline wraps it via `CommandToolExecutor` rather than absorbing it (deliberate).
+- Still later: OS sandbox/orchestrator for `run_command`; SSRF/url guard for future fetch
+  tools; LSP/formatter post-write hooks; deferred-tools/`tool_search`; recall after
+  compaction; workflow/subagent orchestration; model-visible credential redaction policy +
+  managed gateway; configurable `maxWriteBytes` policy-level (not schema) refusal.
 
 ## Decision log (so it isn't re-litigated)
 
