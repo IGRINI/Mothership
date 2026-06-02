@@ -7,7 +7,9 @@ use serde::Deserialize;
 
 use crate::LlmToolCallRequest;
 
-use super::catalog::{LIST_FILES_TOOL_NAME, RUN_COMMAND_TOOL_NAME, SEARCH_TEXT_TOOL_NAME};
+use super::catalog::{
+    LIST_FILES_TOOL_NAME, READ_FILE_TOOL_NAME, RUN_COMMAND_TOOL_NAME, SEARCH_TEXT_TOOL_NAME,
+};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ToolBatchPlan {
@@ -37,11 +39,12 @@ pub fn tool_batch_plan(requests: &[LlmToolCallRequest]) -> ToolBatchPlan {
 }
 
 pub fn tool_concurrency(request: &LlmToolCallRequest) -> ToolConcurrency {
-    // The read-only search tools never mutate state, so a batch of them (or a mix
-    // with read-only commands) is always safe to run concurrently. `read_file` is
-    // intentionally NOT included here yet — its parallel-safety is a separate
-    // follow-up.
-    if request.name == LIST_FILES_TOOL_NAME || request.name == SEARCH_TEXT_TOOL_NAME {
+    // The read-only file and search tools never mutate state, so a batch of them
+    // (or a mix with read-only commands) is always safe to run concurrently.
+    if request.name == READ_FILE_TOOL_NAME
+        || request.name == LIST_FILES_TOOL_NAME
+        || request.name == SEARCH_TEXT_TOOL_NAME
+    {
         return ToolConcurrency::ParallelSafe;
     }
 
@@ -166,6 +169,43 @@ mod tests {
             run_command_request("c3", "git", &["status"]),
         ];
         assert_eq!(tool_batch_plan(&requests), ToolBatchPlan::Parallel);
+    }
+
+    #[test]
+    fn read_file_is_parallel_safe() {
+        // read_file is read-only: a single read is parallel-safe, and a batch mixing
+        // reads with the other read-only tools and a read-only command runs concurrently.
+        assert_eq!(
+            tool_concurrency(&read_file_request("c0")),
+            ToolConcurrency::ParallelSafe
+        );
+
+        let requests = vec![
+            read_file_request("c1"),
+            search_request("c2", LIST_FILES_TOOL_NAME),
+            search_request("c3", SEARCH_TEXT_TOOL_NAME),
+            run_command_request("c4", "git", &["status"]),
+        ];
+        assert_eq!(tool_batch_plan(&requests), ToolBatchPlan::Parallel);
+    }
+
+    #[test]
+    fn read_file_with_mutating_command_stays_sequential() {
+        // A read-only read_file mixed with a mutating command is NOT parallel-safe.
+        let requests = vec![
+            read_file_request("c1"),
+            run_command_request("c2", "git", &["checkout", "main"]),
+        ];
+        assert_eq!(tool_batch_plan(&requests), ToolBatchPlan::Sequential);
+    }
+
+    fn read_file_request(id: &str) -> LlmToolCallRequest {
+        LlmToolCallRequest {
+            run_id: Some("run".to_string()),
+            tool_call_id: id.to_string(),
+            name: READ_FILE_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({ "path": "src/lib.rs" }),
+        }
     }
 
     fn search_request(id: &str, name: &str) -> LlmToolCallRequest {
