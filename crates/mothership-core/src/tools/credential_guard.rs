@@ -16,12 +16,16 @@
 //! later attach.
 
 use std::borrow::Cow;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 
-use super::types::{ToolArtifact, ToolExecutionEvent};
+use crate::Result;
+
+use super::output::{ToolOutputStore, ToolOutputWriter};
+use super::types::{ToolArtifact, ToolExecutionEvent, ToolOutputStream};
 
 /// Redacts obvious secrets from text destined for storage or display.
 pub trait CredentialGuard: Send + Sync {
@@ -132,6 +136,19 @@ pub fn redact_event(guard: &dyn CredentialGuard, event: &ToolExecutionEvent) -> 
     if let Some(chunk) = event.chunk.take() {
         event.chunk = Some(guard.redact(&chunk).into_owned());
     }
+    // Command line: args and env VALUES are model-authored text that may carry a
+    // secret (e.g. `curl -H "Authorization: Bearer …"`). Redact them so the
+    // command is not stored/shown verbatim. Program and env keys are left intact.
+    // This also covers the synthesized run_command payload, which is built from
+    // `command` at the storage layer after this redaction.
+    if let Some(command) = event.command.as_mut() {
+        for arg in command.args.iter_mut() {
+            redact_in_place(guard, arg);
+        }
+        for value in command.env.values_mut() {
+            redact_in_place(guard, value);
+        }
+    }
     if let Some(result) = event.result.as_mut() {
         redact_in_place(guard, &mut result.stdout_preview);
         redact_in_place(guard, &mut result.stderr_preview);
@@ -184,10 +201,105 @@ fn redact_json_strings(guard: &dyn CredentialGuard, value: &mut Value) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Redacting durable output store
+// ---------------------------------------------------------------------------
+
+/// Wraps a [`ToolOutputStore`] so durable spilled blobs (command stdout/stderr,
+/// file-tool diffs/reads/search results) are credential-redacted on the way to
+/// disk — closing the gap where `redact_event` only scrubbed the inline preview,
+/// not the full content behind a `log_ref`. Redaction is line-buffered: complete
+/// lines are scrubbed before they are written; a partial line is held until the
+/// next append (or `finish`). UTF-8 lines are redacted; non-UTF-8 (binary) lines
+/// pass through unchanged so output fidelity is preserved.
+pub struct RedactingOutputStore {
+    inner: Arc<dyn ToolOutputStore>,
+    guard: Arc<dyn CredentialGuard>,
+}
+
+impl RedactingOutputStore {
+    pub fn new(inner: Arc<dyn ToolOutputStore>, guard: Arc<dyn CredentialGuard>) -> Self {
+        Self { inner, guard }
+    }
+}
+
+#[async_trait]
+impl ToolOutputStore for RedactingOutputStore {
+    async fn open(&self, tool_call_id: &str) -> Result<Box<dyn ToolOutputWriter>> {
+        let inner = self.inner.open(tool_call_id).await?;
+        Ok(Box::new(RedactingOutputWriter {
+            inner,
+            guard: Arc::clone(&self.guard),
+            stdout_buf: Vec::new(),
+            stderr_buf: Vec::new(),
+        }))
+    }
+}
+
+struct RedactingOutputWriter {
+    inner: Box<dyn ToolOutputWriter>,
+    guard: Arc<dyn CredentialGuard>,
+    stdout_buf: Vec<u8>,
+    stderr_buf: Vec<u8>,
+}
+
+#[async_trait]
+impl ToolOutputWriter for RedactingOutputWriter {
+    async fn append(&mut self, stream: ToolOutputStream, bytes: &[u8]) -> Result<()> {
+        // Buffer, then flush only the complete-line prefix (through the last
+        // newline) so a secret can never be split across a redaction boundary.
+        let complete = {
+            let buf = match stream {
+                ToolOutputStream::Stdout => &mut self.stdout_buf,
+                ToolOutputStream::Stderr => &mut self.stderr_buf,
+            };
+            buf.extend_from_slice(bytes);
+            match buf.iter().rposition(|&byte| byte == b'\n') {
+                Some(pos) => buf.drain(..=pos).collect::<Vec<u8>>(),
+                None => return Ok(()),
+            }
+        };
+        let redacted = redact_bytes_linewise(self.guard.as_ref(), &complete);
+        self.inner.append(stream, &redacted).await
+    }
+
+    async fn finish(&mut self) -> Result<String> {
+        let stdout_rest = std::mem::take(&mut self.stdout_buf);
+        if !stdout_rest.is_empty() {
+            let redacted = redact_bytes_linewise(self.guard.as_ref(), &stdout_rest);
+            self.inner
+                .append(ToolOutputStream::Stdout, &redacted)
+                .await?;
+        }
+        let stderr_rest = std::mem::take(&mut self.stderr_buf);
+        if !stderr_rest.is_empty() {
+            let redacted = redact_bytes_linewise(self.guard.as_ref(), &stderr_rest);
+            self.inner
+                .append(ToolOutputStream::Stderr, &redacted)
+                .await?;
+        }
+        self.inner.finish().await
+    }
+}
+
+/// Redact a byte buffer line by line: UTF-8 lines are scrubbed through the guard;
+/// non-UTF-8 (binary) lines pass through unchanged to preserve fidelity.
+fn redact_bytes_linewise(guard: &dyn CredentialGuard, bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+        match std::str::from_utf8(line) {
+            Ok(text) => out.extend_from_slice(guard.redact(text).as_bytes()),
+            Err(_) => out.extend_from_slice(line),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tools::ToolExecutionEventKind;
+    use std::sync::Mutex;
 
     fn guard() -> PatternCredentialGuard {
         PatternCredentialGuard::new()
@@ -250,5 +362,100 @@ mod tests {
         // Path is untouched; the secret-bearing preview is scrubbed.
         assert_eq!(payload["path"], "src/config.rs");
         assert_eq!(payload["stdoutPreview"], "[REDACTED:aws-key]");
+    }
+
+    #[test]
+    fn redact_event_scrubs_command_args() {
+        // A secret in a command line (e.g. an auth header) must not be stored/shown
+        // verbatim; the program and env keys are kept.
+        let g = guard();
+        let event = ToolExecutionEvent {
+            tool_call_id: "tc1".to_string(),
+            kind: ToolExecutionEventKind::Queued,
+            command: Some(crate::ToolCommand::new(
+                "curl",
+                ["-H", "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123"],
+            )),
+            ..Default::default()
+        };
+        let redacted = redact_event(&g, &event);
+        let command = redacted.command.expect("command present");
+        assert_eq!(command.program, "curl");
+        assert!(
+            command.args.iter().any(|arg| arg.contains("[REDACTED]")),
+            "bearer token in args must be redacted: {:?}",
+            command.args
+        );
+        assert!(
+            !command
+                .args
+                .iter()
+                .any(|arg| arg.contains("abcdefghijklmnopqrstuvwxyz0123")),
+            "raw token must be gone"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingStore {
+        appended: Arc<Mutex<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl ToolOutputStore for RecordingStore {
+        async fn open(&self, _tool_call_id: &str) -> Result<Box<dyn ToolOutputWriter>> {
+            Ok(Box::new(RecordingWriter {
+                appended: Arc::clone(&self.appended),
+            }))
+        }
+    }
+
+    struct RecordingWriter {
+        appended: Arc<Mutex<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl ToolOutputWriter for RecordingWriter {
+        async fn append(&mut self, _stream: ToolOutputStream, bytes: &[u8]) -> Result<()> {
+            self.appended.lock().unwrap().extend_from_slice(bytes);
+            Ok(())
+        }
+        async fn finish(&mut self) -> Result<String> {
+            Ok("recorded".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn redacting_output_store_scrubs_durable_lines() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let inner =
+            Arc::new(RecordingStore { appended: Arc::clone(&recorded) }) as Arc<dyn ToolOutputStore>;
+        let store = RedactingOutputStore::new(inner, Arc::new(PatternCredentialGuard::new()));
+        let mut writer = store.open("tc1").await.unwrap();
+
+        // A secret split across two appends WITHIN one line: it must still be
+        // redacted because the writer buffers until the newline.
+        writer
+            .append(ToolOutputStream::Stdout, b"export TOKEN=ghp_0123456789")
+            .await
+            .unwrap();
+        writer
+            .append(
+                ToolOutputStream::Stdout,
+                b"abcdef0123456789abcdef0123\nplain line\n",
+            )
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let durable = String::from_utf8(recorded.lock().unwrap().clone()).unwrap();
+        assert!(
+            durable.contains("[REDACTED:github-token]"),
+            "durable blob must be redacted: {durable}"
+        );
+        assert!(
+            !durable.contains("ghp_0123456789abcdef0123456789abcdef0123"),
+            "raw token must not reach disk"
+        );
+        assert!(durable.contains("plain line"), "benign content kept");
     }
 }

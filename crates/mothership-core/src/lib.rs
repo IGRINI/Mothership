@@ -56,7 +56,7 @@ pub use tools::{
     search_text as run_search_text_tool, tool_batch_plan, write_file as run_write_file_tool,
     canonical_catalog_bytes, canonical_json, catalog_fingerprint, CatalogDrift, CatalogPin,
     ConservativeCommandPermissionPolicy, CredentialGuard, FileMetadata, NoopCredentialGuard,
-    PatternCredentialGuard,
+    PatternCredentialGuard, RedactingOutputStore,
     FileSystem, FileTool, FileToolCapability, FileToolError, FileToolOutcome, FileToolOutputStore,
     FileToolSpill, NoopToolExecutionEventSink, PathError, PendingToolApprovalGate, StdFileSystem,
     MAX_TOOL_EVENT_BYTES,

@@ -28,7 +28,7 @@ mod types;
 pub use cancellation::ToolCancellationToken;
 pub use credential_guard::{
     default_credential_guard, redact_event, CredentialGuard, NoopCredentialGuard,
-    PatternCredentialGuard,
+    PatternCredentialGuard, RedactingOutputStore,
 };
 pub use catalog::{
     canonical_catalog_bytes, canonical_json, catalog_fingerprint, default_tool_catalog,

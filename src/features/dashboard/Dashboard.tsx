@@ -2452,7 +2452,12 @@ function InlineToolCall(props: {
           {/* Show the pending change prominently before the human approves it,
               in both the semantic and fallback paths. */}
           <Show when={canApprove() && props.tool.message}>
-            {(message) => <ApprovalPreview message={message()} />}
+            {(message) => (
+              <ApprovalPreview
+                message={message()}
+                artifacts={props.tool.artifacts}
+              />
+            )}
           </Show>
 
           <Show when={canApprove() || canCancel()}>

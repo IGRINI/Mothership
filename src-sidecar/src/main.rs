@@ -31,7 +31,8 @@ use mothership_core::{
     ChatRunCancellationResult, ChatRunEvent, ChatRunEventSink, ChatRunRegistry, ChatRunService,
     ChatUpdatedEvent, ConnectorManager, ConnectorSettingsEvent, ConnectorSettingsEventKind,
     ConservativeCommandPermissionPolicy, Database, FileToolOutputStore, LlmToolCallHandler,
-    PendingToolApprovalGate, ProviderRuntimeManager, SendChatMessageResult, ToolApprovalAnswer,
+    PendingToolApprovalGate, ProviderRuntimeManager, RedactingOutputStore, SendChatMessageResult,
+    ToolApprovalAnswer,
     ToolApprovalDecision, ToolCancellationToken, ToolExecutionAccepted,
     ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionEventKind,
     ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest, ToolExecutionResult,
@@ -163,8 +164,15 @@ fn serve() -> anyhow::Result<()> {
     // the file-tool runner reuses it to spill oversized read_file content.
     let tool_output_store: Option<Arc<dyn mothership_core::ToolOutputStore>> =
         db_path.parent().map(|parent| {
-            Arc::new(FileToolOutputStore::new(parent.join("tool-logs")))
-                as Arc<dyn mothership_core::ToolOutputStore>
+            // Credential firewall: durable spilled blobs (command output, file-tool
+            // diffs/reads/search results) are redacted on the way to disk, so the
+            // full content behind a logRef never leaks a secret — not just previews.
+            let base = Arc::new(FileToolOutputStore::new(parent.join("tool-logs")))
+                as Arc<dyn mothership_core::ToolOutputStore>;
+            Arc::new(RedactingOutputStore::new(
+                base,
+                Arc::new(mothership_core::PatternCredentialGuard::new()),
+            )) as Arc<dyn mothership_core::ToolOutputStore>
         });
     let tool_supervisor = Arc::new(
         ToolSupervisor::new(

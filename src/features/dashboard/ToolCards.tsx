@@ -224,14 +224,13 @@ export function DiffCard(props: {
   );
 }
 
-// Locate a completed mutating tool's unified-diff artifact, if present.
+// Locate a completed mutating tool's unified-diff artifact, if present. Only the
+// completed `diff` artifact — the approval `diff-preview` is rendered separately
+// by ApprovalPreview, so it is intentionally excluded here.
 function findDiffArtifact(
   artifacts: ToolArtifact[] | undefined,
 ): ToolArtifact | undefined {
-  return artifacts?.find(
-    (artifact) =>
-      artifact.kind === "diff" || artifact.contentType === "text/x-diff",
-  );
+  return artifacts?.find((artifact) => artifact.kind === "diff");
 }
 
 // --- Before-approval preview ------------------------------------------------
@@ -269,9 +268,17 @@ function splitApprovalPreview(message: string): {
   return { summary, diff: rest.replace(/\s+$/, "") };
 }
 
-export function ApprovalPreview(props: { message: string }) {
+export function ApprovalPreview(props: {
+  message: string;
+  artifacts?: ToolArtifact[];
+}) {
+  // Prefer the typed `diff-preview` artifact (a real protocol object carried in
+  // the event + persisted to tool_artifacts). Fall back to splitting the legacy
+  // message string only when no artifact is present.
+  const previewArtifact = () =>
+    props.artifacts?.find((artifact) => artifact.kind === "diff-preview");
   const parts = () => splitApprovalPreview(props.message);
-  const truncated = () => /\[preview truncated/i.test(props.message);
+  const messageTruncated = () => /\[preview truncated/i.test(props.message);
   return (
     <div class="tool-card__approval">
       <div class="tool-card__approval-head">
@@ -279,15 +286,34 @@ export function ApprovalPreview(props: { message: string }) {
         <span>Pending change — review before approving</span>
       </div>
       <Show
-        when={parts().diff}
-        fallback={<pre class="tool-card__preview">{props.message}</pre>}
+        when={previewArtifact()}
+        fallback={
+          <Show
+            when={parts().diff}
+            fallback={<pre class="tool-card__preview">{props.message}</pre>}
+          >
+            {(diff) => (
+              <>
+                <Show when={parts().summary}>
+                  <p class="tool-card__approval-summary">{parts().summary}</p>
+                </Show>
+                <DiffCard diff={diff()} truncated={messageTruncated()} />
+              </>
+            )}
+          </Show>
+        }
       >
-        {(diff) => (
+        {(artifact) => (
           <>
             <Show when={parts().summary}>
               <p class="tool-card__approval-summary">{parts().summary}</p>
             </Show>
-            <DiffCard diff={diff()} truncated={truncated()} />
+            <DiffCard
+              diff={artifact().preview}
+              truncated={artifact().truncated}
+              sizeBytes={artifact().sizeBytes}
+              logRef={artifact().logRef}
+            />
           </>
         )}
       </Show>

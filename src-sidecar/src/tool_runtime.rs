@@ -468,8 +468,12 @@ impl FileToolExecutor {
             }
             ToolPermissionAction::Ask => {
                 // Surface the approval request (with a diff/summary preview) and
-                // block on the same gate the UI drives via `decide`.
-                let preview = self.build_preview(tool, arguments, workspace, &capability.summary);
+                // block on the same gate the UI drives via `decide`. The diff is
+                // carried both as the message (fallback) and as a typed
+                // `diff-preview` artifact (the semantic source for the approval
+                // card / DB / remote).
+                let (preview, preview_artifacts) =
+                    self.build_preview_parts(tool, arguments, workspace, &capability.summary);
                 self.emit_file_event(
                     tool,
                     tool_call_id,
@@ -478,7 +482,11 @@ impl FileToolExecutor {
                     ToolExecutionEventKind::PermissionRequested,
                     Some(preview),
                     None,
-                    TypedEventExtras::default(),
+                    TypedEventExtras {
+                        payload: None,
+                        touched_paths: Vec::new(),
+                        artifacts: preview_artifacts,
+                    },
                 );
                 let decision = self
                     .runtime
@@ -690,16 +698,36 @@ impl FileToolExecutor {
     /// file) must not push megabytes through the event store. When the diff
     /// portion overflows the budget it is truncated on a char boundary with a
     /// marker noting the full size (the full change still applies on approval).
-    fn build_preview(
+    fn build_preview_parts(
         &self,
         tool: FileTool,
         arguments: &Value,
         workspace: &Workspace,
         summary: &str,
-    ) -> String {
+    ) -> (String, Vec<ToolArtifact>) {
         match file_tool_preview_diff(tool, arguments, workspace, &self.file_system) {
-            Some(diff) if !diff.is_empty() => bound_preview(summary, &diff),
-            _ => summary.to_string(),
+            Some(diff) if !diff.is_empty() => {
+                // The message keeps the bounded summary+diff string for legacy /
+                // fallback rendering, but the diff is ALSO emitted as a typed
+                // `diff-preview` artifact so the approval card has a real protocol
+                // object (persisted to tool_artifacts; sent to UI/remote) rather
+                // than a string the UI has to re-parse.
+                let message = bound_preview(summary, &diff);
+                let bounded = truncate_on_char_boundary(&diff, MAX_TOOL_EVENT_BYTES);
+                let truncated = bounded.len() < diff.len();
+                let artifact = ToolArtifact {
+                    artifact_id: "preview".to_string(),
+                    kind: "diff-preview".to_string(),
+                    content_type: "text/x-diff".to_string(),
+                    preview: bounded,
+                    log_ref: None,
+                    size_bytes: diff.len() as u64,
+                    sha256: None,
+                    truncated,
+                };
+                (message, vec![artifact])
+            }
+            _ => (summary.to_string(), Vec::new()),
         }
     }
 

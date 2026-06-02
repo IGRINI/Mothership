@@ -921,6 +921,7 @@ impl Database {
         }
 
         let tool_call_id_map = copy_chat_tool_events(&tx, chat_id, &chat.id, &message_id_map)?;
+        copy_typed_tool_data(&tx, chat_id, &chat.id, &message_id_map, &tool_call_id_map)?;
         copy_chat_message_parts(&tx, chat_id, &chat.id, &message_id_map, &tool_call_id_map)?;
         let copied_message_ids = copied_messages
             .iter()
@@ -2515,6 +2516,205 @@ fn copy_chat_tool_events(
     }
 
     Ok(tool_call_id_map)
+}
+
+/// Copy the typed tool storage (`tool_calls`/`tool_events`/`tool_artifacts`) for a
+/// branched/forked chat, remapping `tool_call_id` (via `tool_call_id_map`, built
+/// by [`copy_chat_tool_events`]) and `message_id` (via `message_id_map`). Without
+/// this, a branched conversation keeps only the legacy feed and loses its
+/// `tool_kind`/`payload`/`artifacts`, so semantic cards would silently degrade to
+/// the text fallback on reload.
+fn copy_typed_tool_data(
+    connection: &Connection,
+    source_chat_id: &str,
+    target_chat_id: &str,
+    message_id_map: &HashMap<String, String>,
+    tool_call_id_map: &HashMap<String, String>,
+) -> Result<()> {
+    if tool_call_id_map.is_empty() {
+        return Ok(());
+    }
+    let source_ids = tool_call_id_map.keys().map(String::as_str).collect::<Vec<_>>();
+    let placeholders = std::iter::repeat("?")
+        .take(source_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // 1. tool_calls (must be inserted first — the other two FK to it).
+    struct CallRow {
+        tool_call_id: String,
+        message_id: String,
+        project_id: Option<String>,
+        tool_name: String,
+        tool_kind: String,
+        status: String,
+        permission_state: String,
+        summary: Option<String>,
+        touched_paths: Option<String>,
+        payload_json: Option<String>,
+        started_at: String,
+        completed_at: Option<String>,
+    }
+    let call_sql = format!(
+        "SELECT tool_call_id, message_id, project_id, tool_name, tool_kind, status, permission_state, summary, touched_paths, payload_json, started_at, completed_at
+         FROM tool_calls WHERE chat_id = ? AND tool_call_id IN ({placeholders})"
+    );
+    let calls = {
+        let mut statement = connection.prepare(&call_sql)?;
+        let params = std::iter::once(source_chat_id)
+            .chain(source_ids.iter().copied())
+            .collect::<Vec<_>>();
+        let rows = statement.query_map(params_from_iter(params), |row| {
+            Ok(CallRow {
+                tool_call_id: row.get(0)?,
+                message_id: row.get(1)?,
+                project_id: row.get(2)?,
+                tool_name: row.get(3)?,
+                tool_kind: row.get(4)?,
+                status: row.get(5)?,
+                permission_state: row.get(6)?,
+                summary: row.get(7)?,
+                touched_paths: row.get(8)?,
+                payload_json: row.get(9)?,
+                started_at: row.get(10)?,
+                completed_at: row.get(11)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for row in calls {
+        let (Some(target_call_id), Some(target_message_id)) = (
+            tool_call_id_map.get(&row.tool_call_id),
+            message_id_map.get(&row.message_id),
+        ) else {
+            continue;
+        };
+        connection.execute(
+            "INSERT INTO tool_calls (
+                tool_call_id, chat_id, message_id, run_id, project_id, tool_name, tool_kind,
+                status, permission_state, summary, touched_paths, payload_json, started_at, completed_at
+            ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                target_call_id,
+                target_chat_id,
+                target_message_id,
+                row.project_id,
+                row.tool_name,
+                row.tool_kind,
+                row.status,
+                row.permission_state,
+                row.summary,
+                row.touched_paths,
+                row.payload_json,
+                row.started_at,
+                row.completed_at,
+            ],
+        )?;
+    }
+
+    // 2. tool_events
+    struct EventRow {
+        tool_call_id: String,
+        kind: String,
+        message_preview: Option<String>,
+        typed_payload_json: Option<String>,
+        artifact_refs: Option<String>,
+        occurred_at: String,
+    }
+    let event_sql = format!(
+        "SELECT tool_call_id, kind, message_preview, typed_payload_json, artifact_refs, occurred_at
+         FROM tool_events WHERE tool_call_id IN ({placeholders}) ORDER BY id ASC"
+    );
+    let events = {
+        let mut statement = connection.prepare(&event_sql)?;
+        let rows = statement.query_map(params_from_iter(source_ids.iter().copied()), |row| {
+            Ok(EventRow {
+                tool_call_id: row.get(0)?,
+                kind: row.get(1)?,
+                message_preview: row.get(2)?,
+                typed_payload_json: row.get(3)?,
+                artifact_refs: row.get(4)?,
+                occurred_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for row in events {
+        let Some(target_call_id) = tool_call_id_map.get(&row.tool_call_id) else {
+            continue;
+        };
+        connection.execute(
+            "INSERT INTO tool_events (tool_call_id, kind, message_preview, typed_payload_json, artifact_refs, occurred_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                target_call_id,
+                row.kind,
+                row.message_preview,
+                row.typed_payload_json,
+                row.artifact_refs,
+                row.occurred_at,
+            ],
+        )?;
+    }
+
+    // 3. tool_artifacts
+    struct ArtifactRow {
+        artifact_id: String,
+        tool_call_id: String,
+        artifact_kind: String,
+        content_type: String,
+        preview: Option<String>,
+        log_ref: Option<String>,
+        size_bytes: i64,
+        sha256: Option<String>,
+        truncated: i64,
+        created_at: String,
+    }
+    let artifact_sql = format!(
+        "SELECT artifact_id, tool_call_id, artifact_kind, content_type, preview, log_ref, size_bytes, sha256, truncated, created_at
+         FROM tool_artifacts WHERE tool_call_id IN ({placeholders})"
+    );
+    let artifacts = {
+        let mut statement = connection.prepare(&artifact_sql)?;
+        let rows = statement.query_map(params_from_iter(source_ids.iter().copied()), |row| {
+            Ok(ArtifactRow {
+                artifact_id: row.get(0)?,
+                tool_call_id: row.get(1)?,
+                artifact_kind: row.get(2)?,
+                content_type: row.get(3)?,
+                preview: row.get(4)?,
+                log_ref: row.get(5)?,
+                size_bytes: row.get(6)?,
+                sha256: row.get(7)?,
+                truncated: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for row in artifacts {
+        let Some(target_call_id) = tool_call_id_map.get(&row.tool_call_id) else {
+            continue;
+        };
+        connection.execute(
+            "INSERT INTO tool_artifacts (artifact_id, tool_call_id, artifact_kind, content_type, preview, log_ref, size_bytes, sha256, truncated, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                row.artifact_id,
+                target_call_id,
+                row.artifact_kind,
+                row.content_type,
+                row.preview,
+                row.log_ref,
+                row.size_bytes,
+                row.sha256,
+                row.truncated,
+                row.created_at,
+            ],
+        )?;
+    }
+
+    Ok(())
 }
 
 fn copy_chat_message_parts(
@@ -4178,6 +4378,65 @@ mod tests {
             tool.artifacts[0].log_ref.as_deref(),
             Some("spill://stdout")
         );
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn branch_preserves_typed_tool_data() {
+        let database_path = temp_database_path("branch_typed");
+        let database = Database::open(database_path.clone()).expect("open database");
+        database
+            .set_selected_llm_model("openai", "test-model")
+            .expect("select model");
+        let project = create_project(&database, &database_path, "branch_typed");
+        let run = database
+            .begin_chat_run(None, Some(&project.id), "edit a file", None)
+            .expect("begin run");
+
+        let completed = ToolExecutionEvent {
+            tool_call_id: "tool_typed_branch".to_string(),
+            run_id: Some(run.run_id.clone()),
+            project_id: Some(project.id.clone()),
+            kind: ToolExecutionEventKind::Completed,
+            message: Some("modified a.txt".to_string()),
+            tool_kind: Some(ToolKind::EditFile),
+            payload: Some(serde_json::json!({ "path": "a.txt", "status": "modified" })),
+            artifacts: vec![ToolArtifact {
+                artifact_id: "diff".to_string(),
+                kind: "diff".to_string(),
+                content_type: "text/x-diff".to_string(),
+                preview: "@@\n-old\n+new\n".to_string(),
+                log_ref: None,
+                size_bytes: 12,
+                sha256: None,
+                truncated: false,
+            }],
+            ..Default::default()
+        };
+        database
+            .record_chat_tool_execution_event(&run.chat.id, &run.assistant_message.id, &completed)
+            .expect("legacy feed");
+        database
+            .record_typed_tool_event(&run.chat.id, &run.assistant_message.id, &completed)
+            .expect("typed storage");
+        database
+            .complete_chat_run(&run.run_id, &run.chat.id, &run.assistant_message.id)
+            .expect("complete run");
+
+        let branch = database
+            .branch_chat_from_message(&run.chat.id, &run.assistant_message.id)
+            .expect("branch chat");
+
+        assert_eq!(branch.tool_executions.len(), 1);
+        let tool = &branch.tool_executions[0];
+        assert_ne!(tool.tool_call_id, "tool_typed_branch", "branch remaps tool_call_id");
+        // The whole point: typed data survives the branch, not just the legacy feed.
+        assert_eq!(tool.tool_kind, Some(ToolKind::EditFile));
+        let payload = tool.payload.as_ref().expect("typed payload survives branch");
+        assert_eq!(payload["path"], "a.txt");
+        assert_eq!(tool.artifacts.len(), 1);
+        assert_eq!(tool.artifacts[0].artifact_id, "diff");
 
         let _ = fs::remove_file(database_path);
     }
