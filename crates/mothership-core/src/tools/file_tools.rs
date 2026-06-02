@@ -49,6 +49,14 @@ const MAX_READ_FILE_BYTES: usize = 10 * 1024 * 1024;
 /// so a huge overwrite cannot push megabytes into the event store.
 pub const MAX_TOOL_EVENT_BYTES: usize = 64 * 1024;
 
+/// Upper bound on the combined old+new size a `write_file` will render a full
+/// line diff for. Beyond this we emit a concise summary instead of building a
+/// whole-content diff in memory — so a large NEW content (a new big file, or a
+/// small file replaced by huge content) is bounded the same way a large OLD file
+/// already is. The displayed diff is separately capped to `MAX_TOOL_EVENT_BYTES`
+/// downstream, so a full diff past this size would be discarded anyway.
+const MAX_DIFF_INPUT_BYTES: usize = 1024 * 1024;
+
 /// Number of leading bytes sampled for the binary-content heuristic.
 const BINARY_SNIFF_BYTES: usize = 4096;
 
@@ -651,18 +659,29 @@ pub fn write_file(
         .map_err(|error| FileToolError::Io(error.to_string()))?;
 
     let new_sha = sha256_hex(final_bytes);
-    // Diff: a faithful full line diff only when the old prefix WAS the whole file
-    // (not truncated). If the old file exceeded the cap, rendering a diff over the
-    // partial prefix would be misleading, so emit a concise summary instead. New
-    // files have no old content and always get a full diff (against empty).
-    let diff = if old_truncated {
-        let old_size = old_size.as_deref().unwrap_or(">cap");
-        let old_sha_text = old_sha.as_deref().unwrap_or("");
+    // Diff: build a faithful full line diff only when BOTH sides are small enough
+    // to diff in memory. We summarize instead when either (a) the old file
+    // exceeded the read cap (the prefix is not a faithful base), or (b) the
+    // combined old+new size exceeds MAX_DIFF_INPUT_BYTES — e.g. creating a large
+    // NEW file or replacing a small file with very large content. Otherwise a huge
+    // `content` would be split line-by-line into a diff in memory even though the
+    // stored/streamed diff is capped downstream anyway.
+    let old_for_diff = old_text.as_deref().unwrap_or("");
+    let diff_input_bytes = old_for_diff.len().saturating_add(final_text.len());
+    let diff = if old_truncated || diff_input_bytes > MAX_DIFF_INPUT_BYTES {
+        let old_part = if existed {
+            let old_size = old_size.as_deref().unwrap_or(">cap");
+            let old_sha_text = old_sha.as_deref().unwrap_or("");
+            format!("old {old_size} bytes (sha {old_sha_text})")
+        } else {
+            "new file".to_string()
+        };
         format!(
-            "[existing file was large ({old_size} bytes, sha {old_sha_text}); replaced wholesale — full line diff omitted]"
+            "[large write — full line diff omitted; {old_part} -> {} bytes (sha {new_sha})]",
+            final_bytes.len()
         )
     } else {
-        render_full_diff(old_text.as_deref().unwrap_or(""), &final_text)
+        render_full_diff(old_for_diff, &final_text)
     };
     let status = if existed { "modified" } else { "created" };
     let model_text = format!(
@@ -1726,7 +1745,8 @@ mod tests {
             diff.contains("full line diff omitted"),
             "large overwrite must emit a summary diff, got: {diff}"
         );
-        assert!(diff.contains("replaced wholesale"));
+        // Old-file-large summary reports the old size (the prefix was truncated).
+        assert!(diff.contains("large write") && diff.contains("old "), "got: {diff}");
         // It must NOT contain a hunk header (that would be the full diff path).
         assert!(!diff.contains("@@ -1,"), "summary diff must not be a line diff: {diff}");
 
@@ -1795,6 +1815,33 @@ mod tests {
         assert!(diff.contains("-old"));
         assert!(diff.contains("+new"));
         assert!(!diff.contains("full line diff omitted"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_large_new_content_summarizes_diff() {
+        // Creating a NEW file whose content exceeds MAX_DIFF_INPUT_BYTES must NOT
+        // build a full line diff in memory (old_truncated is false here) — it gets
+        // a concise summary instead, while the file is still written in full.
+        let (ws, dir) = temp_workspace("write_large_new");
+        let fs = StdFileSystem::new();
+        let big = "a".repeat(MAX_DIFF_INPUT_BYTES + 1024);
+
+        let out = write_file(&json!({ "path": "big.txt", "content": big.clone() }), &ws, &fs)
+            .unwrap();
+        assert!(out.ok);
+        let diff = out.diff.as_deref().unwrap();
+        assert!(
+            diff.contains("full line diff omitted") && diff.contains("new file"),
+            "large new content should summarize, not full-diff: {diff}"
+        );
+        assert!(
+            !diff.contains("@@"),
+            "large new content must not build a full line diff"
+        );
+        // The file is still written in full.
+        assert_eq!(fs::read(dir.join("big.txt")).unwrap().len(), big.len());
 
         let _ = fs::remove_dir_all(&dir);
     }
