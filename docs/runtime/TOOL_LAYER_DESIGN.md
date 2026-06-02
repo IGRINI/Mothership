@@ -242,6 +242,14 @@ These hold on `feat/typed-tool-layer` as of the 4th review round. They supersede
   reads+writes flow through the typed pipeline. Native `Glob`/`Grep` are disabled when both
   typed search tools (`list_files`+`search_text`) are bridged. `Bash` is disabled when
   `run_command` is present.
+- **Search honesty (no silent false negatives).** `search_text` reads each candidate file
+  only up to the 10 MiB per-file cap (`readCeilingBytes` = `MAX_READ_FILE_BYTES`); when any
+  file exceeds it the result sets `partial: true`, lists the affected paths in `cappedFiles`,
+  reports the count as `cappedFileCount`, and the `model_text` note warns that matches beyond
+  the cap were not found and points to `run_command` for a full search of very large files.
+  Hitting the match/scan limit sets `truncated: true` (full results spill to a `logRef`);
+  `filesWithMatches` counts distinct matched files even when truncated. `list_files` likewise
+  sets `truncated` and sorts the full candidate set *before* applying `limit` (stable first-N).
 
 ## Deferred (NOT defects — scope, stage considered closed without them)
 
@@ -252,8 +260,8 @@ These hold on `feat/typed-tool-layer` as of the 4th review round. They supersede
   `chat_tool_events` (`command_json` NULL for file tools).
 - **UI semantic cards** + diff-before-approve card — frontend; approval diff currently rides
   (bounded) in the event `message`.
-- **`scheduler.rs`** classifies non-`run_command` tools `Exclusive`; `read_file` →
-  `ParallelSafe` is a small standalone follow-up (do NOT bundle with typed search).
+- **`scheduler.rs` read_file ParallelSafe — DONE.** `read_file`/`list_files`/`search_text`
+  are `ParallelSafe` (read-only); other non-`run_command` tools remain `Exclusive`.
 - **`ToolSupervisor` not genericized** — file tools use an additive `FileToolRunner`
   (deliberate, to avoid destabilizing `run_command`).
 - Optional later policy: a sanity ceiling on `write_file.content` size.
