@@ -93,6 +93,7 @@ impl LlmChatRoundGateway for SubprocessChatGateway {
         let model_id = request.model_id;
         let reasoning = request.reasoning;
         let prompt = request.prompt;
+        let runtime_context = request.runtime_context;
         let tools = request.tools;
         let state = request.state;
         let cancellation = cancellation.clone();
@@ -103,6 +104,7 @@ impl LlmChatRoundGateway for SubprocessChatGateway {
                     &model_id,
                     reasoning,
                     prompt,
+                    runtime_context,
                     messages,
                     tools,
                     state,

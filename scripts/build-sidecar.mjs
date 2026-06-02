@@ -21,8 +21,18 @@ if (!targetTriple) {
 }
 
 const sidecarBinary = "mothership-sidecar";
-const adapterBinaries = ["codex-adapter", "openrouter-adapter"];
+const adapterBinaries = [
+  "codex-adapter",
+  "openrouter-adapter",
+  "claude-agent-adapter",
+];
 const bundledBinaries = [sidecarBinary, ...adapterBinaries];
+const auxiliaryBinaries = [
+  {
+    name: "claude-agent-sdk-cli",
+    source: claudeAgentSdkCliPath(),
+  },
+];
 
 for (const binary of adapterBinaries) {
   buildCargoBinary(binary);
@@ -35,6 +45,7 @@ const adapterHashes = new Map(
 buildCargoBinary(sidecarBinary, {
   MOTHERSHIP_BUILTIN_CODEX_ADAPTER_SHA256: adapterHashes.get("codex-adapter"),
   MOTHERSHIP_BUILTIN_OPENROUTER_ADAPTER_SHA256: adapterHashes.get("openrouter-adapter"),
+  MOTHERSHIP_BUILTIN_CLAUDE_AGENT_ADAPTER_SHA256: adapterHashes.get("claude-agent-adapter"),
 });
 
 const destinationDirectory = join(root, "src-tauri", "binaries");
@@ -52,6 +63,21 @@ for (const binary of bundledBinaries) {
       `${binary}-${target}${executableExtension}`,
     );
     copyFileSync(source, destination);
+    console.log(`bundled binary ready: ${basename(destination)}`);
+  }
+}
+
+for (const binary of auxiliaryBinaries) {
+  if (!existsSync(binary.source)) {
+    throw new Error(`expected auxiliary binary was not found: ${binary.source}`);
+  }
+
+  for (const target of sidecarTargetAliases(targetTriple)) {
+    const destination = join(
+      destinationDirectory,
+      `${binary.name}-${target}${executableExtension}`,
+    );
+    copyFileSync(binary.source, destination);
     console.log(`bundled binary ready: ${basename(destination)}`);
   }
 }
@@ -82,6 +108,32 @@ function sha256File(path) {
     throw new Error(`expected adapter binary was not produced: ${path}`);
   }
   return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function claudeAgentSdkCliPath() {
+  const packageName = claudeAgentSdkPackageName();
+  const executableName = process.platform === "win32" ? "claude.exe" : "claude";
+  return join(
+    root,
+    "node_modules",
+    "@anthropic-ai",
+    packageName,
+    executableName,
+  );
+}
+
+function claudeAgentSdkPackageName() {
+  const arch = process.arch === "arm64" ? "arm64" : "x64";
+  if (process.platform === "win32") {
+    return `claude-agent-sdk-win32-${arch}`;
+  }
+  if (process.platform === "darwin") {
+    return `claude-agent-sdk-darwin-${arch}`;
+  }
+  if (process.platform === "linux") {
+    return `claude-agent-sdk-linux-${arch}`;
+  }
+  throw new Error(`unsupported Claude Agent SDK platform: ${process.platform}/${process.arch}`);
 }
 
 function sidecarTargetAliases(hostTriple) {

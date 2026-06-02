@@ -1,0 +1,15 @@
+{
+  "provider_id": "claude-agent",
+  "provider_label": "Claude Agent SDK",
+  "program": "claude-agent-adapter.exe",
+  "icon": "icon.svg",
+  "capabilities": [
+    "llm.models",
+    "agent.runtime",
+    "agent.self_managed_tools",
+    "settings.read",
+    "settings.write",
+    "network",
+    "process.spawn"
+  ]
+}

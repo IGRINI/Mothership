@@ -36,7 +36,9 @@
     "externalBin": [
       "binaries/mothership-sidecar",
       "binaries/codex-adapter",
-      "binaries/openrouter-adapter"
+      "binaries/openrouter-adapter",
+      "binaries/claude-agent-adapter",
+      "binaries/claude-agent-sdk-cli"
     ],
     "icon": [
       "icons/32x32.png",

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use mothership_adapter_host::protocol::{
-    AuthKind, ChatMessage, ModelManagement, PromptBundle, SettingsFieldKind,
+    AuthKind, ChatMessage, ModelManagement, PromptBundle, RuntimeContext, SettingsFieldKind,
 };
 use mothership_adapter_host::Adapter;
 
@@ -49,6 +49,7 @@ fn echo_adapter_round_trip() {
             "echo-1",
             None,
             PromptBundle::default(),
+            RuntimeContext::default(),
             vec![ChatMessage {
                 role: "user".to_string(),
                 content: "hello brave world".to_string(),

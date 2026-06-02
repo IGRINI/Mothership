@@ -21,7 +21,7 @@ use serde_json::Value;
 /// `initialize` and refuses an adapter that reports a different version, rather
 /// than mis-parsing a contract it doesn't understand. Bump on any incompatible
 /// change to `Request`/`Outbound`.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Host -> adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +67,8 @@ pub enum Request {
         reasoning: Option<ReasoningConfig>,
         #[serde(default)]
         prompt: PromptBundle,
+        #[serde(default)]
+        runtime_context: RuntimeContext,
         messages: Vec<ChatMessage>,
         #[serde(default)]
         tools: Vec<ToolDescriptor>,
@@ -175,6 +177,17 @@ pub struct ToolCallResponse {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeContext {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub project_name: Option<String>,
+    #[serde(default)]
+    pub project_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -14,8 +14,28 @@ use serde_json::Value;
 
 use crate::{ChatCancellationToken, Result};
 use mothership_adapter_host::protocol::{
-    PromptBundle, ReasoningCapabilities, ReasoningConfig, ToolDescriptor,
+    PromptBundle, ReasoningCapabilities, ReasoningConfig, RuntimeContext, ToolDescriptor,
 };
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRuntimeKind {
+    /// Core owns the agent loop and tool execution. The adapter translates one
+    /// provider model round at a time.
+    CoreManaged,
+    /// The adapter owns its upstream agent runtime, including its own loop,
+    /// tools, compaction, subagents, and provider-specific session state.
+    SelfManaged,
+}
+
+impl ProviderRuntimeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CoreManaged => "core_managed",
+            Self::SelfManaged => "self_managed",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +92,8 @@ pub struct LlmChatCompletionRequest {
     pub reasoning: Option<ReasoningConfig>,
     pub prompt: PromptBundle,
     #[serde(default)]
+    pub runtime_context: RuntimeContext,
+    #[serde(default)]
     pub tools: Vec<ToolDescriptor>,
     pub messages: Vec<LlmChatMessage>,
 }
@@ -84,6 +106,8 @@ pub struct LlmChatRoundRequest {
     #[serde(default)]
     pub reasoning: Option<ReasoningConfig>,
     pub prompt: PromptBundle,
+    #[serde(default)]
+    pub runtime_context: RuntimeContext,
     #[serde(default)]
     pub tools: Vec<ToolDescriptor>,
     pub messages: Vec<LlmChatMessage>,
@@ -102,6 +126,7 @@ impl LlmChatRoundRequest {
             model_id: request.model_id,
             reasoning: request.reasoning,
             prompt: request.prompt,
+            runtime_context: request.runtime_context,
             tools: request.tools,
             messages: request.messages,
             state: None,
@@ -120,6 +145,8 @@ pub struct ProviderRequestDraft {
     pub reasoning: Option<ReasoningConfig>,
     pub prompt: PromptBundle,
     #[serde(default)]
+    pub runtime_context: RuntimeContext,
+    #[serde(default)]
     pub tools: Vec<ToolDescriptor>,
     pub messages: Vec<LlmChatMessage>,
 }
@@ -131,6 +158,7 @@ impl From<LlmChatCompletionRequest> for ProviderRequestDraft {
             model_id: request.model_id,
             reasoning: request.reasoning,
             prompt: request.prompt,
+            runtime_context: request.runtime_context,
             tools: request.tools,
             messages: request.messages,
         }
@@ -144,6 +172,7 @@ impl From<ProviderRequestDraft> for LlmChatCompletionRequest {
             model_id: draft.model_id,
             reasoning: draft.reasoning,
             prompt: draft.prompt,
+            runtime_context: draft.runtime_context,
             tools: draft.tools,
             messages: draft.messages,
         }
@@ -152,11 +181,11 @@ impl From<ProviderRequestDraft> for LlmChatCompletionRequest {
 
 /// Core-side hook for provider request modification.
 ///
-/// A modifier sees the provider/model, reasoning config, rendered prompt bundle,
-/// tool catalog, and conversation messages before the request crosses the
-/// adapter boundary. This is the native extension point for future user/plugin
-/// "provider mods"; adapters still only map the final structured request into
-/// provider-specific wire format.
+/// A modifier sees the provider/model, reasoning config, runtime context,
+/// rendered prompt bundle, tool catalog, and conversation messages before the
+/// request crosses the adapter boundary. This is the native extension point for
+/// future user/plugin "provider mods"; adapters still only map the final
+/// structured request into provider-specific wire format.
 pub trait ProviderRequestModifier: Send + Sync {
     fn name(&self) -> &'static str;
 
@@ -339,6 +368,7 @@ mod tests {
             model_id: "model".to_string(),
             reasoning: None,
             prompt: PromptBundle::default(),
+            runtime_context: RuntimeContext::default(),
             tools: Vec::new(),
             messages: Vec::new(),
         };

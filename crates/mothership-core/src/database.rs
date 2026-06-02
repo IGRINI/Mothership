@@ -195,6 +195,65 @@ impl Database {
         select_chat_project(&connection, chat_id)
     }
 
+    pub fn chat_provider_state(
+        &self,
+        chat_id: &str,
+        provider_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        validate_identifier("chat_id", chat_id)?;
+        validate_identifier("provider_id", provider_id)?;
+
+        let connection = self.connect()?;
+        let state = connection
+            .query_row(
+                "
+                SELECT provider_state_provider_id, provider_state_json
+                FROM chats
+                WHERE id = ?1 AND archived = 0
+                ",
+                params![chat_id],
+                |row| {
+                    let stored_provider_id: Option<String> = row.get(0)?;
+                    let state_json: Option<String> = row.get(1)?;
+                    if stored_provider_id.as_deref() != Some(provider_id) {
+                        return Ok(None);
+                    }
+                    json_value(state_json, 1)
+                },
+            )
+            .optional()?
+            .ok_or_else(|| MothershipError::InvalidRequest(format!("chat not found: {chat_id}")))?;
+        Ok(state)
+    }
+
+    pub fn save_chat_provider_state(
+        &self,
+        chat_id: &str,
+        provider_id: &str,
+        state: &serde_json::Value,
+    ) -> Result<()> {
+        validate_identifier("chat_id", chat_id)?;
+        validate_identifier("provider_id", provider_id)?;
+
+        let state_json = serde_json::to_string(state)?;
+        let connection = self.connect()?;
+        let changed = connection.execute(
+            "
+            UPDATE chats
+            SET provider_state_provider_id = ?2,
+                provider_state_json = ?3
+            WHERE id = ?1 AND archived = 0
+            ",
+            params![chat_id, provider_id, state_json],
+        )?;
+        if changed == 0 {
+            return Err(MothershipError::InvalidRequest(format!(
+                "chat not found: {chat_id}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn list_chats(
         &self,
         project_id: Option<&str>,
@@ -562,6 +621,7 @@ impl Database {
             "DELETE FROM chat_messages WHERE chat_id = ?1 AND rowid > ?2",
             params![chat_id, original_user_message.position],
         )?;
+        clear_chat_provider_state(&tx, chat_id)?;
 
         let now = current_timestamp();
         tx.execute(
@@ -1263,6 +1323,8 @@ fn migrate(connection: &Connection) -> Result<()> {
             preview TEXT NOT NULL,
             message_count INTEGER NOT NULL DEFAULT 0,
             archived INTEGER NOT NULL DEFAULT 0,
+            provider_state_provider_id TEXT,
+            provider_state_json TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL
@@ -1367,6 +1429,8 @@ fn migrate(connection: &Connection) -> Result<()> {
     add_column_if_missing(connection, "chat_messages", "model_id", "TEXT")?;
     add_column_if_missing(connection, "chat_messages", "error", "TEXT")?;
     add_column_if_missing(connection, "chats", "project_id", "TEXT")?;
+    add_column_if_missing(connection, "chats", "provider_state_provider_id", "TEXT")?;
+    add_column_if_missing(connection, "chats", "provider_state_json", "TEXT")?;
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_chats_project_updated_at ON chats (project_id, updated_at DESC)",
         [],
@@ -1608,6 +1672,19 @@ fn set_setting(connection: &Connection, key: &str, value: &str, updated_at: &str
             updated_at = excluded.updated_at
         ",
         params![key, value, updated_at],
+    )?;
+    Ok(())
+}
+
+fn clear_chat_provider_state(connection: &Connection, chat_id: &str) -> Result<()> {
+    connection.execute(
+        "
+        UPDATE chats
+        SET provider_state_provider_id = NULL,
+            provider_state_json = NULL
+        WHERE id = ?1
+        ",
+        params![chat_id],
     )?;
     Ok(())
 }

@@ -22,6 +22,13 @@
   поток) — Core видит их одинаково.
 - Адаптер сам владеет: identity, списком моделей, schema настроек, авторизацией,
   транспортом (HTTP/WS/SSE или внешний процесс) и форматом chat-запроса.
+- Адаптеры бывают двух runtime-классов:
+  - `core_managed` — Core владеет agentic loop и tool execution, адаптер
+    выполняет один provider round за раз (`codex`, `openrouter`);
+  - `self_managed` — upstream agent runtime внутри адаптера владеет своим loop,
+    tools, subagents, compaction и continuation state. Core запускает процесс,
+    хранит auth/state, стримит output и отображает события. Первый такой
+    адаптер — `claude-agent` на Claude Agent SDK.
 - Секреты живут в общем app-level vault, ключом служит `provider_id`. Host
   отдаёт их адаптеру и принимает обратно, но остаётся provider-agnostic.
 - Падение адаптера не роняет приложение: он в своём процессе, ошибка всплывает
@@ -65,6 +72,13 @@ provider API           (HTTP / WS / SSE / внешний CLI)
   prompts или обычные logs.
 - Агент/runtime использует провайдера через адаптер и его модель, а не через
   сырые credentials напрямую в бизнес-логике Core.
+
+Исключение: self-managed upstream-agent adapters (например `claude-agent`) могут
+запускать SDK/CLI runtime провайдера как дочерний headless-процесс. Это не
+делает Claude Code владельцем Mothership Core: Core всё ещё хранит настройки,
+секреты, выбранную модель, chat history, cancellation и UI events. Но tools и
+agent loop внутри такого runtime считаются upstream-owned и не проходят через
+Mothership `ToolSupervisor`.
 
 ## Контракт core↔adapter
 
@@ -131,6 +145,17 @@ external_process  адаптер запускает и ведёт внешний
 `StoreSecret` обрабатывается прозрачно внутри `Adapter::recv` и не всплывает
 вызывающему: адаптер может сохранить credential в любой момент, в том числе
 посреди чата, не ломая поток request/response.
+
+Для `self_managed` adapters тот же `chat_start` используется как один запуск
+upstream agent runtime. Адаптер возвращает `chat_round_complete.state` как
+opaque provider state (например Claude session id), а `tool_calls` должен быть
+пустым. Core сохраняет state на уровне chat thread и передаёт его следующему
+запуску того же provider. Если пользователь редактирует старое сообщение и
+ветка истории обрезается, Core очищает provider state.
+
+`chat_start.runtime_context` несёт структурный project context (`projectRoot`,
+`projectId`, `projectName`). Self-managed адаптеры используют его для cwd/рабочей
+среды upstream runtime, а не парсят путь из prompt.
 
 Статус авторизации (`AuthStatus`) остаётся provider-agnostic, но вычисляется
 адаптером, потому что только адаптер знает форму своего credential:
@@ -211,6 +236,24 @@ UI send_chat_message
   -> SQLite deltas/status
   -> chat-run-event -> тонкая подписка UI
 ```
+
+Для self-managed agent runtime flow короче:
+
+```text
+UI send_chat_message
+  -> Core begin_chat_run
+  -> ChatRunService.run
+  -> SubprocessChatGateway -> adapter (single chat_start)
+  -> adapter launches upstream headless agent process
+  -> adapter streams delta and returns opaque state
+  -> Core saves provider state on the chat
+  -> SQLite deltas/status
+  -> chat-run-event
+```
+
+Core не передаёт Mothership tool catalog и не запускает `AgenticLoopPolicy` для
+`agent.runtime` adapters. Это осознанная граница: такие провайдеры уже имеют
+собственный agent loop.
 
 `ChatRunService` (`run.rs`):
 

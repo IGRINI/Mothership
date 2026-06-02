@@ -31,7 +31,7 @@ pub use mothership_adapter_protocol as protocol;
 
 use protocol::{
     AuthKind, AuthStatus, ChatMessage, Model, ModelManagement, Outbound, PromptBundle, Request,
-    SettingsField, ToolCallInvocation, ToolCallResponse, ToolDescriptor,
+    RuntimeContext, SettingsField, ToolCallInvocation, ToolCallResponse, ToolDescriptor,
 };
 
 /// Handler the host registers to persist secrets an adapter pushes via the
@@ -258,6 +258,7 @@ impl Adapter {
         model: &str,
         reasoning: Option<protocol::ReasoningConfig>,
         prompt: PromptBundle,
+        runtime_context: RuntimeContext,
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDescriptor>,
         state: Option<serde_json::Value>,
@@ -272,6 +273,7 @@ impl Adapter {
             model: model.to_string(),
             reasoning,
             prompt,
+            runtime_context,
             messages,
             tools,
             state,

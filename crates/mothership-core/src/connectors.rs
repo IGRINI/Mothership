@@ -30,7 +30,7 @@ use crate::adapter_pool::{
 use crate::auth::FileCredentialVault;
 use crate::llm::{
     ConnectorModelManagementKind, ConnectorModelManagementSchema, ConnectorSettingsSchema,
-    LlmModel, SelectedLlmModel,
+    LlmModel, ProviderRuntimeKind, SelectedLlmModel,
 };
 use crate::provider_runtime::{ProviderRuntimeManager, ProviderRuntimeStatus};
 use crate::{Database, MothershipError, Result};
@@ -38,9 +38,12 @@ use crate::{Database, MothershipError, Result};
 const CODEX_ADAPTER_SHA256: Option<&str> = option_env!("MOTHERSHIP_BUILTIN_CODEX_ADAPTER_SHA256");
 const OPENROUTER_ADAPTER_SHA256: Option<&str> =
     option_env!("MOTHERSHIP_BUILTIN_OPENROUTER_ADAPTER_SHA256");
+const CLAUDE_AGENT_ADAPTER_SHA256: Option<&str> =
+    option_env!("MOTHERSHIP_BUILTIN_CLAUDE_AGENT_ADAPTER_SHA256");
 
 pub(crate) const CAPABILITY_LLM_MODELS: &str = "llm.models";
 pub(crate) const CAPABILITY_LLM_CHAT: &str = "llm.chat";
+pub(crate) const CAPABILITY_AGENT_RUNTIME: &str = "agent.runtime";
 const CAPABILITY_SETTINGS_READ: &str = "settings.read";
 const CAPABILITY_SETTINGS_WRITE: &str = "settings.write";
 const CAPABILITY_AUTH_INTERACTIVE: &str = "auth.interactive";
@@ -57,6 +60,7 @@ pub fn trusted_built_in_adapter_sha256(provider_id: &str) -> Option<&'static str
     match provider_id {
         "codex" => CODEX_ADAPTER_SHA256,
         "openrouter" => OPENROUTER_ADAPTER_SHA256,
+        "claude-agent" => CLAUDE_AGENT_ADAPTER_SHA256,
         _ => None,
     }
 }
@@ -94,6 +98,7 @@ pub enum ConnectorSettingsEventKind {
 pub struct ConnectorProviderSummary {
     pub id: String,
     pub label: String,
+    pub runtime_kind: ProviderRuntimeKind,
     /// The adapter's own icon as a data URI, if it ships one (declared in its
     /// manifest). Core just renders whatever the plugin provides.
     pub icon: Option<String>,
@@ -222,6 +227,7 @@ impl ConnectorManager {
         let selected_model = self.database.selected_llm_model()?;
         let provider_labels = self.provider_labels();
         let provider_icons = self.provider_icons();
+        let provider_runtime_kinds = self.provider_runtime_kinds();
         let provider_errors = self.provider_errors();
         let state = self.state.lock().unwrap();
 
@@ -232,6 +238,7 @@ impl ConnectorManager {
                 &state.adapter_info,
                 &provider_labels,
                 &provider_icons,
+                &provider_runtime_kinds,
                 &state.refreshing,
                 &provider_errors,
                 &self.pool,
@@ -623,6 +630,14 @@ impl ConnectorManager {
             .collect()
     }
 
+    fn provider_runtime_kinds(&self) -> BTreeMap<String, ProviderRuntimeKind> {
+        AdapterRegistry::scan(&self.plugins_dir())
+            .entries()
+            .iter()
+            .map(|entry| (entry.provider_id.clone(), adapter_runtime_kind(entry)))
+            .collect()
+    }
+
     fn provider_errors(&self) -> BTreeMap<String, String> {
         adapter_diagnostics(&self.plugins_dir())
     }
@@ -741,8 +756,31 @@ pub(crate) fn ensure_adapter_capability(
     }
 }
 
+pub(crate) fn adapter_runtime_kind(entry: &AdapterEntry) -> ProviderRuntimeKind {
+    if entry.has_capability(CAPABILITY_AGENT_RUNTIME) {
+        ProviderRuntimeKind::SelfManaged
+    } else {
+        ProviderRuntimeKind::CoreManaged
+    }
+}
+
+pub(crate) fn ensure_adapter_can_run_chat(
+    entry: &AdapterEntry,
+) -> std::result::Result<ProviderRuntimeKind, String> {
+    let runtime_kind = adapter_runtime_kind(entry);
+    match runtime_kind {
+        ProviderRuntimeKind::CoreManaged => {
+            ensure_adapter_capability(entry, CAPABILITY_LLM_CHAT, "run chat")?;
+        }
+        ProviderRuntimeKind::SelfManaged => {
+            ensure_adapter_capability(entry, CAPABILITY_AGENT_RUNTIME, "run self-managed agent")?;
+        }
+    }
+    Ok(runtime_kind)
+}
+
 fn is_built_in_adapter_id(provider_id: &str) -> bool {
-    matches!(provider_id, "codex" | "openrouter")
+    matches!(provider_id, "codex" | "openrouter" | "claude-agent")
 }
 
 /// Spawns an adapter just long enough to read its advertised models. Each call
@@ -839,6 +877,7 @@ fn connector_providers(
     adapter_info: &BTreeMap<String, AdapterInfo>,
     provider_labels: &BTreeMap<String, String>,
     provider_icons: &BTreeMap<String, String>,
+    provider_runtime_kinds: &BTreeMap<String, ProviderRuntimeKind>,
     refreshing: &BTreeSet<String>,
     provider_errors: &BTreeMap<String, String>,
     pool: &AdapterPool,
@@ -899,6 +938,10 @@ fn connector_providers(
                 .unwrap_or_else(|| AuthStatus::missing("connector has not reported auth status"));
             let adapter_settings = info.map(|info| info.view.clone());
             let icon = provider_icons.get(&provider_id).cloned();
+            let runtime_kind = provider_runtime_kinds
+                .get(&provider_id)
+                .copied()
+                .unwrap_or(ProviderRuntimeKind::CoreManaged);
             let catalog = catalogs.get(&provider_id);
             let model_error = catalog
                 .and_then(|catalog| catalog.error.clone())
@@ -920,6 +963,7 @@ fn connector_providers(
             ConnectorProviderSummary {
                 id: provider_id,
                 label,
+                runtime_kind,
                 icon,
                 settings_schema: connector_settings_schema(
                     catalog.map(|catalog| catalog.management),

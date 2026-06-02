@@ -351,6 +351,7 @@ export interface AdapterAuthStatus {
 }
 
 export type ProviderRuntimeHealth = "healthy" | "degraded" | "cooling_down";
+export type ProviderRuntimeKind = "core_managed" | "self_managed";
 
 export interface ProviderRuntimeStatus {
   health: ProviderRuntimeHealth;
@@ -366,6 +367,7 @@ export interface ProviderRuntimeStatus {
 export interface ConnectorProviderSummary {
   id: string;
   label: string;
+  runtimeKind: ProviderRuntimeKind;
   /** The adapter's own icon as a data URI, if it ships one. */
   icon?: string | null;
   settingsSchema: ConnectorSettingsSchema;
@@ -1144,6 +1146,7 @@ function getPreviewConnectorSettings() {
       {
         id: "codex",
         label: "Codex",
+        runtimeKind: "core_managed",
         settingsSchema: {
           modelManagement: {
             kind: "remote_catalog",
@@ -1180,6 +1183,7 @@ function getPreviewConnectorSettings() {
       {
         id: "openrouter",
         label: "OpenRouter",
+        runtimeKind: "core_managed",
         settingsSchema: {
           modelManagement: {
             kind: "editable_list",

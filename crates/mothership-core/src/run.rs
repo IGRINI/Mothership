@@ -4,20 +4,20 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use mothership_adapter_host::protocol::RuntimeContext;
+
 use crate::agentic::AgenticLoopPolicy;
 use crate::auth::FileCredentialVault;
 use crate::chat::{
     ChatCancellationToken, ChatRunEvent, ChatRunEventKind, ChatRunEventSink, SendChatMessageResult,
 };
-use crate::connectors::{
-    ensure_adapter_capability, find_trusted_adapter_entry, CAPABILITY_LLM_CHAT,
-};
+use crate::connectors::{ensure_adapter_can_run_chat, find_trusted_adapter_entry};
 use crate::llm::{
     LlmChatCompletionEventSink, LlmChatCompletionRequest, LlmChatMessage, LlmChatRole,
     LlmChatRoundRequest, LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResponse,
-    LlmTransportKind, ProviderRequestPipeline,
+    LlmTransportKind, ProviderRequestPipeline, ProviderRuntimeKind,
 };
-use crate::prompt::runtime_prompt_bundle;
+use crate::prompt::runtime_prompt_bundle_for;
 use crate::provider_runtime::ProviderRuntimeManager;
 use crate::tools::default_tool_catalog;
 use crate::{Database, MothershipError, Result};
@@ -202,8 +202,8 @@ impl<'a> ChatRunService<'a> {
         // model; the adapter handles its own transport and auth.
         let entry =
             find_trusted_adapter_entry(&plugins_store_path(database), &selected_model.provider_id)?;
-        ensure_adapter_capability(&entry, CAPABILITY_LLM_CHAT, "run chat")
-            .map_err(MothershipError::InvalidRequest)?;
+        let runtime_kind =
+            ensure_adapter_can_run_chat(&entry).map_err(MothershipError::InvalidRequest)?;
 
         let messages = database.llm_chat_context(
             &run.chat.id,
@@ -248,16 +248,33 @@ impl<'a> ChatRunService<'a> {
             provider_id: selected_model.provider_id,
             model_id: selected_model.model_id,
             reasoning: run.context.reasoning.clone(),
-            prompt: runtime_prompt_bundle(project.as_ref()),
-            tools: self
-                .tool_handler
-                .as_ref()
-                .map(|_| default_tool_catalog())
-                .unwrap_or_default(),
+            prompt: runtime_prompt_bundle_for(project.as_ref(), runtime_kind),
+            runtime_context: runtime_context_for(project.as_ref()),
+            tools: if runtime_kind == ProviderRuntimeKind::CoreManaged {
+                self.tool_handler
+                    .as_ref()
+                    .map(|_| default_tool_catalog())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
             messages,
         })?;
 
-        self.complete_agentic_loop(entry, vault, request, &cancellation, &mut llm_sink)?;
+        match runtime_kind {
+            ProviderRuntimeKind::CoreManaged => {
+                self.complete_agentic_loop(entry, vault, request, &cancellation, &mut llm_sink)?;
+            }
+            ProviderRuntimeKind::SelfManaged => {
+                self.complete_self_managed_agent(
+                    entry,
+                    vault,
+                    request,
+                    &cancellation,
+                    &mut llm_sink,
+                )?;
+            }
+        }
 
         llm_sink.flush();
 
@@ -342,6 +359,45 @@ impl<'a> ChatRunService<'a> {
         }
     }
 
+    fn complete_self_managed_agent(
+        &self,
+        entry: mothership_adapter_host::AdapterEntry,
+        vault: FileCredentialVault,
+        request: LlmChatCompletionRequest,
+        cancellation: &ChatCancellationToken,
+        sink: &mut DbForwardingSink<'_>,
+    ) -> Result<()> {
+        let provider_id = request.provider_id.clone();
+        let mut round_request = LlmChatRoundRequest::from_completion(request);
+        round_request.state = self
+            .database
+            .chat_provider_state(sink.chat_id, &provider_id)?;
+
+        let round = self.providers.complete_subprocess_round(
+            entry,
+            vault,
+            Some(sink.run_id.to_string()),
+            round_request,
+            cancellation,
+            sink,
+        )?;
+        sink.flush();
+
+        if !round.tool_calls.is_empty() {
+            return Err(MothershipError::InvalidRequest(
+                "self-managed agent adapter returned Core tool calls; advertise core-managed chat instead"
+                    .to_string(),
+            ));
+        }
+
+        if let Some(state) = round.state {
+            self.database
+                .save_chat_provider_state(sink.chat_id, &provider_id, &state)?;
+        }
+
+        Ok(())
+    }
+
     fn execute_tool_batch(
         &self,
         mut calls: Vec<LlmToolCallRequest>,
@@ -376,6 +432,14 @@ impl<'a> ChatRunService<'a> {
     }
 }
 
+fn runtime_context_for(project: Option<&crate::ProjectSummary>) -> RuntimeContext {
+    RuntimeContext {
+        project_id: project.map(|project| project.id.clone()),
+        project_name: project.map(|project| project.name.clone()),
+        project_root: project.map(|project| project.path.clone()),
+    }
+}
+
 fn next_round_request(
     base: &LlmChatCompletionRequest,
     state: serde_json::Value,
@@ -388,6 +452,7 @@ fn next_round_request(
         model_id: base.model_id.clone(),
         reasoning: base.reasoning.clone(),
         prompt: base.prompt.clone(),
+        runtime_context: base.runtime_context.clone(),
         tools: include_tools
             .then(|| base.tools.clone())
             .unwrap_or_default(),

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="Claude Agent SDK">
+  <rect width="48" height="48" rx="10" fill="#191511"/>
+  <path fill="#d8a56d" d="M24 7 8 39h6.9l3.1-6.7h12.1l3.1 6.7H40L24 7Zm-3.5 19.9L24 19l3.5 7.9h-7Z"/>
+  <path fill="#f2d3ac" d="M24 12.8 11.7 39h2.6L24 18.4 33.7 39h2.6L24 12.8Z" opacity=".72"/>
+</svg>

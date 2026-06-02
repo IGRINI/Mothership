@@ -76,6 +76,21 @@ const BUILT_IN_ADAPTERS: &[BuiltInAdapter] = &[
             "network",
         ],
     },
+    BuiltInAdapter {
+        provider_id: "claude-agent",
+        provider_label: "Claude Agent SDK",
+        binary_name: "claude-agent-adapter",
+        icon_svg: include_str!("../../adapters/claude-agent/icon.svg"),
+        capabilities: &[
+            "llm.models",
+            "agent.runtime",
+            "agent.self_managed_tools",
+            "settings.read",
+            "settings.write",
+            "network",
+            "process.spawn",
+        ],
+    },
 ];
 
 /// Frames queued for the writer thread, which alone owns stdout.

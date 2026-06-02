@@ -43,8 +43,8 @@ const IDLE_TICK: Duration = Duration::from_secs(5);
 
 use protocol::{
     AuthKind, AuthStatus, ChatMessage, Model, ModelManagement, Outbound, PromptBundle,
-    ReasoningConfig, Request, SettingsField, ToolCallInvocation, ToolCallResponse, ToolDescriptor,
-    PROTOCOL_VERSION,
+    ReasoningConfig, Request, RuntimeContext, SettingsField, ToolCallInvocation, ToolCallResponse,
+    ToolDescriptor, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Clone)]
@@ -52,6 +52,7 @@ pub struct ChatRequest {
     pub model: String,
     pub reasoning: Option<ReasoningConfig>,
     pub prompt: PromptBundle,
+    pub runtime_context: RuntimeContext,
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolDescriptor>,
     pub state: Option<serde_json::Value>,
@@ -316,6 +317,7 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
                     model,
                     reasoning,
                     prompt,
+                    runtime_context,
                     messages,
                     tools,
                     state,
@@ -333,6 +335,7 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
                             model,
                             reasoning,
                             prompt,
+                            runtime_context,
                             messages,
                             tools,
                             state,
@@ -363,6 +366,7 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
                         model,
                         reasoning,
                         prompt,
+                        runtime_context,
                         messages,
                         tools,
                         state,
@@ -380,6 +384,7 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
                                 model,
                                 reasoning,
                                 prompt,
+                                runtime_context,
                                 messages,
                                 tools,
                                 state,
@@ -628,6 +633,7 @@ mod tests {
                 model: "test-model".to_string(),
                 reasoning: None,
                 prompt: PromptBundle::default(),
+                runtime_context: RuntimeContext::default(),
                 messages: Vec::new(),
                 tools: Vec::new(),
                 state: None,

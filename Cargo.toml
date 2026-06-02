@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "adapters/claude-agent",
   "adapters/codex",
   "adapters/openrouter",
   "crates/mothership-adapter-host",
