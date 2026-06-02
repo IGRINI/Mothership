@@ -197,8 +197,10 @@ before Approve. Approval is a Core event routed to wherever the human is (incl. 
 
 === file-tool stage CLOSED here ===
 
-7. [NEXT] typed search: Mothership `list_files` + `search_text` tools, THEN disable
-          Claude-native `Glob`/`Grep` once the typed replacement exists.
+7. [DONE] typed search: native `list_files` + `search_text` (`ignore`+`regex`+`globset`,
+          NO shell/`rg`); gitignore-default + `includeIgnored`, sensitive ALWAYS skipped,
+          `dir`/`glob` contained, bounded results; Claude-native `Glob`/`Grep` disabled when
+          both are bridged. read/Allow/ParallelSafe.
 8. [later] scheduler: read_file -> ParallelSafe (small standalone follow-up, not bundled).
 9. [later] typed DB storage (tool_calls/tool_events/tool_artifacts) + UI semantic cards.
 ```
@@ -237,13 +239,15 @@ These hold on `feat/typed-tool-layer` as of the 4th review round. They supersede
   `mcp__mothership__*`), the Claude-agent adapter disables Claude's native `Write`/`Edit`/
   `MultiEdit`/`NotebookEdit` (gated on a Mothership file tool present) AND native `Read`
   (gated on `read_file` present, so the model is never left without a read path) — so
-  reads+writes flow through the typed pipeline. `Bash` is disabled when `run_command` is present.
+  reads+writes flow through the typed pipeline. Native `Glob`/`Grep` are disabled when both
+  typed search tools (`list_files`+`search_text`) are bridged. `Bash` is disabled when
+  `run_command` is present.
 
 ## Deferred (NOT defects — scope, stage considered closed without them)
 
-- **Typed search is the next stage** (see Build order): add Mothership `list_files` +
-  `search_text`, THEN disable Claude-native `Glob`/`Grep` (kept enabled for now — disabling
-  without a typed replacement would degrade search to `run_command`).
+- **Typed search — DONE.** Native `list_files`/`search_text` (read-only, `ParallelSafe`) ship
+  alongside the file tools; Claude-native `Glob`/`Grep` are disabled when both typed search
+  tools are bridged. No shell/`rg` — `ignore`+`regex`+`globset` crates.
 - **Typed storage** (`tool_calls`/`tool_events`/`tool_artifacts`) — events still via
   `chat_tool_events` (`command_json` NULL for file tools).
 - **UI semantic cards** + diff-before-approve card — frontend; approval diff currently rides
