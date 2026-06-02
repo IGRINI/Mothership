@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use super::types::{ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus};
 
 const COMMAND_TOOL_KIND: &str = "run_command";
+const DEFAULT_MAX_TRACKED_RUNS: usize = 1024;
 
 #[derive(Debug)]
 pub struct ToolRepeatGuard {
@@ -112,6 +113,8 @@ pub struct ToolRepeatGuardConfig {
     pub recent_same_result_limit: usize,
     pub recent_window: usize,
     pub max_records_per_run: usize,
+    /// Number of run histories retained in memory. This must comfortably cover
+    /// hundreds of concurrent agents while still bounding repeat-guard state.
     pub max_tracked_runs: usize,
 }
 
@@ -122,7 +125,7 @@ impl Default for ToolRepeatGuardConfig {
             recent_same_result_limit: 4,
             recent_window: 10,
             max_records_per_run: 64,
-            max_tracked_runs: 128,
+            max_tracked_runs: DEFAULT_MAX_TRACKED_RUNS,
         }
     }
 }

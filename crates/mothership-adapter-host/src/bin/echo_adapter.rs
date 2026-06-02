@@ -54,6 +54,7 @@ fn main() -> anyhow::Result<()> {
                         id: "echo-1".to_string(),
                         label: "Echo 1".to_string(),
                         recommended: true,
+                        reasoning: None,
                     }],
                 },
             )?,
@@ -118,8 +119,15 @@ fn main() -> anyhow::Result<()> {
             )?,
             // Api-key auth has no interactive flow; just ack.
             Request::Authenticate { id } => emit(&mut stdout, &Outbound::Ack { id })?,
-            Request::ChatStart { id, messages, .. } => {
+            Request::ChatStart {
+                id,
+                messages,
+                extra_messages,
+                ..
+            } => {
                 let last = messages
+                    .iter()
+                    .chain(extra_messages.iter())
                     .last()
                     .map(|message| message.content.clone())
                     .unwrap_or_default();
@@ -132,10 +140,16 @@ fn main() -> anyhow::Result<()> {
                         },
                     )?;
                 }
-                emit(&mut stdout, &Outbound::Done { id })?;
+                emit(
+                    &mut stdout,
+                    &Outbound::ChatRoundComplete {
+                        id,
+                        state: None,
+                        tool_calls: Vec::new(),
+                    },
+                )?;
             }
-            Request::ChatCancel { id } => emit(&mut stdout, &Outbound::Done { id })?,
-            Request::ToolResult { .. } => {}
+            Request::ChatCancel { id } => emit(&mut stdout, &Outbound::Ack { id })?,
             Request::Logout { id } => emit(&mut stdout, &Outbound::Ack { id })?,
         }
     }

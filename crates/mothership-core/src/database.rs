@@ -7,6 +7,8 @@ use std::{
 
 use rusqlite::{params, params_from_iter, types::Type, Connection, OptionalExtension};
 
+use mothership_adapter_host::protocol::ReasoningConfig;
+
 use crate::{
     id::generate_id, ActivityEvent, ChatConversation, ChatMessage, ChatMessagePart,
     ChatMessagePartKind, ChatMessageRole, ChatMessageStatus, ChatRunContextSpec, ChatRunEvent,
@@ -345,7 +347,7 @@ impl Database {
         project_id: Option<&str>,
         content: &str,
     ) -> Result<SendChatMessageResult> {
-        self.begin_chat_run(chat_id, project_id, content)
+        self.begin_chat_run(chat_id, project_id, content, None)
     }
 
     pub fn recover_interrupted_chat_runs(&self) -> Result<usize> {
@@ -377,6 +379,7 @@ impl Database {
         chat_id: Option<&str>,
         project_id: Option<&str>,
         content: &str,
+        reasoning: Option<ReasoningConfig>,
     ) -> Result<SendChatMessageResult> {
         let content = validate_chat_message_content(content)?;
         let mut connection = self.connect()?;
@@ -508,7 +511,10 @@ impl Database {
             chat: updated_chat,
             user_message,
             assistant_message,
-            context: ChatRunContextSpec::default(),
+            context: ChatRunContextSpec {
+                reasoning,
+                ..ChatRunContextSpec::default()
+            },
         })
     }
 
@@ -852,6 +858,7 @@ impl Database {
             assistant_message,
             context: ChatRunContextSpec {
                 include_failed_assistant_message_id: Some(failed_assistant_message.id),
+                reasoning: None,
             },
         })
     }
@@ -2770,7 +2777,7 @@ mod tests {
         let project = create_project(&database, &database_path, "retry");
 
         let run = database
-            .begin_chat_run(None, Some(&project.id), "Retry me")
+            .begin_chat_run(None, Some(&project.id), "Retry me", None)
             .expect("begin run");
         database
             .record_chat_tool_execution_event(
@@ -2839,7 +2846,7 @@ mod tests {
         let project = create_project(&database, &database_path, "continue");
 
         let run = database
-            .begin_chat_run(None, Some(&project.id), "Continue me")
+            .begin_chat_run(None, Some(&project.id), "Continue me", None)
             .expect("begin run");
         database
             .append_chat_run_delta(
@@ -2898,7 +2905,7 @@ mod tests {
             .expect("select model");
         let project = create_project(&database, &database_path, "tool_history");
         let run = database
-            .begin_chat_run(None, Some(&project.id), "Show the current folder")
+            .begin_chat_run(None, Some(&project.id), "Show the current folder", None)
             .expect("begin run");
         let command = ToolCommand::new("powershell", ["-Command", "Get-Location"]);
 
@@ -3000,7 +3007,7 @@ mod tests {
         let project = create_project(&database, &database_path, "message_parts");
 
         let run = database
-            .begin_chat_run(None, Some(&project.id), "Inspect the workspace")
+            .begin_chat_run(None, Some(&project.id), "Inspect the workspace", None)
             .expect("begin run");
         database
             .append_chat_run_delta(
@@ -3093,7 +3100,7 @@ mod tests {
         let project = create_project(&database, &database_path, "editing");
 
         let first = database
-            .begin_chat_run(None, Some(&project.id), "Original prompt")
+            .begin_chat_run(None, Some(&project.id), "Original prompt", None)
             .expect("begin first run");
         database
             .append_chat_run_delta(
@@ -3108,7 +3115,12 @@ mod tests {
             .expect("complete first run");
 
         let second = database
-            .begin_chat_run(Some(&first.chat.id), Some(&project.id), "Follow-up prompt")
+            .begin_chat_run(
+                Some(&first.chat.id),
+                Some(&project.id),
+                "Follow-up prompt",
+                None,
+            )
             .expect("begin second run");
         database
             .record_chat_tool_execution_event(
@@ -3172,7 +3184,7 @@ mod tests {
         let project = create_project(&database, &database_path, "branch");
 
         let first = database
-            .begin_chat_run(None, Some(&project.id), "First prompt")
+            .begin_chat_run(None, Some(&project.id), "First prompt", None)
             .expect("begin first run");
         database
             .append_chat_run_delta(
@@ -3187,7 +3199,12 @@ mod tests {
             .expect("complete first run");
 
         let second = database
-            .begin_chat_run(Some(&first.chat.id), Some(&project.id), "Second prompt")
+            .begin_chat_run(
+                Some(&first.chat.id),
+                Some(&project.id),
+                "Second prompt",
+                None,
+            )
             .expect("begin second run");
         database
             .record_chat_tool_execution_event(
@@ -3279,7 +3296,7 @@ mod tests {
             .expect("select model");
         let project = create_project(&database, &database_path, "startup_recovery");
         let result = database
-            .begin_chat_run(None, Some(&project.id), "Hello")
+            .begin_chat_run(None, Some(&project.id), "Hello", None)
             .expect("begin chat run");
 
         let changed = database
@@ -3318,10 +3335,15 @@ mod tests {
         let second_project = create_project(&database, &database_path, "second");
 
         database
-            .begin_chat_run(None, Some(&first_project.id), "First project prompt")
+            .begin_chat_run(None, Some(&first_project.id), "First project prompt", None)
             .expect("begin first project run");
         database
-            .begin_chat_run(None, Some(&second_project.id), "Second project prompt")
+            .begin_chat_run(
+                None,
+                Some(&second_project.id),
+                "Second project prompt",
+                None,
+            )
             .expect("begin second project run");
 
         let first_chats = database

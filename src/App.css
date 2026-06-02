@@ -304,15 +304,17 @@ button {
   grid-template-rows: auto auto minmax(210px, 1fr) minmax(220px, 0.86fr) auto;
   gap: 16px;
   border-right: 1px solid #1b2a3a;
-  padding: 68px 16px 16px;
+  padding: 0 16px 16px;
   background: linear-gradient(180deg, #081521, #06111b);
 }
 
-.app-frame--windows .sidebar {
+/* The titlebar inset lives on the brand (not the sidebar) so the whole top strip
+   above the logo is part of the brand's window-drag handle. */
+.app-frame--windows .sidebar__brand {
   padding-top: 20px;
 }
 
-.app-frame--mac .sidebar {
+.app-frame--mac .sidebar__brand {
   padding-top: 68px;
 }
 
@@ -321,6 +323,10 @@ button {
   grid-template-columns: 36px minmax(0, 1fr) 34px;
   align-items: center;
   gap: 12px;
+  /* Full-bleed to the sidebar edges so the entire top plate (full width + the
+     titlebar padding above it) drags the window, not just the logo row. */
+  margin: 0 -16px;
+  padding: 0 16px;
 }
 
 .sidebar__brand strong {
@@ -1970,6 +1976,118 @@ kbd,
   gap: 8px;
 }
 
+.reasoning-selector {
+  position: relative;
+  flex: 0 0 auto;
+  color: #aebdcb;
+}
+
+.reasoning-selector--disabled {
+  color: #637282;
+}
+
+.reasoning-selector__trigger {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  gap: 7px;
+  border: 1px solid #25384c;
+  border-radius: 7px;
+  padding: 0 9px;
+  background: #101d2b;
+  color: inherit;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.reasoning-selector__trigger:hover:not(:disabled),
+.reasoning-selector__trigger:focus-visible,
+.reasoning-selector__trigger[aria-expanded="true"] {
+  border-color: #34506b;
+  background: #142131;
+  color: #eaf1f8;
+}
+
+.reasoning-selector__trigger:focus-visible {
+  outline: 2px solid #2e7bff;
+  outline-offset: 1px;
+}
+
+.reasoning-selector__trigger:disabled {
+  cursor: default;
+  color: #637282;
+}
+
+.reasoning-selector__chevron {
+  color: #8fa0b3;
+  transition: transform 140ms ease, color 140ms ease;
+}
+
+.reasoning-selector__chevron--open {
+  transform: rotate(180deg);
+  color: #dce7f3;
+}
+
+.reasoning-selector__popover {
+  position: absolute;
+  z-index: 70;
+  bottom: calc(100% + 8px);
+  left: 0;
+  width: 216px;
+  border: 1px solid #38424d;
+  border-radius: 8px;
+  padding: 8px 0;
+  background: #242629;
+  box-shadow: 0 18px 48px rgb(0 0 0 / 50%);
+  color: #f2f4f7;
+}
+
+.reasoning-selector__heading {
+  padding: 0 12px 7px;
+  color: #a7adb4;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.reasoning-selector__item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 18px;
+  align-items: center;
+  width: 100%;
+  min-height: 28px;
+  border: 0;
+  padding: 0 10px 0 12px;
+  background: transparent;
+  color: inherit;
+  font-size: 14px;
+  line-height: 1.25;
+  text-align: left;
+}
+
+.reasoning-selector__item:hover:not(:disabled),
+.reasoning-selector__item--active {
+  background: rgb(255 255 255 / 8%);
+}
+
+.reasoning-selector__item span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reasoning-selector__item svg {
+  justify-self: end;
+  color: #cbd2da;
+}
+
+.reasoning-selector__item:disabled {
+  cursor: default;
+  color: #777f88;
+}
+
 .send-button {
   display: grid;
   width: 26px;
@@ -2830,6 +2948,20 @@ kbd,
 
   .composer {
     margin-inline: 12px;
+  }
+
+  .composer__actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .reasoning-selector {
+    order: 0;
+  }
+
+  .reasoning-selector__popover {
+    right: 0;
+    left: auto;
   }
 
   .message-list .virtual-list__row {

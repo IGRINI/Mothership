@@ -768,6 +768,7 @@ fn adapter_model_catalog(
             family: "Adapter".to_string(),
             description: String::new(),
             capabilities: vec!["text".to_string()],
+            reasoning: model.reasoning,
             recommended: model.recommended,
         })
         .collect();

@@ -1,4 +1,5 @@
 pub mod adapter_pool;
+pub mod agentic;
 pub mod auth;
 pub mod chat;
 pub mod connectors;
@@ -16,6 +17,10 @@ pub mod subprocess_gateway;
 pub mod tools;
 
 pub use adapter_pool::AdapterPool;
+pub use agentic::{
+    AgenticLoopPolicy, DEFAULT_FALLBACK_MESSAGE, DEFAULT_FINAL_SYNTHESIS_PROMPT,
+    DEFAULT_MAX_AGENTIC_ROUNDS,
+};
 pub use chat::{
     ChatCancellationToken, ChatConversation, ChatMessage, ChatMessagePart, ChatMessagePartKind,
     ChatMessageRole, ChatMessageStatus, ChatRunCancellationResult, ChatRunContext,
@@ -31,12 +36,15 @@ pub use database::Database;
 pub use error::{MothershipError, Result};
 pub use llm::{
     ConnectorModelManagementKind, ConnectorModelManagementSchema, ConnectorSettingsSchema,
-    LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest, LlmChatMessage,
-    LlmChatRole, LlmModel, LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResult,
-    LlmTransportKind, ProviderRequestDraft, ProviderRequestModifier, ProviderRequestPipeline,
-    SelectedLlmModel,
+    LlmChatCompletionEventSink, LlmChatCompletionRequest, LlmChatMessage, LlmChatRole,
+    LlmChatRound, LlmChatRoundGateway, LlmChatRoundRequest, LlmModel, LlmToolCallHandler,
+    LlmToolCallRequest, LlmToolCallResponse, LlmToolCallResult, LlmTransportKind,
+    ProviderRequestDraft, ProviderRequestModifier, ProviderRequestPipeline, SelectedLlmModel,
 };
 pub use model::{ActivityEvent, DashboardMetric, DashboardSnapshot, SidecarStatus, WorkspaceItem};
+pub use mothership_adapter_host::protocol::{
+    ReasoningCapabilities, ReasoningConfig, ReasoningEffort, ReasoningOption, ReasoningSummary,
+};
 pub use project::{ProjectSnapshot, ProjectSummary};
 pub use provider_runtime::{ProviderRuntimeHealth, ProviderRuntimeManager, ProviderRuntimeStatus};
 pub use run::{schedule_cancel_fallback, ChatRunRegistry, ChatRunService};

@@ -398,9 +398,15 @@ fn handle_request(
         chat_id,
         project_id,
         content,
+        reasoning,
     } = &request
     {
-        let started = database.begin_chat_run(chat_id.as_deref(), project_id.as_deref(), content);
+        let started = database.begin_chat_run(
+            chat_id.as_deref(),
+            project_id.as_deref(),
+            content,
+            reasoning.clone(),
+        );
         run_chat_message(
             id,
             started,

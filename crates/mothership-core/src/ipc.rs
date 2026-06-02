@@ -25,9 +25,9 @@ use crate::connectors::{
 };
 use crate::{
     ChatConversation, ChatRunCancellationResult, ChatRunEvent, ChatThreadSummary,
-    DashboardSnapshot, MothershipError, ProjectSnapshot, SendChatMessageResult, SidecarStatus,
-    ToolApprovalAnswer, ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
-    ToolExecutionRequest,
+    DashboardSnapshot, MothershipError, ProjectSnapshot, ReasoningConfig, SendChatMessageResult,
+    SidecarStatus, ToolApprovalAnswer, ToolExecutionAccepted, ToolExecutionCancellationResult,
+    ToolExecutionEvent, ToolExecutionRequest,
 };
 
 /// Bump the major when a change isn't backward compatible. The host refuses a
@@ -98,6 +98,8 @@ pub enum CoreRequest {
         chat_id: Option<String>,
         project_id: Option<String>,
         content: String,
+        #[serde(default)]
+        reasoning: Option<ReasoningConfig>,
     },
     /// Edit an existing user message, remove everything after it in that chat,
     /// and start a fresh assistant run from the edited prompt.

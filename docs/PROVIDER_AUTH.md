@@ -84,7 +84,7 @@ set_settings          { values }  текущие значения настрое
 get_auth_schema       схема авторизации
 get_auth_status       provider-agnostic статус после применения текущих settings
 authenticate          запустить свой auth-flow (например browser OAuth) сейчас
-chat_start            { model, messages }  один ход чата
+chat_start            { model, messages, state?, tool_results?, extra_messages? }  один model round
 chat_cancel           отмена
 logout                ревокнуть/почистить свой credential перед забыванием в vault
 ```
@@ -100,7 +100,7 @@ settings_schema { fields }
 auth_schema     { auth }
 auth_status     { kind, account_label?, expires_at?, detail? }
 delta           { text }     потоковый кусок ответа
-done            конец потока
+chat_round_complete { state?, tool_calls[] }  конец model round
 error           { message }
 store_secret    { values }   side channel: сохранить секреты в общий vault (без id)
 ```
@@ -205,7 +205,9 @@ UI send_chat_message
   -> Tauri command (фоновый поток)
   -> Core begin_chat_run (user + pending assistant message в SQLite)
   -> ChatRunService.run
-  -> SubprocessChatGateway -> adapter (chat_start, поток delta)
+  -> Core-owned agentic loop
+  -> SubprocessChatGateway -> adapter (chat_start, поток delta, chat_round_complete)
+  -> Core executes any returned tool_calls and starts the next round
   -> SQLite deltas/status
   -> chat-run-event -> тонкая подписка UI
 ```
@@ -216,19 +218,25 @@ UI send_chat_message
    («no LLM model selected; install a provider adapter and choose a model first»);
 2. сканирует `AdapterRegistry` в `<data>/plugins` и находит адаптер по
    `provider_id` модели (иначе — «no adapter installed for provider: …»);
-3. собирает контекст чата и гонит его через `SubprocessChatGateway`.
+3. собирает контекст чата и гонит provider rounds через `SubprocessChatGateway`;
+4. сам решает agentic loop: если адаптер вернул `tool_calls`, Core запускает
+   batch через `ToolSupervisor`, сохраняет порядок результатов и передаёт их в
+   следующий `chat_start`;
+5. после broad safety budget Core делает final no-tool synthesis, а не адаптер.
 
 `SubprocessChatGateway` (`subprocess_gateway.rs`) на каждый вызов: спавнит
 процесс → вешает `store_secret_handler` (merge в vault) → `initialize` → грузит и
 пушит настройки через `set_settings` → `transport_selected(Subprocess)` →
-строит сообщения → `chat_start`, стримит `delta`, завершает на `done`.
+строит сообщения/continuation → `chat_start`, стримит `delta`, завершает на
+`chat_round_complete`.
 
 Важно: с точки зрения Core транспорт всегда `subprocess`
 (`LlmTransportKind::Subprocess`). Реальный транспорт (HTTP/WS/SSE) и выбор
-fallback — внутреннее дело адаптера, Core их не видит. Системный промпт тоже
-владение адаптера: `ChatRunService` сейчас передаёт пустой `system_prompt`, а
-адаптер мапит generic-сообщения в валидный для своего провайдера payload (для
-Codex — top-level `instructions`; для OpenRouter — обычный массив `messages`).
+fallback — внутреннее дело адаптера, Core их не видит. Core владеет runtime
+prompt/tool catalog/agentic loop; адаптер только мапит generic round request в
+валидный для своего провайдера payload (для Codex — top-level `instructions`;
+для OpenRouter — обычный массив `messages`) и возвращает opaque continuation
+state.
 Ошибки provider/model/auth/transport не замалчиваются — run становится `failed`,
 UI получает ошибку.
 

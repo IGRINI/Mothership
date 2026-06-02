@@ -8,8 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter_pool::AdapterPool;
 use crate::auth::FileCredentialVault;
 use crate::llm::{
-    LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest,
-    LlmToolCallHandler,
+    LlmChatCompletionEventSink, LlmChatRound, LlmChatRoundGateway, LlmChatRoundRequest,
 };
 use crate::subprocess_gateway::SubprocessChatGateway;
 use crate::{ChatCancellationToken, MothershipError, Result};
@@ -95,26 +94,22 @@ impl ProviderRuntimeManager {
         self.pool.force_evict(provider_id);
     }
 
-    pub fn complete_subprocess_chat(
+    pub fn complete_subprocess_round(
         &self,
         entry: AdapterEntry,
         vault: FileCredentialVault,
         run_id: Option<String>,
-        tool_handler: Option<Arc<dyn LlmToolCallHandler>>,
-        request: LlmChatCompletionRequest,
+        request: LlmChatRoundRequest,
         cancellation: &ChatCancellationToken,
         sink: &mut dyn LlmChatCompletionEventSink,
-    ) -> Result<String> {
+    ) -> Result<LlmChatRound> {
         let provider_id = request.provider_id.clone();
         let _guard = self.start_run(&provider_id)?;
         let mut gateway = SubprocessChatGateway::new(Arc::clone(&self.pool), entry, vault);
         if let Some(run_id) = run_id {
             gateway = gateway.with_run_id(run_id);
         }
-        if let Some(tool_handler) = tool_handler {
-            gateway = gateway.with_tool_handler(tool_handler);
-        }
-        let result = gateway.complete_chat(request, cancellation, sink);
+        let result = gateway.complete_round(request, cancellation, sink);
 
         if cancellation.is_cancelled() {
             self.record_cancelled(&provider_id);

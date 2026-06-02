@@ -10,6 +10,7 @@ import {
 } from "solid-js";
 import {
   AlertTriangle,
+  BrainCircuit,
   Check,
   ChevronDown,
   Circle,
@@ -40,8 +41,11 @@ import {
   ConnectorSettingsEvent,
   ConnectorProviderSummary,
   ConnectorSettingsSnapshot,
+  LlmModel,
   ProjectSummary,
   ProjectSnapshot,
+  ReasoningConfig,
+  ReasoningOption,
   ToolCommand,
   ToolExecutionEvent,
   ToolExecutionEventKind,
@@ -62,7 +66,6 @@ import {
   pickProjectDirectory,
   retryChatMessage,
   sendChatMessage,
-  setActiveProject,
   setSelectedModel,
 } from "../../shared/api/mothership";
 import { VirtualList } from "../../shared/ui/VirtualList";
@@ -75,6 +78,8 @@ const CHAT_SCROLL_TOP_PADDING_PX = 12;
 const CHAT_SCROLL_BOTTOM_PADDING_PX = 32;
 const CHAT_SCROLL_RESTORE_FRAMES = 12;
 const TOOL_OUTPUT_MAX_VISIBLE_LINES = 10;
+
+type ReasoningOptionId = string;
 
 interface ChatScrollPosition {
   top: number;
@@ -135,10 +140,22 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     const chatId = activeChatId();
     return chatId ? activeRunIds()[chatId] : undefined;
   };
+  const selectedModel = createMemo(() =>
+    selectedConnectorModel(connectorSettings()),
+  );
+  const [reasoningOptionId, setReasoningOptionId] =
+    createSignal<ReasoningOptionId>();
   const isChatRunning = () =>
     messages().some(
       (message) => message.role === "assistant" && message.status === "sending",
     );
+
+  createEffect(() => {
+    const coerced = coerceReasoningOptionId(reasoningOptionId(), selectedModel());
+    if (coerced !== reasoningOptionId()) {
+      setReasoningOptionId(coerced);
+    }
+  });
 
   onMount(() => {
     void loadProjectScope();
@@ -195,14 +212,14 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     setError("");
 
     try {
-      let snapshot = await listProjects();
+      const snapshot = await listProjects();
       applyProjectSnapshot(snapshot);
+      // Which project this client views is purely local UI state — we never ask
+      // the backend to switch a global "active" project (a phone and a desktop
+      // must be able to view different projects independently). The snapshot's id
+      // is only an initial hint; otherwise fall back to the first project.
       const projectId = snapshot.activeProjectId ?? snapshot.projects[0]?.id;
       if (projectId) {
-        if (snapshot.activeProjectId !== projectId) {
-          snapshot = await setActiveProject(projectId);
-          applyProjectSnapshot(snapshot);
-        }
         await loadChats(projectId);
       } else {
         setActiveProjectId(undefined);
@@ -219,12 +236,26 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     }
   }
 
+  // Single writer for project state. Trust the snapshot's active id when it gives
+  // one, but never clear a still-valid selection just because a snapshot omitted
+  // it — the active project is owned by the load/select flow (and, once wired, the
+  // project-event), not by every snapshot echo. Only drop it if the project it
+  // points at no longer exists.
   function applyProjectSnapshot(snapshot: ProjectSnapshot) {
     setProjects(snapshot.projects);
-    setActiveProjectId(snapshot.activeProjectId ?? undefined);
+    if (snapshot.activeProjectId) {
+      setActiveProjectId(snapshot.activeProjectId);
+    } else if (
+      !snapshot.projects.some((project) => project.id === activeProjectId())
+    ) {
+      setActiveProjectId(undefined);
+    }
   }
 
   async function loadChats(projectId: string) {
+    // The project whose chats we load IS the active project (UI source of truth),
+    // regardless of whether the snapshot echoed an active id back.
+    setActiveProjectId(projectId);
     setIsLoadingChats(true);
     setError("");
 
@@ -271,7 +302,8 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     setError("");
 
     try {
-      applyProjectSnapshot(await setActiveProject(projectId));
+      // Local view switch — load this project's chats by id. No backend call sets
+      // a global active project.
       await loadChats(projectId);
     } catch (caughtError) {
       setError(errorMessage(caughtError));
@@ -390,7 +422,12 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     setError("");
 
     try {
-      const result = await sendChatMessage(currentChatId, content, projectId);
+      const result = await sendChatMessage(
+        currentChatId,
+        content,
+        projectId,
+        reasoningConfigForOption(reasoningOptionId(), selectedModel()),
+      );
 
       setActiveRunIds((current) => ({
         ...current,
@@ -1019,14 +1056,12 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         error={error()}
         editingDraft={editingDraft()}
         editingMessageId={editingMessageId()}
-        isLoading={
-          isLoadingMessages() ||
-          (!activeChatId() && isLoadingChats() && messages().length === 0)
-        }
+        isLoading={isLoadingMessages()}
         isSending={isSending() || isSubmittingEdit() || isChatRunning()}
         messages={messages()}
         runTransports={runTransports()}
         activeRunId={activeRunId()}
+        reasoningOptionId={reasoningOptionId()}
         expandedInlineTools={expandedInlineTools()}
         messagePartsByMessageId={messageParts()}
         toolExecutionsByMessageId={toolExecutionsByMessageId()}
@@ -1041,6 +1076,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         onDraftChange={setDraft}
         onEditDraftChange={setEditingDraft}
         onRetry={handleRetry}
+        onReasoningOptionChange={setReasoningOptionId}
         onSelectModel={handleSelectModel}
         onSendMessage={handleSendMessage}
         onStartEdit={handleStartEdit}
@@ -1185,14 +1221,6 @@ function Sidebar(props: {
             />
           )}
         </VirtualList>
-        <button
-          class="text-button text-button--wide"
-          type="button"
-          onClick={() => setIsProjectFormOpen((current) => !current)}
-        >
-          Open project
-          <ChevronDown size={14} />
-        </button>
       </section>
 
       <div class="account-card">
@@ -1228,6 +1256,7 @@ function ConversationPane(props: {
   isSending: boolean;
   messagePartsByMessageId: Record<string, MessagePartView[]>;
   messages: ChatMessage[];
+  reasoningOptionId?: ReasoningOptionId;
   runTransports: Record<string, string>;
   toolExecutionsByMessageId: Record<string, ToolExecutionView[]>;
   onApproveTool: (toolCallId: string) => void;
@@ -1240,6 +1269,7 @@ function ConversationPane(props: {
   onDraftChange: (value: string) => void;
   onEditDraftChange: (value: string) => void;
   onMessageScrollElement: (element: HTMLDivElement | undefined) => void;
+  onReasoningOptionChange: (optionId: ReasoningOptionId) => void;
   onRetry: () => void;
   onSelectModel: (providerId: string, modelId: string) => void;
   onSendMessage: () => void;
@@ -1274,6 +1304,9 @@ function ConversationPane(props: {
   });
   const activeProvider = createMemo(() =>
     selectedConnectorProvider(props.connectorSettings),
+  );
+  const activeModel = createMemo(() =>
+    selectedConnectorModel(props.connectorSettings),
   );
 
   return (
@@ -1380,8 +1413,11 @@ function ConversationPane(props: {
         draft={props.draft}
         hasProject={Boolean(props.activeProject)}
         isSending={props.isSending}
+        model={activeModel()}
+        reasoningOptionId={props.reasoningOptionId}
         onCancelRun={props.onCancelRun}
         onDraftChange={props.onDraftChange}
+        onReasoningOptionChange={props.onReasoningOptionChange}
         onSend={props.onSendMessage}
       />
     </section>
@@ -1424,8 +1460,8 @@ function ConversationState(props: {
   return (
     <div class="conversation-state">
       <BrandMark compact />
-      <strong>Start a provider chat</strong>
-      <span>Select a connected model before sending a message.</span>
+      <strong>New chat</strong>
+      <span>Describe a task for the agent and press Enter to start.</span>
     </div>
   );
 }
@@ -1870,6 +1906,120 @@ function selectedConnectorProvider(settings?: ConnectorSettingsSnapshot) {
   }
 
   return settings?.providers.find((provider) => provider.id === providerId);
+}
+
+function selectedConnectorModel(settings?: ConnectorSettingsSnapshot) {
+  const selected = settings?.selectedModel;
+  if (!selected) {
+    return undefined;
+  }
+
+  return selectedConnectorProvider(settings)?.models.find(
+    (model) => model.id === selected.modelId,
+  );
+}
+
+interface ReasoningSelectorOption {
+  label: string;
+  option: ReasoningOption;
+  title: string;
+  value: ReasoningOptionId;
+}
+
+function reasoningSelectorOptions(model?: LlmModel): ReasoningSelectorOption[] {
+  const reasoning = model?.reasoning;
+  if (!reasoning?.supported) {
+    return [];
+  }
+
+  return (reasoning.options ?? [])
+    .filter((option) => option.id.trim().length > 0)
+    .map((option) => {
+      const label = reasoningOptionLabel(option);
+      return {
+        label,
+        option,
+        title: reasoningOptionTitle(option, label),
+        value: option.id,
+      };
+    });
+}
+
+function coerceReasoningOptionId(
+  optionId: ReasoningOptionId | undefined,
+  model?: LlmModel,
+): ReasoningOptionId | undefined {
+  const options = reasoningSelectorOptions(model);
+  if (options.length === 0) {
+    return undefined;
+  }
+
+  if (optionId && options.some((option) => option.value === optionId)) {
+    return optionId;
+  }
+
+  return options.find((option) => option.option.recommended)?.value ?? options[0].value;
+}
+
+function reasoningConfigForOption(
+  optionId: ReasoningOptionId | undefined,
+  model?: LlmModel,
+): ReasoningConfig | null {
+  const selected = reasoningSelectorOptions(model).find(
+    (option) => option.value === optionId,
+  );
+  if (!selected || isReasoningConfigEmpty(selected.option.config)) {
+    return null;
+  }
+
+  return selected.option.config;
+}
+
+function reasoningOptionLabel(option: ReasoningOption) {
+  const id = option.id.trim().toLowerCase();
+  const effort = option.config?.effort?.trim().toLowerCase();
+
+  switch (id || effort) {
+    case "auto":
+      return "Авто";
+    case "none":
+      return "Отключено";
+    case "minimal":
+      return "Минимальный";
+    case "low":
+      return "Низкий";
+    case "medium":
+      return "Средний";
+    case "high":
+      return "Высокий";
+    case "xhigh":
+      return "Очень высокий";
+    case "max":
+      return "Максимальный";
+    default:
+      return option.label.trim() || option.id;
+  }
+}
+
+function reasoningOptionTitle(option: ReasoningOption, label: string) {
+  const description = option.description?.trim();
+  if (description) {
+    return description;
+  }
+
+  const id = option.id.trim().toLowerCase();
+  if (id === "auto") {
+    return "Дефолтный режим выбранной модели";
+  }
+  if (id === "none") {
+    return "Не отправлять настройку рассуждения";
+  }
+
+  return `${label} уровень рассуждения`;
+}
+
+function isReasoningConfigEmpty(config?: ReasoningConfig | null) {
+  return !config?.effort && !config?.budgetTokens && !config?.summary;
 }
 
 function selectableProviderModelId(provider: ConnectorProviderSummary) {
@@ -2527,8 +2677,11 @@ function Composer(props: {
   draft: string;
   hasProject: boolean;
   isSending: boolean;
+  model?: LlmModel;
+  reasoningOptionId?: ReasoningOptionId;
   onCancelRun: () => void;
   onDraftChange: (value: string) => void;
+  onReasoningOptionChange: (optionId: ReasoningOptionId) => void;
   onSend: () => void;
 }) {
   const canSend = () =>
@@ -2557,6 +2710,12 @@ function Composer(props: {
         }}
       />
       <div class="composer__actions">
+        <ReasoningSelector
+          disabled={props.isSending || Boolean(props.activeRunId)}
+          model={props.model}
+          value={props.reasoningOptionId}
+          onChange={props.onReasoningOptionChange}
+        />
         <button class="icon-button" type="button" title="Attach file">
           <Paperclip size={17} />
         </button>
@@ -2594,6 +2753,202 @@ function SectionHeader(props: { action?: JSX.Element; title: string }) {
       {props.action}
     </div>
   );
+}
+
+function ReasoningSelector(props: {
+  disabled: boolean;
+  model?: LlmModel;
+  value?: ReasoningOptionId;
+  onChange: (optionId: ReasoningOptionId) => void;
+}) {
+  const [isOpen, setIsOpen] = createSignal(false);
+  const [activeIndex, setActiveIndex] = createSignal(-1);
+  let rootRef: HTMLDivElement | undefined;
+
+  const options = createMemo(() => reasoningSelectorOptions(props.model));
+  const supported = () => options().length > 0;
+  const selectedOption = () =>
+    options().find((option) => option.value === props.value) ??
+    options().find((option) => option.option.recommended) ??
+    options()[0];
+
+  createEffect(() => {
+    if (!isOpen()) {
+      return;
+    }
+
+    const currentOptions = options();
+    const current = activeIndex();
+    if (current >= 0 && current < currentOptions.length) {
+      return;
+    }
+
+    setActiveIndex(firstSelectableReasoningOptionIndex(currentOptions));
+  });
+
+  onMount(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!isOpen() || !rootRef) {
+        return;
+      }
+
+      if (event.target instanceof Node && !rootRef.contains(event.target)) {
+        closeMenu();
+      }
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+    });
+  });
+
+  const closeMenu = () => {
+    setIsOpen(false);
+    setActiveIndex(-1);
+  };
+  const openMenu = () => {
+    if (props.disabled || !supported()) {
+      return;
+    }
+
+    setIsOpen(true);
+    setActiveIndex(firstSelectableReasoningOptionIndex(options()));
+  };
+  const toggleMenu = () => {
+    if (isOpen()) {
+      closeMenu();
+    } else {
+      openMenu();
+    }
+  };
+  const selectOption = (option: ReasoningSelectorOption) => {
+    props.onChange(option.value);
+    closeMenu();
+  };
+  const moveActiveOption = (delta: number) => {
+    const currentOptions = options();
+    if (currentOptions.length === 0) {
+      setActiveIndex(-1);
+      return;
+    }
+
+    let nextIndex = activeIndex();
+    for (let attempts = 0; attempts < currentOptions.length; attempts += 1) {
+      nextIndex =
+        (nextIndex + delta + currentOptions.length) % currentOptions.length;
+      if (currentOptions[nextIndex]) {
+        setActiveIndex(nextIndex);
+        return;
+      }
+    }
+
+    setActiveIndex(-1);
+  };
+  const selectActiveOption = () => {
+    const option = options()[activeIndex()];
+    if (option) {
+      selectOption(option);
+    }
+  };
+  const handleTriggerKeyDown = (event: KeyboardEvent) => {
+    if (!isOpen()) {
+      if (
+        event.key === "ArrowDown" ||
+        event.key === "Enter" ||
+        event.key === " "
+      ) {
+        event.preventDefault();
+        openMenu();
+      }
+      return;
+    }
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      moveActiveOption(1);
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      moveActiveOption(-1);
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      selectActiveOption();
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeMenu();
+    }
+  };
+
+  return (
+    <div
+      ref={rootRef}
+      classList={{
+        "reasoning-selector": true,
+        "reasoning-selector--disabled": !supported(),
+      }}
+    >
+      <button
+        class="reasoning-selector__trigger"
+        type="button"
+        aria-expanded={isOpen()}
+        aria-haspopup="menu"
+        disabled={props.disabled || !supported()}
+        title={
+          supported()
+            ? "Рассуждение для следующего сообщения"
+            : "Выбранная модель не поддерживает настройку рассуждения"
+        }
+        onClick={toggleMenu}
+        onKeyDown={handleTriggerKeyDown}
+      >
+        <BrainCircuit size={15} />
+        <span>{selectedOption()?.label ?? "Рассуждение"}</span>
+        <ChevronDown
+          classList={{
+            "reasoning-selector__chevron": true,
+            "reasoning-selector__chevron--open": isOpen(),
+          }}
+          size={13}
+        />
+      </button>
+
+      <Show when={isOpen()}>
+        <div class="reasoning-selector__popover" role="menu">
+          <div class="reasoning-selector__heading">Рассуждение</div>
+          <For each={options()}>
+            {(option, index) => (
+              <button
+                classList={{
+                  "reasoning-selector__item": true,
+                  "reasoning-selector__item--active": index() === activeIndex(),
+                  "reasoning-selector__item--selected":
+                    option.value === selectedOption()?.value,
+                }}
+                type="button"
+                role="menuitemradio"
+                aria-checked={option.value === selectedOption()?.value}
+                title={option.title}
+                onMouseEnter={() => setActiveIndex(index())}
+                onClick={() => selectOption(option)}
+              >
+                <span>{option.label}</span>
+                <Show when={option.value === selectedOption()?.value}>
+                  <Check size={14} />
+                </Show>
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+function firstSelectableReasoningOptionIndex(options: ReasoningSelectorOption[]) {
+  return options.length > 0 ? 0 : -1;
 }
 
 function InspectorSection(props: {

@@ -11,9 +11,9 @@ use std::collections::BTreeMap;
 use mothership_core::ipc::{CoreRequest, CoreResponse};
 use mothership_core::{
     AdapterSettingPatchValue, ChatConversation, ChatRunCancellationResult, ChatThreadSummary,
-    ConnectorSettingsSnapshot, DashboardSnapshot, ProjectSnapshot, SendChatMessageResult,
-    SidecarStatus, ToolApprovalAnswer, ToolExecutionAccepted, ToolExecutionCancellationResult,
-    ToolExecutionRequest,
+    ConnectorSettingsSnapshot, DashboardSnapshot, ProjectSnapshot, ReasoningConfig,
+    SendChatMessageResult, SidecarStatus, ToolApprovalAnswer, ToolExecutionAccepted,
+    ToolExecutionCancellationResult, ToolExecutionRequest,
 };
 use tauri::{State, Window};
 use tauri_plugin_dialog::DialogExt;
@@ -103,6 +103,7 @@ pub async fn send_chat_message(
     chat_id: Option<String>,
     project_id: Option<String>,
     content: String,
+    reasoning: Option<ReasoningConfig>,
 ) -> Result<SendChatMessageResult, String> {
     let response = state
         .sidecar()
@@ -111,6 +112,7 @@ pub async fn send_chat_message(
             chat_id,
             project_id,
             content,
+            reasoning,
         })
         .await?;
     expect_variant!(response, CoreResponse::ChatMessageStarted)

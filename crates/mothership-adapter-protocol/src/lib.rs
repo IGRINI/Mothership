@@ -2,7 +2,8 @@
 //!
 //! The host sends one [`Request`] per line; the adapter replies with one or more
 //! [`Outbound`] messages per line, each echoing the originating request `id`. A
-//! chat request produces a stream of `Delta`s terminated by `Done` (or `Error`).
+//! chat request produces a stream of `Delta`s terminated by
+//! `ChatRoundComplete` (or `Error`).
 //! Every provider — HTTP, WebSocket, or one that spawns an external CLI — speaks
 //! this same contract, so the host never learns how the adapter talks upstream.
 //!
@@ -20,7 +21,7 @@ use serde_json::Value;
 /// `initialize` and refuses an adapter that reports a different version, rather
 /// than mis-parsing a contract it doesn't understand. Bump on any incompatible
 /// change to `Request`/`Outbound`.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Host -> adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,18 +64,24 @@ pub enum Request {
         id: u64,
         model: String,
         #[serde(default)]
+        reasoning: Option<ReasoningConfig>,
+        #[serde(default)]
         prompt: PromptBundle,
         messages: Vec<ChatMessage>,
         #[serde(default)]
         tools: Vec<ToolDescriptor>,
-    },
-    /// Return the result for a model-requested tool call. This is a continuation
-    /// frame for an active chat turn and intentionally has no separate adapter
-    /// response; the chat turn itself continues or finishes afterwards.
-    ToolResult {
-        id: u64,
-        tool_call_id: String,
-        result: ToolCallResult,
+        /// Opaque provider-specific continuation state returned by the previous
+        /// round. Core stores this only in the active run actor and never
+        /// interprets provider wire shapes.
+        #[serde(default)]
+        state: Option<Value>,
+        /// Tool results Core decided to execute after the previous round.
+        #[serde(default)]
+        tool_results: Vec<ToolCallResponse>,
+        /// Extra user-facing messages Core wants appended to the provider
+        /// continuation, for example a final no-tool synthesis instruction.
+        #[serde(default)]
+        extra_messages: Vec<ChatMessage>,
     },
     ChatCancel {
         id: u64,
@@ -127,24 +134,15 @@ pub enum Outbound {
         id: u64,
         text: String,
     },
-    /// The model asked the adapter to call one of the tools exposed by the host.
-    /// The host executes it through its own tool runtime and replies with
-    /// [`Request::ToolResult`].
-    ToolCall {
+    /// One provider model round has finished. If `tool_calls` is non-empty, Core
+    /// owns the next decision: execute/queue/cancel those calls, then start a
+    /// new round with the returned opaque `state` plus `tool_results`.
+    ChatRoundComplete {
         id: u64,
-        tool_call_id: String,
-        name: String,
-        arguments: Value,
-    },
-    /// Batch form of [`Outbound::ToolCall`]. Adapters use this when a provider
-    /// returns multiple tool calls in one model turn; the host/Core receives the
-    /// whole batch and owns the execution policy.
-    ToolCalls {
-        id: u64,
-        calls: Vec<ToolCallInvocation>,
-    },
-    Done {
-        id: u64,
+        #[serde(default)]
+        state: Option<Value>,
+        #[serde(default)]
+        tool_calls: Vec<ToolCallInvocation>,
     },
     Error {
         id: u64,
@@ -164,6 +162,13 @@ pub struct ToolCallInvocation {
     pub tool_call_id: String,
     pub name: String,
     pub arguments: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallResponse {
+    pub tool_call_id: String,
+    pub result: ToolCallResult,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +241,187 @@ pub struct Model {
     pub id: String,
     pub label: String,
     pub recommended: bool,
+    #[serde(default)]
+    pub reasoning: Option<ReasoningCapabilities>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningCapabilities {
+    pub supported: bool,
+    #[serde(default)]
+    pub efforts: Vec<ReasoningEffort>,
+    #[serde(default)]
+    pub options: Vec<ReasoningOption>,
+    #[serde(default)]
+    pub supports_budget: bool,
+    #[serde(default)]
+    pub supports_exclusion: bool,
+    #[serde(default)]
+    pub supports_summary: bool,
+}
+
+impl ReasoningCapabilities {
+    pub fn from_efforts(
+        efforts: Vec<ReasoningEffort>,
+        supports_budget: bool,
+        supports_exclusion: bool,
+        supports_summary: bool,
+    ) -> Self {
+        let mut options = if efforts.is_empty() {
+            Vec::new()
+        } else {
+            vec![ReasoningOption::auto()]
+        };
+        options.extend(efforts.iter().copied().map(ReasoningOption::from_effort));
+
+        Self {
+            supported: true,
+            efforts,
+            options,
+            supports_budget,
+            supports_exclusion,
+            supports_summary,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub recommended: bool,
+    #[serde(default)]
+    pub config: ReasoningConfig,
+}
+
+impl ReasoningOption {
+    pub fn from_effort(effort: ReasoningEffort) -> Self {
+        let id = effort.as_wire_str().to_string();
+        Self {
+            id: id.clone(),
+            label: id,
+            description: None,
+            recommended: false,
+            config: ReasoningConfig {
+                effort: Some(effort),
+                budget_tokens: None,
+                summary: None,
+            },
+        }
+    }
+
+    pub fn auto() -> Self {
+        Self {
+            id: "auto".to_string(),
+            label: "auto".to_string(),
+            description: None,
+            recommended: true,
+            config: ReasoningConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningConfig {
+    #[serde(default)]
+    pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub budget_tokens: Option<u32>,
+    #[serde(default)]
+    pub summary: Option<ReasoningSummary>,
+}
+
+impl ReasoningConfig {
+    pub fn is_empty(&self) -> bool {
+        self.effort.is_none() && self.budget_tokens.is_none() && self.summary.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub fn openai_responses_values() -> Vec<Self> {
+        vec![
+            Self::None,
+            Self::Minimal,
+            Self::Low,
+            Self::Medium,
+            Self::High,
+            Self::XHigh,
+        ]
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" | "x_high" | "very_high" | "very-high" | "very high" => Some(Self::XHigh),
+            "max" | "maximum" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    pub fn ordinal(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Minimal => 1,
+            Self::Low => 2,
+            Self::Medium => 3,
+            Self::High => 4,
+            Self::XHigh => 5,
+            Self::Max => 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
+}
+
+impl ReasoningSummary {
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Concise => "concise",
+            Self::Detailed => "detailed",
+        }
+    }
 }
 
 /// How a provider's model list is managed — drives whether the UI lets the user
@@ -364,5 +550,63 @@ impl AuthStatus {
             expires_at: None,
             detail: Some(detail.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_effort_wire_values_are_centralized() {
+        assert_eq!(ReasoningEffort::parse("max"), Some(ReasoningEffort::Max));
+        assert_eq!(
+            ReasoningEffort::parse("maximum"),
+            Some(ReasoningEffort::Max)
+        );
+        assert_eq!(
+            ReasoningEffort::parse("x_high"),
+            Some(ReasoningEffort::XHigh)
+        );
+        assert_eq!(
+            ReasoningEffort::parse("very_high"),
+            Some(ReasoningEffort::XHigh)
+        );
+        assert_eq!(
+            ReasoningEffort::parse("very-high"),
+            Some(ReasoningEffort::XHigh)
+        );
+        assert_eq!(ReasoningEffort::High.as_wire_str(), "high");
+        assert_eq!(ReasoningEffort::XHigh.as_wire_str(), "xhigh");
+        assert_eq!(ReasoningEffort::Max.as_wire_str(), "max");
+        assert!(ReasoningEffort::Low.ordinal() < ReasoningEffort::High.ordinal());
+        assert!(ReasoningEffort::XHigh.ordinal() < ReasoningEffort::Max.ordinal());
+    }
+
+    #[test]
+    fn reasoning_capabilities_build_provider_options_from_efforts() {
+        let capabilities = ReasoningCapabilities::from_efforts(
+            vec![ReasoningEffort::Low, ReasoningEffort::Max],
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            capabilities.options,
+            vec![
+                ReasoningOption::auto(),
+                ReasoningOption::from_effort(ReasoningEffort::Low),
+                ReasoningOption::from_effort(ReasoningEffort::Max)
+            ]
+        );
+        assert!(capabilities.supports_budget);
+    }
+
+    #[test]
+    fn reasoning_summary_wire_values_are_centralized() {
+        assert_eq!(ReasoningSummary::Auto.as_wire_str(), "auto");
+        assert_eq!(ReasoningSummary::Concise.as_wire_str(), "concise");
+        assert_eq!(ReasoningSummary::Detailed.as_wire_str(), "detailed");
     }
 }

@@ -1,12 +1,7 @@
-//! Shared provider-adapter policy for bounded agentic tool turns.
-//!
-//! The host-side tool runtime detects no-progress repeated tool calls. This
-//! adapter-side policy is only a broad safety budget for providers that keep
-//! asking for tools with distinct arguments. Keep it here so provider adapters
-//! share one contract without depending on the app core.
+//! Core-owned policy for bounded agentic model/tool rounds.
 
-/// Default upper bound for model/tool turns inside one adapter chat request.
-pub const DEFAULT_MAX_AGENTIC_TURNS: usize = 256;
+/// Default upper bound for model rounds that request tools inside one run.
+pub const DEFAULT_MAX_AGENTIC_ROUNDS: usize = 256;
 
 /// Prompt used after the broad agentic safety budget is exhausted.
 pub const DEFAULT_FINAL_SYNTHESIS_PROMPT: &str = "The agentic turn safety budget has been reached. Stop requesting tools. Using only the conversation and tool results already available, answer the user's original request. Be explicit if the result is partial, and suggest the next focused continuation if more inspection is needed.";
@@ -15,27 +10,27 @@ pub const DEFAULT_FINAL_SYNTHESIS_PROMPT: &str = "The agentic turn safety budget
 pub const DEFAULT_FALLBACK_MESSAGE: &str = "\n\nStopped after reaching the agentic turn safety budget. The inspection is partial; ask to continue with a narrower area if more work is needed.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AgenticTurnPolicy {
-    max_turns: usize,
+pub struct AgenticLoopPolicy {
+    max_rounds: usize,
     final_synthesis_prompt: &'static str,
     fallback_message: &'static str,
 }
 
-impl AgenticTurnPolicy {
+impl AgenticLoopPolicy {
     pub const fn new(
-        max_turns: usize,
+        max_rounds: usize,
         final_synthesis_prompt: &'static str,
         fallback_message: &'static str,
     ) -> Self {
         Self {
-            max_turns,
+            max_rounds,
             final_synthesis_prompt,
             fallback_message,
         }
     }
 
-    pub const fn max_turns(self) -> usize {
-        self.max_turns
+    pub const fn max_rounds(self) -> usize {
+        self.max_rounds
     }
 
     pub const fn final_synthesis_prompt(self) -> &'static str {
@@ -47,10 +42,10 @@ impl AgenticTurnPolicy {
     }
 }
 
-impl Default for AgenticTurnPolicy {
+impl Default for AgenticLoopPolicy {
     fn default() -> Self {
         Self::new(
-            DEFAULT_MAX_AGENTIC_TURNS,
+            DEFAULT_MAX_AGENTIC_ROUNDS,
             DEFAULT_FINAL_SYNTHESIS_PROMPT,
             DEFAULT_FALLBACK_MESSAGE,
         )
@@ -63,9 +58,9 @@ mod tests {
 
     #[test]
     fn default_policy_has_actionable_limit_and_messages() {
-        let policy = AgenticTurnPolicy::default();
+        let policy = AgenticLoopPolicy::default();
 
-        assert!(policy.max_turns() > 0);
+        assert!(policy.max_rounds() > 0);
         assert!(policy
             .final_synthesis_prompt()
             .contains("Stop requesting tools"));

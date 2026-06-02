@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-const DEFAULT_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_MAX_ERROR_BODY_CHARS: usize = 300;
+pub const DEFAULT_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_MAX_ERROR_BODY_CHARS: usize = 300;
 
 /// A reqwest client with a bounded connect timeout (so "server unreachable"
 /// fails fast) and no overall timeout (streaming responses run long).

@@ -1,5 +1,5 @@
-//! Proves the core can stream a chat through a subprocess adapter using its
-//! uniform `LlmChatCompletionGateway` interface — driving the sample echo
+//! Proves the core can stream a model round through a subprocess adapter using
+//! its uniform `LlmChatRoundGateway` interface — driving the sample echo
 //! adapter from `mothership-adapter-host`.
 
 use std::collections::BTreeSet;
@@ -11,8 +11,9 @@ use mothership_adapter_host::protocol::PromptBundle;
 use mothership_adapter_host::AdapterEntry;
 use mothership_core::auth::FileCredentialVault;
 use mothership_core::{
-    AdapterPool, ChatCancellationToken, LlmChatCompletionEventSink, LlmChatCompletionGateway,
-    LlmChatCompletionRequest, LlmChatMessage, LlmChatRole, LlmTransportKind, SubprocessChatGateway,
+    AdapterPool, ChatCancellationToken, LlmChatCompletionEventSink, LlmChatCompletionRequest,
+    LlmChatMessage, LlmChatRole, LlmChatRoundGateway, LlmChatRoundRequest, LlmTransportKind,
+    SubprocessChatGateway,
 };
 
 /// Builds a gateway over a fresh single-process pool pointed at the echo adapter.
@@ -82,24 +83,26 @@ fn streams_chat_through_subprocess_adapter() {
     let gateway = echo_gateway(path, temp_vault("stream"));
     let mut sink = RecordingSink::default();
 
-    let full = gateway
-        .complete_chat(
-            LlmChatCompletionRequest {
+    let round = gateway
+        .complete_round(
+            LlmChatRoundRequest::from_completion(LlmChatCompletionRequest {
                 provider_id: "echo".to_string(),
                 model_id: "echo-1".to_string(),
+                reasoning: None,
                 prompt: PromptBundle::default(),
                 tools: Vec::new(),
                 messages: vec![LlmChatMessage {
                     role: LlmChatRole::User,
                     content: "hello brave world".to_string(),
                 }],
-            },
+            }),
             &ChatCancellationToken::default(),
             &mut sink,
         )
-        .expect("chat through subprocess adapter");
+        .expect("round through subprocess adapter");
 
-    assert_eq!(full.trim(), "hello brave world");
+    assert_eq!(round.text.trim(), "hello brave world");
+    assert!(round.tool_calls.is_empty());
     assert_eq!(sink.text.trim(), "hello brave world");
     assert_eq!(sink.transports, vec![LlmTransportKind::Subprocess]);
 }
@@ -125,23 +128,24 @@ fn pushes_settings_before_streaming() {
     let gateway = echo_gateway(path, vault);
     let mut sink = RecordingSink::default();
 
-    let full = gateway
-        .complete_chat(
-            LlmChatCompletionRequest {
+    let round = gateway
+        .complete_round(
+            LlmChatRoundRequest::from_completion(LlmChatCompletionRequest {
                 provider_id: "echo".to_string(),
                 model_id: "echo-1".to_string(),
+                reasoning: None,
                 prompt: PromptBundle::default(),
                 tools: Vec::new(),
                 messages: vec![LlmChatMessage {
                     role: LlmChatRole::User,
                     content: "ping pong".to_string(),
                 }],
-            },
+            }),
             &ChatCancellationToken::default(),
             &mut sink,
         )
-        .expect("chat after settings push");
+        .expect("round after settings push");
 
     // The adapter accepted set_settings (no error) and still streamed.
-    assert_eq!(full.trim(), "ping pong");
+    assert_eq!(round.text.trim(), "ping pong");
 }

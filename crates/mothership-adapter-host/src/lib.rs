@@ -31,7 +31,7 @@ pub use mothership_adapter_protocol as protocol;
 
 use protocol::{
     AuthKind, AuthStatus, ChatMessage, Model, ModelManagement, Outbound, PromptBundle, Request,
-    SettingsField, ToolCallInvocation, ToolCallResult, ToolDescriptor,
+    SettingsField, ToolCallInvocation, ToolCallResponse, ToolDescriptor,
 };
 
 /// Handler the host registers to persist secrets an adapter pushes via the
@@ -41,37 +41,10 @@ type StoreSecretSink = Box<dyn FnMut(BTreeMap<String, String>) + Send>;
 const CHAT_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
-pub struct ToolCallRequest {
-    pub tool_call_id: String,
-    pub name: String,
-    pub arguments: serde_json::Value,
-}
-
-pub trait ToolCallHandler: Send + Sync {
-    fn handle_tool_call(&self, request: ToolCallRequest) -> ToolCallResult;
-
-    fn handle_tool_calls(&self, requests: Vec<ToolCallRequest>) -> Vec<ToolCallResult> {
-        requests
-            .into_iter()
-            .map(|request| self.handle_tool_call(request))
-            .collect()
-    }
-}
-
-pub enum ChatAdapterEvent<'a> {
-    Delta(&'a str),
-    ToolCall(&'a str),
-}
-
-struct RejectingToolCallHandler;
-
-impl ToolCallHandler for RejectingToolCallHandler {
-    fn handle_tool_call(&self, request: ToolCallRequest) -> ToolCallResult {
-        ToolCallResult {
-            ok: false,
-            content: format!("tool calls are not enabled for `{}`", request.name),
-        }
-    }
+pub struct AdapterChatRound {
+    pub text: String,
+    pub state: Option<serde_json::Value>,
+    pub tool_calls: Vec<ToolCallInvocation>,
 }
 
 /// A spawned adapter process and the stdio pipes to talk to it.
@@ -276,89 +249,34 @@ impl Adapter {
         }
     }
 
-    /// Runs a chat turn, invoking `on_delta` for each streamed chunk and
-    /// returning the full concatenated text once the adapter signals `Done`.
-    pub fn chat(
+    /// Runs a single provider model round. The adapter may stream visible text
+    /// and then returns an opaque continuation state plus any model-requested
+    /// tool calls. Core owns whether and how to execute those tools.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat_round_cancellable(
         &mut self,
         model: &str,
-        messages: Vec<ChatMessage>,
-        mut on_delta: impl FnMut(&str),
-    ) -> Result<String> {
-        self.chat_cancellable(model, messages, || false, |delta| on_delta(delta))
-    }
-
-    /// Runs a chat turn like [`chat`](Self::chat), while also sending a
-    /// best-effort `chat_cancel` frame if `is_cancelled` becomes true. SDK-based
-    /// adapters can use that signal to end the turn cleanly; older adapters
-    /// still rely on the host-side process kill fallback.
-    pub fn chat_cancellable(
-        &mut self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        is_cancelled: impl Fn() -> bool + Send + 'static,
-        mut on_delta: impl FnMut(&str),
-    ) -> Result<String> {
-        self.chat_cancellable_with_tools(
-            model,
-            PromptBundle::default(),
-            messages,
-            Vec::new(),
-            is_cancelled,
-            |event| {
-                if let ChatAdapterEvent::Delta(delta) = event {
-                    on_delta(delta);
-                }
-            },
-            Arc::new(RejectingToolCallHandler),
-        )
-    }
-
-    /// Runs a cancellable chat turn with a core-owned prompt bundle but without
-    /// advertising any host tools to the adapter.
-    pub fn chat_cancellable_with_prompt(
-        &mut self,
-        model: &str,
-        prompt: PromptBundle,
-        messages: Vec<ChatMessage>,
-        is_cancelled: impl Fn() -> bool + Send + 'static,
-        mut on_delta: impl FnMut(&str),
-    ) -> Result<String> {
-        self.chat_cancellable_with_tools(
-            model,
-            prompt,
-            messages,
-            Vec::new(),
-            is_cancelled,
-            |event| {
-                if let ChatAdapterEvent::Delta(delta) = event {
-                    on_delta(delta);
-                }
-            },
-            Arc::new(RejectingToolCallHandler),
-        )
-    }
-
-    /// Runs a chat turn and handles model-requested tool calls through the
-    /// supplied host-side handler. Each tool call is executed on a separate
-    /// worker thread and its result is sent back to the adapter, so multiple
-    /// pending tool calls do not block the adapter event reader.
-    pub fn chat_cancellable_with_tools(
-        &mut self,
-        model: &str,
+        reasoning: Option<protocol::ReasoningConfig>,
         prompt: PromptBundle,
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDescriptor>,
+        state: Option<serde_json::Value>,
+        tool_results: Vec<ToolCallResponse>,
+        extra_messages: Vec<ChatMessage>,
         is_cancelled: impl Fn() -> bool + Send + 'static,
-        mut on_event: impl FnMut(ChatAdapterEvent<'_>),
-        tool_handler: Arc<dyn ToolCallHandler>,
-    ) -> Result<String> {
+        mut on_delta: impl FnMut(&str),
+    ) -> Result<AdapterChatRound> {
         let id = self.next_id();
         self.send(&Request::ChatStart {
             id,
             model: model.to_string(),
+            reasoning,
             prompt,
             messages,
             tools,
+            state,
+            tool_results,
+            extra_messages,
         })?;
 
         let stdin = Arc::clone(&self.stdin);
@@ -379,53 +297,19 @@ impl Adapter {
             match self.recv() {
                 Ok(Outbound::Delta { id: got, text }) if got == id => {
                     full.push_str(&text);
-                    on_event(ChatAdapterEvent::Delta(&text));
+                    on_delta(&text);
                 }
-                Ok(Outbound::ToolCall {
+                Ok(Outbound::ChatRoundComplete {
                     id: got,
-                    tool_call_id,
-                    name,
-                    arguments,
+                    state,
+                    tool_calls,
                 }) if got == id => {
-                    on_event(ChatAdapterEvent::ToolCall(&tool_call_id));
-                    let result = tool_handler.handle_tool_call(ToolCallRequest {
-                        tool_call_id: tool_call_id.clone(),
-                        name,
-                        arguments,
-                    });
-                    let request_id = self.next_id();
-                    self.send(&Request::ToolResult {
-                        id: request_id,
-                        tool_call_id,
-                        result,
-                    })?;
+                    break Ok(AdapterChatRound {
+                        text: full,
+                        state,
+                        tool_calls,
+                    })
                 }
-                Ok(Outbound::ToolCalls { id: got, calls }) if got == id => {
-                    for call in &calls {
-                        on_event(ChatAdapterEvent::ToolCall(&call.tool_call_id));
-                    }
-                    let requests = calls
-                        .iter()
-                        .map(tool_call_request_from_invocation)
-                        .collect::<Vec<_>>();
-                    let results = tool_handler.handle_tool_calls(requests);
-                    if results.len() != calls.len() {
-                        break Err(anyhow::anyhow!(
-                            "tool handler returned {} result(s) for {} tool call(s)",
-                            results.len(),
-                            calls.len()
-                        ));
-                    }
-                    for (call, result) in calls.into_iter().zip(results) {
-                        let request_id = self.next_id();
-                        self.send(&Request::ToolResult {
-                            id: request_id,
-                            tool_call_id: call.tool_call_id,
-                            result,
-                        })?;
-                    }
-                }
-                Ok(Outbound::Done { id: got }) if got == id => break Ok(full),
                 Ok(Outbound::Error { id: got, message }) if got == id => {
                     break Err(anyhow::anyhow!("adapter chat error: {message}"))
                 }
@@ -446,14 +330,6 @@ fn write_request(stdin: &Arc<Mutex<ChildStdin>>, request: &Request) -> Result<()
     stdin.write_all(b"\n")?;
     stdin.flush()?;
     Ok(())
-}
-
-fn tool_call_request_from_invocation(call: &ToolCallInvocation) -> ToolCallRequest {
-    ToolCallRequest {
-        tool_call_id: call.tool_call_id.clone(),
-        name: call.name.clone(),
-        arguments: call.arguments.clone(),
-    }
 }
 
 impl Drop for Adapter {

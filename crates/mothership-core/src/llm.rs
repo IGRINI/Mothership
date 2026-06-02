@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{ChatCancellationToken, Result};
-use mothership_adapter_host::protocol::{PromptBundle, ToolDescriptor};
+use mothership_adapter_host::protocol::{
+    PromptBundle, ReasoningCapabilities, ReasoningConfig, ToolDescriptor,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +27,8 @@ pub struct LlmModel {
     pub family: String,
     pub description: String,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub reasoning: Option<ReasoningCapabilities>,
     pub recommended: bool,
 }
 
@@ -64,6 +68,8 @@ pub enum ConnectorModelManagementKind {
 pub struct LlmChatCompletionRequest {
     pub provider_id: String,
     pub model_id: String,
+    #[serde(default)]
+    pub reasoning: Option<ReasoningConfig>,
     pub prompt: PromptBundle,
     #[serde(default)]
     pub tools: Vec<ToolDescriptor>,
@@ -72,9 +78,46 @@ pub struct LlmChatCompletionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct LlmChatRoundRequest {
+    pub provider_id: String,
+    pub model_id: String,
+    #[serde(default)]
+    pub reasoning: Option<ReasoningConfig>,
+    pub prompt: PromptBundle,
+    #[serde(default)]
+    pub tools: Vec<ToolDescriptor>,
+    pub messages: Vec<LlmChatMessage>,
+    #[serde(default)]
+    pub state: Option<Value>,
+    #[serde(default)]
+    pub tool_results: Vec<LlmToolCallResponse>,
+    #[serde(default)]
+    pub extra_messages: Vec<LlmChatMessage>,
+}
+
+impl LlmChatRoundRequest {
+    pub fn from_completion(request: LlmChatCompletionRequest) -> Self {
+        Self {
+            provider_id: request.provider_id,
+            model_id: request.model_id,
+            reasoning: request.reasoning,
+            prompt: request.prompt,
+            tools: request.tools,
+            messages: request.messages,
+            state: None,
+            tool_results: Vec::new(),
+            extra_messages: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderRequestDraft {
     pub provider_id: String,
     pub model_id: String,
+    #[serde(default)]
+    pub reasoning: Option<ReasoningConfig>,
     pub prompt: PromptBundle,
     #[serde(default)]
     pub tools: Vec<ToolDescriptor>,
@@ -86,6 +129,7 @@ impl From<LlmChatCompletionRequest> for ProviderRequestDraft {
         Self {
             provider_id: request.provider_id,
             model_id: request.model_id,
+            reasoning: request.reasoning,
             prompt: request.prompt,
             tools: request.tools,
             messages: request.messages,
@@ -98,6 +142,7 @@ impl From<ProviderRequestDraft> for LlmChatCompletionRequest {
         Self {
             provider_id: draft.provider_id,
             model_id: draft.model_id,
+            reasoning: draft.reasoning,
             prompt: draft.prompt,
             tools: draft.tools,
             messages: draft.messages,
@@ -107,11 +152,11 @@ impl From<ProviderRequestDraft> for LlmChatCompletionRequest {
 
 /// Core-side hook for provider request modification.
 ///
-/// A modifier sees the provider/model, rendered prompt bundle, tool catalog, and
-/// conversation messages before the request crosses the adapter boundary. This is
-/// the native extension point for future user/plugin "provider mods"; adapters
-/// still only map the final structured request into provider-specific wire
-/// format.
+/// A modifier sees the provider/model, reasoning config, rendered prompt bundle,
+/// tool catalog, and conversation messages before the request crosses the
+/// adapter boundary. This is the native extension point for future user/plugin
+/// "provider mods"; adapters still only map the final structured request into
+/// provider-specific wire format.
 pub trait ProviderRequestModifier: Send + Sync {
     fn name(&self) -> &'static str;
 
@@ -209,6 +254,23 @@ pub struct LlmToolCallResult {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmToolCallResponse {
+    pub tool_call_id: String,
+    pub result: LlmToolCallResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmChatRound {
+    pub text: String,
+    #[serde(default)]
+    pub state: Option<Value>,
+    #[serde(default)]
+    pub tool_calls: Vec<LlmToolCallRequest>,
+}
+
 pub trait LlmToolCallHandler: Send + Sync {
     fn handle_tool_call(
         &self,
@@ -228,13 +290,13 @@ pub trait LlmToolCallHandler: Send + Sync {
     }
 }
 
-pub trait LlmChatCompletionGateway: Send + Sync {
-    fn complete_chat(
+pub trait LlmChatRoundGateway: Send + Sync {
+    fn complete_round(
         &self,
-        request: LlmChatCompletionRequest,
+        request: LlmChatRoundRequest,
         cancellation: &ChatCancellationToken,
         sink: &mut dyn LlmChatCompletionEventSink,
-    ) -> Result<String>;
+    ) -> Result<LlmChatRound>;
 }
 
 #[cfg(test)]
@@ -275,6 +337,7 @@ mod tests {
         let request = LlmChatCompletionRequest {
             provider_id: "provider".to_string(),
             model_id: "model".to_string(),
+            reasoning: None,
             prompt: PromptBundle::default(),
             tools: Vec::new(),
             messages: Vec::new(),

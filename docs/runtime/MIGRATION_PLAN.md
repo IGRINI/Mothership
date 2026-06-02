@@ -50,7 +50,7 @@ Implements the "Core owns behavior" rule. No new dependencies. Fixes divergence 
   crates (tauri/wry/winit/gtk/objc) are absent, so the leak-test holds for *platform* crates.
 - _Follow-up (low):_ `auth_store_path` helper now duplicated in `run.rs` / `commands.rs` /
   `src-sidecar`. Consider centralizing in Core.
-- _Deferred:_ happy-path unit test needs a `&dyn LlmChatCompletionGateway` seam to fake the
+- _Deferred:_ happy-path unit test needs a `&dyn LlmChatRoundGateway` seam to fake the
   gateway — do it when Phase 2/4 touches the gateway anyway.
 
 ## Phase 2 — tokio + `RunActor` + cancellation

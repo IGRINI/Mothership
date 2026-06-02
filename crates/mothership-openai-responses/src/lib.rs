@@ -21,10 +21,11 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
-use mothership_adapter_sdk::agentic::AgenticTurnPolicy;
 use mothership_adapter_sdk::http;
 use mothership_adapter_sdk::protocol::ChatMessage;
+use mothership_adapter_sdk::protocol::ReasoningConfig;
 use mothership_adapter_sdk::sse;
+use mothership_adapter_sdk::tools::parse_tool_arguments;
 use mothership_adapter_sdk::ws::WsSession;
 
 /// Fast-fail bound on reaching the backend.
@@ -69,21 +70,16 @@ pub struct ToolCall {
 }
 
 #[derive(Debug, Clone)]
-pub struct ToolOutput {
+pub struct ToolCallOutput {
+    pub call_id: String,
     pub output: String,
 }
 
-#[async_trait::async_trait]
-pub trait ToolDispatcher: Send + Sync {
-    async fn dispatch(&self, call: ToolCall) -> Result<ToolOutput>;
-
-    async fn dispatch_many(&self, calls: Vec<ToolCall>) -> Result<Vec<ToolOutput>> {
-        let mut outputs = Vec::with_capacity(calls.len());
-        for call in calls {
-            outputs.push(self.dispatch(call).await?);
-        }
-        Ok(outputs)
-    }
+#[derive(Debug, Clone)]
+pub struct ChatRound {
+    pub visible_text: String,
+    pub state: Value,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,158 +144,91 @@ pub async fn chat(
     ws: Option<&mut WsSession>,
     on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> Result<Transport> {
-    chat_with_optional_tools(
+    chat_round_with_state(
         client,
         endpoint,
         auth_headers,
         model,
         instructions,
         messages,
+        None,
+        None,
+        Vec::new(),
+        &[],
         ws,
         on_delta,
         &[],
-        None,
     )
     .await
+    .map(|(transport, _)| transport)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn chat_with_tools(
+pub async fn chat_round_with_state(
     client: &reqwest::Client,
     endpoint: &Endpoint,
     auth_headers: &[(String, String)],
     model: &str,
     instructions: &str,
     messages: &[ChatMessage],
+    reasoning: Option<&ReasoningConfig>,
+    state: Option<Value>,
+    tool_outputs: Vec<ToolCallOutput>,
+    extra_messages: &[ChatMessage],
     ws: Option<&mut WsSession>,
     on_delta: &mut (dyn FnMut(&str) + Send),
     tools: &[Value],
-    dispatcher: &dyn ToolDispatcher,
-) -> Result<Transport> {
-    chat_with_optional_tools(
-        client,
-        endpoint,
-        auth_headers,
-        model,
-        instructions,
-        messages,
-        ws,
-        on_delta,
-        tools,
-        Some(dispatcher),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn chat_with_optional_tools(
-    client: &reqwest::Client,
-    endpoint: &Endpoint,
-    auth_headers: &[(String, String)],
-    model: &str,
-    instructions: &str,
-    messages: &[ChatMessage],
-    mut ws: Option<&mut WsSession>,
-    on_delta: &mut (dyn FnMut(&str) + Send),
-    tools: &[Value],
-    dispatcher: Option<&dyn ToolDispatcher>,
-) -> Result<Transport> {
-    let mut input = build_input(messages);
-    let mut last_transport = None;
-    let agentic_policy = AgenticTurnPolicy::default();
-
-    for _ in 0..agentic_policy.max_turns() {
-        let (transport, round) = chat_round(
-            client,
-            endpoint,
-            auth_headers,
-            model,
-            instructions,
-            &input,
-            ws.as_deref_mut(),
-            on_delta,
-            tools,
-        )
-        .await?;
-        last_transport = Some(transport);
-
-        if round.tool_calls.is_empty() {
-            return Ok(transport);
-        }
-
-        let Some(dispatcher) = dispatcher else {
-            bail!("model requested a tool call, but no tool dispatcher is configured");
-        };
-
-        if !round.visible_text.trim().is_empty() {
-            input.push(assistant_text_input_item(&round.visible_text));
-        }
-
-        let dispatch_calls = round
-            .tool_calls
-            .iter()
-            .map(tool_call_for_dispatch)
-            .collect::<Vec<_>>();
-        let outputs = dispatcher.dispatch_many(dispatch_calls).await?;
-        if outputs.len() != round.tool_calls.len() {
-            bail!(
-                "tool dispatcher returned {} result(s) for {} tool call(s)",
-                outputs.len(),
-                round.tool_calls.len()
-            );
-        }
-
-        for (call, output) in round.tool_calls.into_iter().zip(outputs) {
-            input.push(function_call_input_item(&call));
-            input.push(json!({
-                "type": "function_call_output",
-                "call_id": call.call_id,
-                "output": output.output,
-            }));
-        }
+) -> Result<(Transport, ChatRound)> {
+    let mut input = input_from_state_or_messages(state, messages)?;
+    for output in tool_outputs {
+        input.push(json!({
+            "type": "function_call_output",
+            "call_id": output.call_id,
+            "output": output.output,
+        }));
+    }
+    for message in extra_messages {
+        input.push(chat_message_input_item(message));
     }
 
-    input.push(agentic_turn_limit_final_input_item(agentic_policy));
-    match chat_round(
+    let (transport, round) = transport_round(
         client,
         endpoint,
         auth_headers,
         model,
         instructions,
         &input,
-        ws.as_deref_mut(),
+        ws,
         on_delta,
-        &[],
+        tools,
+        reasoning,
     )
-    .await
-    {
-        Ok((transport, round)) if round.tool_calls.is_empty() => {
-            if round.visible_text.trim().is_empty() {
-                on_delta(agentic_policy.fallback_message());
-            }
-            Ok(transport)
-        }
-        Ok((transport, round)) => {
-            on_delta(agentic_policy.fallback_message());
-            eprintln!(
-                "openai-responses: final no-tool synthesis unexpectedly returned {} tool call(s)",
-                round.tool_calls.len()
-            );
-            Ok(transport)
-        }
-        Err(error) => {
-            on_delta(agentic_policy.fallback_message());
-            eprintln!(
-                "openai-responses: final no-tool synthesis after {} agentic turns failed: {error:#}",
-                agentic_policy.max_turns()
-            );
-            Ok(last_transport.unwrap_or(Transport::Json))
-        }
+    .await?;
+
+    if !round.visible_text.trim().is_empty() {
+        input.push(assistant_text_input_item(&round.visible_text));
     }
+    for call in &round.tool_calls {
+        input.push(function_call_input_item(call));
+    }
+    let tool_calls = round
+        .tool_calls
+        .iter()
+        .map(tool_call_for_dispatch)
+        .collect();
+
+    Ok((
+        transport,
+        ChatRound {
+            visible_text: round.visible_text,
+            state: json!({ "input": input }),
+            tool_calls,
+        },
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn chat_round(
+async fn transport_round(
     client: &reqwest::Client,
     endpoint: &Endpoint,
     auth_headers: &[(String, String)],
@@ -309,6 +238,7 @@ async fn chat_round(
     ws: Option<&mut WsSession>,
     on_delta: &mut (dyn FnMut(&str) + Send),
     tools: &[Value],
+    reasoning: Option<&ReasoningConfig>,
 ) -> Result<(Transport, RoundOutput)> {
     let mut committed = false;
 
@@ -320,6 +250,7 @@ async fn chat_round(
             instructions,
             input,
             tools,
+            reasoning,
             &mut committed,
             on_delta,
         )
@@ -345,6 +276,7 @@ async fn chat_round(
         instructions,
         input,
         tools,
+        reasoning,
         &mut committed,
         on_delta,
     )
@@ -368,6 +300,7 @@ async fn chat_round(
         instructions,
         input,
         tools,
+        reasoning,
         on_delta,
     )
     .await?;
@@ -380,10 +313,11 @@ async fn chat_ws(
     instructions: &str,
     input: &[Value],
     tools: &[Value],
+    reasoning: Option<&ReasoningConfig>,
     committed: &mut bool,
     on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> Result<RoundOutput> {
-    let body = build_request_from_input(model, instructions, input, true, tools);
+    let body = build_request_from_input(model, instructions, input, true, tools, reasoning);
     session.send_text(body.to_string()).await?;
     let mut accumulator = ToolCallAccumulator::default();
     let mut round = RoundOutput::default();
@@ -426,10 +360,11 @@ async fn chat_sse(
     instructions: &str,
     input: &[Value],
     tools: &[Value],
+    reasoning: Option<&ReasoningConfig>,
     committed: &mut bool,
     on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> Result<RoundOutput> {
-    let body = build_request_from_input(model, instructions, input, true, tools);
+    let body = build_request_from_input(model, instructions, input, true, tools, reasoning);
     let response = http::post_stream(client, &endpoint.https_url, auth_headers, &body).await?;
     let mut accumulator = ToolCallAccumulator::default();
     let mut round = RoundOutput::default();
@@ -465,9 +400,10 @@ async fn chat_json(
     instructions: &str,
     input: &[Value],
     tools: &[Value],
+    reasoning: Option<&ReasoningConfig>,
     on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> Result<RoundOutput> {
-    let body = build_request_from_input(model, instructions, input, false, tools);
+    let body = build_request_from_input(model, instructions, input, false, tools, reasoning);
     let value = http::post_json(
         client,
         &endpoint.https_url,
@@ -496,7 +432,14 @@ pub fn build_request(
     messages: &[ChatMessage],
     stream: bool,
 ) -> Value {
-    build_request_from_input(model, instructions, &build_input(messages), stream, &[])
+    build_request_from_input(
+        model,
+        instructions,
+        &build_input(messages),
+        stream,
+        &[],
+        None,
+    )
 }
 
 fn build_input(messages: &[ChatMessage]) -> Vec<Value> {
@@ -504,18 +447,35 @@ fn build_input(messages: &[ChatMessage]) -> Vec<Value> {
         .iter()
         .filter(|message| message.role != "system")
         .filter(|message| !message.content.trim().is_empty())
-        .map(|message| {
-            let kind = if message.role == "assistant" {
-                "output_text"
-            } else {
-                "input_text"
-            };
-            json!({
-                "role": message.role,
-                "content": [{ "type": kind, "text": message.content }],
-            })
-        })
+        .map(chat_message_input_item)
         .collect()
+}
+
+fn input_from_state_or_messages(
+    state: Option<Value>,
+    messages: &[ChatMessage],
+) -> Result<Vec<Value>> {
+    match state {
+        None | Some(Value::Null) => Ok(build_input(messages)),
+        Some(Value::Object(mut object)) => match object.remove("input") {
+            Some(Value::Array(input)) => Ok(input),
+            _ => bail!("responses continuation state is missing input array"),
+        },
+        Some(Value::Array(input)) => Ok(input),
+        Some(_) => bail!("responses continuation state must be an object or array"),
+    }
+}
+
+fn chat_message_input_item(message: &ChatMessage) -> Value {
+    let kind = if message.role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    json!({
+        "role": message.role,
+        "content": [{ "type": kind, "text": message.content }],
+    })
 }
 
 fn assistant_text_input_item(text: &str) -> Value {
@@ -525,19 +485,13 @@ fn assistant_text_input_item(text: &str) -> Value {
     })
 }
 
-fn agentic_turn_limit_final_input_item(policy: AgenticTurnPolicy) -> Value {
-    json!({
-        "role": "user",
-        "content": [{ "type": "input_text", "text": policy.final_synthesis_prompt() }],
-    })
-}
-
 fn build_request_from_input(
     model: &str,
     instructions: &str,
     input: &[Value],
     stream: bool,
     tools: &[Value],
+    reasoning: Option<&ReasoningConfig>,
 ) -> Value {
     let mut body = json!({
         "model": model,
@@ -553,7 +507,34 @@ fn build_request_from_input(
             object.insert("parallel_tool_calls".to_string(), Value::Bool(true));
         }
     }
+    if let Some(reasoning) = reasoning.and_then(responses_reasoning_value) {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("reasoning".to_string(), reasoning);
+        }
+    }
     body
+}
+
+fn responses_reasoning_value(reasoning: &ReasoningConfig) -> Option<Value> {
+    if reasoning.is_empty() {
+        return None;
+    }
+
+    let mut object = serde_json::Map::new();
+    if let Some(effort) = reasoning.effort {
+        object.insert(
+            "effort".to_string(),
+            Value::String(effort.as_wire_str().to_string()),
+        );
+    }
+    if let Some(summary) = reasoning.summary {
+        object.insert(
+            "summary".to_string(),
+            Value::String(summary.as_wire_str().to_string()),
+        );
+    }
+
+    (!object.is_empty()).then(|| Value::Object(object))
 }
 
 fn handle_stream_event(
@@ -717,8 +698,7 @@ fn tool_call_for_dispatch(call: &RawToolCall) -> ToolCall {
     ToolCall {
         call_id: call.call_id.clone(),
         name: call.name.clone(),
-        arguments: serde_json::from_str(&call.arguments)
-            .unwrap_or_else(|_| json!({ "rawArguments": call.arguments.clone() })),
+        arguments: parse_tool_arguments(&call.arguments),
     }
 }
 
@@ -868,6 +848,7 @@ fn to_ws_url(https_url: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mothership_adapter_sdk::protocol::{ReasoningEffort, ReasoningSummary};
 
     #[test]
     fn classifies_output_vs_reasoning() {
@@ -907,6 +888,26 @@ mod tests {
             }]
         });
         assert_eq!(extract_output_text(&body), "hello world");
+    }
+
+    #[test]
+    fn build_request_includes_reasoning_config() {
+        let body = build_request_from_input(
+            "gpt-test",
+            "instructions",
+            &[],
+            true,
+            &[],
+            Some(&ReasoningConfig {
+                effort: Some(ReasoningEffort::High),
+                budget_tokens: Some(4_000),
+                summary: Some(ReasoningSummary::Auto),
+            }),
+        );
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert!(body["reasoning"].get("budgetTokens").is_none());
     }
 
     #[test]

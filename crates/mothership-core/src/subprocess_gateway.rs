@@ -1,21 +1,21 @@
 //! Bridges a subprocess adapter to the core's chat-completion interface.
 //!
-//! [`SubprocessChatGateway`] implements [`LlmChatCompletionGateway`] by running
-//! one chat turn against a provider adapter obtained from the shared
+//! [`SubprocessChatGateway`] implements [`LlmChatRoundGateway`] by running
+//! one provider model round against an adapter obtained from the shared
 //! [`AdapterPool`] — a resident process when free, an ephemeral one when busy.
 //! This is how the core chats through any process-based provider (a normal HTTP
 //! adapter or one that drives an external CLI) without knowing which it is.
 
 use std::sync::Arc;
 
-use mothership_adapter_host::protocol::{ChatMessage, ToolCallResult};
-use mothership_adapter_host::{AdapterEntry, ChatAdapterEvent, ToolCallHandler, ToolCallRequest};
+use mothership_adapter_host::protocol::{ChatMessage, ToolCallResponse, ToolCallResult};
+use mothership_adapter_host::AdapterEntry;
 
 use crate::adapter_pool::AdapterPool;
 use crate::auth::FileCredentialVault;
 use crate::llm::{
-    LlmChatCompletionEventSink, LlmChatCompletionGateway, LlmChatCompletionRequest, LlmChatRole,
-    LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResult, LlmTransportKind,
+    LlmChatCompletionEventSink, LlmChatRole, LlmChatRound, LlmChatRoundGateway,
+    LlmChatRoundRequest, LlmToolCallRequest, LlmTransportKind,
 };
 use crate::{ChatCancellationToken, MothershipError, Result};
 
@@ -29,7 +29,6 @@ pub struct SubprocessChatGateway {
     entry: AdapterEntry,
     vault: FileCredentialVault,
     run_id: Option<String>,
-    tool_handler: Option<Arc<dyn LlmToolCallHandler>>,
 }
 
 impl SubprocessChatGateway {
@@ -39,7 +38,6 @@ impl SubprocessChatGateway {
             entry,
             vault,
             run_id: None,
-            tool_handler: None,
         }
     }
 
@@ -47,20 +45,15 @@ impl SubprocessChatGateway {
         self.run_id = Some(run_id.into());
         self
     }
-
-    pub fn with_tool_handler(mut self, handler: Arc<dyn LlmToolCallHandler>) -> Self {
-        self.tool_handler = Some(handler);
-        self
-    }
 }
 
-impl LlmChatCompletionGateway for SubprocessChatGateway {
-    fn complete_chat(
+impl LlmChatRoundGateway for SubprocessChatGateway {
+    fn complete_round(
         &self,
-        request: LlmChatCompletionRequest,
+        request: LlmChatRoundRequest,
         cancellation: &ChatCancellationToken,
         sink: &mut dyn LlmChatCompletionEventSink,
-    ) -> Result<String> {
+    ) -> Result<LlmChatRound> {
         sink.transport_selected(LlmTransportKind::Subprocess);
 
         // Core owns the runtime prompt and tool catalog. The adapter receives
@@ -80,45 +73,58 @@ impl LlmChatCompletionGateway for SubprocessChatGateway {
                 }
             })
             .collect::<Vec<_>>();
+        let extra_messages = request
+            .extra_messages
+            .into_iter()
+            .map(chat_message_from_llm)
+            .collect::<Vec<_>>();
+        let tool_results = request
+            .tool_results
+            .into_iter()
+            .map(|result| ToolCallResponse {
+                tool_call_id: result.tool_call_id,
+                result: ToolCallResult {
+                    ok: result.result.ok,
+                    content: model_facing_tool_content(result.result),
+                },
+            })
+            .collect::<Vec<_>>();
 
         let model_id = request.model_id;
+        let reasoning = request.reasoning;
         let prompt = request.prompt;
         let tools = request.tools;
+        let state = request.state;
         let cancellation = cancellation.clone();
         let run_id = self.run_id.clone();
-        let tool_handler = self.tool_handler.as_ref().map(|handler| {
-            Arc::new(SubprocessToolCallHandler {
-                inner: Arc::clone(handler),
-                run_id,
-                cancellation: cancellation.clone(),
-            }) as Arc<dyn ToolCallHandler>
-        });
         self.pool
             .with(&self.entry, &self.vault, |adapter| {
-                if let Some(tool_handler) = tool_handler {
-                    adapter.chat_cancellable_with_tools(
-                        &model_id,
-                        prompt,
-                        messages,
-                        tools,
-                        move || cancellation.is_cancelled(),
-                        |event| match event {
-                            ChatAdapterEvent::Delta(delta) => sink.delta(delta),
-                            ChatAdapterEvent::ToolCall(tool_call_id) => {
-                                sink.before_tool_call(tool_call_id)
-                            }
-                        },
-                        tool_handler,
-                    )
-                } else {
-                    adapter.chat_cancellable_with_prompt(
-                        &model_id,
-                        prompt,
-                        messages,
-                        move || cancellation.is_cancelled(),
-                        |delta| sink.delta(delta),
-                    )
-                }
+                adapter.chat_round_cancellable(
+                    &model_id,
+                    reasoning,
+                    prompt,
+                    messages,
+                    tools,
+                    state,
+                    tool_results,
+                    extra_messages,
+                    move || cancellation.is_cancelled(),
+                    |delta| sink.delta(delta),
+                )
+            })
+            .map(|round| LlmChatRound {
+                text: round.text,
+                state: round.state,
+                tool_calls: round
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| LlmToolCallRequest {
+                        run_id: run_id.clone(),
+                        tool_call_id: call.tool_call_id,
+                        name: call.name,
+                        arguments: call.arguments,
+                    })
+                    .collect(),
             })
             .map_err(|error| {
                 MothershipError::InvalidRequest(format!("adapter chat failed: {error}"))
@@ -126,53 +132,18 @@ impl LlmChatCompletionGateway for SubprocessChatGateway {
     }
 }
 
-struct SubprocessToolCallHandler {
-    inner: Arc<dyn LlmToolCallHandler>,
-    run_id: Option<String>,
-    cancellation: ChatCancellationToken,
-}
-
-impl ToolCallHandler for SubprocessToolCallHandler {
-    fn handle_tool_call(&self, request: ToolCallRequest) -> ToolCallResult {
-        let result = self
-            .inner
-            .handle_tool_call(self.llm_tool_call_request(request), &self.cancellation);
-        ToolCallResult {
-            ok: result.ok,
-            content: model_facing_tool_content(result),
-        }
-    }
-
-    fn handle_tool_calls(&self, requests: Vec<ToolCallRequest>) -> Vec<ToolCallResult> {
-        self.inner
-            .handle_tool_calls(
-                requests
-                    .into_iter()
-                    .map(|request| self.llm_tool_call_request(request))
-                    .collect(),
-                &self.cancellation,
-            )
-            .into_iter()
-            .map(|result| ToolCallResult {
-                ok: result.ok,
-                content: model_facing_tool_content(result),
-            })
-            .collect()
+fn chat_message_from_llm(message: crate::LlmChatMessage) -> ChatMessage {
+    let role = match message.role {
+        LlmChatRole::User => "user",
+        LlmChatRole::Assistant => "assistant",
+    };
+    ChatMessage {
+        role: role.to_string(),
+        content: message.content,
     }
 }
 
-impl SubprocessToolCallHandler {
-    fn llm_tool_call_request(&self, request: ToolCallRequest) -> LlmToolCallRequest {
-        LlmToolCallRequest {
-            run_id: self.run_id.clone(),
-            tool_call_id: request.tool_call_id,
-            name: request.name,
-            arguments: request.arguments,
-        }
-    }
-}
-
-fn model_facing_tool_content(result: LlmToolCallResult) -> String {
+fn model_facing_tool_content(result: crate::LlmToolCallResult) -> String {
     if result.ok {
         return result.content;
     }

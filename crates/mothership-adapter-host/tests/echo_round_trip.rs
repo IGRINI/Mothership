@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use mothership_adapter_host::protocol::{
-    AuthKind, ChatMessage, ModelManagement, SettingsFieldKind,
+    AuthKind, ChatMessage, ModelManagement, PromptBundle, SettingsFieldKind,
 };
 use mothership_adapter_host::Adapter;
 
@@ -44,18 +44,26 @@ fn echo_adapter_round_trip() {
     assert!(matches!(auth, AuthKind::ApiKey { .. }));
 
     let mut deltas = Vec::new();
-    let full = adapter
-        .chat(
+    let round = adapter
+        .chat_round_cancellable(
             "echo-1",
+            None,
+            PromptBundle::default(),
             vec![ChatMessage {
                 role: "user".to_string(),
                 content: "hello brave world".to_string(),
             }],
+            Vec::new(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            || false,
             |delta| deltas.push(delta.to_string()),
         )
-        .expect("chat");
+        .expect("chat round");
 
-    assert_eq!(full.trim(), "hello brave world");
+    assert_eq!(round.text.trim(), "hello brave world");
+    assert!(round.tool_calls.is_empty());
     // Streamed word-by-word, not delivered in one shot.
     assert!(
         deltas.len() >= 3,

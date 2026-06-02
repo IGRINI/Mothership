@@ -6,6 +6,7 @@ use std::sync::{
 use serde::{Deserialize, Serialize};
 
 use crate::tools::ToolExecutionRecord;
+use mothership_adapter_host::protocol::ReasoningConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,6 +102,7 @@ pub struct SendChatMessageResult {
 #[derive(Debug, Clone, Default)]
 pub struct ChatRunContextSpec {
     pub include_failed_assistant_message_id: Option<String>,
+    pub reasoning: Option<ReasoningConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

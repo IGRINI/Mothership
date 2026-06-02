@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::agentic::AgenticLoopPolicy;
 use crate::auth::FileCredentialVault;
 use crate::chat::{
     ChatCancellationToken, ChatRunEvent, ChatRunEventKind, ChatRunEventSink, SendChatMessageResult,
@@ -12,8 +13,9 @@ use crate::connectors::{
     ensure_adapter_capability, find_trusted_adapter_entry, CAPABILITY_LLM_CHAT,
 };
 use crate::llm::{
-    LlmChatCompletionEventSink, LlmChatCompletionRequest, LlmToolCallHandler, LlmTransportKind,
-    ProviderRequestPipeline,
+    LlmChatCompletionEventSink, LlmChatCompletionRequest, LlmChatMessage, LlmChatRole,
+    LlmChatRoundRequest, LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResponse,
+    LlmTransportKind, ProviderRequestPipeline,
 };
 use crate::prompt::runtime_prompt_bundle;
 use crate::provider_runtime::ProviderRuntimeManager;
@@ -245,6 +247,7 @@ impl<'a> ChatRunService<'a> {
         let request = self.provider_pipeline.apply(LlmChatCompletionRequest {
             provider_id: selected_model.provider_id,
             model_id: selected_model.model_id,
+            reasoning: run.context.reasoning.clone(),
             prompt: runtime_prompt_bundle(project.as_ref()),
             tools: self
                 .tool_handler
@@ -253,15 +256,8 @@ impl<'a> ChatRunService<'a> {
                 .unwrap_or_default(),
             messages,
         })?;
-        let result = self.providers.complete_subprocess_chat(
-            entry,
-            vault,
-            Some(run.run_id.clone()),
-            self.tool_handler.clone(),
-            request,
-            &cancellation,
-            &mut llm_sink,
-        );
+
+        self.complete_agentic_loop(entry, vault, request, &cancellation, &mut llm_sink)?;
 
         llm_sink.flush();
 
@@ -272,12 +268,133 @@ impl<'a> ChatRunService<'a> {
             return Ok(());
         }
 
-        result?;
-
         let event =
             database.complete_chat_run(&run.run_id, &run.chat.id, &run.assistant_message.id)?;
         llm_sink.emit(event);
         Ok(())
+    }
+
+    fn complete_agentic_loop(
+        &self,
+        entry: mothership_adapter_host::AdapterEntry,
+        vault: FileCredentialVault,
+        request: LlmChatCompletionRequest,
+        cancellation: &ChatCancellationToken,
+        sink: &mut DbForwardingSink<'_>,
+    ) -> Result<()> {
+        let policy = AgenticLoopPolicy::default();
+        let mut round_request = LlmChatRoundRequest::from_completion(request.clone());
+
+        for _ in 0..policy.max_rounds() {
+            let round = self.providers.complete_subprocess_round(
+                entry.clone(),
+                vault.clone(),
+                Some(sink.run_id.to_string()),
+                round_request,
+                cancellation,
+                sink,
+            )?;
+            sink.flush();
+
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
+            if round.tool_calls.is_empty() {
+                return Ok(());
+            }
+            let state = round.state.ok_or_else(|| {
+                MothershipError::InvalidRequest(
+                    "adapter returned tool calls without continuation state".to_string(),
+                )
+            })?;
+            let tool_results = self.execute_tool_batch(round.tool_calls, cancellation, sink)?;
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
+
+            round_request = next_round_request(&request, state, tool_results, Vec::new(), true);
+        }
+
+        let final_request = next_round_request(
+            &request,
+            round_request.state.unwrap_or(serde_json::Value::Null),
+            round_request.tool_results,
+            vec![LlmChatMessage {
+                role: LlmChatRole::User,
+                content: policy.final_synthesis_prompt().to_string(),
+            }],
+            false,
+        );
+
+        match self.providers.complete_subprocess_round(
+            entry,
+            vault,
+            Some(sink.run_id.to_string()),
+            final_request,
+            cancellation,
+            sink,
+        ) {
+            Ok(round) if round.tool_calls.is_empty() && !round.text.trim().is_empty() => Ok(()),
+            Ok(_) | Err(_) => {
+                sink.delta(policy.fallback_message());
+                Ok(())
+            }
+        }
+    }
+
+    fn execute_tool_batch(
+        &self,
+        mut calls: Vec<LlmToolCallRequest>,
+        cancellation: &ChatCancellationToken,
+        sink: &mut DbForwardingSink<'_>,
+    ) -> Result<Vec<LlmToolCallResponse>> {
+        let handler = self.tool_handler.as_ref().ok_or_else(|| {
+            MothershipError::InvalidRequest(
+                "model requested a tool call, but tools are not enabled for this run".to_string(),
+            )
+        })?;
+        for call in &mut calls {
+            call.run_id = Some(sink.run_id.to_string());
+            sink.before_tool_call(&call.tool_call_id);
+        }
+        let results = handler.handle_tool_calls(calls.clone(), cancellation);
+        if results.len() != calls.len() {
+            return Err(MothershipError::Runtime(format!(
+                "tool handler returned {} result(s) for {} tool call(s)",
+                results.len(),
+                calls.len()
+            )));
+        }
+        Ok(calls
+            .into_iter()
+            .zip(results)
+            .map(|(call, result)| LlmToolCallResponse {
+                tool_call_id: call.tool_call_id,
+                result,
+            })
+            .collect())
+    }
+}
+
+fn next_round_request(
+    base: &LlmChatCompletionRequest,
+    state: serde_json::Value,
+    tool_results: Vec<LlmToolCallResponse>,
+    extra_messages: Vec<LlmChatMessage>,
+    include_tools: bool,
+) -> LlmChatRoundRequest {
+    LlmChatRoundRequest {
+        provider_id: base.provider_id.clone(),
+        model_id: base.model_id.clone(),
+        reasoning: base.reasoning.clone(),
+        prompt: base.prompt.clone(),
+        tools: include_tools
+            .then(|| base.tools.clone())
+            .unwrap_or_default(),
+        messages: base.messages.clone(),
+        state: Some(state),
+        tool_results,
+        extra_messages,
     }
 }
 

@@ -244,7 +244,42 @@ export interface LlmModel {
   family: string;
   description: string;
   capabilities: string[];
+  reasoning?: ReasoningCapabilities | null;
   recommended: boolean;
+}
+
+export type ReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
+export type ReasoningSummary = "auto" | "concise" | "detailed";
+
+export interface ReasoningOption {
+  id: string;
+  label: string;
+  description?: string | null;
+  recommended?: boolean;
+  config: ReasoningConfig;
+}
+
+export interface ReasoningCapabilities {
+  supported: boolean;
+  efforts: ReasoningEffort[];
+  options: ReasoningOption[];
+  supportsBudget: boolean;
+  supportsExclusion: boolean;
+  supportsSummary: boolean;
+}
+
+export interface ReasoningConfig {
+  effort?: ReasoningEffort | null;
+  budgetTokens?: number | null;
+  summary?: ReasoningSummary | null;
 }
 
 export interface ConnectorSettingsSchema {
@@ -485,6 +520,7 @@ export function sendChatMessage(
   chatId: string | undefined,
   content: string,
   projectId?: string | null,
+  reasoning?: ReasoningConfig | null,
 ): Promise<SendChatMessageResult> {
   if (!isTauriRuntime()) {
     return Promise.resolve(sendPreviewChatMessage(chatId, content, projectId));
@@ -494,6 +530,7 @@ export function sendChatMessage(
     chatId,
     projectId,
     content,
+    reasoning,
   });
 }
 
@@ -1268,6 +1305,24 @@ function hashSecret(value: string) {
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
+const previewReasoning: ReasoningCapabilities = {
+  supported: true,
+  efforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+  options: [
+    { id: "auto", label: "auto", recommended: true, config: {} },
+    { id: "none", label: "none", config: { effort: "none" } },
+    { id: "minimal", label: "minimal", config: { effort: "minimal" } },
+    { id: "low", label: "low", config: { effort: "low" } },
+    { id: "medium", label: "medium", config: { effort: "medium" } },
+    { id: "high", label: "high", config: { effort: "high" } },
+    { id: "xhigh", label: "xhigh", config: { effort: "xhigh" } },
+    { id: "max", label: "max", config: { effort: "max" } },
+  ],
+  supportsBudget: false,
+  supportsExclusion: false,
+  supportsSummary: true,
+};
+
 const previewModels: LlmModel[] = [
   {
     providerId: "openai",
@@ -1277,6 +1332,7 @@ const previewModels: LlmModel[] = [
     family: "GPT-5",
     description: "Current high-capability Codex model for complex agent work.",
     capabilities: ["text", "reasoning", "tools", "code"],
+    reasoning: previewReasoning,
     recommended: true,
   },
   {
@@ -1287,6 +1343,7 @@ const previewModels: LlmModel[] = [
     family: "GPT-5",
     description: "Balanced Codex model for everyday coding sessions.",
     capabilities: ["text", "reasoning", "tools", "code"],
+    reasoning: previewReasoning,
     recommended: false,
   },
   {
@@ -1298,6 +1355,7 @@ const previewModels: LlmModel[] = [
     description:
       "Lower-latency Codex model for smaller edits and quick checks.",
     capabilities: ["text", "reasoning", "tools", "code"],
+    reasoning: previewReasoning,
     recommended: false,
   },
   {
@@ -1309,6 +1367,7 @@ const previewModels: LlmModel[] = [
     description:
       "Codex-specialized model kept for compatibility with existing workflows.",
     capabilities: ["text", "reasoning", "tools", "code"],
+    reasoning: previewReasoning,
     recommended: false,
   },
   {
@@ -1319,6 +1378,7 @@ const previewModels: LlmModel[] = [
     family: "GPT-5 Codex",
     description: "Fast Codex-specialized model for lightweight agent tasks.",
     capabilities: ["text", "reasoning", "tools", "code"],
+    reasoning: previewReasoning,
     recommended: false,
   },
   {
@@ -1330,6 +1390,7 @@ const previewModels: LlmModel[] = [
     description:
       "Older Codex-compatible model kept for account catalogs that still expose it.",
     capabilities: ["text", "reasoning", "tools", "code"],
+    reasoning: previewReasoning,
     recommended: false,
   },
 ];
@@ -1364,6 +1425,16 @@ function copyConnectorSettings(
       models: provider.models.map((model) => ({
         ...model,
         capabilities: [...model.capabilities],
+        reasoning: model.reasoning
+          ? {
+              ...model.reasoning,
+              efforts: [...model.reasoning.efforts],
+              options: (model.reasoning.options ?? []).map((option) => ({
+                ...option,
+                config: { ...option.config },
+              })),
+            }
+          : model.reasoning,
       })),
       adapterSettings: provider.adapterSettings
         ? {
