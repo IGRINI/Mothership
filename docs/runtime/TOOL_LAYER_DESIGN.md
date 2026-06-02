@@ -276,17 +276,24 @@ typed storage, semantic UI, catalog stability, and a credential firewall.
   typed tables so a reloaded conversation still renders cards. No schema cap on
   `write_file.content`.
 - **Phase 4 — semantic UI.** Per-tool semantic cards (SolidJS `ToolCards.tsx`) keyed on
-  `toolKind`, a colored diff card, and a before-approval diff preview above Approve/Deny. Full
-  text fallback when a typed payload is absent.
+  `toolKind`, a colored diff card, and a before-approval diff preview above Approve/Deny. The
+  approval diff is a typed `diff-preview` artifact (persisted to `tool_artifacts`; sent to
+  UI/remote) — message-string parsing is only a fallback. Full text fallback when a typed
+  payload is absent. Branch/fork copies the typed tables too (`copy_typed_tool_data`), so a
+  branched conversation keeps its cards rather than degrading to text.
 - **Phase 5 — catalog stability.** `canonical_json` / `canonical_catalog_bytes` /
   `catalog_fingerprint` (byte-stable, key-sorted) + `CatalogPin` drift detection (the
   MCP-byte-pin). Pinned per process in `run.rs`; warns on drift; documented attach point for
   merged MCP/dynamic tools.
 - **Phase 6 — credential firewall foundation.** `CredentialGuard` + `PatternCredentialGuard`
-  (PEM keys, cloud/provider tokens, bearer headers, `key=value` secrets) applied at the event
-  sink — the single chokepoint for everything persisted + shown. Model-facing *result* text is
-  intentionally not yet redacted (the model needs real file contents; known-secret files are
-  already path-blocked); the trait is the seam for policy-driven model-visible redaction later.
+  (PEM keys, cloud/provider tokens, bearer headers, `key=value` secrets). `redact_event` at the
+  event sink scrubs **command args + env values**, event/result previews+tails, artifact
+  previews, and string values in the typed payload. Durable spilled blobs (the content behind a
+  `log_ref`: command stdout/stderr, file-tool diff/read/search) are scrubbed at rest by
+  `RedactingOutputStore` (line-buffered so a secret split across writes is still caught; UTF-8
+  lines redacted, binary passed through). Model-facing *result* text is intentionally not yet
+  redacted (the model needs real file contents; known-secret files are already path-blocked);
+  the trait is the seam for policy-driven model-visible redaction later.
 
 ## Deferred (NOT defects — scope, stage considered closed without them)
 
