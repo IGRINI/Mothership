@@ -274,9 +274,13 @@ typed storage, semantic UI, catalog stability, and a credential firewall.
   synthesized from command+result at the storage layer (supervisor untouched). Large content
   is always referenced via `log_ref`, never inlined. The read path enriches records from the
   typed tables so a reloaded conversation still renders cards. No JSON-schema cap on
-  `write_file.content`; instead a **policy ceiling** (`DEFAULT_MAX_WRITE_FILE_BYTES`, 10 MiB,
-  configurable via `write_file_with_limit`) refuses an oversized write up front
-  (`status: "too_large"` + `contentBytes`/`maxWriteBytes`) with no side effect.
+  `write_file.content`; instead a **policy ceiling** (`DEFAULT_MAX_WRITE_FILE_BYTES`, 10 MiB)
+  refuses an oversized write up front (`status: "too_large"` + `contentBytes`/`maxWriteBytes`)
+  with no side effect. The ceiling is carried by the sidecar's `FileToolExecutor`
+  (`max_write_bytes`, composition-root-settable) and applied to BOTH the actual write
+  (`write_file_with_limit`) AND the approval preview — `preview_diff` checks the raw content
+  size first (no clone) and summarizes an oversized/large write instead of building a full diff,
+  so the preview path can't blow memory or bypass the bounded-diff gate.
 - **Phase 4 — semantic UI.** Per-tool semantic cards (SolidJS `ToolCards.tsx`) keyed on
   `toolKind`, a colored diff card, and a before-approval diff preview above Approve/Deny. The
   approval diff is a typed `diff-preview` artifact (persisted to `tool_artifacts`; sent to
