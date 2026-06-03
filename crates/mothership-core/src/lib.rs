@@ -59,6 +59,8 @@ pub use tools::{
     canonical_json, catalog_fingerprint, CatalogDrift, CatalogPin, DEFAULT_MAX_WRITE_FILE_BYTES,
     ConservativeCommandPermissionPolicy, CredentialGuard, FileMetadata, NoopCredentialGuard,
     PatternCredentialGuard, RedactingOutputStore,
+    ApprovalPreview, BackendOutcome, ResourceRequest, ToolBackend, ToolCapability, ToolDecision,
+    ToolOrchestrator,
     FileSystem, FileTool, FileToolCapability, FileToolError, FileToolOutcome, FileToolOutputStore,
     FileToolSpill, NoopToolExecutionEventSink, PathError, PendingToolApprovalGate, StdFileSystem,
     MAX_TOOL_EVENT_BYTES,
