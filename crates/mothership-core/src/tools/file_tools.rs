@@ -244,12 +244,15 @@ pub fn classify(
             }
         }
         FileTool::Write => {
-            let input: WriteFileInput = parse_args(arguments)?;
-            let touched = vec![input.path.clone()];
-            match guard_paths(workspace, &[&input.path]) {
+            // Only the path is needed to classify a write; extract it BORROWED so
+            // an oversized `content` is never cloned just to decide permissions
+            // (`parse_args` clones the whole argument object, content included).
+            let path = arg_str(arguments, "path")?;
+            let touched = vec![path.to_string()];
+            match guard_paths(workspace, &[path]) {
                 Ok(()) => Ok(FileToolCapability {
                     action: ToolPermissionAction::Ask,
-                    summary: format!("write {}", input.path),
+                    summary: format!("write {path}"),
                     touched_paths: touched,
                 }),
                 Err(reason) => Ok(deny(reason, touched)),
@@ -619,19 +622,25 @@ pub fn write_file_with_limit(
     fs: &dyn FileSystem,
     max_write_bytes: usize,
 ) -> Result<FileToolOutcome, FileToolError> {
-    let input: WriteFileInput = parse_args(arguments)?;
-
-    // Policy ceiling: refuse an oversized write up front — before reading the old
-    // file, computing a diff, or writing anything (no side effect on refusal).
-    let content_bytes = input.content.as_bytes().len();
+    // Policy ceiling, checked on the BORROWED content BEFORE `parse_args` clones
+    // the arguments — an oversized write is refused without ever cloning its
+    // content (no side effect, no memory blowup).
+    let content_bytes = arguments
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::len)
+        .unwrap_or(0);
     if content_bytes > max_write_bytes {
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
         return Ok(FileToolOutcome::failure(
             format!(
-                "refused to write `{}`: content is {content_bytes} bytes, over the {max_write_bytes}-byte write limit",
-                input.path
+                "refused to write `{path}`: content is {content_bytes} bytes, over the {max_write_bytes}-byte write limit"
             ),
             json!({
-                "path": input.path,
+                "path": path,
                 "status": "too_large",
                 "contentBytes": content_bytes,
                 "maxWriteBytes": max_write_bytes,
@@ -639,6 +648,7 @@ pub fn write_file_with_limit(
         ));
     }
 
+    let input: WriteFileInput = parse_args(arguments)?;
     let resolved = match resolve_guarded(workspace, &input.path) {
         Ok(path) => path,
         Err(reason) => return Ok(path_failure(&input.path, reason)),
@@ -1330,6 +1340,16 @@ impl FileMap for WorkspaceFileMap<'_> {
 fn parse_args<T: for<'de> Deserialize<'de>>(arguments: &Value) -> Result<T, FileToolError> {
     serde_json::from_value(arguments.clone())
         .map_err(|error| FileToolError::InvalidArguments(error.to_string()))
+}
+
+/// Borrow a required string field from tool arguments without cloning the whole
+/// argument object — so a permission check or size gate never has to clone a
+/// (potentially huge) sibling field such as `content` just to read a `path`.
+fn arg_str<'a>(arguments: &'a Value, field: &str) -> Result<&'a str, FileToolError> {
+    arguments
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| FileToolError::InvalidArguments(format!("missing or non-string `{field}`")))
 }
 
 /// The full set of paths a patch references (sources and move destinations).
@@ -2917,6 +2937,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read.action, ToolPermissionAction::Deny);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classify_write_reads_only_path_not_content() {
+        // Permission classification must not parse/clone the (possibly huge)
+        // content: it succeeds from the path ALONE. With the old full-parse this
+        // would error (content is a required field) and the unwrap would panic.
+        let (ws, dir) = temp_workspace("classify_write_path_only");
+        let capability = classify(FileTool::Write, &json!({ "path": "out.txt" }), &ws).unwrap();
+        assert_eq!(capability.action, ToolPermissionAction::Ask);
+        assert_eq!(capability.touched_paths, vec!["out.txt".to_string()]);
         let _ = fs::remove_dir_all(&dir);
     }
 }
