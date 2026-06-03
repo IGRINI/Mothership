@@ -43,6 +43,12 @@ const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
 /// that need more can page with `startLine`/`limit`.
 const MAX_READ_FILE_BYTES: usize = 10 * 1024 * 1024;
 
+/// Default policy ceiling on `write_file` content size. A policy-level refusal
+/// (NOT a JSON-schema cap): a legit large write up to this limit still works,
+/// while a runaway one is rejected with no side effect. The composition root can
+/// override it via [`write_file_with_limit`].
+pub const DEFAULT_MAX_WRITE_FILE_BYTES: usize = 10 * 1024 * 1024;
+
 /// Cap on the diff / synthesized result text that a mutating tool puts into the
 /// persisted execution event and `ToolExecutionResult` (UI/DB). The model-facing
 /// response has its own, larger budget; this only bounds what is stored/streamed
@@ -576,7 +582,38 @@ pub fn write_file(
     workspace: &Workspace,
     fs: &dyn FileSystem,
 ) -> Result<FileToolOutcome, FileToolError> {
+    write_file_with_limit(arguments, workspace, fs, DEFAULT_MAX_WRITE_FILE_BYTES)
+}
+
+/// Like [`write_file`] but with an explicit policy ceiling on the content size.
+/// `write_file` uses [`DEFAULT_MAX_WRITE_FILE_BYTES`]; the composition root can
+/// pass a configured `max_write_bytes` to override it.
+pub fn write_file_with_limit(
+    arguments: &Value,
+    workspace: &Workspace,
+    fs: &dyn FileSystem,
+    max_write_bytes: usize,
+) -> Result<FileToolOutcome, FileToolError> {
     let input: WriteFileInput = parse_args(arguments)?;
+
+    // Policy ceiling: refuse an oversized write up front — before reading the old
+    // file, computing a diff, or writing anything (no side effect on refusal).
+    let content_bytes = input.content.as_bytes().len();
+    if content_bytes > max_write_bytes {
+        return Ok(FileToolOutcome::failure(
+            format!(
+                "refused to write `{}`: content is {content_bytes} bytes, over the {max_write_bytes}-byte write limit",
+                input.path
+            ),
+            json!({
+                "path": input.path,
+                "status": "too_large",
+                "contentBytes": content_bytes,
+                "maxWriteBytes": max_write_bytes,
+            }),
+        ));
+    }
+
     let resolved = match resolve_guarded(workspace, &input.path) {
         Ok(path) => path,
         Err(reason) => return Ok(path_failure(&input.path, reason)),
@@ -1584,6 +1621,29 @@ mod tests {
         assert!(out.ok);
         assert_eq!(out.data["status"], "created");
         assert_eq!(fs::read(dir.join("new.txt")).unwrap(), b"hello\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_refuses_oversized_content_without_writing() {
+        let (ws, dir) = temp_workspace("write_too_large");
+        let fs = StdFileSystem::new();
+        let big = "x".repeat(2048);
+
+        // A 1 KiB policy limit refuses 2 KiB of content, with no file written.
+        let out =
+            write_file_with_limit(&json!({ "path": "big.txt", "content": big }), &ws, &fs, 1024)
+                .unwrap();
+
+        assert!(!out.ok, "oversized write must be refused");
+        assert_eq!(out.data["status"], "too_large");
+        assert_eq!(out.data["contentBytes"], 2048);
+        assert_eq!(out.data["maxWriteBytes"], 1024);
+        assert!(
+            !dir.join("big.txt").exists(),
+            "no file may be written when the write is refused"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

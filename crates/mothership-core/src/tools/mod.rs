@@ -38,8 +38,9 @@ pub use catalog::{
     SEARCH_TEXT_TOOL_NAME, WRITE_FILE_TOOL_ID, WRITE_FILE_TOOL_NAME,
 };
 pub use file_tools::{
-    apply_patch, classify, edit_file, preview_diff, read_file, write_file, FileTool,
-    FileToolCapability, FileToolError, FileToolOutcome, FileToolSpill, MAX_TOOL_EVENT_BYTES,
+    apply_patch, classify, edit_file, preview_diff, read_file, write_file, write_file_with_limit,
+    FileTool, FileToolCapability, FileToolError, FileToolOutcome, FileToolSpill,
+    DEFAULT_MAX_WRITE_FILE_BYTES, MAX_TOOL_EVENT_BYTES,
 };
 pub use search::{
     classify_list_files, classify_search_text, list_files, search_text,

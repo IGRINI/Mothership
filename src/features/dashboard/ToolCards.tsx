@@ -128,7 +128,8 @@ function statusTone(status: string | undefined): string {
   if (
     normalized === "failed" ||
     normalized === "error" ||
-    normalized === "denied"
+    normalized === "denied" ||
+    normalized === "too_large"
   ) {
     return "error";
   }
@@ -421,6 +422,9 @@ function WriteFileCard(props: { payload: Record<string, unknown> | null | undefi
   const status = () => readString(props.payload, "status");
   const bytes = () => readNumber(props.payload, "bytes");
   const sha = () => shortSha(readString(props.payload, "sha256"));
+  // Present only on a `too_large` refusal.
+  const contentBytes = () => readNumber(props.payload, "contentBytes");
+  const maxWriteBytes = () => readNumber(props.payload, "maxWriteBytes");
 
   return (
     <div class="tool-card">
@@ -435,6 +439,12 @@ function WriteFileCard(props: { payload: Record<string, unknown> | null | undefi
         </Show>
         <Show when={sha()}>
           {(value) => <Chip label="sha" value={<code>{value()}</code>} />}
+        </Show>
+        <Show when={formatBytes(contentBytes())}>
+          {(value) => <Chip label="content" value={value()} />}
+        </Show>
+        <Show when={formatBytes(maxWriteBytes())}>
+          {(value) => <Chip label="limit" value={value()} />}
         </Show>
       </div>
     </div>
