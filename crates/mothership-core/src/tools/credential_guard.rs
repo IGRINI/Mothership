@@ -229,70 +229,205 @@ impl ToolOutputStore for RedactingOutputStore {
         let inner = self.inner.open(tool_call_id).await?;
         Ok(Box::new(RedactingOutputWriter {
             inner,
-            guard: Arc::clone(&self.guard),
-            stdout_buf: Vec::new(),
-            stderr_buf: Vec::new(),
+            stdout: BoundedRedactor::new(Arc::clone(&self.guard)),
+            stderr: BoundedRedactor::new(Arc::clone(&self.guard)),
         }))
     }
 }
 
 struct RedactingOutputWriter {
     inner: Box<dyn ToolOutputWriter>,
-    guard: Arc<dyn CredentialGuard>,
-    stdout_buf: Vec<u8>,
-    stderr_buf: Vec<u8>,
+    stdout: BoundedRedactor,
+    stderr: BoundedRedactor,
 }
 
 #[async_trait]
 impl ToolOutputWriter for RedactingOutputWriter {
     async fn append(&mut self, stream: ToolOutputStream, bytes: &[u8]) -> Result<()> {
-        // Buffer, then flush only the complete-line prefix (through the last
-        // newline) so a secret can never be split across a redaction boundary.
-        let complete = {
-            let buf = match stream {
-                ToolOutputStream::Stdout => &mut self.stdout_buf,
-                ToolOutputStream::Stderr => &mut self.stderr_buf,
-            };
-            buf.extend_from_slice(bytes);
-            match buf.iter().rposition(|&byte| byte == b'\n') {
-                Some(pos) => buf.drain(..=pos).collect::<Vec<u8>>(),
-                None => return Ok(()),
-            }
+        let redacted = match stream {
+            ToolOutputStream::Stdout => self.stdout.push(bytes),
+            ToolOutputStream::Stderr => self.stderr.push(bytes),
         };
-        let redacted = redact_bytes_linewise(self.guard.as_ref(), &complete);
+        if redacted.is_empty() {
+            return Ok(());
+        }
         self.inner.append(stream, &redacted).await
     }
 
     async fn finish(&mut self) -> Result<String> {
-        let stdout_rest = std::mem::take(&mut self.stdout_buf);
+        let stdout_rest = self.stdout.flush();
         if !stdout_rest.is_empty() {
-            let redacted = redact_bytes_linewise(self.guard.as_ref(), &stdout_rest);
             self.inner
-                .append(ToolOutputStream::Stdout, &redacted)
+                .append(ToolOutputStream::Stdout, &stdout_rest)
                 .await?;
         }
-        let stderr_rest = std::mem::take(&mut self.stderr_buf);
+        let stderr_rest = self.stderr.flush();
         if !stderr_rest.is_empty() {
-            let redacted = redact_bytes_linewise(self.guard.as_ref(), &stderr_rest);
             self.inner
-                .append(ToolOutputStream::Stderr, &redacted)
+                .append(ToolOutputStream::Stderr, &stderr_rest)
                 .await?;
         }
         self.inner.finish().await
     }
 }
 
-/// Redact a byte buffer line by line: UTF-8 lines are scrubbed through the guard;
-/// non-UTF-8 (binary) lines pass through unchanged to preserve fidelity.
-fn redact_bytes_linewise(guard: &dyn CredentialGuard, bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    for line in bytes.split_inclusive(|&byte| byte == b'\n') {
-        match std::str::from_utf8(line) {
-            Ok(text) => out.extend_from_slice(guard.redact(text).as_bytes()),
-            Err(_) => out.extend_from_slice(line),
+/// Once a line buffers past this without a newline, it is force-flushed in
+/// bounded segments — so a no-newline torrent (`print('x'*500_000_000)`) cannot
+/// grow memory without bound. Also caps how long a `BEGIN…END` private-key block
+/// is buffered before it is force-redacted.
+const REDACTOR_BUFFER_LIMIT: usize = 64 * 1024;
+/// Raw bytes retained at a forced no-newline flush so a secret straddling the cut
+/// is re-examined with the next chunk. Larger than any single-line secret pattern.
+const REDACTOR_OVERLAP: usize = 1024;
+const PEM_MARKER: &[u8] = b"[REDACTED:private-key]\n";
+
+/// A bounded, stateful streaming redactor for one output stream. It guarantees
+/// two things the naive line-buffer did not:
+///
+/// 1. **Bounded memory** — it never retains more than ~`REDACTOR_BUFFER_LIMIT`
+///    bytes, force-flushing a long no-newline run in segments (keeping a small
+///    overlap so a secret split across the cut is still caught).
+/// 2. **Multi-line secrets** — a `BEGIN…END PRIVATE KEY` block is held and
+///    redacted as a *unit* (emitting a single marker), since the PEM pattern only
+///    matches across lines. A runaway block (> the buffer limit without an `END`)
+///    is force-redacted to a marker rather than buffered or leaked.
+///
+/// UTF-8 segments are scrubbed through the guard; non-UTF-8 (binary) segments pass
+/// through unchanged to preserve fidelity.
+struct BoundedRedactor {
+    guard: Arc<dyn CredentialGuard>,
+    pending: Vec<u8>,
+    in_pem: bool,
+}
+
+impl BoundedRedactor {
+    fn new(guard: Arc<dyn CredentialGuard>) -> Self {
+        Self {
+            guard,
+            pending: Vec::new(),
+            in_pem: false,
         }
     }
-    out
+
+    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        loop {
+            if self.in_pem {
+                if let Some(end) = find_pem_end(&self.pending) {
+                    // Complete BEGIN…END block: drop the key bytes, emit one marker.
+                    self.pending.drain(..end);
+                    out.extend_from_slice(PEM_MARKER);
+                    self.in_pem = false;
+                    continue;
+                }
+                if self.pending.len() > REDACTOR_BUFFER_LIMIT {
+                    // Runaway key with no END in sight: emit a marker, drop the
+                    // buffered key bytes (keep a small tail to catch the END), and
+                    // stay in_pem. No key material is written.
+                    let drop_to = self.pending.len() - REDACTOR_OVERLAP;
+                    self.pending.drain(..drop_to);
+                    out.extend_from_slice(PEM_MARKER);
+                }
+                break;
+            }
+
+            if let Some(nl) = self.pending.iter().position(|&byte| byte == b'\n') {
+                if line_starts_pem(&self.pending[..=nl]) {
+                    // Keep the BEGIN line in the buffer as the block start.
+                    self.in_pem = true;
+                    continue;
+                }
+                let line: Vec<u8> = self.pending.drain(..=nl).collect();
+                out.extend_from_slice(&redact_segment(self.guard.as_ref(), &line));
+                continue;
+            }
+
+            if self.pending.len() > REDACTOR_BUFFER_LIMIT {
+                // Long no-newline run: flush a bounded prefix, cutting on a
+                // non-token boundary so a single-line secret is not split.
+                let cut = safe_cut(&self.pending, REDACTOR_OVERLAP);
+                let segment: Vec<u8> = self.pending.drain(..cut).collect();
+                out.extend_from_slice(&redact_segment(self.guard.as_ref(), &segment));
+                continue;
+            }
+
+            break;
+        }
+        out
+    }
+
+    fn flush(&mut self) -> Vec<u8> {
+        if self.pending.is_empty() {
+            self.in_pem = false;
+            return Vec::new();
+        }
+        let rest = std::mem::take(&mut self.pending);
+        let out = if self.in_pem {
+            // Trailing, unterminated key material — never write it raw.
+            PEM_MARKER.to_vec()
+        } else {
+            redact_segment(self.guard.as_ref(), &rest)
+        };
+        self.in_pem = false;
+        out
+    }
+}
+
+/// Redact one segment: UTF-8 → scrubbed through the guard; non-UTF-8 → raw.
+fn redact_segment(guard: &dyn CredentialGuard, bytes: &[u8]) -> Vec<u8> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => guard.redact(text).into_owned().into_bytes(),
+        Err(_) => bytes.to_vec(),
+    }
+}
+
+/// True if a (CR-tolerant) line opens a PEM private-key block.
+fn line_starts_pem(line: &[u8]) -> bool {
+    std::str::from_utf8(line)
+        .map(|text| text.contains("BEGIN") && text.contains("PRIVATE KEY"))
+        .unwrap_or(false)
+}
+
+/// If `buf` contains the closing line of a PEM private-key block, return the byte
+/// index just past that line (so `buf[..idx]` is the whole `BEGIN…END` block).
+fn find_pem_end(buf: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    for line in buf.split_inclusive(|&byte| byte == b'\n') {
+        offset += line.len();
+        if let Ok(text) = std::str::from_utf8(line) {
+            if text.contains("END") && text.contains("PRIVATE KEY") {
+                return Some(offset);
+            }
+        }
+    }
+    None
+}
+
+/// Choose a flush cut for a long no-newline run: target `len - overlap`, then back
+/// up (at most `overlap` more) to a non-token, char-boundary byte so a single-line
+/// secret isn't split across the cut. Always returns a positive, bounded cut.
+fn safe_cut(buf: &[u8], overlap: usize) -> usize {
+    let target = buf.len().saturating_sub(overlap).max(1);
+    let floor = target.saturating_sub(overlap).max(1);
+    let is_token = |byte: u8| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'+' | b'=' | b':')
+    };
+    let mut cut = target;
+    while cut > floor {
+        let byte = buf[cut - 1];
+        if is_token(byte) || (byte & 0xC0) == 0x80 {
+            cut -= 1;
+        } else {
+            break;
+        }
+    }
+    // Don't cut in the middle of a UTF-8 character.
+    while cut > floor && (buf[cut] & 0xC0) == 0x80 {
+        cut -= 1;
+    }
+    cut.max(floor)
 }
 
 #[cfg(test)]
@@ -457,5 +592,65 @@ mod tests {
             "raw token must not reach disk"
         );
         assert!(durable.contains("plain line"), "benign content kept");
+    }
+
+    #[test]
+    fn bounded_redactor_stays_bounded_on_no_newline_torrent() {
+        // A no-newline torrent (e.g. `print('x'*500_000_000, end='')`) must not
+        // grow memory without bound: pending stays capped and bytes still flow.
+        let mut r = BoundedRedactor::new(Arc::new(PatternCredentialGuard::new()));
+        let chunk = vec![b'x'; 8 * 1024];
+        let mut total = 0usize;
+        for _ in 0..256 {
+            total += r.push(&chunk).len();
+            assert!(
+                r.pending.len() <= REDACTOR_BUFFER_LIMIT + chunk.len(),
+                "pending must stay bounded, got {}",
+                r.pending.len()
+            );
+        }
+        total += r.flush().len();
+        assert_eq!(total, 256 * 8 * 1024, "benign bytes pass through without loss");
+    }
+
+    #[test]
+    fn bounded_redactor_redacts_secret_in_long_run() {
+        let mut r = BoundedRedactor::new(Arc::new(PatternCredentialGuard::new()));
+        let chunk = vec![b'x'; 8 * 1024];
+        let mut out = Vec::new();
+        for _ in 0..12 {
+            out.extend(r.push(&chunk)); // ~96 KiB with no newline, force-flushed
+        }
+        out.extend(r.push(b" AKIAIOSFODNN7EXAMPLE \n"));
+        out.extend(r.flush());
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("[REDACTED:aws-key]"),
+            "a secret after a long no-newline run must still be redacted"
+        );
+    }
+
+    #[test]
+    fn bounded_redactor_redacts_multiline_pem_block() {
+        // The PEM pattern only matches across lines; the durable path must hold
+        // the whole BEGIN…END block and redact it as a unit, not line-by-line.
+        let mut r = BoundedRedactor::new(Arc::new(PatternCredentialGuard::new()));
+        let mut out =
+            r.push(b"before\n-----BEGIN RSA PRIVATE KEY-----\nMIIsecretAAAA\nBBBBsecret\n");
+        out.extend(r.push(b"-----END RSA PRIVATE KEY-----\nafter\n"));
+        out.extend(r.flush());
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("[REDACTED:private-key]"),
+            "multi-line PEM must be redacted in the durable blob: {text}"
+        );
+        assert!(
+            !text.contains("MIIsecret"),
+            "key material must not reach disk: {text}"
+        );
+        assert!(
+            text.contains("before") && text.contains("after"),
+            "content surrounding the key is kept"
+        );
     }
 }
