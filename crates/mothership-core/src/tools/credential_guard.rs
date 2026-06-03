@@ -32,6 +32,21 @@ pub trait CredentialGuard: Send + Sync {
     /// Return `input` with any detected secrets replaced by a redaction marker.
     /// Borrows unchanged input when nothing matched (cheap common case).
     fn redact<'a>(&self, input: &'a str) -> Cow<'a, str>;
+
+    /// The largest byte offset `cut <= commit_limit` such that no secret match in
+    /// `text` straddles `cut` — i.e. starts before `cut` but ends after
+    /// `commit_limit`. A streaming caller can flush `text[..cut]` safely while
+    /// retaining `text[cut..]` (the rolling window) for the next chunk, so a
+    /// secret spanning a flush boundary is never split. The default is a
+    /// char-boundary clamp of `commit_limit`; pattern guards override it to honor
+    /// their own match shapes.
+    fn safe_prefix_cut(&self, text: &str, commit_limit: usize) -> usize {
+        let mut cut = commit_limit.min(text.len());
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        cut
+    }
 }
 
 /// A guard that never redacts — for contexts where the firewall is intentionally
@@ -114,6 +129,30 @@ impl CredentialGuard for PatternCredentialGuard {
             }
         }
         current
+    }
+
+    fn safe_prefix_cut(&self, text: &str, commit_limit: usize) -> usize {
+        // Run every pattern over the full rolling window `text` and pull the cut
+        // back before the earliest match that would straddle `commit_limit`
+        // (starts before the cut, ends past the commit point). Such a match is
+        // retained whole for the next chunk instead of being split.
+        let mut cut = commit_limit.min(text.len());
+        for (regex, _) in &self.rules {
+            for found in regex.find_iter(text) {
+                if found.start() >= cut {
+                    // Matches arrive in increasing start order; nothing past the
+                    // current cut can lower it further for this pattern.
+                    break;
+                }
+                if found.end() > commit_limit {
+                    cut = found.start();
+                }
+            }
+        }
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        cut
     }
 }
 
@@ -271,26 +310,30 @@ impl ToolOutputWriter for RedactingOutputWriter {
     }
 }
 
-/// Once a line buffers past this without a newline, it is force-flushed in
-/// bounded segments — so a no-newline torrent (`print('x'*500_000_000)`) cannot
-/// grow memory without bound. Also caps how long a `BEGIN…END` private-key block
-/// is buffered before it is force-redacted.
+/// A `BEGIN…END` private-key block is buffered until its `END` is seen or it
+/// passes this cap, at which point it is force-redacted to a marker (never
+/// buffered or leaked further). Bounds memory for a never-closed block.
 const REDACTOR_BUFFER_LIMIT: usize = 64 * 1024;
-/// Raw bytes retained at a forced no-newline flush so a secret straddling the cut
-/// is re-examined with the next chunk. Larger than any single-line secret pattern.
-const REDACTOR_OVERLAP: usize = 1024;
+/// The rolling scan window. The redactor never emits the last
+/// `MAX_SECRET_SCAN_WINDOW` bytes of its buffer, so any secret up to this length
+/// straddling a flush boundary is re-examined (whole) with the next chunk. It
+/// also bounds memory: a no-newline torrent is force-flushed down to this tail.
+const MAX_SECRET_SCAN_WINDOW: usize = 16 * 1024;
 const PEM_MARKER: &[u8] = b"[REDACTED:private-key]\n";
 
-/// A bounded, stateful streaming redactor for one output stream. It guarantees
-/// two things the naive line-buffer did not:
+/// A bounded, stateful streaming redactor for one output stream. It guarantees:
 ///
-/// 1. **Bounded memory** — it never retains more than ~`REDACTOR_BUFFER_LIMIT`
-///    bytes, force-flushing a long no-newline run in segments (keeping a small
-///    overlap so a secret split across the cut is still caught).
-/// 2. **Multi-line secrets** — a `BEGIN…END PRIVATE KEY` block is held and
-///    redacted as a *unit* (emitting a single marker), since the PEM pattern only
-///    matches across lines. A runaway block (> the buffer limit without an `END`)
-///    is force-redacted to a marker rather than buffered or leaked.
+/// 1. **Bounded memory** — the last `MAX_SECRET_SCAN_WINDOW` bytes are always
+///    held back (the rolling window) and everything before is flushed, so a
+///    no-newline torrent is force-flushed down to that window rather than buffered
+///    whole.
+/// 2. **No split secrets** — before flushing a no-newline prefix it runs the
+///    guard's matcher over the rolling window and cuts *before* any match that
+///    would straddle the flush boundary, so a token split across chunks is caught
+///    whole on the next push.
+/// 3. **Multi-line secrets** — a `BEGIN…END PRIVATE KEY` block is held and
+///    redacted as a *unit* (one marker); a runaway block past the buffer cap is
+///    force-redacted to a marker rather than buffered or leaked.
 ///
 /// UTF-8 segments are scrubbed through the guard; non-UTF-8 (binary) segments pass
 /// through unchanged to preserve fidelity.
@@ -323,18 +366,31 @@ impl BoundedRedactor {
                 }
                 if self.pending.len() > REDACTOR_BUFFER_LIMIT {
                     // Runaway key with no END in sight: emit a marker, drop the
-                    // buffered key bytes (keep a small tail to catch the END), and
+                    // buffered key bytes (keep a window tail to catch the END), and
                     // stay in_pem. No key material is written.
-                    let drop_to = self.pending.len() - REDACTOR_OVERLAP;
+                    let drop_to = self.pending.len() - MAX_SECRET_SCAN_WINDOW;
                     self.pending.drain(..drop_to);
                     out.extend_from_slice(PEM_MARKER);
+                    continue;
                 }
                 break;
             }
 
-            if let Some(nl) = self.pending.iter().position(|&byte| byte == b'\n') {
+            // Always retain the last MAX_SECRET_SCAN_WINDOW bytes so a secret
+            // straddling the emit point is re-examined with the next chunk.
+            let commit_limit = self.pending.len().saturating_sub(MAX_SECRET_SCAN_WINDOW);
+            if commit_limit == 0 {
+                break;
+            }
+
+            // A newline-terminated line within the committable region flushes as a
+            // unit (single-line secrets live within one line; multi-line PEM is
+            // handled above). A BEGIN line switches to block-mode, unemitted.
+            if let Some(nl) = self.pending[..commit_limit]
+                .iter()
+                .position(|&byte| byte == b'\n')
+            {
                 if line_starts_pem(&self.pending[..=nl]) {
-                    // Keep the BEGIN line in the buffer as the block start.
                     self.in_pem = true;
                     continue;
                 }
@@ -343,18 +399,36 @@ impl BoundedRedactor {
                 continue;
             }
 
-            if self.pending.len() > REDACTOR_BUFFER_LIMIT {
-                // Long no-newline run: flush a bounded prefix, cutting on a
-                // non-token boundary so a single-line secret is not split.
-                let cut = safe_cut(&self.pending, REDACTOR_OVERLAP);
-                let segment: Vec<u8> = self.pending.drain(..cut).collect();
-                out.extend_from_slice(&redact_segment(self.guard.as_ref(), &segment));
-                continue;
+            // No newline in the committable region: a long no-newline run. Flush a
+            // bounded prefix, cutting before any match straddling the window.
+            let cut = self.rolling_cut(commit_limit);
+            if cut == 0 {
+                break;
             }
-
-            break;
+            let segment: Vec<u8> = self.pending.drain(..cut).collect();
+            out.extend_from_slice(&redact_segment(self.guard.as_ref(), &segment));
         }
         out
+    }
+
+    /// Choose a safe flush boundary for a no-newline run: run the guard's matcher
+    /// over the rolling window (the whole buffer) and cut before any match that
+    /// would straddle `commit_limit`. Never backs up more than one window — a
+    /// "secret" longer than the window is not one of our patterns — which also
+    /// guarantees forward progress, and therefore bounded memory.
+    fn rolling_cut(&self, commit_limit: usize) -> usize {
+        let floor = commit_limit.saturating_sub(MAX_SECRET_SCAN_WINDOW);
+        let cut = match std::str::from_utf8(&self.pending) {
+            Ok(text) => self.guard.safe_prefix_cut(text, commit_limit),
+            Err(error) if error.valid_up_to() >= commit_limit => {
+                // The committable region is valid UTF-8; scan its valid extent.
+                let text = std::str::from_utf8(&self.pending[..error.valid_up_to()]).unwrap_or("");
+                self.guard.safe_prefix_cut(text, commit_limit)
+            }
+            // Binary in/around the committable region: no text secrets to split.
+            Err(_) => commit_limit,
+        };
+        cut.max(floor)
     }
 
     fn flush(&mut self) -> Vec<u8> {
@@ -402,32 +476,6 @@ fn find_pem_end(buf: &[u8]) -> Option<usize> {
         }
     }
     None
-}
-
-/// Choose a flush cut for a long no-newline run: target `len - overlap`, then back
-/// up (at most `overlap` more) to a non-token, char-boundary byte so a single-line
-/// secret isn't split across the cut. Always returns a positive, bounded cut.
-fn safe_cut(buf: &[u8], overlap: usize) -> usize {
-    let target = buf.len().saturating_sub(overlap).max(1);
-    let floor = target.saturating_sub(overlap).max(1);
-    let is_token = |byte: u8| {
-        byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'+' | b'=' | b':')
-    };
-    let mut cut = target;
-    while cut > floor {
-        let byte = buf[cut - 1];
-        if is_token(byte) || (byte & 0xC0) == 0x80 {
-            cut -= 1;
-        } else {
-            break;
-        }
-    }
-    // Don't cut in the middle of a UTF-8 character.
-    while cut > floor && (buf[cut] & 0xC0) == 0x80 {
-        cut -= 1;
-    }
-    cut.max(floor)
 }
 
 #[cfg(test)]
@@ -604,7 +652,7 @@ mod tests {
         for _ in 0..256 {
             total += r.push(&chunk).len();
             assert!(
-                r.pending.len() <= REDACTOR_BUFFER_LIMIT + chunk.len(),
+                r.pending.len() <= 2 * MAX_SECRET_SCAN_WINDOW + chunk.len(),
                 "pending must stay bounded, got {}",
                 r.pending.len()
             );
@@ -652,5 +700,57 @@ mod tests {
             text.contains("before") && text.contains("after"),
             "content surrounding the key is kept"
         );
+    }
+
+    #[test]
+    fn bounded_redactor_redacts_token_across_force_flush_boundary() {
+        // A token split across pushes inside a no-newline torrent (which forces
+        // flushes) must still be redacted: the rolling window keeps a straddling
+        // token whole until it is complete, then redacts it.
+        let mut r = BoundedRedactor::new(Arc::new(PatternCredentialGuard::new()));
+        let mut out = Vec::new();
+        out.extend(r.push(&vec![b'x'; 40 * 1024])); // forces flushes, no newline
+        out.extend(r.push(b" ghp_0123456789abcdef0123")); // ghp_ + 20 chars (partial)
+        out.extend(r.push(b"456789abcdef0123 more")); // + 16 chars, then a boundary
+        out.extend(r.push(&vec![b'y'; 40 * 1024]));
+        out.extend(r.flush());
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("[REDACTED:github-token]"),
+            "a github token straddling a force-flush boundary must be redacted"
+        );
+        assert!(
+            !text.contains("ghp_0123456789abcdef0123456789abcdef0123"),
+            "the raw github token must not be emitted"
+        );
+
+        // Same for a bearer token split across pushes.
+        let mut r2 = BoundedRedactor::new(Arc::new(PatternCredentialGuard::new()));
+        let mut out2 = Vec::new();
+        out2.extend(r2.push(&vec![b'z'; 40 * 1024]));
+        out2.extend(r2.push(b" Authorization: Bearer abcdefghij"));
+        out2.extend(r2.push(b"klmnopqrstuvwxyz0123 end"));
+        out2.extend(r2.push(&vec![b'w'; 40 * 1024]));
+        out2.extend(r2.flush());
+        let text2 = String::from_utf8_lossy(&out2);
+        assert!(
+            text2.contains("[REDACTED]"),
+            "a bearer token straddling a force-flush boundary must be redacted"
+        );
+        assert!(
+            !text2.contains("abcdefghijklmnopqrstuvwxyz0123"),
+            "the raw bearer token must not be emitted"
+        );
+    }
+
+    #[test]
+    fn bounded_redactor_passes_binary_intact() {
+        // Non-UTF-8 output passes through byte-for-byte — redaction must not
+        // corrupt binary spilled content.
+        let mut r = BoundedRedactor::new(Arc::new(PatternCredentialGuard::new()));
+        let binary: Vec<u8> = (0u8..=255).cycle().take(40 * 1024).collect();
+        let mut out = r.push(&binary);
+        out.extend(r.flush());
+        assert_eq!(out, binary, "binary output must pass through unchanged");
     }
 }
