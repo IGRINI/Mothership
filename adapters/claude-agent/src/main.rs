@@ -7,9 +7,12 @@
 //! subagents.
 
 mod adapter;
+mod auth;
 mod bridge;
+mod builtin_models;
 mod cli;
 mod mcp;
+mod model_catalog;
 mod models;
 mod settings;
 

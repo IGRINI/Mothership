@@ -21,7 +21,7 @@ use serde_json::Value;
 /// `initialize` and refuses an adapter that reports a different version, rather
 /// than mis-parsing a contract it doesn't understand. Bump on any incompatible
 /// change to `Request`/`Outbound`.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Host -> adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -464,6 +464,9 @@ pub enum ModelManagement {
     Fixed,
     /// Fetched from the provider's server (e.g. Codex).
     Server,
+    /// Fetched from the provider, but the provider also accepts manually typed
+    /// model ids/aliases that are not present in the advertised catalog.
+    ServerWithCustom,
     /// The user maintains the list (e.g. OpenRouter); UI shows a "+".
     UserDefined,
 }
@@ -476,6 +479,16 @@ pub struct SettingsField {
     pub label: String,
     pub kind: SettingsFieldKind,
     pub required: bool,
+    #[serde(default)]
+    pub options: Vec<SettingsFieldOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingsFieldOption {
+    pub value: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,6 +500,10 @@ pub enum SettingsFieldKind {
     /// An editable list of strings (e.g. a user-defined model-id list). The host
     /// renders add/remove rows; the value is stored as the items joined by `\n`.
     StringList,
+    /// A provider-declared model visibility checklist. The UI renders
+    /// human-readable options as checked when visible; unchecked option values
+    /// are stored in this field as newline-separated hidden model ids.
+    ModelVisibilityList,
 }
 
 /// The adapter's auth scheme. Secret values (API keys) are persisted by the host

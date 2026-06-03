@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{bail, Context as _};
 use mothership_adapter_sdk::protocol::{ReasoningConfig, ReasoningEffort};
@@ -10,12 +11,15 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+use crate::auth::ClaudeAuthRuntime;
 use crate::bridge::ToolBridgeServer;
+use crate::model_catalog::{ClaudeModelCatalog, ClaudeModelInfo};
 use crate::settings::ClaudeAgentSettings;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CLIENT_APP: &str = "mothership/0.1.0";
 const SETTING_SOURCES: &str = "user,project";
+const MODEL_METADATA_TIMEOUT: Duration = Duration::from_secs(20);
 const HEADLESS_DISALLOWED_TOOLS: &[&str] = &[
     "AskUserQuestion",
     "CronCreate",
@@ -27,21 +31,6 @@ const HEADLESS_DISALLOWED_TOOLS: &[&str] = &[
     "ExitWorktree",
     "ScheduleWakeup",
 ];
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ClaudeModelInfo {
-    pub(crate) value: String,
-    pub(crate) display_name: String,
-    #[serde(default)]
-    pub(crate) supports_effort: bool,
-    #[serde(default)]
-    pub(crate) supported_effort_levels: Vec<String>,
-    #[serde(default)]
-    pub(crate) supports_adaptive_thinking: bool,
-    #[serde(default)]
-    pub(crate) recommended: bool,
-}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,7 +55,8 @@ struct ControlEnvelope {
 enum ControlResponse {
     Success {
         request_id: String,
-        response: InitializeResponse,
+        #[serde(default)]
+        response: Value,
     },
     Error {
         request_id: String,
@@ -80,11 +70,57 @@ struct InitializeResponse {
     models: Vec<ClaudeModelInfo>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsResponse {
+    #[serde(default)]
+    effective: Option<EffectiveSettings>,
+    #[serde(default)]
+    available_models: Option<Vec<String>>,
+}
+
+impl SettingsResponse {
+    fn into_available_models(self) -> Option<Vec<String>> {
+        self.effective
+            .and_then(|settings| settings.available_models)
+            .or(self.available_models)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EffectiveSettings {
+    #[serde(default)]
+    available_models: Option<Vec<String>>,
+}
+
 pub(crate) async fn supported_models(
     settings: &ClaudeAgentSettings,
-) -> anyhow::Result<Vec<ClaudeModelInfo>> {
+    ctx: &AdapterContext,
+) -> anyhow::Result<ClaudeModelCatalog> {
+    match tokio::time::timeout(
+        MODEL_METADATA_TIMEOUT,
+        supported_models_inner(settings, ctx),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => bail!(
+            "Claude model metadata request timed out after {} seconds",
+            MODEL_METADATA_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+async fn supported_models_inner(
+    settings: &ClaudeAgentSettings,
+    ctx: &AdapterContext,
+) -> anyhow::Result<ClaudeModelCatalog> {
     let executable = resolve_executable(settings)?;
-    let mut child = claude_command(&executable, settings)
+    let auth = ClaudeAuthRuntime::prepare(settings)?;
+    let mut command = claude_command(&executable, &auth);
+    command.kill_on_drop(true);
+    command
         .args([
             "--print",
             "--input-format",
@@ -102,7 +138,9 @@ pub(crate) async fn supported_models(
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
         .spawn()
         .with_context(|| format!("spawn Claude Agent SDK binary {}", executable.display()))?;
 
@@ -124,10 +162,21 @@ pub(crate) async fn supported_models(
     });
     stdin.write_all(request.to_string().as_bytes()).await?;
     stdin.write_all(b"\n").await?;
+    let request = json!({
+        "type": "control_request",
+        "request_id": "settings",
+        "request": {
+            "subtype": "get_settings"
+        }
+    });
+    stdin.write_all(request.to_string().as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
     stdin.shutdown().await?;
 
     let mut reader = BufReader::new(stdout).lines();
     let mut models = None;
+    let mut available_models = None;
+    let mut settings_seen = false;
     while let Some(line) = reader.next_line().await? {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -141,14 +190,48 @@ pub(crate) async fn supported_models(
                 request_id,
                 response,
             } if request_id == "models" => {
-                models = Some(response.models);
-                break;
+                models = Some(
+                    serde_json::from_value::<InitializeResponse>(response)
+                        .context("decode Claude model metadata response")?
+                        .models,
+                );
+                if settings_seen {
+                    break;
+                }
+            }
+            ControlResponse::Success {
+                request_id,
+                response,
+            } if request_id == "settings" => {
+                available_models = serde_json::from_value::<SettingsResponse>(response)
+                    .ok()
+                    .and_then(SettingsResponse::into_available_models);
+                settings_seen = true;
+                if models.is_some() {
+                    break;
+                }
             }
             ControlResponse::Error { request_id, error } if request_id == "models" => {
                 bail!("Claude model metadata request failed: {error}");
             }
+            ControlResponse::Error { request_id, .. } if request_id == "settings" => {
+                settings_seen = true;
+                if models.is_some() {
+                    break;
+                }
+            }
             _ => {}
         }
+    }
+
+    if let Some(models) = models {
+        let _ = child.kill().await;
+        let _ = stderr_task.await.unwrap_or_default();
+        auth.persist_refreshed_credentials(Some(ctx));
+        return Ok(ClaudeModelCatalog {
+            models,
+            available_models,
+        });
     }
 
     let status = child.wait().await?;
@@ -159,8 +242,12 @@ pub(crate) async fn supported_models(
             stderr.trim()
         );
     }
+    auth.persist_refreshed_credentials(Some(ctx));
 
-    Ok(models.unwrap_or_default())
+    Ok(ClaudeModelCatalog {
+        models: Vec::new(),
+        available_models,
+    })
 }
 
 pub(crate) async fn stream_chat(
@@ -170,6 +257,7 @@ pub(crate) async fn stream_chat(
     sink: &mut ChatSink,
 ) -> anyhow::Result<ChatRoundOutcome> {
     let executable = resolve_executable(settings)?;
+    let auth = ClaudeAuthRuntime::prepare(settings)?;
     let mut state = request
         .state
         .clone()
@@ -194,7 +282,8 @@ pub(crate) async fn stream_chat(
         )
     };
 
-    let mut command = claude_command(&executable, settings);
+    let mut command = claude_command(&executable, &auth);
+    command.kill_on_drop(true);
     let disallowed_tools = disallowed_tools_for_request(&request).join(",");
     command.args([
         "--print",
@@ -258,6 +347,7 @@ pub(crate) async fn stream_chat(
             }
             _ = sink.cancelled() => {
                 let _ = child.kill().await;
+                auth.persist_refreshed_credentials(Some(ctx));
                 return Ok(ChatRoundOutcome::default());
             }
         }
@@ -271,6 +361,7 @@ pub(crate) async fn stream_chat(
     if let Some(error) = result_error {
         bail!("Claude returned an error: {error}");
     }
+    auth.persist_refreshed_credentials(Some(ctx));
 
     Ok(ChatRoundOutcome {
         state: Some(serde_json::to_value(ClaudeAgentState {
@@ -463,14 +554,13 @@ fn handle_chat_line(
     Ok(())
 }
 
-fn claude_command(executable: &Path, settings: &ClaudeAgentSettings) -> Command {
+fn claude_command(executable: &Path, auth: &ClaudeAuthRuntime) -> Command {
     let mut command = Command::new(executable);
     command.env_clear();
     for (key, value) in inherited_child_env() {
         command.env(key, value);
     }
-    command.env("ANTHROPIC_AUTH_TOKEN", settings.oauth_token());
-    command.env("CLAUDE_CODE_OAUTH_TOKEN", settings.oauth_token());
+    auth.apply_to_command(&mut command);
     command.env("CLAUDE_AGENT_SDK_CLIENT_APP", CLIENT_APP);
     command.env("NO_COLOR", "1");
     #[cfg(windows)]

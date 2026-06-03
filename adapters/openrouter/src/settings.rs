@@ -46,18 +46,21 @@ pub(crate) fn settings_schema() -> Vec<SettingsField> {
             label: "OpenRouter API key".to_string(),
             kind: SettingsFieldKind::Secret,
             required: true,
+            options: Vec::new(),
         },
         SettingsField {
             key: "base_url".to_string(),
             label: "Base URL (optional)".to_string(),
             kind: SettingsFieldKind::Text,
             required: false,
+            options: Vec::new(),
         },
         SettingsField {
             key: "models".to_string(),
             label: "Models".to_string(),
             kind: SettingsFieldKind::StringList,
             required: false,
+            options: Vec::new(),
         },
     ]
 }

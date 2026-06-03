@@ -26,20 +26,22 @@ impl ProviderAdapter for ClaudeAgentAdapter {
 
     fn auth_schema(&self) -> AuthKind {
         AuthKind::ApiKey {
-            label: "Claude OAuth token".to_string(),
+            label: "Claude credentials".to_string(),
         }
     }
 
     fn auth_status(&self) -> AuthStatus {
-        if self.settings.has_oauth_token() {
+        if self.settings.has_credentials() {
             AuthStatus {
                 kind: AuthStatusKind::Configured,
                 account_label: None,
                 expires_at: None,
-                detail: Some("Claude OAuth token is configured".to_string()),
+                detail: Some("Claude credentials are configured".to_string()),
             }
         } else {
-            AuthStatus::missing("Paste a Claude OAuth token to use Claude Agent SDK")
+            AuthStatus::missing(
+                "Paste Claude credentials JSON or configure a Claude config directory",
+            )
         }
     }
 
@@ -48,15 +50,18 @@ impl ProviderAdapter for ClaudeAgentAdapter {
         Ok(())
     }
 
-    async fn models(&mut self, _ctx: &Context) -> anyhow::Result<(ModelManagement, Vec<Model>)> {
-        if !self.settings.has_oauth_token() {
-            return Ok((ModelManagement::Fixed, models::fallback_models()));
+    async fn models(&mut self, ctx: &Context) -> anyhow::Result<(ModelManagement, Vec<Model>)> {
+        if !self.settings.has_credentials() {
+            return Ok((ModelManagement::Fixed, Vec::new()));
         }
 
-        let sdk_models = cli::supported_models(&self.settings)
+        let sdk_catalog = cli::supported_models(&self.settings, ctx)
             .await
             .context("read Claude Agent SDK model metadata")?;
-        Ok((ModelManagement::Server, models::from_sdk_models(sdk_models)))
+        Ok((
+            ModelManagement::ServerWithCustom,
+            models::from_sdk_catalog(sdk_catalog, &self.settings),
+        ))
     }
 
     async fn chat(
@@ -65,8 +70,10 @@ impl ProviderAdapter for ClaudeAgentAdapter {
         ctx: &Context,
         sink: &mut ChatSink,
     ) -> anyhow::Result<ChatRoundOutcome> {
-        if !self.settings.has_oauth_token() {
-            anyhow::bail!("missing Claude OAuth token (set it in adapter settings)");
+        if !self.settings.has_credentials() {
+            anyhow::bail!(
+                "missing Claude credentials (paste credentials JSON or configure a Claude config directory)"
+            );
         }
         cli::stream_chat(&self.settings, request, ctx, sink).await
     }
