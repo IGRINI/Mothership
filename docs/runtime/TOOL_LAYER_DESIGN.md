@@ -128,8 +128,10 @@ unit-test against an in-memory FS.
 - **Atomic write**: temp file beside target -> fsync where possible -> `std::fs::rename`
   (which replaces an existing dest on all platforms incl. Windows — no `ReplaceFile`/
   `MoveFileEx` needed). Old file is stream-hashed (never slurped); diff summarized when large.
-- Overwrite of an existing file: `expectedSha256` effectively required; if missing and the
-  file exists, treat as full-overwrite → ask with explicit warning. Mismatch → conflict, do not write.
+- Overwrite of an existing file: blind overwrite is refused. The call must carry
+  `expectedSha256`, or the current run must have a fresh **complete** `read_file`
+  observation whose SHA still matches the file on disk. `overwrite=true` is not a
+  security precondition. Mismatch/stale observation → conflict-style failure, do not write.
 - Result: `{ path, created|modified, bytes, +N/-N, sha256 }`.
 
 ### edit_file  (pure core LANDED: `tools/file_edit.rs::apply_edit`)
@@ -183,7 +185,8 @@ before Approve. Approval is a Core event routed to wherever the human is (incl. 
 1. [DONE] filesystem.rs: Workspace (path resolve + containment + sensitive-path policy)
           + FileSystem port + StdFileSystem (atomic write = temp + fsync + rename).
 2. [DONE] read_file  (binary guard, cat -n line numbers, offset/limit, large-output spill).
-3. [DONE] write_file (create/overwrite, expectedSha256 conflict, BOM/EOL preserve, atomic).
+3. [DONE] write_file (create/overwrite, expectedSha256 or full-read observation
+          precondition, BOM/EOL preserve, atomic).
 4. [DONE] edit_file  (wires apply_edit; atomic write; NotFound/Ambiguous as ok:false).
 5. [DONE] apply_patch (wires plan_patch; guard all paths; plan-level all-or-none; batched
           approval; per-file apply).
@@ -235,6 +238,12 @@ These hold on `feat/typed-tool-layer` as of the 4th review round. They supersede
 - **Bounded events/DB/approval.** Diff/result text persisted/streamed and the
   PermissionRequested *preview* diff are bounded to `MAX_TOOL_EVENT_BYTES` (64 KiB), spilling
   the full diff to a `logRef`. `expectedSha256` gives optimistic-concurrency conflict checks.
+- **write_file cannot blind-overwrite existing files.** Existing-file writes require either
+  `expectedSha256` or a fresh complete `read_file` observation from the same run. The sidecar
+  records observations as `(run_id, resolved_path) -> sha256` only when `read_file` returned the
+  whole file (`startLine=1`, `endLine=totalLines`, no `bytesTruncated`, no display truncation).
+  The precondition is checked before approval and repeated at execution, so future auto/yolo
+  modes cannot bypass it.
 - **Claude adapter routing.** When the Mothership file tools are bridged (as
   `mcp__mothership__*`), the Claude-agent adapter disables Claude's native `Write`/`Edit`/
   `MultiEdit`/`NotebookEdit` (gated on a Mothership file tool present) AND native `Read`
@@ -337,7 +346,7 @@ typed storage, semantic UI, catalog stability, and a credential firewall.
 | Aggressive 9-stage fuzzy matcher for `edit_file` (opencode-style) | **Rejected → strict + narrow fallback** | Aggressive fuzzy can confidently patch the *wrong* region. Default exact+unique; v1.5 whitespace/indent-only fallback; uniqueness always enforced. (Implemented in `file_edit.rs`.) |
 | line-number-based edits as the primary API | **Rejected** | Line numbers go stale after any shift. Content-addressed `oldText`; line-range only later, gated by `expectedSha256`. |
 | `classify()` all-in-tool **or** all-in-one-policy | **Split** | Tool declares intent/capability/paths; policy engine decides allow/ask/deny with project/path/settings/remote context. |
-| `expectedSha256` on every mutation incl. apply_patch | **Refined** | Required-ish for write_file overwrite; recommended for edit_file; **redundant for apply_patch** (`plan_patch` all-hunks-match is the content check). |
+| `expectedSha256` on every mutation incl. apply_patch | **Refined** | Existing-file `write_file` requires a content precondition: `expectedSha256` or a fresh complete same-run `read_file` observation. `edit_file` keeps exact current-content matching plus optional sha. `apply_patch` does not need a separate sha because `plan_patch` all-hunks-match is the content check. |
 | Per-adapter hardcoded tool schemas | **Rejected (already fixed)** | Core `catalog.rs` owns schemas; adapters only convert format. |
 | read_file streams any file | **Rejected** | Binary guard: detect + refuse with size + hint; large text spills (preview+tail+contentRef). |
 | Atomic write needs `ReplaceFile`/`MoveFileEx` on Windows | **Corrected** | `std::fs::rename` already REPLACES an existing dest on all platforms incl. Windows (verified). `StdFileSystem::write_atomic` = temp-in-same-dir + fsync + `fs::rename`. |

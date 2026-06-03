@@ -51,12 +51,15 @@ pub use run::{schedule_cancel_fallback, ChatRunRegistry, ChatRunService};
 pub use subprocess_gateway::SubprocessChatGateway;
 pub use tools::{
     apply_patch as run_apply_patch_tool, classify as classify_file_tool,
+    check_write_content_precondition as check_write_file_content_precondition,
     default_credential_guard, edit_file as run_edit_file_tool, list_files as run_list_files_tool,
     preview_diff as file_tool_preview_diff, read_file as run_read_file_tool, redact_event,
     search_text as run_search_text_tool, tool_batch_plan,
     validate_args_shallow as validate_file_tool_args_shallow, write_file as run_write_file_tool,
-    write_file_with_limit as run_write_file_tool_with_limit, canonical_catalog_bytes,
-    canonical_json, catalog_fingerprint, CatalogDrift, CatalogPin, DEFAULT_MAX_WRITE_FILE_BYTES,
+    write_file_with_limit as run_write_file_tool_with_limit,
+    write_file_with_limit_and_observation as run_write_file_tool_with_limit_and_observation,
+    canonical_catalog_bytes, canonical_json, catalog_fingerprint, CatalogDrift, CatalogPin,
+    DEFAULT_MAX_WRITE_FILE_BYTES,
     ConservativeCommandPermissionPolicy, CredentialGuard, FileMetadata, NoopCredentialGuard,
     PatternCredentialGuard, RedactingOutputStore,
     ApprovalPreview, BackendOutcome, ResourceRequest, ToolBackend, ToolCapability, ToolDecision,

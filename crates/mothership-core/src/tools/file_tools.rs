@@ -618,9 +618,10 @@ pub fn read_file(
 // write_file
 // ===========================================================================
 
-/// Run `write_file`. Creates or fully overwrites a file. Honors `create` /
-/// `overwrite` flags and an `expectedSha256` precondition; preserves a leading
-/// BOM and the dominant line ending of an existing file; writes atomically.
+/// Run `write_file`. Creates or fully overwrites a file. Honors `create` and
+/// requires a content precondition (`expectedSha256` or a fresh full-file
+/// observation) before replacing an existing file; preserves a leading BOM and
+/// the dominant line ending of an existing file; writes atomically.
 pub fn write_file(
     arguments: &Value,
     workspace: &Workspace,
@@ -637,6 +638,21 @@ pub fn write_file_with_limit(
     workspace: &Workspace,
     fs: &dyn FileSystem,
     max_write_bytes: usize,
+) -> Result<FileToolOutcome, FileToolError> {
+    write_file_with_limit_and_observation(arguments, workspace, fs, max_write_bytes, None)
+}
+
+/// Like [`write_file_with_limit`], but accepts a fresh full-file observation
+/// from the current run as a content precondition for replacing an existing
+/// file. This makes blind overwrites impossible even when approval is bypassed:
+/// an existing file must match either `expectedSha256` from the call or the
+/// SHA-256 captured by a prior complete `read_file`.
+pub fn write_file_with_limit_and_observation(
+    arguments: &Value,
+    workspace: &Workspace,
+    fs: &dyn FileSystem,
+    max_write_bytes: usize,
+    observed_sha256: Option<&str>,
 ) -> Result<FileToolOutcome, FileToolError> {
     // Policy ceiling, checked on BORROWED fields BEFORE `parse_args` clones the
     // arguments — an oversized write is refused without ever cloning its content.
@@ -664,7 +680,6 @@ pub fn write_file_with_limit(
 
     let existed = fs.exists(&resolved);
     let create = input.create.unwrap_or(true);
-    let overwrite = input.overwrite.unwrap_or(false);
 
     if !existed && !create {
         return Ok(FileToolOutcome::failure(
@@ -703,14 +718,12 @@ pub fn write_file_with_limit(
                     }),
                 ));
             }
-        } else if !overwrite {
-            return Ok(FileToolOutcome::failure(
-                format!(
-                    "`{}` already exists; pass overwrite or expectedSha256 to replace it",
-                    input.path
-                ),
-                json!({ "path": input.path, "status": "exists", "sha256": old_sha }),
-            ));
+        } else if let Some(observed) = observed_sha256 {
+            if !observed.eq_ignore_ascii_case(old_sha) {
+                return Ok(write_precondition_failure(&input.path, old_sha, Some(observed)));
+            }
+        } else {
+            return Ok(write_precondition_failure(&input.path, old_sha, None));
         }
     }
 
@@ -794,6 +807,73 @@ pub fn write_file_with_limit(
         sha256: Some(new_sha),
         diff: Some(diff),
     })
+}
+
+/// Validate the write content precondition without cloning `content` or writing.
+/// Returns `Some(outcome)` when the call should be refused before approval /
+/// execution, and `None` when the write may continue. The actual handler repeats
+/// the same check after approval so a file changed between preview and execution
+/// still fails closed.
+pub fn check_write_content_precondition(
+    arguments: &Value,
+    workspace: &Workspace,
+    fs: &dyn FileSystem,
+    observed_sha256: Option<&str>,
+) -> Result<Option<FileToolOutcome>, FileToolError> {
+    validate_args_shallow(FileTool::Write, arguments)?;
+    let path = arg_str(arguments, "path")?;
+    let expected = optional_string_value_any(arguments, &["expectedSha256", "expected_sha256"])?;
+    let resolved = match resolve_guarded(workspace, path) {
+        Ok(path) => path,
+        Err(reason) => return Ok(Some(path_failure(path, reason))),
+    };
+    if !fs.exists(&resolved) || expected.is_some() {
+        return Ok(None);
+    }
+
+    let current_sha = fs
+        .hash_file_sha256(&resolved)
+        .map_err(|error| FileToolError::Io(error.to_string()))?;
+    match observed_sha256 {
+        Some(observed) if observed.eq_ignore_ascii_case(&current_sha) => Ok(None),
+        observed => Ok(Some(write_precondition_failure(
+            path,
+            &current_sha,
+            observed,
+        ))),
+    }
+}
+
+fn write_precondition_failure(
+    path: &str,
+    actual_sha256: &str,
+    observed_sha256: Option<&str>,
+) -> FileToolOutcome {
+    match observed_sha256 {
+        Some(observed) => FileToolOutcome::failure(
+            format!(
+                "`{path}` changed since it was read (observed sha256 {observed}, found {actual_sha256}); not written"
+            ),
+            json!({
+                "path": path,
+                "status": "stale_observation",
+                "observedSha256": observed,
+                "actualSha256": actual_sha256,
+                "required": "expectedSha256 or a fresh complete read_file observation",
+            }),
+        ),
+        None => FileToolOutcome::failure(
+            format!(
+                "`{path}` already exists; refusing blind overwrite. Read the full file first or pass expectedSha256."
+            ),
+            json!({
+                "path": path,
+                "status": "precondition_required",
+                "sha256": actual_sha256,
+                "required": "expectedSha256 or a fresh complete read_file observation",
+            }),
+        ),
+    }
 }
 
 // ===========================================================================
@@ -1382,6 +1462,20 @@ fn optional_string_any(arguments: &Value, fields: &[&str]) -> Result<(), FileToo
     Ok(())
 }
 
+fn optional_string_value_any<'a>(
+    arguments: &'a Value,
+    fields: &[&str],
+) -> Result<Option<&'a str>, FileToolError> {
+    for field in fields {
+        if let Some(value) = arguments.get(*field) {
+            return value.as_str().map(Some).ok_or_else(|| {
+                FileToolError::InvalidArguments(format!("`{field}` must be a string"))
+            });
+        }
+    }
+    Ok(None)
+}
+
 /// The full set of paths a patch references (sources and move destinations).
 fn patch_paths(ops: &[super::patch::PatchOp]) -> Vec<String> {
     use super::patch::PatchOp;
@@ -1724,7 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn write_file_refuses_existing_without_overwrite() {
+    fn write_file_refuses_existing_without_content_precondition() {
         let (ws, dir) = temp_workspace("write_noover");
         let fs = StdFileSystem::new();
         fs::write(dir.join("a.txt"), b"old\n").unwrap();
@@ -1736,7 +1830,8 @@ mod tests {
         )
         .unwrap();
         assert!(!out.ok);
-        assert_eq!(out.data["status"], "exists");
+        assert_eq!(out.data["status"], "precondition_required");
+        assert_eq!(out.data["required"], "expectedSha256 or a fresh complete read_file observation");
         // File unchanged.
         assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"old\n");
 
@@ -1744,7 +1839,7 @@ mod tests {
     }
 
     #[test]
-    fn write_file_overwrites_with_flag() {
+    fn write_file_overwrite_flag_does_not_bypass_content_precondition() {
         let (ws, dir) = temp_workspace("write_over");
         let fs = StdFileSystem::new();
         fs::write(dir.join("a.txt"), b"old\n").unwrap();
@@ -1755,9 +1850,52 @@ mod tests {
             &fs,
         )
         .unwrap();
+        assert!(!out.ok);
+        assert_eq!(out.data["status"], "precondition_required");
+        assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"old\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_existing_allows_matching_observation() {
+        let (ws, dir) = temp_workspace("write_observed");
+        let fs = StdFileSystem::new();
+        fs::write(dir.join("a.txt"), b"old\n").unwrap();
+        let observed = sha_of("old\n");
+
+        let out = write_file_with_limit_and_observation(
+            &json!({ "path": "a.txt", "content": "new\n" }),
+            &ws,
+            &fs,
+            DEFAULT_MAX_WRITE_FILE_BYTES,
+            Some(&observed),
+        )
+        .unwrap();
         assert!(out.ok);
         assert_eq!(out.data["status"], "modified");
         assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"new\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_existing_rejects_stale_observation() {
+        let (ws, dir) = temp_workspace("write_stale_observed");
+        let fs = StdFileSystem::new();
+        fs::write(dir.join("a.txt"), b"old\n").unwrap();
+
+        let out = write_file_with_limit_and_observation(
+            &json!({ "path": "a.txt", "content": "new\n" }),
+            &ws,
+            &fs,
+            DEFAULT_MAX_WRITE_FILE_BYTES,
+            Some("deadbeef"),
+        )
+        .unwrap();
+        assert!(!out.ok);
+        assert_eq!(out.data["status"], "stale_observation");
+        assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"old\n");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1806,9 +1944,10 @@ mod tests {
         let fs = StdFileSystem::new();
         // Existing file: BOM + CRLF.
         fs::write(dir.join("a.txt"), "\u{FEFF}one\r\ntwo\r\n".as_bytes()).unwrap();
+        let expected = sha_of("\u{FEFF}one\r\ntwo\r\n");
 
         let out = write_file(
-            &json!({ "path": "a.txt", "content": "alpha\nbeta\n", "overwrite": true }),
+            &json!({ "path": "a.txt", "content": "alpha\nbeta\n", "expectedSha256": expected }),
             &ws,
             &fs,
         )
@@ -1894,12 +2033,15 @@ mod tests {
         // truncated and the summary path is taken. `read()` panicking proves
         // write_file never slurps it.
         let old = vec![b'x'; 4096];
+        let observed = sha256_hex(&old);
         let fs = NoFullReadFs::new(old, 256);
 
-        let out = write_file(
-            &json!({ "path": "big.txt", "content": "brand new content\n", "overwrite": true }),
+        let out = write_file_with_limit_and_observation(
+            &json!({ "path": "big.txt", "content": "brand new content\n" }),
             &ws,
             &fs,
+            DEFAULT_MAX_WRITE_FILE_BYTES,
+            Some(&observed),
         )
         .unwrap();
         assert!(out.ok, "{}", out.model_text);
@@ -1971,9 +2113,10 @@ mod tests {
         let (ws, dir) = temp_workspace("write_small_diff");
         let fs = StdFileSystem::new();
         fs::write(dir.join("a.txt"), b"old\n").unwrap();
+        let expected = sha_of("old\n");
 
         let out = write_file(
-            &json!({ "path": "a.txt", "content": "new\n", "overwrite": true }),
+            &json!({ "path": "a.txt", "content": "new\n", "expectedSha256": expected }),
             &ws,
             &fs,
         )

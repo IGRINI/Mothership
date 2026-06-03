@@ -1,19 +1,19 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
 use std::time::Duration;
 
 use mothership_core::{
-    classify_file_tool, file_tool_preview_diff, run_apply_patch_tool, run_edit_file_tool,
-    run_list_files_tool, run_read_file_tool, run_search_text_tool,
-    run_write_file_tool_with_limit, DEFAULT_MAX_WRITE_FILE_BYTES,
-    tool_batch_plan, validate_file_tool_args_shallow, ChatCancellationToken, FileTool,
-    FileToolOutcome,
+    check_write_file_content_precondition, classify_file_tool, file_tool_preview_diff,
+    run_apply_patch_tool, run_edit_file_tool, run_list_files_tool, run_read_file_tool,
+    run_search_text_tool, run_write_file_tool_with_limit_and_observation,
+    DEFAULT_MAX_WRITE_FILE_BYTES, tool_batch_plan, ChatCancellationToken, FileTool, FileToolOutcome,
     FileToolSpill, LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResult, MothershipError,
     PendingToolApprovalGate, Result, SpawnedToolProcess, StdFileSystem, ToolApprovalDecision,
     ToolArtifact, ToolBatchPlan, ToolCallContext, ToolCancellationToken, ToolCommand,
@@ -31,6 +31,7 @@ const DEFAULT_TOOL_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const MAX_TOOL_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const CHAT_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_TOOL_RESULT_CHARS: usize = 160 * 1024;
+const MAX_FILE_OBSERVATIONS: usize = 4096;
 
 pub struct ProcessSandboxToolAdapter {
     inner: Arc<dyn process_sandbox::ProcessSandbox>,
@@ -171,6 +172,13 @@ struct FileToolExecutor {
     /// approval preview and the actual write (the composition root sets it; the
     /// default is [`DEFAULT_MAX_WRITE_FILE_BYTES`]).
     max_write_bytes: usize,
+    observations: Arc<Mutex<HashMap<FileObservationKey, String>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FileObservationKey {
+    run_id: String,
+    path: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +222,7 @@ impl SidecarLlmToolHandler {
             file_system: StdFileSystem::new(),
             output_store,
             max_write_bytes: DEFAULT_MAX_WRITE_FILE_BYTES,
+            observations: Arc::new(Mutex::new(HashMap::new())),
         });
         Self {
             command_executor,
@@ -425,6 +434,62 @@ impl ToolExecutor for FileToolExecutor {
 }
 
 impl FileToolExecutor {
+    fn observation_key_for_path(
+        &self,
+        run_id: &Option<String>,
+        workspace: &Workspace,
+        path: &str,
+    ) -> Option<FileObservationKey> {
+        let run_id = run_id.as_ref()?.clone();
+        let resolved = workspace.resolve(path).ok()?;
+        Some(FileObservationKey {
+            run_id,
+            path: resolved,
+        })
+    }
+
+    fn observed_sha_for_write(
+        &self,
+        arguments: &Value,
+        workspace: &Workspace,
+        run_id: &Option<String>,
+    ) -> Option<String> {
+        let path = arguments.get("path").and_then(Value::as_str)?;
+        let key = self.observation_key_for_path(run_id, workspace, path)?;
+        self.observations.lock().ok()?.get(&key).cloned()
+    }
+
+    fn record_read_observation(
+        &self,
+        tool: FileTool,
+        outcome: &FileToolOutcome,
+        workspace: &Workspace,
+        run_id: &Option<String>,
+    ) {
+        if tool != FileTool::Read || !is_complete_read_observation(outcome) {
+            return;
+        }
+        let Some(path) = outcome.data.get("path").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(sha256) = outcome
+            .sha256
+            .as_deref()
+            .or_else(|| outcome.data.get("sha256").and_then(Value::as_str))
+        else {
+            return;
+        };
+        let Some(key) = self.observation_key_for_path(run_id, workspace, path) else {
+            return;
+        };
+        let Ok(mut observations) = self.observations.lock() else {
+            return;
+        };
+        if observations.len() >= MAX_FILE_OBSERVATIONS {
+            observations.clear();
+        }
+        observations.insert(key, sha256.to_string());
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn run_file_tool_inner(
@@ -449,31 +514,66 @@ impl FileToolExecutor {
             }
         };
 
-        match capability.action {
-            ToolPermissionAction::Deny => {
-                let result = synthesized_result(
-                    tool_call_id,
-                    ToolExecutionStatus::PermissionDenied,
-                    String::new(),
-                    Some(capability.summary.clone()),
-                );
-                self.emit_file_event(
-                    tool,
-                    tool_call_id,
-                    run_id,
-                    project_id,
-                    ToolExecutionEventKind::PermissionDenied,
-                    Some(capability.summary.clone()),
-                    Some(result),
-                    TypedEventExtras::default(),
-                );
-                return LlmToolCallResult {
-                    ok: false,
-                    content: capability.summary,
-                };
-            }
-            ToolPermissionAction::Ask => {
-                if let Err(error) = validate_file_tool_args_shallow(tool, arguments) {
+        if capability.action == ToolPermissionAction::Deny {
+            let result = synthesized_result(
+                tool_call_id,
+                ToolExecutionStatus::PermissionDenied,
+                String::new(),
+                Some(capability.summary.clone()),
+            );
+            self.emit_file_event(
+                tool,
+                tool_call_id,
+                run_id,
+                project_id,
+                ToolExecutionEventKind::PermissionDenied,
+                Some(capability.summary.clone()),
+                Some(result),
+                TypedEventExtras::default(),
+            );
+            return LlmToolCallResult {
+                ok: false,
+                content: capability.summary,
+            };
+        }
+
+        let observed_write_sha = if tool == FileTool::Write {
+            let observed_sha = self.observed_sha_for_write(arguments, workspace, run_id);
+            match check_write_file_content_precondition(
+                arguments,
+                workspace,
+                &self.file_system,
+                observed_sha.as_deref(),
+            ) {
+                Ok(Some(outcome)) => {
+                    let message = file_outcome_text(&outcome);
+                    let result = synthesized_result(
+                        tool_call_id,
+                        ToolExecutionStatus::Failed,
+                        String::new(),
+                        Some(message.clone()),
+                    );
+                    self.emit_file_event(
+                        tool,
+                        tool_call_id,
+                        run_id,
+                        project_id,
+                        ToolExecutionEventKind::Failed,
+                        Some(message.clone()),
+                        Some(result),
+                        TypedEventExtras {
+                            payload: Some(outcome.data.clone()),
+                            touched_paths: touched_paths_from_data(&outcome.data),
+                            ..TypedEventExtras::default()
+                        },
+                    );
+                    return LlmToolCallResult {
+                        ok: false,
+                        content: message,
+                    };
+                }
+                Ok(None) => observed_sha,
+                Err(error) => {
                     let message = error.to_string();
                     let result = synthesized_result(
                         tool_call_id,
@@ -499,7 +599,13 @@ impl FileToolExecutor {
                         content: message,
                     };
                 }
+            }
+        } else {
+            None
+        };
 
+        match capability.action {
+            ToolPermissionAction::Ask => {
                 // Surface the approval request (with a diff/summary preview) and
                 // block on the same gate the UI drives via `decide`. The diff is
                 // carried both as the message (fallback) and as a typed
@@ -548,6 +654,7 @@ impl FileToolExecutor {
                 }
             }
             ToolPermissionAction::Allow => {}
+            ToolPermissionAction::Deny => unreachable!("deny handled before preflight"),
         }
 
         // A chat cancelled during approval (or before execution) is reported as
@@ -599,11 +706,12 @@ impl FileToolExecutor {
                 tool_call_id,
                 spill.as_ref().map(|spill| spill as &dyn FileToolSpill),
             ),
-            FileTool::Write => run_write_file_tool_with_limit(
+            FileTool::Write => run_write_file_tool_with_limit_and_observation(
                 arguments,
                 workspace,
                 &self.file_system,
                 self.max_write_bytes,
+                observed_write_sha.as_deref(),
             ),
             FileTool::Edit => run_edit_file_tool(arguments, workspace, &self.file_system),
             FileTool::ApplyPatch => run_apply_patch_tool(arguments, workspace, &self.file_system),
@@ -625,6 +733,8 @@ impl FileToolExecutor {
 
         match outcome {
             Ok(outcome) => {
+                self.record_read_observation(tool, &outcome, workspace, run_id);
+
                 let status = if outcome.ok {
                     ToolExecutionStatus::Completed
                 } else {
@@ -903,6 +1013,46 @@ fn file_outcome_text(outcome: &FileToolOutcome) -> String {
         }
         _ => outcome.model_text.clone(),
     }
+}
+
+fn is_complete_read_observation(outcome: &FileToolOutcome) -> bool {
+    if !outcome.ok || outcome.sha256.is_none() {
+        return false;
+    }
+    if outcome
+        .data
+        .get("bytesTruncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if outcome
+        .data
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    let start_line = outcome
+        .data
+        .get("startLine")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let end_line = outcome
+        .data
+        .get("endLine")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let total_lines = outcome
+        .data
+        .get("totalLines")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+
+    start_line == 1 && end_line == total_lines
 }
 
 /// What goes into the persisted [`ToolExecutionResult`] / event for a file tool,
@@ -1235,6 +1385,33 @@ mod tests {
         }
     }
 
+    fn test_file_executor(
+        root: &Path,
+        sink: Arc<RecordingEventSink>,
+        approvals: Arc<PendingToolApprovalGate>,
+    ) -> FileToolExecutor {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime"),
+        );
+        let sink_for_executor: Arc<dyn ToolExecutionEventSink> = sink;
+        FileToolExecutor {
+            runtime,
+            sink: sink_for_executor,
+            project: Some(ToolProjectContext {
+                id: "project_file_tool_test".to_string(),
+                root: root.to_path_buf(),
+            }),
+            approvals,
+            file_system: StdFileSystem::new(),
+            output_store: None,
+            max_write_bytes: DEFAULT_MAX_WRITE_FILE_BYTES,
+            observations: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
     fn outcome_with_diff(diff: String) -> FileToolOutcome {
         FileToolOutcome {
             ok: true,
@@ -1325,26 +1502,8 @@ mod tests {
     fn malformed_write_fails_preflight_without_permission_request() {
         let root = temp_project_dir("malformed_write_preflight");
         let workspace = Workspace::new(&root).expect("workspace");
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("runtime"),
-        );
         let sink = Arc::new(RecordingEventSink::default());
-        let sink_for_executor: Arc<dyn ToolExecutionEventSink> = sink.clone();
-        let executor = FileToolExecutor {
-            runtime,
-            sink: sink_for_executor,
-            project: Some(ToolProjectContext {
-                id: "project_preflight".to_string(),
-                root: root.clone(),
-            }),
-            approvals: PendingToolApprovalGate::new(),
-            file_system: StdFileSystem::new(),
-            output_store: None,
-            max_write_bytes: DEFAULT_MAX_WRITE_FILE_BYTES,
-        };
+        let executor = test_file_executor(&root, sink.clone(), PendingToolApprovalGate::new());
         let cancellation = ToolCancellationToken::default();
         let chat_cancellation = ChatCancellationToken::default();
         let run_id = None;
@@ -1375,6 +1534,174 @@ mod tests {
                 .iter()
                 .all(|event| event.kind != ToolExecutionEventKind::PermissionRequested),
             "malformed write must not ask for approval"
+        );
+    }
+
+    #[test]
+    fn blind_existing_write_fails_before_permission_request() {
+        let root = temp_project_dir("blind_write_precondition");
+        fs::write(root.join("a.txt"), b"old\n").expect("seed file");
+        let workspace = Workspace::new(&root).expect("workspace");
+        let sink = Arc::new(RecordingEventSink::default());
+        let executor = test_file_executor(&root, sink.clone(), PendingToolApprovalGate::new());
+        let cancellation = ToolCancellationToken::default();
+        let chat_cancellation = ChatCancellationToken::default();
+        let run_id = Some("run_blind".to_string());
+        let project_id = Some("project_precondition".to_string());
+
+        let result = executor.run_file_tool_inner(
+            FileTool::Write,
+            &json!({ "path": "a.txt", "content": "new\n", "overwrite": true }),
+            &workspace,
+            "tc_blind",
+            &run_id,
+            &project_id,
+            &cancellation,
+            &chat_cancellation,
+        );
+
+        assert!(!result.ok);
+        assert!(
+            result.content.contains("refusing blind overwrite"),
+            "got: {}",
+            result.content
+        );
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"old\n");
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "expected one terminal event: {events:?}");
+        assert_eq!(events[0].kind, ToolExecutionEventKind::Failed);
+        assert_eq!(
+            events[0].payload.as_ref().and_then(|payload| payload.get("status")),
+            Some(&json!("precondition_required"))
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != ToolExecutionEventKind::PermissionRequested
+                    && event.kind != ToolExecutionEventKind::Started),
+            "blind write must not ask approval or start execution"
+        );
+    }
+
+    #[test]
+    fn complete_read_observation_allows_existing_write_without_expected_sha() {
+        let root = temp_project_dir("read_observation_write");
+        fs::write(root.join("a.txt"), b"old\n").expect("seed file");
+        let workspace = Workspace::new(&root).expect("workspace");
+        let sink = Arc::new(RecordingEventSink::default());
+        let approvals = PendingToolApprovalGate::new();
+        let executor = test_file_executor(&root, sink.clone(), approvals.clone());
+        let cancellation = ToolCancellationToken::default();
+        let chat_cancellation = ChatCancellationToken::default();
+        let run_id = Some("run_observed".to_string());
+        let project_id = Some("project_precondition".to_string());
+
+        let read_result = executor.run_file_tool_inner(
+            FileTool::Read,
+            &json!({ "path": "a.txt" }),
+            &workspace,
+            "tc_read_observed",
+            &run_id,
+            &project_id,
+            &cancellation,
+            &chat_cancellation,
+        );
+        assert!(read_result.ok, "{}", read_result.content);
+
+        let workspace_for_thread = workspace.clone();
+        let run_id_for_thread = run_id.clone();
+        let project_id_for_thread = project_id.clone();
+        let handle = thread::spawn(move || {
+            executor.run_file_tool_inner(
+                FileTool::Write,
+                &json!({ "path": "a.txt", "content": "new\n" }),
+                &workspace_for_thread,
+                "tc_write_observed",
+                &run_id_for_thread,
+                &project_id_for_thread,
+                &ToolCancellationToken::default(),
+                &ChatCancellationToken::default(),
+            )
+        });
+
+        let mut approved = false;
+        for _ in 0..100 {
+            if approvals.decide("tc_write_observed", ToolApprovalDecision::Approved) {
+                approved = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(approved, "write approval was not registered");
+        let write_result = handle.join().expect("write thread");
+
+        assert!(write_result.ok, "{}", write_result.content);
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"new\n");
+        let events = sink.events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == ToolExecutionEventKind::PermissionRequested),
+            "observed write should still request approval in normal mode"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == ToolExecutionEventKind::Completed
+                    && event.tool_call_id == "tc_write_observed"),
+            "observed write should complete"
+        );
+    }
+
+    #[test]
+    fn partial_read_observation_does_not_allow_existing_write() {
+        let root = temp_project_dir("partial_read_observation_write");
+        fs::write(root.join("a.txt"), b"old\nsecond\n").expect("seed file");
+        let workspace = Workspace::new(&root).expect("workspace");
+        let sink = Arc::new(RecordingEventSink::default());
+        let executor = test_file_executor(&root, sink.clone(), PendingToolApprovalGate::new());
+        let cancellation = ToolCancellationToken::default();
+        let chat_cancellation = ChatCancellationToken::default();
+        let run_id = Some("run_partial_read".to_string());
+        let project_id = Some("project_precondition".to_string());
+
+        let read_result = executor.run_file_tool_inner(
+            FileTool::Read,
+            &json!({ "path": "a.txt", "limit": 1 }),
+            &workspace,
+            "tc_partial_read",
+            &run_id,
+            &project_id,
+            &cancellation,
+            &chat_cancellation,
+        );
+        assert!(read_result.ok, "{}", read_result.content);
+
+        let write_result = executor.run_file_tool_inner(
+            FileTool::Write,
+            &json!({ "path": "a.txt", "content": "new\n" }),
+            &workspace,
+            "tc_write_after_partial",
+            &run_id,
+            &project_id,
+            &cancellation,
+            &chat_cancellation,
+        );
+
+        assert!(!write_result.ok);
+        assert!(
+            write_result.content.contains("refusing blind overwrite"),
+            "got: {}",
+            write_result.content
+        );
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"old\nsecond\n");
+        let events = sink.events.lock().unwrap();
+        assert!(
+            events.iter().filter(|event| event.tool_call_id == "tc_write_after_partial").all(
+                |event| event.kind != ToolExecutionEventKind::PermissionRequested
+                    && event.kind != ToolExecutionEventKind::Started
+            ),
+            "partial read must not authorize write approval/execution"
         );
     }
 
