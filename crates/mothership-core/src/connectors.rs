@@ -159,6 +159,15 @@ pub struct AdapterSettingsFieldView {
     pub label: String,
     pub kind: String,
     pub required: bool,
+    pub options: Vec<AdapterSettingsFieldOptionView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterSettingsFieldOptionView {
+    pub value: String,
+    pub label: String,
+    pub description: Option<String>,
 }
 
 /// Per-adapter UI info gathered from one spawn: the settings form (declared
@@ -253,22 +262,28 @@ impl ConnectorManager {
     /// (global default) and by per-chat model changes (which must NOT touch the
     /// global default).
     pub fn ensure_model_supported(&self, provider_id: &str, model_id: &str) -> Result<()> {
-        let supported = {
+        let support = {
             let state = self.state.lock().unwrap();
             state
                 .catalogs
                 .get(provider_id)
-                .map(|catalog| catalog.models.iter().any(|model| model.id == model_id))
-                .unwrap_or(false)
+                .map(|catalog| {
+                    let catalog_match = catalog.models.iter().any(|model| model.id == model_id);
+                    let custom_allowed = model_management_accepts_custom_ids(catalog.management);
+                    (catalog_match, custom_allowed)
+                })
         };
 
-        if !supported {
-            return Err(MothershipError::InvalidRequest(format!(
+        match support {
+            Some((true, _)) => Ok(()),
+            Some((false, true)) if is_valid_custom_model_id(model_id) => Ok(()),
+            Some((false, true)) => Err(MothershipError::InvalidRequest(format!(
+                "invalid custom model id: {model_id}"
+            ))),
+            _ => Err(MothershipError::InvalidRequest(format!(
                 "unsupported model: {provider_id}/{model_id}"
-            )));
+            ))),
         }
-
-        Ok(())
     }
 
     pub fn set_selected_model(
@@ -488,9 +503,7 @@ impl ConnectorManager {
         }
 
         for entry in entries {
-            if let Some(event) = self.refresh_entry(&entry) {
-                emit(event);
-            }
+            self.refresh_entry(&entry, emit);
         }
     }
 
@@ -509,7 +522,7 @@ impl ConnectorManager {
         }
     }
 
-    fn refresh_entry(&self, entry: &AdapterEntry) -> Option<ConnectorSettingsEvent> {
+    fn refresh_entry(&self, entry: &AdapterEntry, emit: &mut impl FnMut(ConnectorSettingsEvent)) {
         if let Err(error) = verified_adapter_entry(entry) {
             let mut state = self.state.lock().unwrap();
             let previous = state.catalogs.get(&entry.provider_id).cloned();
@@ -530,17 +543,30 @@ impl ConnectorManager {
             state.catalog_fetched_at.remove(&entry.provider_id);
             state.adapter_info.remove(&entry.provider_id);
             state.refreshing.remove(&entry.provider_id);
-            return self.event(ConnectorSettingsEventKind::ProviderUpdated);
+            if let Some(event) = self.event(ConnectorSettingsEventKind::ProviderUpdated) {
+                emit(event);
+            }
+            return;
         }
 
         let vault = self.vault();
+        let info_result = adapter_info_result(&self.pool, entry, &vault);
+        if let Ok(info) = info_result {
+            {
+                let mut state = self.state.lock().unwrap();
+                state.adapter_info.insert(entry.provider_id.clone(), info);
+            }
+            if let Some(event) = self.event(ConnectorSettingsEventKind::ProviderUpdated) {
+                emit(event);
+            }
+        }
+
         let catalog_result = self
             .cached_model_catalog(&entry.provider_id)
             .map(|catalog| Ok((catalog, false)))
             .unwrap_or_else(|| {
                 adapter_model_catalog(&self.pool, entry, &vault).map(|catalog| (catalog, true))
             });
-        let info_result = adapter_info_result(&self.pool, entry, &vault);
 
         {
             let mut state = self.state.lock().unwrap();
@@ -573,13 +599,12 @@ impl ConnectorManager {
                 }
             }
 
-            if let Ok(info) = info_result {
-                state.adapter_info.insert(entry.provider_id.clone(), info);
-            }
             state.refreshing.remove(&entry.provider_id);
         }
 
-        self.event(ConnectorSettingsEventKind::ProviderUpdated)
+        if let Some(event) = self.event(ConnectorSettingsEventKind::ProviderUpdated) {
+            emit(event);
+        }
     }
 
     fn event(&self, kind: ConnectorSettingsEventKind) -> Option<ConnectorSettingsEvent> {
@@ -670,10 +695,16 @@ pub fn kill_process(pid: u32) {
     #[cfg(windows)]
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/F"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn();
     #[cfg(unix)]
     let _ = std::process::Command::new("kill")
         .args(["-9", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn();
 }
 
@@ -994,21 +1025,31 @@ fn connector_providers(
 
 fn connector_settings_schema(management: Option<ModelManagement>) -> ConnectorSettingsSchema {
     let management = management.unwrap_or(ModelManagement::Fixed);
-    let (kind, description, add_model_label) = match management {
+    let (kind, description, add_model_label, accepts_custom_model_ids) = match management {
         ModelManagement::Fixed => (
             ConnectorModelManagementKind::FixedCatalog,
             "This connector exposes a fixed model catalog.".to_string(),
             None,
+            false,
         ),
         ModelManagement::Server => (
             ConnectorModelManagementKind::RemoteCatalog,
             "Models are fetched from the provider adapter.".to_string(),
             None,
+            false,
+        ),
+        ModelManagement::ServerWithCustom => (
+            ConnectorModelManagementKind::RemoteCatalog,
+            "Models are fetched from the provider adapter; custom model ids can also be used."
+                .to_string(),
+            Some("Use custom model".to_string()),
+            true,
         ),
         ModelManagement::UserDefined => (
             ConnectorModelManagementKind::EditableList,
             "Add the model ids this connector should expose.".to_string(),
             Some("Add model".to_string()),
+            true,
         ),
     };
     ConnectorSettingsSchema {
@@ -1017,8 +1058,24 @@ fn connector_settings_schema(management: Option<ModelManagement>) -> ConnectorSe
             title: "Models".to_string(),
             description,
             add_model_label,
+            accepts_custom_model_ids,
         },
     }
+}
+
+fn model_management_accepts_custom_ids(management: ModelManagement) -> bool {
+    matches!(
+        management,
+        ModelManagement::ServerWithCustom | ModelManagement::UserDefined
+    )
+}
+
+fn is_valid_custom_model_id(model_id: &str) -> bool {
+    let trimmed = model_id.trim();
+    !trimmed.is_empty()
+        && trimmed == model_id
+        && trimmed.len() <= 256
+        && !trimmed.chars().any(|ch| ch.is_control() || ch.is_whitespace())
 }
 
 fn sanitized_adapter_settings(
@@ -1049,9 +1106,19 @@ fn sanitized_adapter_settings(
                     SettingsFieldKind::Secret => "secret",
                     SettingsFieldKind::Bool => "bool",
                     SettingsFieldKind::StringList => "string_list",
+                    SettingsFieldKind::ModelVisibilityList => "model_visibility_list",
                 }
                 .to_string(),
                 required: field.required,
+                options: field
+                    .options
+                    .into_iter()
+                    .map(|option| AdapterSettingsFieldOptionView {
+                        value: option.value,
+                        label: option.label,
+                        description: option.description,
+                    })
+                    .collect(),
             }
         })
         .collect();
@@ -1175,6 +1242,36 @@ mod tests {
             serde_json::to_string(&manifest).expect("manifest json"),
         )
         .expect("write manifest");
+    }
+
+    #[test]
+    fn model_management_schema_marks_custom_model_support() {
+        let remote = connector_settings_schema(Some(ModelManagement::Server));
+        assert!(!remote.model_management.accepts_custom_model_ids);
+
+        let remote_custom = connector_settings_schema(Some(ModelManagement::ServerWithCustom));
+        assert_eq!(
+            remote_custom.model_management.kind,
+            ConnectorModelManagementKind::RemoteCatalog
+        );
+        assert!(remote_custom.model_management.accepts_custom_model_ids);
+
+        let user_defined = connector_settings_schema(Some(ModelManagement::UserDefined));
+        assert_eq!(
+            user_defined.model_management.kind,
+            ConnectorModelManagementKind::EditableList
+        );
+        assert!(user_defined.model_management.accepts_custom_model_ids);
+    }
+
+    #[test]
+    fn custom_model_id_validation_accepts_provider_aliases_without_whitespace() {
+        assert!(is_valid_custom_model_id("opus[1m]"));
+        assert!(is_valid_custom_model_id("claude-opus-4-7"));
+        assert!(is_valid_custom_model_id("anthropic/claude-sonnet-4.6"));
+        assert!(!is_valid_custom_model_id(""));
+        assert!(!is_valid_custom_model_id(" claude-opus-4-7"));
+        assert!(!is_valid_custom_model_id("claude opus"));
     }
 
     #[test]

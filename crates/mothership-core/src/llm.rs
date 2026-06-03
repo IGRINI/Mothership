@@ -73,6 +73,8 @@ pub struct ConnectorModelManagementSchema {
     pub title: String,
     pub description: String,
     pub add_model_label: Option<String>,
+    #[serde(default)]
+    pub accepts_custom_model_ids: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
