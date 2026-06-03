@@ -312,11 +312,26 @@ pub fn preview_diff(
     arguments: &Value,
     workspace: &Workspace,
     fs: &dyn FileSystem,
+    max_write_bytes: usize,
 ) -> Option<String> {
     match tool {
         // Read-only tools have nothing to preview before approval.
         FileTool::Read | FileTool::ListFiles | FileTool::SearchText => None,
         FileTool::Write => {
+            // Limit-aware preview. Check the raw content size FIRST (a borrow, no
+            // clone): an oversized write is refused at execution, so never parse,
+            // clone, or diff it here — that would blow memory and bypass the
+            // bounded-diff gate. Summarize instead.
+            let content_len = arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::len)
+                .unwrap_or(0);
+            if content_len > max_write_bytes {
+                return Some(format!(
+                    "# write refused before approval: content is {content_len} bytes, over the {max_write_bytes}-byte write limit"
+                ));
+            }
             let input: WriteFileInput = parse_args(arguments).ok()?;
             let resolved = resolve_guarded(workspace, &input.path).ok()?;
             // Cap the old-file read: previewing a write over a huge existing file
@@ -333,6 +348,16 @@ pub fn preview_diff(
                 Some(old) => match_bom_and_eol(old, &input.content),
                 None => input.content.clone(),
             };
+            // Mirror the handler's bounded-diff gate: don't build a full line diff
+            // for a large write (it would be summarized at write time anyway).
+            let diff_input = old.as_deref().map(str::len).unwrap_or(0) + new_text.len();
+            if diff_input > MAX_DIFF_INPUT_BYTES {
+                return Some(format!(
+                    "# write {} (~{} bytes; diff too large to preview)",
+                    input.path,
+                    new_text.len()
+                ));
+            }
             Some(render_full_diff(old.as_deref().unwrap_or(""), &new_text))
         }
         FileTool::Edit => {
@@ -2778,6 +2803,7 @@ mod tests {
             &json!({ "path": "a.rs", "oldText": "let x = 1;", "newText": "let x = 2;" }),
             &ws,
             &fs,
+            DEFAULT_MAX_WRITE_FILE_BYTES,
         )
         .expect("preview");
         assert!(diff.contains("-let x = 1;"));
@@ -2792,7 +2818,14 @@ mod tests {
     fn preview_diff_for_read_is_none() {
         let (ws, dir) = temp_workspace("preview_read");
         let fs = StdFileSystem::new();
-        assert!(preview_diff(FileTool::Read, &json!({ "path": "a.txt" }), &ws, &fs).is_none());
+        assert!(preview_diff(
+            FileTool::Read,
+            &json!({ "path": "a.txt" }),
+            &ws,
+            &fs,
+            DEFAULT_MAX_WRITE_FILE_BYTES
+        )
+        .is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2811,11 +2844,66 @@ mod tests {
  tail
 *** End Patch
 ";
-        let diff = preview_diff(FileTool::ApplyPatch, &json!({ "patch": patch }), &ws, &fs)
-            .expect("preview");
+        let diff = preview_diff(
+            FileTool::ApplyPatch,
+            &json!({ "patch": patch }),
+            &ws,
+            &fs,
+            DEFAULT_MAX_WRITE_FILE_BYTES,
+        )
+        .expect("preview");
         assert!(diff.contains("update a.txt"));
         // Untouched.
         assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"keep\nold\ntail\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_diff_for_oversized_write_summarizes_without_building_diff() {
+        let (ws, dir) = temp_workspace("preview_too_large");
+        let fs = StdFileSystem::new();
+        let big = "x".repeat(4096);
+
+        // Under a 1 KiB limit, the preview must NOT parse/clone/diff the content —
+        // it returns a refusal summary (mirrors the executor's too_large refusal).
+        let preview = preview_diff(
+            FileTool::Write,
+            &json!({ "path": "big.txt", "content": big }),
+            &ws,
+            &fs,
+            1024,
+        )
+        .expect("summary");
+        assert!(
+            preview.contains("over the 1024-byte write limit"),
+            "preview should summarize the refusal: {preview}"
+        );
+        assert!(!preview.contains('+'), "no diff lines should be built: {preview}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_diff_for_large_write_summarizes_instead_of_full_diff() {
+        let (ws, dir) = temp_workspace("preview_large_diff");
+        let fs = StdFileSystem::new();
+        // Content under the write limit but over the diff-input gate → summary, not
+        // a full line diff (so the preview never builds a multi-MB diff).
+        let big = "a\n".repeat(MAX_DIFF_INPUT_BYTES);
+
+        let preview = preview_diff(
+            FileTool::Write,
+            &json!({ "path": "big.txt", "content": big }),
+            &ws,
+            &fs,
+            50 * 1024 * 1024,
+        )
+        .expect("summary");
+        assert!(
+            preview.contains("diff too large to preview"),
+            "large write should summarize: {preview}"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 

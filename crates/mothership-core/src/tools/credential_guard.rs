@@ -247,10 +247,12 @@ fn redact_json_strings(guard: &dyn CredentialGuard, value: &mut Value) {
 /// Wraps a [`ToolOutputStore`] so durable spilled blobs (command stdout/stderr,
 /// file-tool diffs/reads/search results) are credential-redacted on the way to
 /// disk — closing the gap where `redact_event` only scrubbed the inline preview,
-/// not the full content behind a `log_ref`. Redaction is line-buffered: complete
-/// lines are scrubbed before they are written; a partial line is held until the
-/// next append (or `finish`). UTF-8 lines are redacted; non-UTF-8 (binary) lines
-/// pass through unchanged so output fidelity is preserved.
+/// not the full content behind a `log_ref`. Redaction uses a bounded
+/// [`BoundedRedactor`]: it never emits the last `MAX_SECRET_SCAN_WINDOW` bytes
+/// (the rolling window) and cuts before any match that would straddle the flush
+/// boundary, so a secret split across writes is caught whole; multi-line PEM
+/// blocks are redacted as a unit. UTF-8 segments are redacted; non-UTF-8 (binary)
+/// segments pass through unchanged so output fidelity is preserved.
 pub struct RedactingOutputStore {
     inner: Arc<dyn ToolOutputStore>,
     guard: Arc<dyn CredentialGuard>,

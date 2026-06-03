@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use mothership_core::{
     classify_file_tool, file_tool_preview_diff, run_apply_patch_tool, run_edit_file_tool,
-    run_list_files_tool, run_read_file_tool, run_search_text_tool, run_write_file_tool,
+    run_list_files_tool, run_read_file_tool, run_search_text_tool,
+    run_write_file_tool_with_limit, DEFAULT_MAX_WRITE_FILE_BYTES,
     tool_batch_plan, ChatCancellationToken, FileTool,
     FileToolOutcome,
     FileToolSpill, LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResult, MothershipError,
@@ -166,6 +167,10 @@ struct FileToolExecutor {
     approvals: Arc<PendingToolApprovalGate>,
     file_system: StdFileSystem,
     output_store: Option<Arc<dyn ToolOutputStore>>,
+    /// Policy ceiling on `write_file` content size, applied to BOTH the
+    /// approval preview and the actual write (the composition root sets it; the
+    /// default is [`DEFAULT_MAX_WRITE_FILE_BYTES`]).
+    max_write_bytes: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +213,7 @@ impl SidecarLlmToolHandler {
             approvals,
             file_system: StdFileSystem::new(),
             output_store,
+            max_write_bytes: DEFAULT_MAX_WRITE_FILE_BYTES,
         });
         Self {
             command_executor,
@@ -566,7 +572,12 @@ impl FileToolExecutor {
                 tool_call_id,
                 spill.as_ref().map(|spill| spill as &dyn FileToolSpill),
             ),
-            FileTool::Write => run_write_file_tool(arguments, workspace, &self.file_system),
+            FileTool::Write => run_write_file_tool_with_limit(
+                arguments,
+                workspace,
+                &self.file_system,
+                self.max_write_bytes,
+            ),
             FileTool::Edit => run_edit_file_tool(arguments, workspace, &self.file_system),
             FileTool::ApplyPatch => run_apply_patch_tool(arguments, workspace, &self.file_system),
             // Read-only search tools: spill large results like read_file does.
@@ -705,7 +716,8 @@ impl FileToolExecutor {
         workspace: &Workspace,
         summary: &str,
     ) -> (String, Vec<ToolArtifact>) {
-        match file_tool_preview_diff(tool, arguments, workspace, &self.file_system) {
+        match file_tool_preview_diff(tool, arguments, workspace, &self.file_system, self.max_write_bytes)
+        {
             Some(diff) if !diff.is_empty() => {
                 // The message keeps the bounded summary+diff string for legacy /
                 // fallback rendering, but the diff is ALSO emitted as a typed
