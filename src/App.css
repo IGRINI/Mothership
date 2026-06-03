@@ -1979,6 +1979,7 @@ kbd,
 .reasoning-selector {
   position: relative;
   flex: 0 0 auto;
+  --reasoning-selector-popover-width: 236px;
   color: #aebdcb;
 }
 
@@ -2034,8 +2035,11 @@ kbd,
   position: absolute;
   z-index: 70;
   bottom: calc(100% + 8px);
-  left: 0;
-  width: 216px;
+  right: 0;
+  left: auto;
+  width: max-content;
+  min-width: var(--reasoning-selector-popover-width);
+  max-width: min(280px, calc(100vw - 24px));
   border: 1px solid #38424d;
   border-radius: 8px;
   padding: 8px 0;
@@ -2465,6 +2469,38 @@ kbd,
 .adapter-list {
   display: grid;
   gap: 6px;
+}
+
+.adapter-visibility-list {
+  display: grid;
+  gap: 6px;
+}
+
+.adapter-visibility-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  min-height: 34px;
+  border: 1px solid #27394b;
+  border-radius: 8px;
+  padding: 0 10px;
+  background: #07101a;
+  color: #e7eff8;
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.adapter-visibility-row input {
+  width: 15px;
+  height: 15px;
+}
+
+.adapter-visibility-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .adapter-list__row {
@@ -2957,11 +2993,6 @@ kbd,
 
   .reasoning-selector {
     order: 0;
-  }
-
-  .reasoning-selector__popover {
-    right: 0;
-    left: auto;
   }
 
   .message-list .virtual-list__row {

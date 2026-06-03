@@ -115,6 +115,7 @@ export interface SendChatMessageResult {
   chat: ChatThreadSummary;
   userMessage: ChatMessage;
   assistantMessage: ChatMessage;
+  removedMessageIds?: string[];
 }
 
 export interface ChatRunCancellationResult {
@@ -141,6 +142,7 @@ export interface ChatRunEvent {
   chat?: ChatThreadSummary | null;
   transport?: string | null;
   toolCallId?: string | null;
+  removedMessageIds?: string[];
   error?: string | null;
 }
 
@@ -327,6 +329,7 @@ export interface ConnectorSettingsSchema {
     title: string;
     description: string;
     addModelLabel?: string | null;
+    acceptsCustomModelIds?: boolean;
   };
 }
 
@@ -336,13 +339,25 @@ export interface SelectedLlmModel {
   updatedAt: string;
 }
 
-export type AdapterSettingsFieldKind = "text" | "secret" | "bool" | "string_list";
+export type AdapterSettingsFieldKind =
+  | "text"
+  | "secret"
+  | "bool"
+  | "string_list"
+  | "model_visibility_list";
+
+export interface AdapterSettingsFieldOption {
+  value: string;
+  label: string;
+  description?: string | null;
+}
 
 export interface AdapterSettingsField {
   key: string;
   label: string;
   kind: AdapterSettingsFieldKind;
   required: boolean;
+  options: AdapterSettingsFieldOption[];
 }
 
 export interface SecretSettingState {
@@ -1284,18 +1299,21 @@ function getPreviewConnectorSettings() {
               label: "OpenRouter API key",
               kind: "secret",
               required: true,
+              options: [],
             },
             {
               key: "base_url",
               label: "Base URL (optional)",
               kind: "text",
               required: false,
+              options: [],
             },
             {
               key: "models",
               label: "Models",
               kind: "string_list",
               required: false,
+              options: [],
             },
           ],
           values: {},
@@ -1507,6 +1525,7 @@ function copyConnectorSettings(
         ? {
             fields: provider.adapterSettings.fields.map((field) => ({
               ...field,
+              options: field.options.map((option) => ({ ...option })),
             })),
             values: { ...provider.adapterSettings.values },
             secrets: copySecretSettings(provider.adapterSettings.secrets),

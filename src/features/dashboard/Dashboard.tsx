@@ -4,9 +4,11 @@ import {
   createSignal,
   For,
   JSX,
+  Match,
   onCleanup,
   onMount,
   Show,
+  Switch,
 } from "solid-js";
 import {
   AlertTriangle,
@@ -47,6 +49,7 @@ import {
   ProjectSnapshot,
   ReasoningConfig,
   ReasoningOption,
+  SendChatMessageResult,
   ToolArtifact,
   ToolCommand,
   ToolExecutionEvent,
@@ -152,7 +155,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   const selectedModel = createMemo(() => {
     const chat = activeChat();
     const settings = connectorSettings();
-    return connectorModelFor(
+    return selectableConnectorModelFor(
       settings,
       chat?.providerId ?? settings?.selectedModel.providerId,
       chat?.modelId ?? settings?.selectedModel.modelId,
@@ -617,16 +620,24 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
 
     try {
       const result = await retryChatMessage(chatId);
+      const removedMessageIds = removedMessageIdsForRetry(result, messages());
       setActiveRunIds((current) => ({
         ...current,
         [result.chat.id]: result.runId,
       }));
-      clearMessageToolExecutions(result.assistantMessage.id);
-      clearMessagePartsForMessageIds([result.assistantMessage.id]);
+      clearToolExecutionsForMessageIds(removedMessageIds);
+      clearMessagePartsForMessageIds(removedMessageIds);
       rememberRunMessage(result.runId, result.assistantMessage.id);
       setChats((current) => bumpChat(current, result.chat));
       setMessages((current) =>
-        mergeMessages(current, [result.userMessage, result.assistantMessage]),
+        mergeMessages(
+          current.filter(
+            (message) =>
+              message.chatId === result.chat.id &&
+              message.position < result.userMessage.position,
+          ),
+          [result.userMessage, result.assistantMessage],
+        ),
       );
     } catch (caughtError) {
       setError(errorMessage(caughtError));
@@ -741,6 +752,16 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
       clearMessagePartsForMessageIds([event.messageId]);
     }
 
+    if (event.removedMessageIds && event.removedMessageIds.length > 0) {
+      const removedMessageIds = event.removedMessageIds;
+      const removed = new Set(removedMessageIds);
+      clearToolExecutionsForMessageIds(removedMessageIds);
+      clearMessagePartsForMessageIds(removedMessageIds);
+      setMessages((current) =>
+        current.filter((message) => !removed.has(message.id)),
+      );
+    }
+
     if (event.chat) {
       setChats((current) => bumpChat(current, event.chat!));
     }
@@ -833,10 +854,6 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         ]),
       ),
     }));
-  }
-
-  function clearMessageToolExecutions(messageId: string) {
-    clearToolExecutionsForMessageIds([messageId]);
   }
 
   function clearToolExecutionsForMessageIds(messageIds: string[]) {
@@ -1362,12 +1379,12 @@ function ConversationPane(props: {
     };
   });
   const activeProvider = createMemo(() =>
-    connectorProviderFor(props.connectorSettings, chatModel().providerId),
+    selectableConnectorProviderFor(props.connectorSettings, chatModel().providerId),
   );
   // Reasoning options must follow the OPEN CHAT's model, not the global one —
   // otherwise the composer offers reasoning levels for the wrong model.
   const activeModel = createMemo(() =>
-    connectorModelFor(
+    selectableConnectorModelFor(
       props.connectorSettings,
       chatModel().providerId,
       chatModel().modelId,
@@ -1491,45 +1508,46 @@ function ConversationPane(props: {
   );
 }
 
+// IMPORTANT: branch with <Switch>, not early `return`s. A component body runs
+// once; `if (!props.hasProject) return ...` would freeze on whatever was true at
+// mount (e.g. "No project selected" while the snapshot is still loading) and
+// never update when the project resolves — even though the header badge and
+// sidebar highlight (both reactive <Show>s) correctly show the project.
 function ConversationState(props: {
   error: string;
   hasProject: boolean;
   isLoading: boolean;
 }) {
-  if (props.error) {
-    return (
-      <div class="conversation-state conversation-state--error">
-        {props.error}
-      </div>
-    );
-  }
-
-  if (props.isLoading) {
-    return (
-      <div class="conversation-state conversation-state--loading">
-        <div class="message-skeleton message-skeleton--assistant" />
-        <div class="message-skeleton message-skeleton--user" />
-        <div class="message-skeleton message-skeleton--assistant message-skeleton--short" />
-      </div>
-    );
-  }
-
-  if (!props.hasProject) {
-    return (
-      <div class="conversation-state">
-        <Folder size={22} />
-        <strong>Open a project</strong>
-        <span>No project selected.</span>
-      </div>
-    );
-  }
-
   return (
-    <div class="conversation-state">
-      <BrandMark compact />
-      <strong>New chat</strong>
-      <span>Describe a task for the agent and press Enter to start.</span>
-    </div>
+    <Switch
+      fallback={
+        <div class="conversation-state">
+          <BrandMark compact />
+          <strong>New chat</strong>
+          <span>Describe a task for the agent and press Enter to start.</span>
+        </div>
+      }
+    >
+      <Match when={props.error}>
+        <div class="conversation-state conversation-state--error">
+          {props.error}
+        </div>
+      </Match>
+      <Match when={props.isLoading}>
+        <div class="conversation-state conversation-state--loading">
+          <div class="message-skeleton message-skeleton--assistant" />
+          <div class="message-skeleton message-skeleton--user" />
+          <div class="message-skeleton message-skeleton--assistant message-skeleton--short" />
+        </div>
+      </Match>
+      <Match when={!props.hasProject}>
+        <div class="conversation-state">
+          <Folder size={22} />
+          <strong>Open a project</strong>
+          <span>No project selected.</span>
+        </div>
+      </Match>
+    </Switch>
   );
 }
 
@@ -1539,7 +1557,7 @@ function ModelSelector(props: {
   settings?: ConnectorSettingsSnapshot;
 }) {
   const activeProvider = () =>
-    connectorProviderFor(
+    selectableConnectorProviderFor(
       props.settings,
       props.selected?.providerId ?? props.settings?.selectedModel.providerId,
     );
@@ -1591,12 +1609,16 @@ function ModelSelector(props: {
           ? "No models for provider"
           : "No models connected";
   const options = createMemo<SearchSelectOption[]>(() =>
-    models().map((model) => ({
-      detail: model.id === model.label ? model.providerLabel : model.id,
-      label: model.label,
-      searchText: `${model.providerLabel} ${model.label} ${model.id}`,
-      value: modelOptionValue(model.providerId, model.id),
-    })),
+    withSelectedCustomModelOption(
+      models().map((model) => ({
+        detail: model.id === model.label ? model.providerLabel : model.id,
+        label: model.label,
+        searchText: `${model.providerLabel} ${model.label} ${model.id}`,
+        value: modelOptionValue(model.providerId, model.id),
+      })),
+      activeProvider(),
+      props.selected?.modelId ?? props.settings?.selectedModel.modelId,
+    ),
   );
 
   return (
@@ -1607,6 +1629,7 @@ function ModelSelector(props: {
       options={options()}
       placeholder={placeholder()}
       value={selectedValue()}
+      createOption={(query) => customModelOption(activeProvider(), models(), query)}
       onSelect={(value) => {
         const [providerId, modelId] = parseModelOptionValue(value);
         if (providerId && modelId) {
@@ -1634,12 +1657,13 @@ function ProviderSelector(props: {
   selected?: { providerId?: string | null; modelId?: string | null };
   settings?: ConnectorSettingsSnapshot;
 }) {
-  const providers = () => props.settings?.providers ?? [];
+  const providers = () =>
+    (props.settings?.providers ?? []).filter(isProviderSelectableForChat);
   const currentProviderId = () =>
     props.selected?.providerId ?? props.settings?.selectedModel.providerId;
   const selectedProviderId = () => currentProviderId() ?? "";
   const activeProvider = () =>
-    connectorProviderFor(props.settings, currentProviderId());
+    providers().find((provider) => provider.id === currentProviderId());
   const status = () => providerStatusSummary(activeProvider());
   const options = createMemo<SearchSelectOption[]>(() =>
     providers().map((provider) => {
@@ -1710,6 +1734,7 @@ function SearchSelect(props: {
   placeholder: string;
   title?: string;
   value?: string;
+  createOption?: (query: string) => SearchSelectOption | undefined;
   onSelect: (value: string) => void;
 }) {
   const [isOpen, setIsOpen] = createSignal(false);
@@ -1724,17 +1749,20 @@ function SearchSelect(props: {
     query().trim().length > 0 ? "No matches" : props.emptyLabel;
   const filteredOptions = createMemo(() => {
     const normalizedQuery = normalizeSearchQuery(query());
-    if (!normalizedQuery) {
-      return props.options;
+    const filtered = normalizedQuery
+      ? props.options.filter((option) =>
+          normalizeSearchQuery(
+            [option.label, option.detail, option.searchText, option.status?.label]
+              .filter(Boolean)
+              .join(" "),
+          ).includes(normalizedQuery),
+        )
+      : props.options;
+    const created = normalizedQuery ? props.createOption?.(query().trim()) : undefined;
+    if (!created || filtered.some((option) => option.value === created.value)) {
+      return filtered;
     }
-
-    return props.options.filter((option) =>
-      normalizeSearchQuery(
-        [option.label, option.detail, option.searchText, option.status?.label]
-          .filter(Boolean)
-          .join(" "),
-      ).includes(normalizedQuery),
-    );
+    return [...filtered, created];
   });
 
   createEffect(() => {
@@ -1959,6 +1987,69 @@ function modelOptionValue(providerId: string, modelId: string) {
   return JSON.stringify([providerId, modelId]);
 }
 
+function customModelOption(
+  provider: ConnectorProviderSummary | undefined,
+  models: LlmModel[],
+  query: string,
+): SearchSelectOption | undefined {
+  if (!provider || !providerAcceptsCustomModelIds(provider)) {
+    return undefined;
+  }
+
+  const modelId = normalizeCustomModelId(query);
+  if (!modelId || models.some((model) => model.id === modelId)) {
+    return undefined;
+  }
+  if (providerVisibilityModelIds(provider).has(modelId)) {
+    return undefined;
+  }
+
+  return {
+    detail: "Custom model id",
+    label: `Use ${modelId}`,
+    searchText: modelId,
+    value: modelOptionValue(provider.id, modelId),
+  };
+}
+
+function withSelectedCustomModelOption(
+  options: SearchSelectOption[],
+  provider: ConnectorProviderSummary | undefined,
+  selectedModelId: string | null | undefined,
+) {
+  if (
+    !provider ||
+    !providerAcceptsCustomModelIds(provider) ||
+    !selectedModelId ||
+    providerVisibilityModelIds(provider).has(selectedModelId) ||
+    options.some((option) => option.value === modelOptionValue(provider.id, selectedModelId))
+  ) {
+    return options;
+  }
+
+  return [
+    ...options,
+    {
+      detail: "Custom model id",
+      label: selectedModelId,
+      searchText: selectedModelId,
+      value: modelOptionValue(provider.id, selectedModelId),
+    },
+  ];
+}
+
+function normalizeCustomModelId(value: string) {
+  const modelId = value.trim();
+  if (
+    modelId.length === 0 ||
+    modelId.length > 256 ||
+    /[\s\x00-\x1f\x7f]/.test(modelId)
+  ) {
+    return "";
+  }
+  return modelId;
+}
+
 function parseModelOptionValue(value: string): [string, string] {
   try {
     const parsed = JSON.parse(value);
@@ -1988,16 +2079,101 @@ function connectorProviderFor(
   return settings?.providers.find((provider) => provider.id === providerId);
 }
 
-function connectorModelFor(
+function selectableConnectorProviderFor(
+  settings: ConnectorSettingsSnapshot | undefined,
+  providerId: string | null | undefined,
+) {
+  const provider = connectorProviderFor(settings, providerId);
+  return provider && isProviderSelectableForChat(provider) ? provider : undefined;
+}
+
+function selectableConnectorModelFor(
   settings: ConnectorSettingsSnapshot | undefined,
   providerId: string | null | undefined,
   modelId: string | null | undefined,
 ) {
-  if (!modelId) {
+  const provider = selectableConnectorProviderFor(settings, providerId);
+  if (!provider || !modelId) {
     return undefined;
   }
-  return connectorProviderFor(settings, providerId)?.models.find(
-    (model) => model.id === modelId,
+
+  return (
+    provider.models.find((model) => model.id === modelId) ??
+    customConnectorModelFor(provider, modelId)
+  );
+}
+
+function customConnectorModelFor(
+  provider: ConnectorProviderSummary,
+  modelId: string,
+): LlmModel | undefined {
+  if (!providerAcceptsCustomModelIds(provider) || !normalizeCustomModelId(modelId)) {
+    return undefined;
+  }
+  if (providerVisibilityModelIds(provider).has(modelId)) {
+    return undefined;
+  }
+
+  const template = customModelCapabilityTemplate(provider, modelId);
+  return {
+    providerId: provider.id,
+    providerLabel: provider.label,
+    id: modelId,
+    label: modelId,
+    family: template?.family ?? "Custom",
+    description: "Custom model id",
+    capabilities: template?.capabilities ? [...template.capabilities] : ["text"],
+    reasoning: template?.reasoning,
+    recommended: false,
+  };
+}
+
+function customModelCapabilityTemplate(
+  provider: ConnectorProviderSummary,
+  modelId: string,
+) {
+  const targetTokens = significantModelTokens(modelId);
+  if (targetTokens.size === 0) {
+    return undefined;
+  }
+
+  let bestModel: LlmModel | undefined;
+  let bestScore = 0;
+  for (const model of provider.models) {
+    const modelTokens = significantModelTokens(
+      `${model.id} ${model.label} ${model.family}`,
+    );
+    let score = 0;
+    for (const token of targetTokens) {
+      if (modelTokens.has(token)) {
+        score += 1;
+      }
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestModel = model;
+    }
+  }
+
+  return bestScore > 0 ? bestModel : undefined;
+}
+
+function significantModelTokens(value: string) {
+  const ignored = new Set([
+    "claude",
+    "model",
+    "default",
+    "recommended",
+    "context",
+    "with",
+    "custom",
+  ]);
+  return new Set(
+    value
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .map((token) => token.trim())
+      .filter((token) => token.length >= 3 && !ignored.has(token)),
   );
 }
 
@@ -2105,14 +2281,45 @@ function isReasoningConfigEmpty(config?: ReasoningConfig | null) {
 }
 
 function selectableProviderModelId(provider: ConnectorProviderSummary) {
-  if (
-    provider.selectedModelId &&
-    provider.models.some((model) => model.id === provider.selectedModelId)
-  ) {
-    return provider.selectedModelId;
+  const selectedModelId = provider.selectedModelId;
+  if (selectedModelId) {
+    if (provider.models.some((model) => model.id === selectedModelId)) {
+      return selectedModelId;
+    }
+    if (
+      providerAcceptsCustomModelIds(provider) &&
+      !providerVisibilityModelIds(provider).has(selectedModelId)
+    ) {
+      return selectedModelId;
+    }
   }
 
   return provider.models[0]?.id;
+}
+
+function isProviderSelectableForChat(provider: ConnectorProviderSummary) {
+  if (requiresInteractiveAuth(provider)) {
+    return false;
+  }
+
+  if (missingRequiredAdapterSettings(provider).length > 0) {
+    return false;
+  }
+
+  return Boolean(selectableProviderModelId(provider));
+}
+
+function providerAcceptsCustomModelIds(provider: ConnectorProviderSummary | undefined) {
+  return Boolean(provider?.settingsSchema.modelManagement.acceptsCustomModelIds);
+}
+
+function providerVisibilityModelIds(provider: ConnectorProviderSummary | undefined) {
+  const fields = provider?.adapterSettings?.fields ?? [];
+  return new Set(
+    fields
+      .filter((field) => field.kind === "model_visibility_list")
+      .flatMap((field) => field.options.map((option) => option.value)),
+  );
 }
 
 function providerStatusSummary(
@@ -2332,7 +2539,8 @@ function ToolCallRow(props: {
   onCancel: () => void;
   onDeny: () => void;
 }) {
-  const command = () => formatToolCommand(props.tool.command);
+  const command = () => formatToolCommand(props.tool);
+  const headline = () => formatToolHeadline(props.tool);
   const canApprove = () => props.tool.kind === "permission_requested";
   const canCancel = () =>
     !canApprove() && !isTerminalToolKind(props.tool.kind);
@@ -2341,7 +2549,7 @@ function ToolCallRow(props: {
     <div class="tool-call-row">
       <Terminal size={16} />
       <div class="tool-call-row__body">
-        <strong title={command()}>{command()}</strong>
+        <strong title={command() || headline()}>{headline()}</strong>
         <span class={`tool-status tool-status--${toolTone(props.tool.kind)}`}>
           {toolStatusLabel(props.tool.kind)}
         </span>
@@ -2379,7 +2587,7 @@ function InlineToolCall(props: {
   onDeny: () => void;
   onToggle: () => void;
 }) {
-  const command = () => formatToolCommand(props.tool.command);
+  const command = () => formatToolCommand(props.tool);
   const output = () => formatToolOutput(props.tool);
   const outputLineCount = () => countTextLines(output());
   const isOutputScrollable = () =>
@@ -2409,7 +2617,7 @@ function InlineToolCall(props: {
         />
         <Terminal size={15} />
         <span class="inline-tool-call__title" title={command()}>
-          {formatToolHeadline(props.tool.command)}
+          {formatToolHeadline(props.tool)}
         </span>
         <span class={`tool-status tool-status--${toolTone(props.tool.kind)}`}>
           {toolStatusLabel(props.tool.kind)}
@@ -2422,10 +2630,12 @@ function InlineToolCall(props: {
             when={hasSemanticCard()}
             fallback={
               <>
-                <span class="inline-tool-call__label">
-                  {toolCommandLabel(props.tool.command)}
-                </span>
-                <pre class="inline-tool-call__command">{command()}</pre>
+                <Show when={command()}>
+                  <span class="inline-tool-call__label">
+                    {toolCommandLabel(props.tool.command)}
+                  </span>
+                  <pre class="inline-tool-call__command">{command()}</pre>
+                </Show>
 
                 <Show when={!canApprove() && props.tool.message}>
                   <p class="inline-tool-call__message">{props.tool.message}</p>
@@ -3204,6 +3414,23 @@ function mergeMessages(
   return Array.from(messagesById.values()).sort(compareMessages);
 }
 
+function removedMessageIdsForRetry(
+  result: SendChatMessageResult,
+  current: ChatMessage[],
+): string[] {
+  if (result.removedMessageIds && result.removedMessageIds.length > 0) {
+    return result.removedMessageIds;
+  }
+
+  return current
+    .filter(
+      (message) =>
+        message.chatId === result.chat.id &&
+        message.position > result.userMessage.position,
+    )
+    .map((message) => message.id);
+}
+
 function appendMessageDelta(
   current: ChatMessage[],
   messageId: string,
@@ -3628,23 +3855,64 @@ function appendToolOutput(
   return next.length > max ? `... output trimmed ...\n${next.slice(-max)}` : next;
 }
 
-function formatToolCommand(command?: ToolCommand | null) {
-  if (!command) {
-    return "tool command";
+// The full `program arg1 arg2 …` line for a run_command call. Sourced from the
+// legacy `command` field when present, otherwise from the typed `payload`
+// (program/args) — the unified orchestrator carries the command in the payload,
+// not the legacy field, so reading only `command` showed nothing.
+function formatToolCommand(tool: ToolExecutionView): string {
+  if (tool.command) {
+    return [tool.command.program, ...(tool.command.args ?? [])].join(" ");
   }
-  return [command.program, ...(command.args ?? [])].join(" ");
+  const program = toolProgram(tool);
+  if (!program) {
+    return "";
+  }
+  return [program, ...toolPayloadArgs(tool)].join(" ").trim();
 }
 
-function formatToolHeadline(command?: ToolCommand | null) {
-  if (!command) {
-    return "Used tool";
+// The program a run_command call ran, from the legacy command field or the typed
+// payload (the payload arrives on the terminal event; command is null on the new
+// orchestrator path).
+function toolProgram(tool: ToolExecutionView): string | undefined {
+  if (tool.command?.program) {
+    return tool.command.program;
+  }
+  const program = tool.payload?.["program"];
+  return typeof program === "string" && program ? program : undefined;
+}
+
+function toolPayloadArgs(tool: ToolExecutionView): string[] {
+  const args = tool.payload?.["args"];
+  return Array.isArray(args)
+    ? args.filter((arg): arg is string => typeof arg === "string")
+    : [];
+}
+
+const TOOL_KIND_HEADLINES: Record<ToolKind, string> = {
+  run_command: "Ran command",
+  read_file: "Read file",
+  write_file: "Wrote file",
+  edit_file: "Edited file",
+  apply_patch: "Applied patch",
+  list_files: "Listed files",
+  search_text: "Searched",
+};
+
+function formatToolHeadline(tool: ToolExecutionView) {
+  // run_command: name the actual program so the user sees "Used PowerShell" /
+  // "Ran git" rather than a generic label.
+  if (tool.toolKind === "run_command" || tool.command) {
+    const program = toolProgram(tool);
+    if (program) {
+      return isPowerShellCommand(program) ? "Used PowerShell" : `Ran ${program}`;
+    }
   }
 
-  if (isPowerShellCommand(command.program)) {
-    return "Used PowerShell";
+  if (tool.toolKind) {
+    return TOOL_KIND_HEADLINES[tool.toolKind];
   }
 
-  return `Ran ${command.program}`;
+  return "Used tool";
 }
 
 function toolCommandLabel(command?: ToolCommand | null) {

@@ -1,4 +1,4 @@
-import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createSignal, For, Index, onCleanup, onMount, Show } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
 import {
   ChevronLeft,
@@ -13,6 +13,7 @@ import {
 } from "lucide-solid";
 
 import type {
+  AdapterSettingsField,
   AdapterSettingPatchValue,
   AdapterSettingsView,
   ConnectorSettingsEvent,
@@ -27,6 +28,7 @@ import {
   saveAdapterSettings,
   setSelectedModel,
 } from "../../shared/api/mothership";
+import { parseSettingsList } from "../../shared/settings-lists";
 import { startWindowDrag } from "../../shared/window-drag";
 
 export function Settings(props: { onBack: () => void }) {
@@ -217,24 +219,24 @@ export function Settings(props: { onBack: () => void }) {
               }
             >
               <div class="connector-grid">
-                <For each={settings()?.providers ?? []}>
+                <Index each={settings()?.providers ?? []}>
                   {(provider) => (
                     <ConnectorCard
-                      provider={provider}
-                      selectedModelId={provider.selectedModelId ?? undefined}
-                      busy={authorizingId() === provider.id}
-                      onAuthorize={() => void authorize(provider.id)}
-                      onCancelAuthorize={() => void cancelAuthorize(provider.id)}
-                      onLogout={() => void logout(provider.id)}
+                      provider={provider()}
+                      selectedModelId={provider().selectedModelId ?? undefined}
+                      busy={authorizingId() === provider().id}
+                      onAuthorize={() => void authorize(provider().id)}
+                      onCancelAuthorize={() => void cancelAuthorize(provider().id)}
+                      onLogout={() => void logout(provider().id)}
                       onSelectModel={(modelId) =>
-                        void selectModel(provider.id, modelId)
+                        void selectModel(provider().id, modelId)
                       }
                       onSaveSettings={(patch) =>
-                        void saveAdapter(provider.id, patch)
+                        void saveAdapter(provider().id, patch)
                       }
                     />
                   )}
-                </For>
+                </Index>
               </div>
             </Show>
           </Show>
@@ -436,11 +438,8 @@ function AdapterSettingsForm(props: {
   const secretClearInit: Record<string, boolean> = {};
   const listInit: Record<string, string[]> = {};
   for (const field of props.view.fields) {
-    if (field.kind === "string_list") {
-      listInit[field.key] = (props.view.values[field.key] ?? "")
-        .split(/[\n,]/)
-        .map((item) => item.trim())
-        .filter(Boolean);
+    if (field.kind === "string_list" || field.kind === "model_visibility_list") {
+      listInit[field.key] = parseSettingsList(props.view.values[field.key] ?? "");
     } else if (field.kind === "secret") {
       secretInit[field.key] = "";
       secretClearInit[field.key] = false;
@@ -485,11 +484,29 @@ function AdapterSettingsForm(props: {
       ...current,
       [key]: (current[key] ?? []).filter((_, i) => i !== index),
     }));
+  const setModelVisible = (
+    field: AdapterSettingsField,
+    modelId: string,
+    visible: boolean,
+  ) =>
+    setLists((current) => {
+      const hidden = new Set(current[field.key] ?? []);
+      if (visible) {
+        hidden.delete(modelId);
+      } else {
+        hidden.add(modelId);
+      }
+
+      const optionValues = field.options.map((option) => option.value);
+      const orderedKnown = optionValues.filter((value) => hidden.has(value));
+      const unknown = [...hidden].filter((value) => !optionValues.includes(value));
+      return { ...current, [field.key]: [...orderedKnown, ...unknown] };
+    });
 
   function submit() {
     const patch: Record<string, AdapterSettingPatchValue> = {};
     for (const field of props.view.fields) {
-      if (field.kind === "string_list") {
+      if (field.kind === "string_list" || field.kind === "model_visibility_list") {
         patch[field.key] = {
           action: "set",
           value: (lists()[field.key] ?? [])
@@ -534,137 +551,179 @@ function AdapterSettingsForm(props: {
     <div class="connector-card__block">
       <h4>Settings</h4>
       <div class="adapter-settings">
-        <For each={props.view.fields}>
+        <Index each={props.view.fields}>
           {(field) => (
             <Show
-              when={field.kind === "string_list"}
+              when={field().kind === "model_visibility_list"}
               fallback={
                 <Show
-                  when={field.kind === "bool"}
+                  when={field().kind === "string_list"}
                   fallback={
                     <Show
-                      when={field.kind === "secret"}
+                      when={field().kind === "bool"}
                       fallback={
-                        <label class="adapter-setting">
-                          <span>
-                            {field.label}
-                            {field.required ? " *" : ""}
-                          </span>
-                          <input
-                            type="text"
-                            value={scalars()[field.key] ?? ""}
-                            onInput={(event) =>
-                              setScalar(field.key, event.currentTarget.value)
-                            }
-                          />
-                        </label>
-                      }
-                    >
-                      <div class="adapter-setting">
-                        <span>
-                          {field.label}
-                          {field.required ? " *" : ""}
-                        </span>
-                        <input
-                          aria-label={field.label}
-                          type="password"
-                          value={secrets()[field.key] ?? ""}
-                          placeholder={
-                            hasSavedSecret(field.key)
-                              ? "Leave blank to keep saved secret"
-                              : ""
+                        <Show
+                          when={field().kind === "secret"}
+                          fallback={
+                            <label class="adapter-setting">
+                              <span>
+                                {field().label}
+                                {field().required ? " *" : ""}
+                              </span>
+                              <input
+                                type="text"
+                                value={scalars()[field().key] ?? ""}
+                                onInput={(event) =>
+                                  setScalar(
+                                    field().key,
+                                    event.currentTarget.value,
+                                  )
+                                }
+                              />
+                            </label>
                           }
-                          onInput={(event) =>
-                            setSecret(field.key, event.currentTarget.value)
-                          }
-                        />
-                        <p class="muted-line">{secretDescription(field.key)}</p>
-                        <Show when={hasSavedSecret(field.key)}>
-                          <label class="adapter-setting adapter-setting--bool">
+                        >
+                          <div class="adapter-setting">
+                            <span>
+                              {field().label}
+                              {field().required ? " *" : ""}
+                            </span>
                             <input
-                              type="checkbox"
-                              checked={secretClears()[field.key] ?? false}
-                              onChange={(event) =>
-                                setSecretClear(
-                                  field.key,
-                                  event.currentTarget.checked,
-                                )
+                              aria-label={field().label}
+                              type="password"
+                              value={secrets()[field().key] ?? ""}
+                              placeholder={
+                                hasSavedSecret(field().key)
+                                  ? "Leave blank to keep saved secret"
+                                  : ""
+                              }
+                              onInput={(event) =>
+                                setSecret(field().key, event.currentTarget.value)
                               }
                             />
-                            <span>Clear saved secret</span>
-                          </label>
+                            <p class="muted-line">
+                              {secretDescription(field().key)}
+                            </p>
+                            <Show when={hasSavedSecret(field().key)}>
+                              <label class="adapter-setting adapter-setting--bool">
+                                <input
+                                  type="checkbox"
+                                  checked={secretClears()[field().key] ?? false}
+                                  onChange={(event) =>
+                                    setSecretClear(
+                                      field().key,
+                                      event.currentTarget.checked,
+                                    )
+                                  }
+                                />
+                                <span>Clear saved secret</span>
+                              </label>
+                            </Show>
+                          </div>
                         </Show>
-                      </div>
+                      }
+                    >
+                      <label class="adapter-setting adapter-setting--bool">
+                        <input
+                          type="checkbox"
+                          checked={scalars()[field().key] === "true"}
+                          onChange={(event) =>
+                            setScalar(
+                              field().key,
+                              event.currentTarget.checked ? "true" : "false",
+                            )
+                          }
+                        />
+                        <span>
+                          {field().label}
+                          {field().required ? " *" : ""}
+                        </span>
+                      </label>
                     </Show>
                   }
                 >
-                  <label class="adapter-setting adapter-setting--bool">
-                    <input
-                      type="checkbox"
-                      checked={scalars()[field.key] === "true"}
-                      onChange={(event) =>
-                        setScalar(
-                          field.key,
-                          event.currentTarget.checked ? "true" : "false",
-                        )
-                      }
-                    />
+                  <div class="adapter-setting">
                     <span>
-                      {field.label}
-                      {field.required ? " *" : ""}
+                      {field().label}
+                      {field().required ? " *" : ""}
                     </span>
-                  </label>
+                    <div class="adapter-list">
+                      <Index
+                        each={lists()[field().key] ?? []}
+                        fallback={<p class="muted-line">None yet.</p>}
+                      >
+                        {(item, index) => (
+                          <div class="adapter-list__row">
+                            <input
+                              type="text"
+                              value={item()}
+                              placeholder="provider/model-id"
+                              onInput={(event) =>
+                                setListItem(
+                                  field().key,
+                                  index,
+                                  event.currentTarget.value,
+                                )
+                              }
+                            />
+                            <button
+                              class="adapter-list__remove"
+                              type="button"
+                              aria-label="Remove"
+                              onClick={() => removeListItem(field().key, index)}
+                            >
+                              <X size={14} />
+                            </button>
+                          </div>
+                        )}
+                      </Index>
+                      <button
+                        class="adapter-list__add"
+                        type="button"
+                        onClick={() => addListItem(field().key)}
+                      >
+                        <Plus size={14} />
+                        Add model
+                      </button>
+                    </div>
+                  </div>
                 </Show>
               }
             >
               <div class="adapter-setting">
                 <span>
-                  {field.label}
-                  {field.required ? " *" : ""}
+                  {field().label}
+                  {field().required ? " *" : ""}
                 </span>
-                <div class="adapter-list">
-                  <For
-                    each={lists()[field.key] ?? []}
+                <div class="adapter-visibility-list">
+                  <Index
+                    each={field().options}
                     fallback={<p class="muted-line">None yet.</p>}
                   >
-                    {(item, index) => (
-                      <div class="adapter-list__row">
+                    {(option) => (
+                      <label class="adapter-visibility-row">
                         <input
-                          type="text"
-                          value={item}
-                          placeholder="provider/model-id"
-                          onInput={(event) =>
-                            setListItem(
-                              field.key,
-                              index(),
-                              event.currentTarget.value,
+                          type="checkbox"
+                          checked={
+                            !(lists()[field().key] ?? []).includes(option().value)
+                          }
+                          onChange={(event) =>
+                            setModelVisible(
+                              field(),
+                              option().value,
+                              event.currentTarget.checked,
                             )
                           }
                         />
-                        <button
-                          class="adapter-list__remove"
-                          type="button"
-                          aria-label="Remove"
-                          onClick={() => removeListItem(field.key, index())}
-                        >
-                          <X size={14} />
-                        </button>
-                      </div>
+                        <span>{option().label}</span>
+                      </label>
                     )}
-                  </For>
-                  <button
-                    class="adapter-list__add"
-                    type="button"
-                    onClick={() => addListItem(field.key)}
-                  >
-                    <Plus size={14} />
-                    Add model
-                  </button>
+                  </Index>
                 </div>
               </div>
             </Show>
           )}
-        </For>
+        </Index>
         <button
           class="settings-primary-button"
           type="button"

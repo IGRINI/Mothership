@@ -218,7 +218,10 @@ async fn run_connection(app: &AppHandle, shared: &Arc<Shared>, db_path: PathBuf)
                     let frame: ServerFrame = match serde_json::from_str(&line) {
                         Ok(frame) => frame,
                         Err(error) => {
-                            eprintln!("sidecar: undecodable frame: {error}");
+                            eprintln!(
+                                "sidecar: undecodable frame: {error}; {}",
+                                invalid_frame_preview(&line)
+                            );
                             continue;
                         }
                     };
@@ -306,5 +309,28 @@ fn take_line(buffer: &mut Vec<u8>) -> Option<String> {
         String::from_utf8_lossy(&line[..line.len() - 1])
             .trim_end_matches('\r')
             .to_string(),
+    )
+}
+
+fn invalid_frame_preview(line: &str) -> String {
+    let first = line
+        .trim_start()
+        .chars()
+        .next()
+        .map(|character| character.escape_debug().to_string())
+        .unwrap_or_else(|| "<empty>".to_string());
+    let prefix_hex = line
+        .as_bytes()
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    format!(
+        "len={}, first='{}', prefix_hex=[{}]",
+        line.len(),
+        first,
+        prefix_hex
     )
 }
