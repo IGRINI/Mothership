@@ -290,10 +290,14 @@ typed storage, semantic UI, catalog stability, and a credential firewall.
   event sink scrubs **command args + env values**, event/result previews+tails, artifact
   previews, and string values in the typed payload. Durable spilled blobs (the content behind a
   `log_ref`: command stdout/stderr, file-tool diff/read/search) are scrubbed at rest by
-  `RedactingOutputStore` (line-buffered so a secret split across writes is still caught; UTF-8
-  lines redacted, binary passed through). Model-facing *result* text is intentionally not yet
-  redacted (the model needs real file contents; known-secret files are already path-blocked);
-  the trait is the seam for policy-driven model-visible redaction later.
+  `RedactingOutputStore` via a **bounded streaming redactor**: a no-newline torrent is
+  force-flushed in capped segments so memory stays bounded (no whole-line buffering); a secret
+  split across writes is caught via overlap + non-token cut points; and a multi-line
+  `BEGIN…END` private-key block is held and redacted as a unit (a runaway block past the cap is
+  force-redacted to a marker, never buffered or leaked). UTF-8 segments redacted, binary passed
+  through. Model-facing *result* text is intentionally not yet redacted (the model needs real
+  file contents; known-secret files are already path-blocked); the trait is the seam for
+  policy-driven model-visible redaction later.
 
 ## Deferred (NOT defects — scope, stage considered closed without them)
 
