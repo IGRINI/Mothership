@@ -145,11 +145,13 @@ struct ToolProjectContext {
 // Executors
 // ---------------------------------------------------------------------------
 
-/// Process-command executor. Wraps the unchanged [`ToolSupervisor`], which owns
-/// the full command lifecycle (queued → permission → approval → spawn → stream →
-/// terminal). The dispatcher supplies the per-call cancellation token and the
-/// shared registry slot; this executor only adapts arguments and maps the
-/// supervisor's result back to the model-facing response.
+/// Process-command executor. Builds the [`ToolExecutionRequest`] from the call
+/// arguments and drives the shared [`ToolOrchestrator`] over a per-call
+/// [`CommandCall`] backend — the orchestrator owns the lifecycle (queued →
+/// classify → guard → approval → lease → started → execute → terminal), and
+/// [`ToolSupervisor`] is now just the command ports (policy / repeat-block /
+/// lease / spawn+stream+wait / record). The dispatcher supplies the per-call
+/// cancellation token and the shared registry slot.
 struct CommandToolExecutor {
     supervisor: Arc<ToolSupervisor>,
     runtime: Arc<tokio::runtime::Runtime>,
@@ -464,6 +466,10 @@ impl ToolBackend for CommandCall {
     }
 
     fn record(&self, _ctx: &ToolCallContext<'_>, outcome: &BackendOutcome) {
+        // The orchestrator calls record() ONLY for an executed outcome (never a
+        // pre-execution terminal like a denial), so a user's repeated *denial*
+        // never reaches the repeat guard. The guard additionally ignores
+        // Cancelled/LoopBlocked itself.
         self.supervisor
             .record_command_outcome(&self.request, &outcome.result);
     }
@@ -2160,5 +2166,62 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("Repeated identical tool call suppressed"));
+    }
+
+    #[test]
+    fn denied_commands_are_not_recorded_for_repeat_suppression() {
+        // A user's repeated *denial* of the same command must NOT feed the repeat
+        // guard — only executed commands do. So denying twice then approving must
+        // run the command, not suppress it as a "repeat" before approval.
+        let sandbox = Arc::new(FakeSandbox::new(b"ok".to_vec(), Vec::new(), Some(0)));
+        let supervisor = Arc::new(
+            ToolSupervisor::new(sandbox.clone(), None, ToolResourceLimits::default())
+                .with_repeat_guard(Arc::new(ToolRepeatGuard::default())),
+        );
+        let approvals = PendingToolApprovalGate::new();
+        let sink = Arc::new(RecordingEventSink::default());
+
+        let run_with_decision = |tool_call_id: &str, decision: ToolApprovalDecision| {
+            let request =
+                command_request(tool_call_id, "npm", &["install"], ToolOutputPolicy::default());
+            let supervisor = Arc::clone(&supervisor);
+            let approvals_for_thread = Arc::clone(&approvals);
+            let sink_dyn: Arc<dyn ToolExecutionEventSink> = sink.clone();
+            let tcid = tool_call_id.to_string();
+            let handle = thread::spawn(move || {
+                run_command_via_orchestrator(
+                    request,
+                    ToolCancellationToken::default(),
+                    supervisor,
+                    approvals_for_thread,
+                    command_runtime(),
+                    sink_dyn,
+                );
+            });
+            for _ in 0..400 {
+                if approvals.decide(&tcid, decision.clone()) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            handle.join().expect("command thread");
+        };
+
+        let deny = ToolApprovalDecision::Denied {
+            reason: "no".to_string(),
+        };
+        run_with_decision("cmd_deny_a", deny.clone());
+        run_with_decision("cmd_deny_b", deny);
+        run_with_decision("cmd_approve_c", ToolApprovalDecision::Approved);
+
+        assert_eq!(
+            sandbox.spawn_count(),
+            1,
+            "the approved third call must run — prior denials must not suppress it"
+        );
+        assert!(
+            !event_kinds(&sink).contains(&ToolExecutionEventKind::LoopBlocked),
+            "user denials must not trigger repeat suppression"
+        );
     }
 }

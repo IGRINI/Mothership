@@ -1,22 +1,27 @@
 //! Unified tool-call orchestration — one lifecycle for every tool kind.
 //!
 //! ```text
-//! queued → classify → preflight → policy/approval
-//!        → [resource lease / repeat guard]* → started
-//!        → execute (backend) → terminal
+//! queued → classify → preflight → guard → policy/approval
+//!        → [resource lease]? → started → execute (backend) → terminal
 //! ```
-//! `*` = optional, requested by the call's [`ToolCapability`] (e.g. a process
-//! needs a lease; a typed file tool does not).
+//! `?` = optional, requested by the call's [`ToolCapability`] (a process needs a
+//! lease; a typed file tool does not).
 //!
 //! The orchestrator owns the cross-cuts; a [`ToolBackend`] provides only the
 //! kind-specific work, split into clear concerns:
 //! - `classify` declares **what** the call wants (intent + touched paths +
 //!   resources) — it carries no allow/deny decision;
 //! - `preflight` rejects malformed arguments *before* an approval prompt;
-//! - `decide` is the **policy** step (Allow / Ask / Deny);
+//! - `guard` is a pre-policy short-circuit (e.g. repeat suppression → a
+//!   `LoopBlocked` terminal) that runs before any approval or execution;
+//! - `decide` is the **policy** step (Allow / Ask / Deny / Reject);
 //! - `preview` is a side-effect-free approval card (diff/summary);
+//! - `acquire` takes a resource lease (held across `execute`) when the
+//!   capability asks for one;
 //! - `execute` does the actual work (spawn+stream+wait for a process; a pure
-//!   handler for a typed tool) and returns an already-bounded outcome.
+//!   handler for a typed tool) and returns an already-bounded outcome;
+//! - `record` is post-terminal bookkeeping (the repeat guard) — the orchestrator
+//!   calls it ONLY for an executed outcome, never for a pre-execution terminal.
 //!
 //! The orchestrator emits [`ToolExecutionEvent`]s to the sink and NEVER touches
 //! storage / redaction / UI directly — the sink fans those out. Backends are
@@ -226,7 +231,6 @@ impl ToolOrchestrator {
                 &ctx,
                 project_id,
                 sink,
-                backend,
                 cancelled_outcome(ctx.tool_call_id, "tool call was cancelled before it started"),
             );
         }
@@ -234,9 +238,7 @@ impl ToolOrchestrator {
         // classify — intent + touched paths + resource needs (no decision).
         let capability = match backend.classify(&ctx) {
             Ok(capability) => capability,
-            Err(error) => {
-                return self.fail(&ctx, project_id, sink, backend, error.to_string(), Vec::new())
-            }
+            Err(error) => return self.fail(&ctx, project_id, sink, error.to_string(), Vec::new()),
         };
 
         // preflight — reject malformed args BEFORE asking for approval.
@@ -245,7 +247,6 @@ impl ToolOrchestrator {
                 &ctx,
                 project_id,
                 sink,
-                backend,
                 error.to_string(),
                 capability.touched_paths.clone(),
             );
@@ -254,16 +255,16 @@ impl ToolOrchestrator {
         // guard — a pre-policy short-circuit (e.g. repeat-suppression) emitted as
         // a terminal without asking or executing.
         if let Some(outcome) = backend.guard(&ctx) {
-            return self.terminal(&ctx, project_id, sink, backend, outcome);
+            return self.terminal(&ctx, project_id, sink, outcome);
         }
 
         // policy → approval.
         match backend.decide(&ctx, &capability) {
             ToolDecision::Reject(outcome) => {
-                return self.terminal(&ctx, project_id, sink, backend, *outcome);
+                return self.terminal(&ctx, project_id, sink, *outcome);
             }
             ToolDecision::Deny { reason } => {
-                return self.denied(&ctx, project_id, sink, backend, reason, &capability);
+                return self.denied(&ctx, project_id, sink, reason, &capability);
             }
             ToolDecision::Ask { reason } => {
                 let preview = backend.preview(&ctx, &capability);
@@ -287,21 +288,32 @@ impl ToolOrchestrator {
                     self.approval_gate
                         .request_decision(ctx.tool_call_id, ctx.cancellation),
                 );
+                // A cancel (chat or tool) unblocks the gate as a Denied — but it is
+                // a cancellation, not a refusal. Check the token BEFORE mapping the
+                // decision so the terminal is Cancelled, and (being pre-execute) it
+                // never reaches the repeat guard.
+                if ctx.cancellation.is_cancelled() || ctx.chat_cancellation.is_cancelled() {
+                    return self.terminal(
+                        &ctx,
+                        project_id,
+                        sink,
+                        cancelled_outcome(ctx.tool_call_id, "tool call was cancelled"),
+                    );
+                }
                 if let ToolApprovalDecision::Denied { reason } = decision {
-                    return self.denied(&ctx, project_id, sink, backend, reason, &capability);
+                    return self.denied(&ctx, project_id, sink, reason, &capability);
                 }
             }
             ToolDecision::Allow => {}
         }
 
-        // A chat cancelled during approval is reported as a cancellation rather
-        // than running the side effect.
+        // A chat cancelled after an Allow (or otherwise before execute) is a
+        // cancellation rather than running the side effect.
         if ctx.cancellation.is_cancelled() || ctx.chat_cancellation.is_cancelled() {
             return self.terminal(
                 &ctx,
                 project_id,
                 sink,
-                backend,
                 cancelled_outcome(ctx.tool_call_id, "tool call was cancelled"),
             );
         }
@@ -332,7 +344,7 @@ impl ToolOrchestrator {
                             error.to_string(),
                         )
                     };
-                    return self.terminal(&ctx, project_id, sink, backend, outcome);
+                    return self.terminal(&ctx, project_id, sink, outcome);
                 }
             }
         } else {
@@ -344,31 +356,37 @@ impl ToolOrchestrator {
             Some(capability.summary.clone()),
         );
 
-        // `_lease` is held here through execute + terminal, then dropped on return.
-        match backend.execute(&ctx, sink) {
-            Ok(outcome) => self.terminal(&ctx, project_id, sink, backend, outcome),
-            Err(error) => self.fail(
-                &ctx,
-                project_id,
-                sink,
-                backend,
-                error.to_string(),
-                capability.touched_paths,
-            ),
-        }
+        // ONLY an executed outcome (Ok, or a spawn/IO failure synthesized here) is
+        // recorded for cross-call bookkeeping. Pre-execution terminals — cancel,
+        // guard, reject, denial, lease failure — must NOT feed the repeat guard, so
+        // a user's repeated *denial* is never suppressed as a repeated *execution*.
+        // `_lease` is held through execute + terminal, then dropped on return.
+        let outcome = match backend.execute(&ctx, sink) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let mut outcome = terminal_outcome(
+                    ctx.tool_call_id,
+                    ToolExecutionStatus::Failed,
+                    error.to_string(),
+                );
+                outcome.touched_paths = capability.touched_paths;
+                outcome
+            }
+        };
+        backend.record(&ctx, &outcome);
+        self.terminal(&ctx, project_id, sink, outcome)
     }
 
-    /// Record the outcome (backend bookkeeping, e.g. the repeat guard), emit the
-    /// terminal event, and return the model-facing result.
+    /// Emit the terminal event for an outcome and return the model-facing result.
+    /// Does NOT record — recording is the executed path's job (see `run`), so
+    /// pre-execution terminals never reach the repeat guard.
     fn terminal(
         &self,
         ctx: &ToolCallContext<'_>,
         project_id: Option<&str>,
         sink: &Arc<dyn ToolExecutionEventSink>,
-        backend: &dyn ToolBackend,
         outcome: BackendOutcome,
     ) -> LlmToolCallResult {
-        backend.record(ctx, &outcome);
         let ok = outcome.status == ToolExecutionStatus::Completed;
         sink.emit(ToolExecutionEvent {
             tool_call_id: ctx.tool_call_id.to_string(),
@@ -394,17 +412,13 @@ impl ToolOrchestrator {
         ctx: &ToolCallContext<'_>,
         project_id: Option<&str>,
         sink: &Arc<dyn ToolExecutionEventSink>,
-        backend: &dyn ToolBackend,
         reason: String,
         capability: &ToolCapability,
     ) -> LlmToolCallResult {
-        let mut outcome = terminal_outcome(
-            ctx.tool_call_id,
-            ToolExecutionStatus::PermissionDenied,
-            reason.clone(),
-        );
+        let mut outcome =
+            terminal_outcome(ctx.tool_call_id, ToolExecutionStatus::PermissionDenied, reason);
         outcome.touched_paths = capability.touched_paths.clone();
-        self.terminal(ctx, project_id, sink, backend, outcome)
+        self.terminal(ctx, project_id, sink, outcome)
     }
 
     fn fail(
@@ -412,14 +426,12 @@ impl ToolOrchestrator {
         ctx: &ToolCallContext<'_>,
         project_id: Option<&str>,
         sink: &Arc<dyn ToolExecutionEventSink>,
-        backend: &dyn ToolBackend,
         message: String,
         touched_paths: Vec<String>,
     ) -> LlmToolCallResult {
-        let mut outcome =
-            terminal_outcome(ctx.tool_call_id, ToolExecutionStatus::Failed, message);
+        let mut outcome = terminal_outcome(ctx.tool_call_id, ToolExecutionStatus::Failed, message);
         outcome.touched_paths = touched_paths;
-        self.terminal(ctx, project_id, sink, backend, outcome)
+        self.terminal(ctx, project_id, sink, outcome)
     }
 }
 
@@ -672,5 +684,77 @@ mod tests {
             "preflight failure must not ask for approval"
         );
         assert!(kinds.contains(&ToolExecutionEventKind::Failed));
+    }
+
+    #[test]
+    fn cancel_during_approval_is_cancelled_not_denied() {
+        // The gate returns Denied when the call is cancelled; the orchestrator
+        // must still report a *cancellation*, not a refusal, and not execute.
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let gate = PendingToolApprovalGate::new();
+        let gate_dyn: Arc<dyn ToolApprovalGate> = gate.clone();
+        let orchestrator = ToolOrchestrator::new(gate_dyn, Arc::clone(&runtime));
+        let recording = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn ToolExecutionEventSink> = recording.clone();
+        let executed = Arc::new(Mutex::new(false));
+        let backend = FakeBackend {
+            decision: ToolDecision::Ask {
+                reason: "approve?".to_string(),
+            },
+            preflight_ok: true,
+            executed: Arc::clone(&executed),
+        };
+        let cancellation = ToolCancellationToken::default();
+        let chat = ChatCancellationToken::default();
+        let arguments = json!({});
+
+        // Cancel the call once the approval request has been emitted (the gate is
+        // then blocked waiting for a decision).
+        let canceller = {
+            let recording = Arc::clone(&recording);
+            let cancellation = cancellation.clone();
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    if recording
+                        .kinds()
+                        .contains(&ToolExecutionEventKind::PermissionRequested)
+                    {
+                        cancellation.cancel();
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        };
+
+        let ctx = ToolCallContext {
+            tool_call_id: "tc",
+            run_id: Some("run"),
+            tool_name: "run_command",
+            kind: ToolKind::RunCommand,
+            arguments: &arguments,
+            cancellation: &cancellation,
+            chat_cancellation: &chat,
+        };
+        let result = orchestrator.run(ctx, Some("project"), &backend, &sink);
+        canceller.join().unwrap();
+
+        assert!(!result.ok);
+        assert!(!*executed.lock().unwrap(), "cancelled call must not execute");
+        let kinds = recording.kinds();
+        assert!(kinds.contains(&ToolExecutionEventKind::PermissionRequested));
+        assert!(
+            kinds.contains(&ToolExecutionEventKind::Cancelled),
+            "cancel during approval must terminate as Cancelled: {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&ToolExecutionEventKind::PermissionDenied),
+            "cancel must not be reported as a denial: {kinds:?}"
+        );
     }
 }
