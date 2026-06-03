@@ -177,10 +177,11 @@ pub trait ToolBackend: Send + Sync {
         sink: &Arc<dyn ToolExecutionEventSink>,
     ) -> Result<BackendOutcome>;
 
-    /// Record the terminal outcome for cross-call bookkeeping (e.g. the repeat
-    /// guard's history). Called on every terminal — including denials and
-    /// cancellations — so the backend decides what is worth remembering. Default:
-    /// noop.
+    /// Record an **executed** outcome for cross-call bookkeeping (e.g. the repeat
+    /// guard's history). The orchestrator calls this ONLY for the result of
+    /// `execute` (success, or a spawn/IO failure) — never for a pre-execution
+    /// terminal (cancel, guard, reject, denial, lease failure), so a user's
+    /// repeated denial never feeds the repeat guard. Default: noop.
     fn record(&self, _ctx: &ToolCallContext<'_>, _outcome: &BackendOutcome) {}
 }
 
