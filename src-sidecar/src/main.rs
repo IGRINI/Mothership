@@ -34,9 +34,9 @@ use mothership_core::{
     PendingToolApprovalGate, ProviderRuntimeManager, RedactingOutputStore, SendChatMessageResult,
     ToolApprovalAnswer,
     ToolApprovalDecision, ToolCancellationToken, ToolExecutionAccepted,
-    ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionEventKind,
-    ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest, ToolExecutionResult,
-    ToolExecutionStatus, ToolKind, ToolRepeatGuard, ToolResourceLimits, ToolSupervisor,
+    ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionEventSink,
+    ToolExecutionRegistry, ToolExecutionRequest, ToolRepeatGuard, ToolResourceLimits,
+    ToolSupervisor,
 };
 use sha2::{Digest, Sha256};
 
@@ -182,10 +182,7 @@ fn serve() -> anyhow::Result<()> {
             tool_output_store.clone(),
             ToolResourceLimits::default(),
         )
-        .with_policy(
-            Arc::new(ConservativeCommandPermissionPolicy),
-            Arc::clone(&tool_approvals) as Arc<dyn mothership_core::ToolApprovalGate>,
-        )
+        .with_policy(Arc::new(ConservativeCommandPermissionPolicy))
         .with_repeat_guard(tool_repeat_guard),
     );
     let tool_registry = Arc::new(ToolExecutionRegistry::new());
@@ -516,6 +513,7 @@ fn handle_request(
             outbox,
             tool_supervisor,
             tool_registry,
+            tool_approvals,
             async_runtime,
         );
         return;
@@ -705,6 +703,7 @@ fn run_tool_command(
     outbox: Outbox,
     tool_supervisor: Arc<ToolSupervisor>,
     tool_registry: Arc<ToolExecutionRegistry>,
+    tool_approvals: Arc<PendingToolApprovalGate>,
     async_runtime: Arc<tokio::runtime::Runtime>,
 ) {
     if request.tool_call_id.trim().is_empty() {
@@ -746,45 +745,20 @@ fn run_tool_command(
         chat_id: None,
         message_id: None,
     });
-    async_runtime.spawn(async move {
-        let result = tool_supervisor
-            .run_command(request.clone(), cancellation, Arc::clone(&sink))
-            .await;
-        if let Err(error) = result {
-            let failed = ToolExecutionResult {
-                tool_call_id: request.tool_call_id.clone(),
-                status: ToolExecutionStatus::Failed,
-                exit_code: None,
-                stdout_preview: String::new(),
-                stderr_preview: String::new(),
-                stdout_tail: String::new(),
-                stderr_tail: String::new(),
-                stdout_bytes: 0,
-                stderr_bytes: 0,
-                truncated_for_display: false,
-                truncated_for_agent: false,
-                log_ref: None,
-                message: Some(error.to_string()),
-            };
-            sink.emit(ToolExecutionEvent {
-                tool_call_id: request.tool_call_id.clone(),
-                run_id: request.run_id.clone(),
-                project_id: request.project_id.clone(),
-                command: Some(request.command.clone()),
-                kind: ToolExecutionEventKind::Failed,
-                stream: None,
-                chunk: None,
-                message: Some(error.to_string()),
-                result: Some(failed),
-                // A run_command spawn failure; the typed payload is synthesized
-                // from command + result at the storage layer.
-                tool_kind: Some(ToolKind::RunCommand),
-                payload: None,
-                touched_paths: Vec::new(),
-                artifacts: Vec::new(),
-            });
-        }
-        tool_registry.finish(&request.tool_call_id);
+    // The orchestrator is synchronous (it blocks on the runtime for approval and
+    // process I/O), so it must run on a dedicated thread, never an async-runtime
+    // worker. A spawn failure or non-zero exit surfaces as the orchestrator's own
+    // terminal event — no hand-rolled failure path here.
+    std::thread::spawn(move || {
+        tool_runtime::run_command_via_orchestrator(
+            request,
+            cancellation,
+            tool_supervisor,
+            tool_approvals,
+            async_runtime,
+            sink,
+        );
+        tool_registry.finish(&tool_call_id);
     });
 }
 

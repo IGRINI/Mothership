@@ -29,7 +29,7 @@ use serde_json::Value;
 
 use crate::{LlmToolCallResult, Result};
 
-use super::permissions::{PendingToolApprovalGate, ToolApprovalDecision};
+use super::permissions::{ToolApprovalDecision, ToolApprovalGate};
 use super::pipeline::ToolCallContext;
 use super::types::{
     ToolArtifact, ToolExecutionEvent, ToolExecutionEventKind, ToolExecutionEventSink,
@@ -102,6 +102,25 @@ pub struct BackendOutcome {
     pub artifacts: Vec<ToolArtifact>,
 }
 
+/// An opaque RAII lease the orchestrator holds across `execute`; dropping it
+/// releases whatever the backend acquired (e.g. resource-gate permits). A no-op
+/// when the backend needs no lease. Kept generic (not process-only) so future
+/// backends (LSP, browser, fetch) can request leases without changing the
+/// orchestrator.
+pub struct ResourceLease(#[allow(dead_code)] Option<Box<dyn Send>>);
+
+impl ResourceLease {
+    /// A lease that holds nothing.
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// Wrap an owned guard whose `Drop` releases the resource.
+    pub fn new(guard: Box<dyn Send>) -> Self {
+        Self(Some(guard))
+    }
+}
+
 /// The kind-specific seam. The orchestrator runs the shared lifecycle around it.
 ///
 /// Synchronous on purpose: the file backends' output spill bridges to the async
@@ -117,12 +136,32 @@ pub trait ToolBackend: Send + Sync {
         Ok(())
     }
 
+    /// A pre-policy guard run before approval: return a terminal outcome (e.g. a
+    /// `LoopBlocked` repeat suppression) to short-circuit the call without asking
+    /// or executing, or `None` to proceed. Default: proceed.
+    fn guard(&self, _ctx: &ToolCallContext<'_>) -> Option<BackendOutcome> {
+        None
+    }
+
     /// Apply policy to a classified call → Allow / Ask / Deny / Reject.
     fn decide(&self, ctx: &ToolCallContext<'_>, capability: &ToolCapability) -> ToolDecision;
 
     /// A side-effect-free preview for the approval card. Default: none.
     fn preview(&self, _ctx: &ToolCallContext<'_>, _capability: &ToolCapability) -> ApprovalPreview {
         ApprovalPreview::default()
+    }
+
+    /// Acquire a resource lease before execution — called only when the
+    /// capability's `resource_request` asks for one. The returned
+    /// [`ResourceLease`] is held by the orchestrator across `execute` and dropped
+    /// after, so any permits/guards inside it stay held for the call's duration.
+    /// Default: no lease.
+    fn acquire(
+        &self,
+        _ctx: &ToolCallContext<'_>,
+        _sink: &Arc<dyn ToolExecutionEventSink>,
+    ) -> Result<ResourceLease> {
+        Ok(ResourceLease::none())
     }
 
     /// Execute after approval; may stream `Output` events through `sink`. Returns
@@ -132,19 +171,25 @@ pub trait ToolBackend: Send + Sync {
         ctx: &ToolCallContext<'_>,
         sink: &Arc<dyn ToolExecutionEventSink>,
     ) -> Result<BackendOutcome>;
+
+    /// Record the terminal outcome for cross-call bookkeeping (e.g. the repeat
+    /// guard's history). Called on every terminal — including denials and
+    /// cancellations — so the backend decides what is worth remembering. Default:
+    /// noop.
+    fn record(&self, _ctx: &ToolCallContext<'_>, _outcome: &BackendOutcome) {}
 }
 
 /// Drives the unified lifecycle for any [`ToolBackend`]. Owns the cross-cuts
 /// (approval gate today; resource lease / repeat guard attach here as backends
 /// that need them are migrated).
 pub struct ToolOrchestrator {
-    approval_gate: Arc<PendingToolApprovalGate>,
+    approval_gate: Arc<dyn ToolApprovalGate>,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl ToolOrchestrator {
     pub fn new(
-        approval_gate: Arc<PendingToolApprovalGate>,
+        approval_gate: Arc<dyn ToolApprovalGate>,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Self {
         Self {
@@ -181,6 +226,7 @@ impl ToolOrchestrator {
                 &ctx,
                 project_id,
                 sink,
+                backend,
                 cancelled_outcome(ctx.tool_call_id, "tool call was cancelled before it started"),
             );
         }
@@ -188,7 +234,9 @@ impl ToolOrchestrator {
         // classify — intent + touched paths + resource needs (no decision).
         let capability = match backend.classify(&ctx) {
             Ok(capability) => capability,
-            Err(error) => return self.fail(&ctx, project_id, sink, error.to_string(), Vec::new()),
+            Err(error) => {
+                return self.fail(&ctx, project_id, sink, backend, error.to_string(), Vec::new())
+            }
         };
 
         // preflight — reject malformed args BEFORE asking for approval.
@@ -197,18 +245,25 @@ impl ToolOrchestrator {
                 &ctx,
                 project_id,
                 sink,
+                backend,
                 error.to_string(),
                 capability.touched_paths.clone(),
             );
         }
 
+        // guard — a pre-policy short-circuit (e.g. repeat-suppression) emitted as
+        // a terminal without asking or executing.
+        if let Some(outcome) = backend.guard(&ctx) {
+            return self.terminal(&ctx, project_id, sink, backend, outcome);
+        }
+
         // policy → approval.
         match backend.decide(&ctx, &capability) {
             ToolDecision::Reject(outcome) => {
-                return self.terminal(&ctx, project_id, sink, *outcome);
+                return self.terminal(&ctx, project_id, sink, backend, *outcome);
             }
             ToolDecision::Deny { reason } => {
-                return self.denied(&ctx, project_id, sink, reason, &capability);
+                return self.denied(&ctx, project_id, sink, backend, reason, &capability);
             }
             ToolDecision::Ask { reason } => {
                 let preview = backend.preview(&ctx, &capability);
@@ -233,7 +288,7 @@ impl ToolOrchestrator {
                         .request_decision(ctx.tool_call_id, ctx.cancellation),
                 );
                 if let ToolApprovalDecision::Denied { reason } = decision {
-                    return self.denied(&ctx, project_id, sink, reason, &capability);
+                    return self.denied(&ctx, project_id, sink, backend, reason, &capability);
                 }
             }
             ToolDecision::Allow => {}
@@ -246,39 +301,74 @@ impl ToolOrchestrator {
                 &ctx,
                 project_id,
                 sink,
+                backend,
                 cancelled_outcome(ctx.tool_call_id, "tool call was cancelled"),
             );
         }
 
-        // NOTE: resource lease (capability.resource_request) + repeat guard are
-        // command-only cross-cuts; they attach here when run_command migrates onto
-        // the orchestrator.
+        // resource lease — acquired only when the capability asks for one (e.g. a
+        // process needs a concurrency/git lease; a typed file tool does not). Held
+        // across execute and dropped when this call returns, so its permits stay
+        // for the whole side effect.
+        let _lease = if capability
+            .resource_request
+            .as_ref()
+            .is_some_and(|request| request.needs_lease)
+        {
+            match backend.acquire(&ctx, sink) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    let outcome = if ctx.cancellation.is_cancelled()
+                        || ctx.chat_cancellation.is_cancelled()
+                    {
+                        cancelled_outcome(
+                            ctx.tool_call_id,
+                            "tool call cancelled while waiting for resources",
+                        )
+                    } else {
+                        terminal_outcome(
+                            ctx.tool_call_id,
+                            ToolExecutionStatus::Failed,
+                            error.to_string(),
+                        )
+                    };
+                    return self.terminal(&ctx, project_id, sink, backend, outcome);
+                }
+            }
+        } else {
+            ResourceLease::none()
+        };
 
         emit(
             ToolExecutionEventKind::Started,
             Some(capability.summary.clone()),
         );
 
+        // `_lease` is held here through execute + terminal, then dropped on return.
         match backend.execute(&ctx, sink) {
-            Ok(outcome) => self.terminal(&ctx, project_id, sink, outcome),
+            Ok(outcome) => self.terminal(&ctx, project_id, sink, backend, outcome),
             Err(error) => self.fail(
                 &ctx,
                 project_id,
                 sink,
+                backend,
                 error.to_string(),
                 capability.touched_paths,
             ),
         }
     }
 
-    /// Emit the terminal event for an outcome and return the model-facing result.
+    /// Record the outcome (backend bookkeeping, e.g. the repeat guard), emit the
+    /// terminal event, and return the model-facing result.
     fn terminal(
         &self,
         ctx: &ToolCallContext<'_>,
         project_id: Option<&str>,
         sink: &Arc<dyn ToolExecutionEventSink>,
+        backend: &dyn ToolBackend,
         outcome: BackendOutcome,
     ) -> LlmToolCallResult {
+        backend.record(ctx, &outcome);
         let ok = outcome.status == ToolExecutionStatus::Completed;
         sink.emit(ToolExecutionEvent {
             tool_call_id: ctx.tool_call_id.to_string(),
@@ -304,6 +394,7 @@ impl ToolOrchestrator {
         ctx: &ToolCallContext<'_>,
         project_id: Option<&str>,
         sink: &Arc<dyn ToolExecutionEventSink>,
+        backend: &dyn ToolBackend,
         reason: String,
         capability: &ToolCapability,
     ) -> LlmToolCallResult {
@@ -313,7 +404,7 @@ impl ToolOrchestrator {
             reason.clone(),
         );
         outcome.touched_paths = capability.touched_paths.clone();
-        self.terminal(ctx, project_id, sink, outcome)
+        self.terminal(ctx, project_id, sink, backend, outcome)
     }
 
     fn fail(
@@ -321,13 +412,14 @@ impl ToolOrchestrator {
         ctx: &ToolCallContext<'_>,
         project_id: Option<&str>,
         sink: &Arc<dyn ToolExecutionEventSink>,
+        backend: &dyn ToolBackend,
         message: String,
         touched_paths: Vec<String>,
     ) -> LlmToolCallResult {
         let mut outcome =
             terminal_outcome(ctx.tool_call_id, ToolExecutionStatus::Failed, message);
         outcome.touched_paths = touched_paths;
-        self.terminal(ctx, project_id, sink, outcome)
+        self.terminal(ctx, project_id, sink, backend, outcome)
     }
 }
 
@@ -384,7 +476,7 @@ fn cancelled_outcome(tool_call_id: &str, message: &str) -> BackendOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ChatCancellationToken, ToolCancellationToken, ToolKind};
+    use crate::{ChatCancellationToken, PendingToolApprovalGate, ToolCancellationToken, ToolKind};
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -463,7 +555,8 @@ mod tests {
                 .unwrap(),
         );
         let gate = PendingToolApprovalGate::new();
-        let orchestrator = ToolOrchestrator::new(Arc::clone(&gate), Arc::clone(&runtime));
+        let gate_dyn: Arc<dyn ToolApprovalGate> = gate.clone();
+        let orchestrator = ToolOrchestrator::new(gate_dyn, Arc::clone(&runtime));
         let recording = Arc::new(RecordingSink::default());
         let sink: Arc<dyn ToolExecutionEventSink> = recording.clone();
         let executed = Arc::new(Mutex::new(false));

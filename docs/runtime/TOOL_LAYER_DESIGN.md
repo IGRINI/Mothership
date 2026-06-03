@@ -10,12 +10,27 @@ there stay; this doc generalizes *what* runs through them.
 
 > **Status: IMPLEMENTED + review-hardened on `feat/typed-tool-layer`.** All four file
 > tools (`read_file`/`write_file`/`edit_file`/`apply_patch`) are wired end-to-end
-> alongside an unchanged `run_command`, and survived 4 review rounds. `mothership-core`:
-> 207 tests green; whole workspace (incl. the Tauri app) builds clean. Pure cores
-> (`tools/file_edit.rs`, `tools/patch.rs`) were aligned to the canonical Codex/Claude
-> implementations before wiring. **The "As shipped — final invariants" section below is
-> the source of truth; the "starting line" and "(todo)" notes are historical design
-> context.**
+> alongside `run_command`, and survived 4 review rounds. `mothership-core`:
+> 267 tests green; whole workspace (incl. the Tauri app) builds clean; `tsc --noEmit`
+> clean. Pure cores (`tools/file_edit.rs`, `tools/patch.rs`) were aligned to the
+> canonical Codex/Claude implementations before wiring. **The "As shipped — final
+> invariants" section below is the source of truth; the "starting line" and "(todo)"
+> notes are historical design context.**
+>
+> **Status: UNIFIED `ToolOrchestrator` — LANDED.** `run_command` no longer has its own
+> lifecycle. One sync orchestrator (`tools/orchestrator.rs`) drives **every** tool kind
+> through `queued → classify → preflight → guard → policy/approval → resource lease →
+> started → execute → terminal`, emitting `ToolExecutionEvent`s to the sink (it never
+> touches storage/redaction/UI directly). Kind-specific work is a `ToolBackend` port
+> (`classify`/`preflight`/`guard`/`decide`/`preview`/`acquire`/`execute`/`record`,
+> most defaulted). `FileToolExecutor` and the sidecar `CommandCall` both implement it;
+> `ToolSupervisor` is now just the command ports (policy / repeat-block / resource lease
+> / `run_command_process` spawn+stream+wait / record), holding no approval gate. Approval
+> is unified on `ToolApprovalGate::request_decision(tool_call_id)` (file + command share
+> one `PendingToolApprovalGate`). The orchestrator + backends are **sync** on purpose —
+> `block_on` only at the leaves (approval gate, output spill, process spawn/wait) so it is
+> never nested. The 4 former supervisor tests moved 1:1 into the sidecar, exercising the
+> real `run_command_via_orchestrator` path.
 
 ## The spine (two ideas)
 
@@ -36,9 +51,12 @@ policy" — the split is the point.
 ```text
 adapter (adapters/*/src/chat.rs: converts Core ToolDescriptors -> provider JSON)
   -> core run.rs (chat loop, LlmToolCallHandler; tools: Vec<ToolDescriptor> in request)
-  -> sidecar SidecarLlmToolHandler  (match name { "run_command" => .., _ => unsupported })
-  -> core ToolSupervisor.run_command (repeat-guard -> permission -> approval
-        -> leases -> ProcessSandbox.spawn -> bounded output / spill -> result)
+  -> sidecar SidecarLlmToolHandler  (dispatch by ToolKind -> File / Command executor)
+  -> core ToolOrchestrator.run(ctx, backend, sink)   // one lifecycle, all tool kinds
+        queued -> classify -> preflight -> guard(repeat) -> policy/approval
+              -> resource lease -> started -> backend.execute -> terminal(+record)
+     where backend = FileToolExecutor (pure handlers) | CommandCall (supervisor ports:
+        run_command_process = ProcessSandbox.spawn -> bounded output / spill -> result)
 ```
 
 Already done by recent commits (do NOT redo):
@@ -83,9 +101,11 @@ src-sidecar/src/tool_runtime.rs
 **Generic invocation.** The existing `LlmToolCallRequest{ run_id, tool_call_id, name,
 arguments: Value }` already *is* a generic envelope. The remaining work is a registry
 + pipeline that dispatches by `name` to a typed handler instead of the hardcoded
-`run_command` match; `run_command` becomes one handler among many. The supervisor keeps
-every cross-cut (repeat-guard, permission, approval, leases, output policy, events,
-cancellation); only the "execute" step becomes pluggable.
+`run_command` match; `run_command` becomes one handler among many. **As landed**, the
+cross-cuts (repeat-guard, approval, resource lease, cancellation, event emission) moved
+*up* into the `ToolOrchestrator`, driven by `ToolBackend` ports; the supervisor kept only
+the command-specific work (policy eval, repeat check, lease acquire, spawn/stream/wait,
+record). So the "execute" step is pluggable AND the lifecycle is shared by every kind.
 
 **Where IO lives.** Edit/patch *algorithms* and the path *policy* live in Core
 (`file_edit.rs` / `patch.rs` already pure; a `filesystem.rs` resolver next). Raw byte IO
@@ -328,9 +348,11 @@ typed storage, semantic UI, catalog stability, and a credential firewall.
 - **UI semantic cards — DONE.** Per-tool cards + diff-before-approve; text fallback retained.
 - **`scheduler.rs` read_file ParallelSafe — DONE.** `read_file`/`list_files`/`search_text`
   are `ParallelSafe` (read-only); other non-`run_command` tools remain `Exclusive`.
-- **`ToolSupervisor` not genericized** — `run_command` keeps its own lifecycle; the unified
-  pipeline wraps it via `CommandToolExecutor` rather than absorbing it (deliberate).
-- Still later: OS sandbox/orchestrator for `run_command`; SSRF/url guard for future fetch
+- **`ToolSupervisor` genericized — DONE.** `run_command` no longer has its own lifecycle;
+  it runs through the shared `ToolOrchestrator` like every other tool, with the supervisor
+  reduced to command ports (policy / repeat-block / lease / spawn+stream+wait / record).
+  Cross-cuts (repeat-guard, approval, lease, cancellation, events) live in the orchestrator.
+- Still later: OS sandbox for `run_command`; SSRF/url guard for future fetch
   tools; LSP/formatter post-write hooks; deferred-tools/`tool_search`; recall after
   compaction; workflow/subagent orchestration; model-visible credential redaction policy +
   managed gateway. (`write_file` policy ceiling + the rolling-window durable redactor are now

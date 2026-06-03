@@ -16,7 +16,8 @@ use mothership_core::{
     validate_file_tool_args_shallow, DEFAULT_MAX_WRITE_FILE_BYTES, tool_batch_plan,
     ChatCancellationToken, FileTool, FileToolOutcome, FileToolSpill, LlmToolCallHandler,
     LlmToolCallRequest, LlmToolCallResult, MothershipError, ApprovalPreview, BackendOutcome,
-    PendingToolApprovalGate, Result, SpawnedToolProcess, StdFileSystem, ToolArtifact, ToolBackend,
+    PendingToolApprovalGate, ResourceLease, ResourceRequest, Result, SpawnedToolProcess,
+    StdFileSystem, ToolApprovalGate, ToolArtifact, ToolBackend,
     ToolBatchPlan, ToolCallContext, ToolCancellationToken, ToolCapability, ToolCommand, ToolDecision,
     ToolOrchestrator, ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest,
     ToolExecutionResult, ToolExecutionStatus, ToolExecutor, ToolKind, ToolOutputPolicy,
@@ -154,6 +155,9 @@ struct CommandToolExecutor {
     runtime: Arc<tokio::runtime::Runtime>,
     sink: Arc<dyn ToolExecutionEventSink>,
     project: Option<ToolProjectContext>,
+    /// Drives the same approval gate the file tools use; the orchestrator blocks
+    /// on it during the Ask phase.
+    approvals: Arc<PendingToolApprovalGate>,
 }
 
 /// Typed file/search executor. Runs the shared classify → permission → approval
@@ -213,6 +217,7 @@ impl SidecarLlmToolHandler {
             runtime: Arc::clone(&runtime),
             sink: Arc::clone(&sink),
             project: project.clone(),
+            approvals: Arc::clone(&approvals),
         });
         let file_executor = Arc::new(FileToolExecutor {
             runtime,
@@ -353,6 +358,11 @@ impl LlmToolCallHandler for SidecarLlmToolHandler {
 }
 
 impl ToolExecutor for CommandToolExecutor {
+    /// Thin adapter onto the unified [`ToolOrchestrator`]: build the command
+    /// request, wrap it in a per-call [`CommandCall`] backend, and drive the
+    /// shared lifecycle. The orchestrator owns Queued/Started/terminal events,
+    /// the repeat guard, approval, and the resource lease; the backend supplies
+    /// only the command-specific work via the supervisor's ports.
     fn execute(&self, ctx: ToolCallContext<'_>) -> LlmToolCallResult {
         let request = match command_request_from_ctx(&ctx, self.project.as_ref()) {
             Ok(request) => request,
@@ -363,26 +373,183 @@ impl ToolExecutor for CommandToolExecutor {
                 };
             }
         };
-
-        // The dispatcher already registered the cancellation slot and is watching
-        // the chat token; the supervisor owns the rest of the command lifecycle.
-        let result = self.runtime.block_on(self.supervisor.run_command(
+        // Events carry the request's project id (project root, or the cwd
+        // fallback) just as the former hand-rolled lifecycle did.
+        let event_project_id = request.project_id.clone();
+        let backend = CommandCall {
+            supervisor: Arc::clone(&self.supervisor),
+            runtime: Arc::clone(&self.runtime),
             request,
-            ctx.cancellation.clone(),
-            Arc::clone(&self.sink),
-        ));
+        };
+        let gate: Arc<dyn ToolApprovalGate> = self.approvals.clone();
+        let orchestrator = ToolOrchestrator::new(gate, Arc::clone(&self.runtime));
+        orchestrator.run(ctx, event_project_id.as_deref(), &backend, &self.sink)
+    }
+}
 
-        match result {
-            Ok(result) => LlmToolCallResult {
-                ok: result.status == ToolExecutionStatus::Completed,
-                content: format_tool_result(&result),
+/// Per-call command backend: the already-resolved [`ToolExecutionRequest`] plus
+/// the shared supervisor/runtime, adapting the supervisor's command ports to the
+/// [`ToolBackend`] seam the orchestrator drives. Standalone (owns its `Arc`s) so
+/// both the chat dispatcher and the protocol-level `run_tool_command` build one.
+struct CommandCall {
+    supervisor: Arc<ToolSupervisor>,
+    runtime: Arc<tokio::runtime::Runtime>,
+    request: ToolExecutionRequest,
+}
+
+impl ToolBackend for CommandCall {
+    fn classify(&self, _ctx: &ToolCallContext<'_>) -> Result<ToolCapability> {
+        Ok(ToolCapability {
+            summary: command_summary(&self.request),
+            touched_paths: self
+                .request
+                .cwd
+                .as_ref()
+                .map(|cwd| vec![cwd.display().to_string()])
+                .unwrap_or_default(),
+            // Commands always take a concurrency/process lease (the orchestrator
+            // acquires it after approval, before the process spawns).
+            resource_request: Some(ResourceRequest { needs_lease: true }),
+        })
+    }
+
+    fn guard(&self, _ctx: &ToolCallContext<'_>) -> Option<BackendOutcome> {
+        self.supervisor
+            .command_repeat_block(&self.request)
+            .map(|block| {
+                command_backend_outcome(synthesized_command_result(
+                    &self.request,
+                    ToolExecutionStatus::LoopBlocked,
+                    block.message,
+                ))
+            })
+    }
+
+    fn decide(&self, _ctx: &ToolCallContext<'_>, _capability: &ToolCapability) -> ToolDecision {
+        let evaluation = self.supervisor.command_permission(&self.request);
+        match evaluation.action {
+            ToolPermissionAction::Allow => ToolDecision::Allow,
+            ToolPermissionAction::Ask => ToolDecision::Ask {
+                reason: evaluation.reason,
             },
-            Err(error) => LlmToolCallResult {
-                ok: false,
-                content: format!("tool supervisor failed: {error}"),
+            ToolPermissionAction::Deny => ToolDecision::Deny {
+                reason: evaluation.reason,
             },
         }
     }
+
+    fn acquire(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        sink: &Arc<dyn ToolExecutionEventSink>,
+    ) -> Result<ResourceLease> {
+        self.runtime.block_on(self.supervisor.acquire_command_resources(
+            &self.request,
+            ctx.cancellation,
+            sink,
+        ))
+    }
+
+    fn execute(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        sink: &Arc<dyn ToolExecutionEventSink>,
+    ) -> Result<BackendOutcome> {
+        let result = self.runtime.block_on(self.supervisor.run_command_process(
+            &self.request,
+            ctx.cancellation,
+            sink,
+        ))?;
+        Ok(command_backend_outcome(result))
+    }
+
+    fn record(&self, _ctx: &ToolCallContext<'_>, outcome: &BackendOutcome) {
+        self.supervisor
+            .record_command_outcome(&self.request, &outcome.result);
+    }
+}
+
+/// `program arg1 arg2 …` — the human-readable command summary used as the call's
+/// intent (the Started event message and approval-card summary).
+fn command_summary(request: &ToolExecutionRequest) -> String {
+    let mut parts = Vec::with_capacity(1 + request.command.args.len());
+    parts.push(request.command.program.as_str());
+    parts.extend(request.command.args.iter().map(String::as_str));
+    parts.join(" ")
+}
+
+/// Wrap a command [`ToolExecutionResult`] as the orchestrator's terminal outcome:
+/// the model sees the formatted text; the typed result carries the log ref.
+fn command_backend_outcome(result: ToolExecutionResult) -> BackendOutcome {
+    BackendOutcome {
+        status: result.status,
+        model_text: format_tool_result(&result),
+        payload: None,
+        touched_paths: Vec::new(),
+        artifacts: Vec::new(),
+        result,
+    }
+}
+
+/// A bare command result carrying only a status + message (no output) — used for
+/// the repeat-guard `LoopBlocked` terminal.
+fn synthesized_command_result(
+    request: &ToolExecutionRequest,
+    status: ToolExecutionStatus,
+    message: String,
+) -> ToolExecutionResult {
+    ToolExecutionResult {
+        tool_call_id: request.tool_call_id.clone(),
+        status,
+        exit_code: None,
+        stdout_preview: String::new(),
+        stderr_preview: String::new(),
+        stdout_tail: String::new(),
+        stderr_tail: String::new(),
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        truncated_for_display: false,
+        truncated_for_agent: false,
+        log_ref: None,
+        message: Some(message),
+    }
+}
+
+/// Drive one protocol-level `run_command` through the unified [`ToolOrchestrator`]
+/// (Queued → policy/approval → lease → process → terminal). Synchronous: the
+/// caller MUST invoke it on a dedicated OS thread, never an async-runtime worker,
+/// because the orchestrator blocks on `runtime` for approval and process I/O.
+/// Used by the `RunToolCommand` protocol handler; the chat dispatcher uses
+/// [`CommandToolExecutor`] for the same lifecycle.
+pub fn run_command_via_orchestrator(
+    request: ToolExecutionRequest,
+    cancellation: ToolCancellationToken,
+    supervisor: Arc<ToolSupervisor>,
+    approvals: Arc<PendingToolApprovalGate>,
+    runtime: Arc<tokio::runtime::Runtime>,
+    sink: Arc<dyn ToolExecutionEventSink>,
+) {
+    // No chat context here, so a fresh (never-cancelled) chat token.
+    let chat_cancellation = ChatCancellationToken::default();
+    let event_project_id = request.project_id.clone();
+    let backend = CommandCall {
+        supervisor,
+        runtime: Arc::clone(&runtime),
+        request,
+    };
+    let ctx = ToolCallContext {
+        tool_call_id: &backend.request.tool_call_id,
+        run_id: backend.request.run_id.as_deref(),
+        tool_name: ToolKind::RunCommand.as_str(),
+        kind: ToolKind::RunCommand,
+        // CommandCall reads `self.request`, not `ctx.arguments`.
+        arguments: &Value::Null,
+        cancellation: &cancellation,
+        chat_cancellation: &chat_cancellation,
+    };
+    let gate: Arc<dyn ToolApprovalGate> = approvals;
+    let orchestrator = ToolOrchestrator::new(gate, runtime);
+    let _ = orchestrator.run(ctx, event_project_id.as_deref(), &backend, &sink);
 }
 
 impl ToolExecutor for FileToolExecutor {
@@ -776,8 +943,8 @@ impl FileToolExecutor {
             cancellation,
             chat_cancellation,
         };
-        let orchestrator =
-            ToolOrchestrator::new(Arc::clone(&self.approvals), Arc::clone(&self.runtime));
+        let gate: Arc<dyn ToolApprovalGate> = self.approvals.clone();
+        let orchestrator = ToolOrchestrator::new(gate, Arc::clone(&self.runtime));
         orchestrator.run(ctx, project_id.as_deref(), self, &self.sink)
     }
 
@@ -1693,5 +1860,305 @@ mod tests {
         let path = std::env::temp_dir().join(format!("mothership_tool_{name}_{stamp}"));
         fs::create_dir_all(&path).expect("create temp project");
         path
+    }
+
+    // --- run_command lifecycle (driven through the unified orchestrator) ------
+    //
+    // These mirror the former ToolSupervisor::run_command tests 1:1 (stream+spill,
+    // deny-without-spawn, non-zero-exit, repeat-block) but exercise the real
+    // production path: run_command_via_orchestrator → CommandCall → orchestrator →
+    // supervisor command ports.
+
+    use mothership_core::{FileToolOutputStore, ToolRepeatGuard, ToolResourceLimits};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn command_runtime() -> Arc<tokio::runtime::Runtime> {
+        Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime"),
+        )
+    }
+
+    fn event_kinds(sink: &RecordingEventSink) -> Vec<ToolExecutionEventKind> {
+        sink.events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event.kind)
+            .collect()
+    }
+
+    /// The most recent terminal event's result (Completed/Failed/LoopBlocked all
+    /// carry one).
+    fn last_terminal_result(sink: &RecordingEventSink) -> ToolExecutionResult {
+        sink.events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|event| event.result.clone())
+            .expect("a terminal result")
+    }
+
+    fn command_request(
+        tool_call_id: &str,
+        program: &str,
+        args: &[&str],
+        output_policy: ToolOutputPolicy,
+    ) -> ToolExecutionRequest {
+        ToolExecutionRequest {
+            tool_call_id: tool_call_id.to_string(),
+            run_id: Some("run_cmd".to_string()),
+            project_id: Some("project_cmd".to_string()),
+            cwd: None,
+            command: ToolCommand::new(program, args.iter().copied()),
+            timeout_ms: None,
+            output_policy,
+        }
+    }
+
+    struct FakeSandbox {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        exit_code: Option<i32>,
+        spawns: AtomicUsize,
+    }
+
+    impl FakeSandbox {
+        fn new(stdout: Vec<u8>, stderr: Vec<u8>, exit_code: Option<i32>) -> Self {
+            Self {
+                stdout,
+                stderr,
+                exit_code,
+                spawns: AtomicUsize::new(0),
+            }
+        }
+
+        fn spawn_count(&self) -> usize {
+            self.spawns.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolProcessSandbox for FakeSandbox {
+        async fn spawn(&self, _spec: ToolProcessSpec) -> Result<Box<dyn SpawnedToolProcess>> {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FakeProcess {
+                stdout: Some(self.stdout.clone()),
+                stderr: Some(self.stderr.clone()),
+                exit_code: self.exit_code,
+                killed: false,
+            }))
+        }
+    }
+
+    struct FakeProcess {
+        stdout: Option<Vec<u8>>,
+        stderr: Option<Vec<u8>>,
+        exit_code: Option<i32>,
+        killed: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SpawnedToolProcess for FakeProcess {
+        fn pid(&self) -> u32 {
+            42
+        }
+
+        fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+            self.stdout.take().map(|bytes| {
+                Box::new(std::io::Cursor::new(bytes)) as Box<dyn tokio::io::AsyncRead + Send + Unpin>
+            })
+        }
+
+        fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+            self.stderr.take().map(|bytes| {
+                Box::new(std::io::Cursor::new(bytes)) as Box<dyn tokio::io::AsyncRead + Send + Unpin>
+            })
+        }
+
+        async fn wait(&mut self) -> Result<ToolProcessExit> {
+            if self.killed {
+                return Ok(ToolProcessExit { code: Some(1) });
+            }
+            Ok(ToolProcessExit {
+                code: self.exit_code,
+            })
+        }
+
+        async fn kill_tree(&mut self) -> Result<()> {
+            self.killed = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn run_command_streams_spills_and_returns_bounded_output() {
+        let sandbox = Arc::new(FakeSandbox::new(
+            b"abcdefghijklmnopqrstuvwxyz".to_vec(),
+            b"warning".to_vec(),
+            Some(0),
+        ));
+        let output_dir = temp_project_dir("cmd_stream_spill");
+        let supervisor = Arc::new(ToolSupervisor::new(
+            sandbox.clone(),
+            Some(Arc::new(FileToolOutputStore::new(&output_dir))),
+            ToolResourceLimits::default(),
+        ));
+        let sink = Arc::new(RecordingEventSink::default());
+        let request = command_request(
+            "tool_cmd_1",
+            "git",
+            &["status"],
+            ToolOutputPolicy {
+                memory_preview_bytes: 10,
+                ui_stream_bytes_per_sec: 1024,
+                agent_tail_bytes: 6,
+                spill_to_file: true,
+            },
+        );
+        let sink_dyn: Arc<dyn ToolExecutionEventSink> = sink.clone();
+        run_command_via_orchestrator(
+            request,
+            ToolCancellationToken::default(),
+            supervisor,
+            PendingToolApprovalGate::new(),
+            command_runtime(),
+            sink_dyn,
+        );
+
+        let result = last_terminal_result(&sink);
+        assert_eq!(result.status, ToolExecutionStatus::Completed);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout_bytes, 26);
+        assert!(result.truncated_for_display);
+        assert!(result.truncated_for_agent);
+        assert_eq!(result.stdout_tail, "uvwxyz");
+        let log = fs::read_to_string(result.log_ref.expect("log ref")).unwrap();
+        assert!(log.contains("--- stdout 26 bytes ---"));
+        assert!(log.contains("abcdefghijklmnopqrstuvwxyz"));
+
+        let kinds = event_kinds(&sink);
+        assert!(kinds.contains(&ToolExecutionEventKind::Queued));
+        assert!(kinds.contains(&ToolExecutionEventKind::Started));
+        assert!(kinds.contains(&ToolExecutionEventKind::Output));
+        assert!(kinds.contains(&ToolExecutionEventKind::Completed));
+        let _ = fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn command_requiring_approval_does_not_spawn_when_denied() {
+        let sandbox = Arc::new(FakeSandbox::new(Vec::new(), Vec::new(), Some(0)));
+        let supervisor = Arc::new(ToolSupervisor::new(
+            sandbox.clone(),
+            None,
+            ToolResourceLimits::default(),
+        ));
+        let approvals = PendingToolApprovalGate::new();
+        let sink = Arc::new(RecordingEventSink::default());
+        let request = command_request("tool_cmd_2", "npm", &["install"], ToolOutputPolicy::default());
+
+        let handle = {
+            let supervisor = Arc::clone(&supervisor);
+            let approvals = Arc::clone(&approvals);
+            let sink_dyn: Arc<dyn ToolExecutionEventSink> = sink.clone();
+            thread::spawn(move || {
+                run_command_via_orchestrator(
+                    request,
+                    ToolCancellationToken::default(),
+                    supervisor,
+                    approvals,
+                    command_runtime(),
+                    sink_dyn,
+                );
+            })
+        };
+
+        // npm install requires approval; wait for the request, then deny it.
+        let mut denied = false;
+        for _ in 0..400 {
+            if approvals.decide(
+                "tool_cmd_2",
+                ToolApprovalDecision::Denied {
+                    reason: "not approved".to_string(),
+                },
+            ) {
+                denied = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        handle.join().expect("command thread");
+        assert!(denied, "approval was never requested");
+
+        assert_eq!(sandbox.spawn_count(), 0);
+        let kinds = event_kinds(&sink);
+        assert!(kinds.contains(&ToolExecutionEventKind::PermissionRequested));
+        assert!(kinds.contains(&ToolExecutionEventKind::PermissionDenied));
+    }
+
+    #[test]
+    fn non_zero_exit_is_a_failed_command_terminal() {
+        let sandbox = Arc::new(FakeSandbox::new(b"bad".to_vec(), Vec::new(), Some(2)));
+        let supervisor = Arc::new(ToolSupervisor::new(sandbox, None, ToolResourceLimits::default()));
+        let sink = Arc::new(RecordingEventSink::default());
+        let request = command_request("tool_cmd_3", "git", &["status"], ToolOutputPolicy::default());
+        let sink_dyn: Arc<dyn ToolExecutionEventSink> = sink.clone();
+        run_command_via_orchestrator(
+            request,
+            ToolCancellationToken::default(),
+            supervisor,
+            PendingToolApprovalGate::new(),
+            command_runtime(),
+            sink_dyn,
+        );
+
+        let result = last_terminal_result(&sink);
+        assert_eq!(result.status, ToolExecutionStatus::Failed);
+        assert_eq!(result.exit_code, Some(2));
+        assert!(event_kinds(&sink).contains(&ToolExecutionEventKind::Failed));
+    }
+
+    #[test]
+    fn repeat_guard_blocks_third_identical_command_without_spawning() {
+        let sandbox = Arc::new(FakeSandbox::new(
+            b"nothing to commit".to_vec(),
+            Vec::new(),
+            Some(0),
+        ));
+        let supervisor = Arc::new(
+            ToolSupervisor::new(sandbox.clone(), None, ToolResourceLimits::default())
+                .with_repeat_guard(Arc::new(ToolRepeatGuard::default())),
+        );
+        let runtime = command_runtime();
+        let approvals = PendingToolApprovalGate::new();
+        let sink = Arc::new(RecordingEventSink::default());
+
+        for tool_call_id in ["tool_rep_1", "tool_rep_2", "tool_rep_3"] {
+            let request =
+                command_request(tool_call_id, "git", &["status"], ToolOutputPolicy::default());
+            let sink_dyn: Arc<dyn ToolExecutionEventSink> = sink.clone();
+            run_command_via_orchestrator(
+                request,
+                ToolCancellationToken::default(),
+                Arc::clone(&supervisor),
+                Arc::clone(&approvals),
+                Arc::clone(&runtime),
+                sink_dyn,
+            );
+        }
+
+        assert_eq!(sandbox.spawn_count(), 2);
+        let kinds = event_kinds(&sink);
+        assert!(kinds.contains(&ToolExecutionEventKind::LoopBlocked));
+        let result = last_terminal_result(&sink);
+        assert_eq!(result.status, ToolExecutionStatus::LoopBlocked);
+        assert!(result
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Repeated identical tool call suppressed"));
     }
 }

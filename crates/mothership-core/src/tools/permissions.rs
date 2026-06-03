@@ -52,6 +52,18 @@ pub trait ToolApprovalGate: Send + Sync {
         evaluation: &ToolPermissionEvaluation,
         cancellation: &ToolCancellationToken,
     ) -> Result<ToolApprovalDecision>;
+
+    /// Await an approval decision keyed only by `tool_call_id`. The orchestrator
+    /// has already emitted the `PermissionRequested` event (with the preview), so
+    /// the gate only blocks until the UI resolves this id (or the call is
+    /// cancelled). This is the unified entry point used for every tool kind —
+    /// unlike [`request_approval`](Self::request_approval) it needs no
+    /// [`ToolExecutionRequest`], so typed file tools use it too.
+    async fn request_decision(
+        &self,
+        tool_call_id: &str,
+        cancellation: &ToolCancellationToken,
+    ) -> ToolApprovalDecision;
 }
 
 #[derive(Debug, Default)]
@@ -71,14 +83,25 @@ impl PendingToolApprovalGate {
         sender.send(decision).is_ok()
     }
 
-    /// Await an approval decision for `tool_call_id` through the same pending
-    /// map that [`decide`](Self::decide) resolves. This is the entry point for
-    /// tools that are not modeled as a [`ToolExecutionRequest`] (the file
-    /// tools): the runner has already emitted a `PermissionRequested` event, so
-    /// here we only register the waiter keyed by `tool_call_id` and block until
-    /// the UI calls `decide` (or the chat is cancelled). Mirrors the body of the
-    /// [`ToolApprovalGate`] impl but takes a bare id instead of a request.
-    pub async fn request_decision(
+}
+
+#[async_trait::async_trait]
+impl ToolApprovalGate for PendingToolApprovalGate {
+    async fn request_approval(
+        &self,
+        request: &ToolExecutionRequest,
+        _evaluation: &ToolPermissionEvaluation,
+        cancellation: &ToolCancellationToken,
+    ) -> Result<ToolApprovalDecision> {
+        Ok(self
+            .request_decision(&request.tool_call_id, cancellation)
+            .await)
+    }
+
+    /// Await a decision through the same pending map that [`decide`](Self::decide)
+    /// resolves: register a waiter keyed by `tool_call_id` and block until the UI
+    /// calls `decide` (or the call is cancelled).
+    async fn request_decision(
         &self,
         tool_call_id: &str,
         cancellation: &ToolCancellationToken,
@@ -105,39 +128,6 @@ impl PendingToolApprovalGate {
 
         self.pending.lock().unwrap().remove(tool_call_id);
         decision
-    }
-}
-
-#[async_trait::async_trait]
-impl ToolApprovalGate for PendingToolApprovalGate {
-    async fn request_approval(
-        &self,
-        request: &ToolExecutionRequest,
-        _evaluation: &ToolPermissionEvaluation,
-        cancellation: &ToolCancellationToken,
-    ) -> Result<ToolApprovalDecision> {
-        let (sender, receiver) = oneshot::channel();
-        {
-            let mut pending = self.pending.lock().unwrap();
-            if pending.contains_key(&request.tool_call_id) {
-                return Ok(ToolApprovalDecision::Denied {
-                    reason: "approval is already pending for this tool call".to_string(),
-                });
-            }
-            pending.insert(request.tool_call_id.clone(), sender);
-        }
-
-        let decision = tokio::select! {
-            decision = receiver => decision.unwrap_or(ToolApprovalDecision::Denied {
-                reason: "approval channel closed".to_string(),
-            }),
-            _ = cancellation.cancelled() => ToolApprovalDecision::Denied {
-                reason: "tool call was cancelled before approval".to_string(),
-            },
-        };
-
-        self.pending.lock().unwrap().remove(&request.tool_call_id);
-        Ok(decision)
     }
 }
 
@@ -170,12 +160,20 @@ impl ToolApprovalGate for StaticToolApprovalGate {
         _evaluation: &ToolPermissionEvaluation,
         cancellation: &ToolCancellationToken,
     ) -> Result<ToolApprovalDecision> {
+        Ok(self.request_decision("", cancellation).await)
+    }
+
+    async fn request_decision(
+        &self,
+        _tool_call_id: &str,
+        cancellation: &ToolCancellationToken,
+    ) -> ToolApprovalDecision {
         if cancellation.is_cancelled() {
-            return Ok(ToolApprovalDecision::Denied {
+            return ToolApprovalDecision::Denied {
                 reason: "tool call was cancelled before approval".to_string(),
-            });
+            };
         }
-        Ok(self.decision.clone())
+        self.decision.clone()
     }
 }
 

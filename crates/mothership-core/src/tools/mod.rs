@@ -28,8 +28,8 @@ mod types;
 
 pub use cancellation::ToolCancellationToken;
 pub use orchestrator::{
-    ApprovalPreview, BackendOutcome, ResourceRequest, ToolBackend, ToolCapability, ToolDecision,
-    ToolOrchestrator,
+    ApprovalPreview, BackendOutcome, ResourceLease, ResourceRequest, ToolBackend, ToolCapability,
+    ToolDecision, ToolOrchestrator,
 };
 pub use credential_guard::{
     default_credential_guard, redact_event, CredentialGuard, NoopCredentialGuard,
