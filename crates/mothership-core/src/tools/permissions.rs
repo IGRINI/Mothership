@@ -82,7 +82,6 @@ impl PendingToolApprovalGate {
         };
         sender.send(decision).is_ok()
     }
-
 }
 
 #[async_trait::async_trait]

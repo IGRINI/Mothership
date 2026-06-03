@@ -244,7 +244,8 @@ fn is_section_marker(line: &str) -> bool {
 /// annotation. Such lines are emitted by some diff tools and carry no content;
 /// like git/codex we skip them wherever they appear inside a body.
 fn is_no_newline_marker(line: &str) -> bool {
-    line.trim_start().starts_with("\\ No newline at end of file")
+    line.trim_start()
+        .starts_with("\\ No newline at end of file")
 }
 
 // ---------------------------------------------------------------------------
@@ -639,9 +640,7 @@ fn parse_update_body(
             Some(_) => {
                 return Err(PatchError::BadHunkLine {
                     line: lineno,
-                    detail: format!(
-                        "hunk line must start with ' ', '-', or '+', found {line:?}"
-                    ),
+                    detail: format!("hunk line must start with ' ', '-', or '+', found {line:?}"),
                 });
             }
         }
@@ -834,11 +833,7 @@ pub fn plan_patch(ops: &[PatchOp], fs: &dyn FileMap) -> Result<PatchPlan, PlanEr
                 if !existing.exists(path) {
                     return Err(PlanError::FileNotFound { path: path.clone() });
                 }
-                let removed = existing
-                    .read(path)
-                    .as_deref()
-                    .map(count_lines)
-                    .unwrap_or(0);
+                let removed = existing.read(path).as_deref().map(count_lines).unwrap_or(0);
                 existing.claim_delete(path);
                 files.push(PlannedFile {
                     path: path.clone(),
@@ -1157,9 +1152,8 @@ fn seek_sequence(lines: &[String], pattern: &[String], start: usize, eof: bool) 
     }
     // Tier 4: Unicode-punctuation normalization (typographic dashes/quotes/odd
     // spaces folded to ASCII), mirroring `git apply`'s tolerance.
-    window().find(|&i| {
-        (0..pattern.len()).all(|k| normalise(&lines[i + k]) == normalise(&pattern[k]))
-    })
+    window()
+        .find(|&i| (0..pattern.len()).all(|k| normalise(&lines[i + k]) == normalise(&pattern[k])))
 }
 
 /// Fold common Unicode punctuation to ASCII so ASCII-authored diffs can match
@@ -1264,8 +1258,7 @@ mod tests {
 
     #[test]
     fn quoted_heredoc_wrapper_is_stripped() {
-        let single =
-            "<<'EOF'\n*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\nEOF\n";
+        let single = "<<'EOF'\n*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\nEOF\n";
         assert_eq!(parse_v4a(single).unwrap().len(), 1);
 
         let double =
@@ -1304,7 +1297,8 @@ mod tests {
     fn heredoc_terminator_is_not_confused_with_indented_content() {
         // A context/added line that merely contains the delimiter word is not a
         // terminator (content lines are prefixed / indented, never column 0).
-        let patch = "<<EOF\n*** Begin Patch\n*** Add File: s.sh\n+echo EOF\n+ EOF\n*** End Patch\nEOF\n";
+        let patch =
+            "<<EOF\n*** Begin Patch\n*** Add File: s.sh\n+echo EOF\n+ EOF\n*** End Patch\nEOF\n";
         let ops = parse_v4a(patch).unwrap();
         assert_eq!(ops.len(), 1);
     }
@@ -1793,8 +1787,8 @@ mod tests {
     #[test]
     fn plan_add_new_file() {
         let fs = fm(&[]);
-        let ops = parse_v4a("*** Begin Patch\n*** Add File: n.txt\n+one\n+two\n*** End Patch\n")
-            .unwrap();
+        let ops =
+            parse_v4a("*** Begin Patch\n*** Add File: n.txt\n+one\n+two\n*** End Patch\n").unwrap();
         let plan = plan_patch(&ops, &fs).expect("plan");
         let f = &plan.files[0];
         assert_eq!(f.op, PlannedKind::Add);
@@ -1831,7 +1825,12 @@ mod tests {
         .expect("plan");
         let f = &plan.files[0];
         assert_eq!(f.path, "a.txt");
-        assert_eq!(f.op, PlannedKind::Move { to: "b.txt".to_string() });
+        assert_eq!(
+            f.op,
+            PlannedKind::Move {
+                to: "b.txt".to_string()
+            }
+        );
         assert_eq!(f.new_content.as_deref(), Some("y\n"));
         assert_eq!(f.added, 1);
         assert_eq!(f.removed, 1);
@@ -1846,7 +1845,10 @@ mod tests {
             &[("e.txt", "")],
         )
         .expect("plan");
-        assert_eq!(plan.files[0].new_content.as_deref(), Some("first\nsecond\n"));
+        assert_eq!(
+            plan.files[0].new_content.as_deref(),
+            Some("first\nsecond\n")
+        );
         assert_eq!(plan.files[0].added, 2);
     }
 
@@ -2049,9 +2051,7 @@ fn second() {
         .expect("plan");
         assert_eq!(
             plan.files[0].new_content.as_deref(),
-            Some(
-                "fn first() {\n    value = 1\n}\nfn second() {\n    value = 1\n    extra()\n}\n"
-            )
+            Some("fn first() {\n    value = 1\n}\nfn second() {\n    value = 1\n    extra()\n}\n")
         );
     }
 
@@ -2133,8 +2133,7 @@ fn second() {
     #[test]
     fn plan_add_over_existing_is_file_exists() {
         let fs = fm(&[("a.txt", "already\n")]);
-        let ops =
-            parse_v4a("*** Begin Patch\n*** Add File: a.txt\n+new\n*** End Patch\n").unwrap();
+        let ops = parse_v4a("*** Begin Patch\n*** Add File: a.txt\n+new\n*** End Patch\n").unwrap();
         assert_eq!(
             plan_patch(&ops, &fs),
             Err(PlanError::FileExists {
@@ -2146,8 +2145,7 @@ fn second() {
     #[test]
     fn plan_delete_missing_is_file_not_found() {
         let fs = fm(&[]);
-        let ops =
-            parse_v4a("*** Begin Patch\n*** Delete File: nope.txt\n*** End Patch\n").unwrap();
+        let ops = parse_v4a("*** Begin Patch\n*** Delete File: nope.txt\n*** End Patch\n").unwrap();
         assert_eq!(
             plan_patch(&ops, &fs),
             Err(PlanError::FileNotFound {
@@ -2159,10 +2157,9 @@ fn second() {
     #[test]
     fn plan_update_missing_is_file_not_found() {
         let fs = fm(&[]);
-        let ops = parse_v4a(
-            "*** Begin Patch\n*** Update File: nope.txt\n@@\n-a\n+b\n*** End Patch\n",
-        )
-        .unwrap();
+        let ops =
+            parse_v4a("*** Begin Patch\n*** Update File: nope.txt\n@@\n-a\n+b\n*** End Patch\n")
+                .unwrap();
         assert_eq!(
             plan_patch(&ops, &fs),
             Err(PlanError::FileNotFound {
@@ -2228,7 +2225,10 @@ fn second() {
         .unwrap();
         let lf_fs = fm(&[("a.txt", "keep\nold\ntail\n")]);
         let plan = plan_patch(&ops, &lf_fs).expect("plan lf");
-        assert_eq!(plan.files[0].new_content.as_deref(), Some("keep\nnew\ntail\n"));
+        assert_eq!(
+            plan.files[0].new_content.as_deref(),
+            Some("keep\nnew\ntail\n")
+        );
 
         // CRLF map: the stored lines carry '\r'; matching now succeeds via the
         // rstrip tier (it absorbs the trailing '\r'). Note: any line that passes
@@ -2238,7 +2238,10 @@ fn second() {
         // original CRLF ending. This matches Codex's replacement model.
         let crlf_fs = fm(&[("a.txt", "keep\r\nold\r\ntail\r\n")]);
         let plan = plan_patch(&ops, &crlf_fs).expect("plan crlf");
-        assert_eq!(plan.files[0].new_content.as_deref(), Some("keep\nnew\ntail\n"));
+        assert_eq!(
+            plan.files[0].new_content.as_deref(),
+            Some("keep\nnew\ntail\n")
+        );
     }
 
     #[test]
@@ -2246,10 +2249,9 @@ fn second() {
         // A CRLF file where the edited region does NOT cover the surrounding
         // lines: those lines lie outside every replacement and so keep their
         // original '\r\n'. Only the replaced line is rewritten LF-only.
-        let ops = parse_v4a(
-            "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch\n",
-        )
-        .unwrap();
+        let ops =
+            parse_v4a("*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch\n")
+                .unwrap();
         let crlf_fs = fm(&[("a.txt", "head\r\nold\r\ntail\r\n")]);
         let plan = plan_patch(&ops, &crlf_fs).expect("plan crlf");
         assert_eq!(
@@ -2340,10 +2342,7 @@ fn second() {
         assert_eq!(plan.files[0].new_content.as_deref(), Some("relative add"));
         assert_eq!(plan.files[1].op, PlannedKind::Delete);
         assert_eq!(plan.files[2].op, PlannedKind::Update);
-        assert_eq!(
-            plan.files[2].new_content.as_deref(),
-            Some("relative new\n")
-        );
+        assert_eq!(plan.files[2].new_content.as_deref(), Some("relative new\n"));
         assert_eq!(
             plan.files[3].op,
             PlannedKind::Move {
@@ -2385,7 +2384,10 @@ fn second() {
 
     #[test]
     fn seek_sequence_tiers_and_guards() {
-        let lines: Vec<String> = ["foo", "bar", "baz"].iter().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = ["foo", "bar", "baz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         // exact
         assert_eq!(
             seek_sequence(&lines, &["bar".to_string(), "baz".to_string()], 0, false),

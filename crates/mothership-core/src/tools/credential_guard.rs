@@ -83,16 +83,16 @@ impl PatternCredentialGuard {
             // GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_).
             (r"\bgh[pousr]_[A-Za-z0-9]{36,}\b", "[REDACTED:github-token]"),
             // Slack tokens.
-            (r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", "[REDACTED:slack-token]"),
+            (
+                r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
+                "[REDACTED:slack-token]",
+            ),
             // OpenAI / Anthropic style keys.
             (r"\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b", "[REDACTED:api-key]"),
             // Google API key.
             (r"\bAIza[0-9A-Za-z_-]{35}\b", "[REDACTED:google-key]"),
             // Bearer token in an Authorization-style header (keep the scheme).
-            (
-                r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{20,}",
-                "${1}[REDACTED]",
-            ),
+            (r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{20,}", "${1}[REDACTED]"),
             // `key = value` / `key: value` credential assignments (keep the key).
             (
                 r#"(?i)(password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret)("?\s*[:=]\s*"?)[^\s"']{8,}"#,
@@ -612,8 +612,9 @@ mod tests {
     #[tokio::test]
     async fn redacting_output_store_scrubs_durable_lines() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
-        let inner =
-            Arc::new(RecordingStore { appended: Arc::clone(&recorded) }) as Arc<dyn ToolOutputStore>;
+        let inner = Arc::new(RecordingStore {
+            appended: Arc::clone(&recorded),
+        }) as Arc<dyn ToolOutputStore>;
         let store = RedactingOutputStore::new(inner, Arc::new(PatternCredentialGuard::new()));
         let mut writer = store.open("tc1").await.unwrap();
 
@@ -660,7 +661,11 @@ mod tests {
             );
         }
         total += r.flush().len();
-        assert_eq!(total, 256 * 8 * 1024, "benign bytes pass through without loss");
+        assert_eq!(
+            total,
+            256 * 8 * 1024,
+            "benign bytes pass through without loss"
+        );
     }
 
     #[test]

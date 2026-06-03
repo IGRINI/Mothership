@@ -172,12 +172,7 @@ pub fn apply_edit(
     let exact = find_exact(content, old_text);
     if !exact.is_empty() {
         if replace_all {
-            return Ok(build_result(
-                content,
-                &exact,
-                new_text,
-                EditStrategy::Exact,
-            ));
+            return Ok(build_result(content, &exact, new_text, EditStrategy::Exact));
         }
         return match exact.len() {
             1 => Ok(build_result(content, &exact, new_text, EditStrategy::Exact)),
@@ -219,11 +214,7 @@ pub fn apply_edit(
     let quote_spans = find_quote_normalized(content, old_text);
     if !quote_spans.is_empty() {
         let decided = decide(content, &quote_spans, replace_all)?;
-        return Ok(build_result_quote_preserving(
-            content,
-            decided,
-            new_text,
-        ));
+        return Ok(build_result_quote_preserving(content, decided, new_text));
     }
 
     // Stage 4: literal escape-sequence normalization. A model emitted `\n`/`\t`
@@ -710,11 +701,7 @@ fn build_result(
 /// a *style-preserved* rendering of `new_text` derived from that span's own
 /// original quote style, so differently-quoted matches under `replace_all` each
 /// keep their own typography. The diff shows the first span's change.
-fn build_result_quote_preserving(
-    content: &str,
-    spans: &[Span],
-    new_text: &str,
-) -> EditApplied {
+fn build_result_quote_preserving(content: &str, spans: &[Span], new_text: &str) -> EditApplied {
     let mut new_content = String::with_capacity(content.len());
     let mut cursor = 0usize;
     let mut first_replacement: Option<String> = None;
@@ -806,7 +793,10 @@ fn render_diff(old: &str, new: &str) -> String {
 /// from each so CRLF fragments render cleanly. An empty fragment yields a single
 /// empty line so the diff still shows a removed/added blank.
 fn diff_lines(text: &str) -> Vec<&str> {
-    let mut lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let mut lines: Vec<&str> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
     // `split` on a string with a trailing newline yields a trailing empty
     // element; drop it so a fragment ending in "\n" doesn't render a spurious
     // extra blank line. Keep a genuinely empty fragment as one empty line.
@@ -952,8 +942,8 @@ mod tests {
     fn clearly_different_text_does_not_fuzzy_match() {
         let content = "let total = compute_sum(values);\n";
         // Same shape, but a genuinely different identifier. Must NOT match.
-        let err = apply_edit(content, "let total = compute_average(values);", "x", false)
-            .unwrap_err();
+        let err =
+            apply_edit(content, "let total = compute_average(values);", "x", false).unwrap_err();
         assert_eq!(err, EditError::NotFound);
     }
 
@@ -1199,7 +1189,12 @@ mod tests {
         // File has curly double quotes; model sent straight quotes. It must match
         // via stage 3 and the writeback must KEEP the file's curly style.
         let content = format!("let msg = {LDQUO}hello{RDQUO};\n");
-        let res = applied(&content, "let msg = \"hello\";", "let msg = \"world\";", false);
+        let res = applied(
+            &content,
+            "let msg = \"hello\";",
+            "let msg = \"world\";",
+            false,
+        );
         assert_eq!(res.strategy, EditStrategy::QuoteNormalized);
         assert_eq!(res.occurrences, 1);
         let expected = format!("let msg = {LDQUO}world{RDQUO};\n");
@@ -1287,8 +1282,8 @@ mod tests {
     fn quote_normalized_does_not_fire_when_no_quotes_involved() {
         // Quote-free, clearly different text must NOT be rescued by stage 3.
         let content = "let total = compute_sum(values);\n";
-        let err = apply_edit(content, "let total = compute_average(values);", "x", false)
-            .unwrap_err();
+        let err =
+            apply_edit(content, "let total = compute_average(values);", "x", false).unwrap_err();
         assert_eq!(err, EditError::NotFound);
     }
 
@@ -1492,8 +1487,7 @@ mod tests {
         // remain NotFound across ALL stages (the central anti-fuzz guarantee).
         let content = format!("greeting = {LDQUO}hello there{RDQUO}\n");
         // Different words AND quote style AND a literal escape: still no match.
-        let err =
-            apply_edit(&content, "greeting = \"farewell\\nfriend\"", "x", false).unwrap_err();
+        let err = apply_edit(&content, "greeting = \"farewell\\nfriend\"", "x", false).unwrap_err();
         assert_eq!(err, EditError::NotFound);
     }
 

@@ -232,7 +232,10 @@ impl ToolOrchestrator {
                 &ctx,
                 project_id,
                 sink,
-                cancelled_outcome(ctx.tool_call_id, "tool call was cancelled before it started"),
+                cancelled_outcome(
+                    ctx.tool_call_id,
+                    "tool call was cancelled before it started",
+                ),
             );
         }
 
@@ -416,8 +419,11 @@ impl ToolOrchestrator {
         reason: String,
         capability: &ToolCapability,
     ) -> LlmToolCallResult {
-        let mut outcome =
-            terminal_outcome(ctx.tool_call_id, ToolExecutionStatus::PermissionDenied, reason);
+        let mut outcome = terminal_outcome(
+            ctx.tool_call_id,
+            ToolExecutionStatus::PermissionDenied,
+            reason,
+        );
         outcome.touched_paths = capability.touched_paths.clone();
         self.terminal(ctx, project_id, sink, outcome)
     }
@@ -534,7 +540,9 @@ mod tests {
             if self.preflight_ok {
                 Ok(())
             } else {
-                Err(crate::MothershipError::InvalidRequest("malformed".to_string()))
+                Err(crate::MothershipError::InvalidRequest(
+                    "malformed".to_string(),
+                ))
             }
         }
         fn decide(&self, _ctx: &ToolCallContext<'_>, _cap: &ToolCapability) -> ToolDecision {
@@ -746,7 +754,10 @@ mod tests {
         canceller.join().unwrap();
 
         assert!(!result.ok);
-        assert!(!*executed.lock().unwrap(), "cancelled call must not execute");
+        assert!(
+            !*executed.lock().unwrap(),
+            "cancelled call must not execute"
+        );
         let kinds = recording.kinds();
         assert!(kinds.contains(&ToolExecutionEventKind::PermissionRequested));
         assert!(

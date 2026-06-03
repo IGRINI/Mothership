@@ -159,7 +159,10 @@ impl Workspace {
 /// root). Matching is case-insensitive to cover Windows and mixed-case repos.
 pub fn is_sensitive_relative(relative: &Path) -> bool {
     // Whole-path needles that imply a credential store regardless of position.
-    let lower = relative.to_string_lossy().to_ascii_lowercase().replace('\\', "/");
+    let lower = relative
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace('\\', "/");
     if lower.contains("/.git/config") || lower == ".git/config" {
         return true;
     }
@@ -663,7 +666,10 @@ mod tests {
             out
         };
         let streamed = fs_port.hash_file_sha256(&target).unwrap();
-        assert_eq!(streamed, expected, "streamed hash must cover the whole file");
+        assert_eq!(
+            streamed, expected,
+            "streamed hash must cover the whole file"
+        );
 
         // Empty file hashes to the well-known empty SHA-256.
         let empty = dir.join("empty.bin");
@@ -729,11 +735,17 @@ mod tests {
             Path::new(r"\\?\E:\proj"),
             Path::new(r"E:\proj\src\x.rs")
         ));
-        assert!(path_contains(Path::new("/home/u/proj"), Path::new("/home/u/proj/src")));
+        assert!(path_contains(
+            Path::new("/home/u/proj"),
+            Path::new("/home/u/proj/src")
+        ));
         // The root itself is contained.
         assert!(path_contains(Path::new("/a/b"), Path::new("/a/b")));
         // A sibling that merely shares a prefix is NOT contained.
-        assert!(!path_contains(Path::new("/a/proj"), Path::new("/a/project")));
+        assert!(!path_contains(
+            Path::new("/a/proj"),
+            Path::new("/a/project")
+        ));
         // A genuine escape is rejected.
         assert!(!path_contains(Path::new("/a/proj"), Path::new("/a/other")));
     }

@@ -441,7 +441,9 @@ mod tests {
 
         // A reconnect that re-advertises a changed tool: drift is reported.
         let mut drifted = base.clone();
-        drifted[1].description.push_str(" (silently changed on reconnect)");
+        drifted[1]
+            .description
+            .push_str(" (silently changed on reconnect)");
         let err = pin.check(&drifted).expect_err("drift must be detected");
         assert_eq!(err.pinned_fingerprint, pin.fingerprint());
         assert_ne!(err.current_fingerprint, pin.fingerprint());

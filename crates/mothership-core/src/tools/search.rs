@@ -183,7 +183,10 @@ pub fn list_files(
     };
 
     let include_ignored = input.include_ignored.unwrap_or(false);
-    let limit = input.limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
+    let limit = input
+        .limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .min(MAX_LIST_LIMIT);
 
     let mut paths: Vec<String> = Vec::new();
     let mut scan_truncated = false;
@@ -549,8 +552,8 @@ fn build_glob_matcher(glob: Option<&str>) -> Result<Option<GlobMatcher>, String>
             "glob `{glob}` must be a relative pattern that stays inside the project"
         ));
     }
-    let compiled = Glob::new(&normalized)
-        .map_err(|error| format!("invalid glob `{glob}`: {error}"))?;
+    let compiled =
+        Glob::new(&normalized).map_err(|error| format!("invalid glob `{glob}`: {error}"))?;
     Ok(Some(compiled.compile_matcher()))
 }
 
@@ -1021,7 +1024,10 @@ mod tests {
             fn write_atomic(&self, _p: &Path, _b: &[u8]) -> std::io::Result<()> {
                 Ok(())
             }
-            fn metadata(&self, _p: &Path) -> std::io::Result<crate::tools::filesystem::FileMetadata> {
+            fn metadata(
+                &self,
+                _p: &Path,
+            ) -> std::io::Result<crate::tools::filesystem::FileMetadata> {
                 Ok(crate::tools::filesystem::FileMetadata {
                     len: MAX_READ_FILE_BYTES as u64 + 1,
                     is_dir: false,

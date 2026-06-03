@@ -683,7 +683,10 @@ pub fn write_file_with_limit_and_observation(
 
     if !existed && !create {
         return Ok(FileToolOutcome::failure(
-            format!("`{}` does not exist and create was not requested", input.path),
+            format!(
+                "`{}` does not exist and create was not requested",
+                input.path
+            ),
             json!({ "path": input.path, "status": "missing" }),
         ));
     }
@@ -720,7 +723,11 @@ pub fn write_file_with_limit_and_observation(
             }
         } else if let Some(observed) = observed_sha256 {
             if !observed.eq_ignore_ascii_case(old_sha) {
-                return Ok(write_precondition_failure(&input.path, old_sha, Some(observed)));
+                return Ok(write_precondition_failure(
+                    &input.path,
+                    old_sha,
+                    Some(observed),
+                ));
             }
         } else {
             return Ok(write_precondition_failure(&input.path, old_sha, None));
@@ -925,7 +932,9 @@ pub fn edit_file(
         }
     }
 
-    let bytes = fs.read(&resolved).map_err(|error| FileToolError::Io(error.to_string()))?;
+    let bytes = fs
+        .read(&resolved)
+        .map_err(|error| FileToolError::Io(error.to_string()))?;
     let old_sha = sha256_hex(&bytes);
     if let Some(expected) = &input.expected_sha256 {
         if !expected.eq_ignore_ascii_case(&old_sha) {
@@ -1240,7 +1249,9 @@ fn capture_snapshot(
     let mut write_targets: Vec<PathBuf> = Vec::new();
     for file in &plan.files {
         let source = resolve_for_apply(workspace, &file.path)?;
-        if matches!(file.op, PlannedKind::Add | PlannedKind::Update) && !write_targets.contains(&source) {
+        if matches!(file.op, PlannedKind::Add | PlannedKind::Update)
+            && !write_targets.contains(&source)
+        {
             write_targets.push(source.clone());
         }
         if !paths.contains(&source) {
@@ -1271,7 +1282,10 @@ fn capture_snapshot(
     }
 
     let created_dirs = collect_created_dirs(workspace, fs, &write_targets);
-    Ok(PatchSnapshot { files, created_dirs })
+    Ok(PatchSnapshot {
+        files,
+        created_dirs,
+    })
 }
 
 /// Compute the set of directories that do not currently exist but will be created
@@ -1544,7 +1558,10 @@ fn split_keep_lines(text: &str) -> Vec<&str> {
     if text.is_empty() {
         return Vec::new();
     }
-    let mut lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let mut lines: Vec<&str> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
     if lines.len() > 1 && lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
@@ -1699,7 +1716,10 @@ mod tests {
         assert!(out.model_text.contains("     1\u{2192}alpha"));
         assert!(out.model_text.contains("     3\u{2192}gamma"));
         assert_eq!(out.data["totalLines"], 3);
-        assert_eq!(out.sha256.as_deref(), Some(sha_of("alpha\nbeta\ngamma\n").as_str()));
+        assert_eq!(
+            out.sha256.as_deref(),
+            Some(sha_of("alpha\nbeta\ngamma\n").as_str())
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1801,9 +1821,13 @@ mod tests {
         let big = "x".repeat(2048);
 
         // A 1 KiB policy limit refuses 2 KiB of content, with no file written.
-        let out =
-            write_file_with_limit(&json!({ "path": "big.txt", "content": big }), &ws, &fs, 1024)
-                .unwrap();
+        let out = write_file_with_limit(
+            &json!({ "path": "big.txt", "content": big }),
+            &ws,
+            &fs,
+            1024,
+        )
+        .unwrap();
 
         assert!(!out.ok, "oversized write must be refused");
         assert_eq!(out.data["status"], "too_large");
@@ -1823,15 +1847,13 @@ mod tests {
         let fs = StdFileSystem::new();
         fs::write(dir.join("a.txt"), b"old\n").unwrap();
 
-        let out = write_file(
-            &json!({ "path": "a.txt", "content": "new\n" }),
-            &ws,
-            &fs,
-        )
-        .unwrap();
+        let out = write_file(&json!({ "path": "a.txt", "content": "new\n" }), &ws, &fs).unwrap();
         assert!(!out.ok);
         assert_eq!(out.data["status"], "precondition_required");
-        assert_eq!(out.data["required"], "expectedSha256 or a fresh complete read_file observation");
+        assert_eq!(
+            out.data["required"],
+            "expectedSha256 or a fresh complete read_file observation"
+        );
         // File unchanged.
         assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"old\n");
 
@@ -2006,7 +2028,10 @@ mod tests {
             Ok(())
         }
         fn metadata(&self, _p: &std::path::Path) -> std::io::Result<FileMetadata> {
-            Ok(FileMetadata { len: self.old.len() as u64, is_dir: false })
+            Ok(FileMetadata {
+                len: self.old.len() as u64,
+                is_dir: false,
+            })
         }
         fn exists(&self, _p: &std::path::Path) -> bool {
             true
@@ -2058,9 +2083,15 @@ mod tests {
             "large overwrite must emit a summary diff, got: {diff}"
         );
         // Old-file-large summary reports the old size (the prefix was truncated).
-        assert!(diff.contains("large write") && diff.contains("old "), "got: {diff}");
+        assert!(
+            diff.contains("large write") && diff.contains("old "),
+            "got: {diff}"
+        );
         // It must NOT contain a hunk header (that would be the full diff path).
-        assert!(!diff.contains("@@ -1,"), "summary diff must not be a line diff: {diff}");
+        assert!(
+            !diff.contains("@@ -1,"),
+            "summary diff must not be a line diff: {diff}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2088,7 +2119,10 @@ mod tests {
         assert!(!out.ok);
         assert_eq!(out.data["status"], "conflict");
         assert_eq!(out.data["actualSha256"], correct);
-        assert!(fs.written.lock().unwrap().is_none(), "conflict must not write");
+        assert!(
+            fs.written.lock().unwrap().is_none(),
+            "conflict must not write"
+        );
 
         // Correct expectedSha256 -> write proceeds.
         let fs = NoFullReadFs::new(old, 8);
@@ -2103,7 +2137,10 @@ mod tests {
         )
         .unwrap();
         assert!(out.ok, "{}", out.model_text);
-        assert_eq!(fs.written.lock().unwrap().clone().unwrap(), b"replacement\n");
+        assert_eq!(
+            fs.written.lock().unwrap().clone().unwrap(),
+            b"replacement\n"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2124,7 +2161,10 @@ mod tests {
         assert!(out.ok);
         let diff = out.diff.as_deref().unwrap();
         // Small (sub-cap) overwrite keeps the real line diff.
-        assert!(diff.contains("@@ -1,"), "small overwrite should keep a full diff: {diff}");
+        assert!(
+            diff.contains("@@ -1,"),
+            "small overwrite should keep a full diff: {diff}"
+        );
         assert!(diff.contains("-old"));
         assert!(diff.contains("+new"));
         assert!(!diff.contains("full line diff omitted"));
@@ -2141,8 +2181,12 @@ mod tests {
         let fs = StdFileSystem::new();
         let big = "a".repeat(MAX_DIFF_INPUT_BYTES + 1024);
 
-        let out = write_file(&json!({ "path": "big.txt", "content": big.clone() }), &ws, &fs)
-            .unwrap();
+        let out = write_file(
+            &json!({ "path": "big.txt", "content": big.clone() }),
+            &ws,
+            &fs,
+        )
+        .unwrap();
         assert!(out.ok);
         let diff = out.diff.as_deref().unwrap();
         assert!(
@@ -2426,7 +2470,10 @@ mod tests {
         )
         .unwrap();
         assert!(out.ok, "{}", out.model_text);
-        assert_eq!(fs::read(dir.join("u.txt")).unwrap(), "café\nmême\n".as_bytes());
+        assert_eq!(
+            fs::read(dir.join("u.txt")).unwrap(),
+            "café\nmême\n".as_bytes()
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2455,7 +2502,10 @@ mod tests {
         assert_eq!(out.data["status"], "not_utf8");
         // No writes: the bad file is untouched AND the Add target was not created.
         assert_eq!(fs::read(dir.join("bad.txt")).unwrap(), bad);
-        assert!(!dir.join("fresh.txt").exists(), "no file should have been written");
+        assert!(
+            !dir.join("fresh.txt").exists(),
+            "no file should have been written"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2577,9 +2627,18 @@ mod tests {
         assert_eq!(out.data["status"], "apply_error");
 
         // The created file is gone, and so are the orphan directories.
-        assert!(!dir.join("newdir/sub/file.txt").exists(), "created file must be removed");
-        assert!(!dir.join("newdir/sub").exists(), "newdir/sub must be removed on rollback");
-        assert!(!dir.join("newdir").exists(), "newdir must be removed on rollback");
+        assert!(
+            !dir.join("newdir/sub/file.txt").exists(),
+            "created file must be removed"
+        );
+        assert!(
+            !dir.join("newdir/sub").exists(),
+            "newdir/sub must be removed on rollback"
+        );
+        assert!(
+            !dir.join("newdir").exists(),
+            "newdir must be removed on rollback"
+        );
         // The second target was never written.
         assert!(!dir.join("other.txt").exists());
         // The workspace root itself survives.
@@ -2613,8 +2672,14 @@ mod tests {
 
         // The newly-added file is rolled back, but the pre-existing directory and
         // its prior content are untouched.
-        assert!(!dir.join("existing/new.txt").exists(), "added file must be removed");
-        assert!(dir.join("existing").exists(), "pre-existing dir must NOT be removed");
+        assert!(
+            !dir.join("existing/new.txt").exists(),
+            "added file must be removed"
+        );
+        assert!(
+            dir.join("existing").exists(),
+            "pre-existing dir must NOT be removed"
+        );
         assert_eq!(
             fs::read(dir.join("existing/keep.txt")).unwrap(),
             b"keep me\n",
@@ -2761,7 +2826,10 @@ mod tests {
             Ok(())
         }
         fn metadata(&self, _p: &std::path::Path) -> std::io::Result<FileMetadata> {
-            Ok(FileMetadata { len: self.total_len as u64, is_dir: false })
+            Ok(FileMetadata {
+                len: self.total_len as u64,
+                is_dir: false,
+            })
         }
         fn exists(&self, _p: &std::path::Path) -> bool {
             true
@@ -2792,7 +2860,10 @@ mod tests {
         let out = read_file(&json!({ "path": "big.txt" }), &ws, &fs, "tc_tf", None).unwrap();
         assert!(out.ok);
         // The small prefix renders inline (non-spill branch) yet truncation is set.
-        assert!(out.data.get("logRef").is_none(), "small prefix should not spill");
+        assert!(
+            out.data.get("logRef").is_none(),
+            "small prefix should not spill"
+        );
         assert_eq!(out.data["bytesTruncated"], true);
         assert!(out.model_text.contains("l1"));
         assert!(out.model_text.contains("l3"));
@@ -2832,7 +2903,8 @@ mod tests {
         assert!(out.ok);
         assert_eq!(out.data["startBeyondWindow"], true);
         assert!(
-            out.model_text.contains("beyond the 3 line(s) in this read window"),
+            out.model_text
+                .contains("beyond the 3 line(s) in this read window"),
             "should explain the requested start is past the window: {}",
             out.model_text
         );
@@ -2882,7 +2954,10 @@ mod tests {
                 Ok(())
             }
             fn metadata(&self, _p: &std::path::Path) -> std::io::Result<FileMetadata> {
-                Ok(FileMetadata { len: 11, is_dir: false })
+                Ok(FileMetadata {
+                    len: 11,
+                    is_dir: false,
+                })
             }
             fn exists(&self, _p: &std::path::Path) -> bool {
                 true
@@ -3071,7 +3146,10 @@ mod tests {
             preview.contains("over the 1024-byte write limit"),
             "preview should summarize the refusal: {preview}"
         );
-        assert!(!preview.contains('+'), "no diff lines should be built: {preview}");
+        assert!(
+            !preview.contains('+'),
+            "no diff lines should be built: {preview}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3103,12 +3181,7 @@ mod tests {
     #[test]
     fn classify_outside_workspace_is_denied() {
         let (ws, dir) = temp_workspace("classify_outside");
-        let read = classify(
-            FileTool::Read,
-            &json!({ "path": "../../etc/passwd" }),
-            &ws,
-        )
-        .unwrap();
+        let read = classify(FileTool::Read, &json!({ "path": "../../etc/passwd" }), &ws).unwrap();
         assert_eq!(read.action, ToolPermissionAction::Deny);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3127,9 +3200,8 @@ mod tests {
 
     #[test]
     fn validate_write_shallow_rejects_malformed_without_full_parse() {
-        let missing_content =
-            validate_args_shallow(FileTool::Write, &json!({ "path": "out.txt" }))
-                .expect_err("missing content must fail before approval");
+        let missing_content = validate_args_shallow(FileTool::Write, &json!({ "path": "out.txt" }))
+            .expect_err("missing content must fail before approval");
         assert!(
             missing_content.to_string().contains("content"),
             "got: {missing_content}"
