@@ -25,7 +25,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::{LlmToolCallResult, Result};
@@ -69,6 +68,11 @@ pub enum ToolDecision {
     Ask { reason: String },
     /// Refuse; `reason` explains why.
     Deny { reason: String },
+    /// Refuse with a fully-formed typed terminal outcome (e.g. a write
+    /// precondition failure that must carry its own `status`/payload). Emitted as
+    /// the terminal directly — no approval, no execute. This is how a policy step
+    /// rejects a call before approval while preserving a typed payload.
+    Reject(Box<BackendOutcome>),
 }
 
 /// A side-effect-free approval preview rendered before the human approves.
@@ -83,6 +87,7 @@ pub struct ApprovalPreview {
 /// The terminal outcome a backend's `execute` produces. Already bounded by the
 /// backend (large content referenced via artifact `log_ref`, never inline). The
 /// orchestrator turns this into the terminal event + model-facing result.
+#[derive(Debug, Clone)]
 pub struct BackendOutcome {
     pub status: ToolExecutionStatus,
     /// The full result record (process result, or a synthesized file result).
@@ -98,7 +103,11 @@ pub struct BackendOutcome {
 }
 
 /// The kind-specific seam. The orchestrator runs the shared lifecycle around it.
-#[async_trait]
+///
+/// Synchronous on purpose: the file backends' output spill bridges to the async
+/// output store via `block_on`, so a backend may only `block_on` its own async
+/// work (process spawn/wait, store spill) at the leaf — the orchestrator never
+/// wraps `execute` in its own runtime, keeping every `block_on` un-nested.
 pub trait ToolBackend: Send + Sync {
     /// Declare intent + touched paths + resource needs. No allow/deny decision.
     fn classify(&self, ctx: &ToolCallContext<'_>) -> Result<ToolCapability>;
@@ -108,7 +117,7 @@ pub trait ToolBackend: Send + Sync {
         Ok(())
     }
 
-    /// Apply policy to a classified call → Allow / Ask / Deny.
+    /// Apply policy to a classified call → Allow / Ask / Deny / Reject.
     fn decide(&self, ctx: &ToolCallContext<'_>, capability: &ToolCapability) -> ToolDecision;
 
     /// A side-effect-free preview for the approval card. Default: none.
@@ -118,7 +127,7 @@ pub trait ToolBackend: Send + Sync {
 
     /// Execute after approval; may stream `Output` events through `sink`. Returns
     /// an already-bounded outcome.
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolCallContext<'_>,
         sink: &Arc<dyn ToolExecutionEventSink>,
@@ -130,16 +139,23 @@ pub trait ToolBackend: Send + Sync {
 /// that need them are migrated).
 pub struct ToolOrchestrator {
     approval_gate: Arc<PendingToolApprovalGate>,
+    runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl ToolOrchestrator {
-    pub fn new(approval_gate: Arc<PendingToolApprovalGate>) -> Self {
-        Self { approval_gate }
+    pub fn new(
+        approval_gate: Arc<PendingToolApprovalGate>,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Self {
+        Self {
+            approval_gate,
+            runtime,
+        }
     }
 
     /// Run one tool call through the full lifecycle. Always resolves to a
     /// model-facing [`LlmToolCallResult`]; lifecycle events are emitted to `sink`.
-    pub async fn run(
+    pub fn run(
         &self,
         ctx: ToolCallContext<'_>,
         project_id: Option<&str>,
@@ -188,6 +204,9 @@ impl ToolOrchestrator {
 
         // policy → approval.
         match backend.decide(&ctx, &capability) {
+            ToolDecision::Reject(outcome) => {
+                return self.terminal(&ctx, project_id, sink, *outcome);
+            }
             ToolDecision::Deny { reason } => {
                 return self.denied(&ctx, project_id, sink, reason, &capability);
             }
@@ -209,11 +228,11 @@ impl ToolOrchestrator {
                     artifacts: preview.artifacts,
                     ..Default::default()
                 });
-                if let ToolApprovalDecision::Denied { reason } = self
-                    .approval_gate
-                    .request_decision(ctx.tool_call_id, ctx.cancellation)
-                    .await
-                {
+                let decision = self.runtime.block_on(
+                    self.approval_gate
+                        .request_decision(ctx.tool_call_id, ctx.cancellation),
+                );
+                if let ToolApprovalDecision::Denied { reason } = decision {
                     return self.denied(&ctx, project_id, sink, reason, &capability);
                 }
             }
@@ -240,7 +259,7 @@ impl ToolOrchestrator {
             Some(capability.summary.clone()),
         );
 
-        match backend.execute(&ctx, sink).await {
+        match backend.execute(&ctx, sink) {
             Ok(outcome) => self.terminal(&ctx, project_id, sink, outcome),
             Err(error) => self.fail(
                 &ctx,
@@ -398,7 +417,6 @@ mod tests {
         executed: Arc<Mutex<bool>>,
     }
 
-    #[async_trait]
     impl ToolBackend for FakeBackend {
         fn classify(&self, _ctx: &ToolCallContext<'_>) -> Result<ToolCapability> {
             Ok(ToolCapability {
@@ -417,7 +435,7 @@ mod tests {
         fn decide(&self, _ctx: &ToolCallContext<'_>, _cap: &ToolCapability) -> ToolDecision {
             self.decision.clone()
         }
-        async fn execute(
+        fn execute(
             &self,
             ctx: &ToolCallContext<'_>,
             _sink: &Arc<dyn ToolExecutionEventSink>,
@@ -438,54 +456,53 @@ mod tests {
         preflight_ok: bool,
         decide_after: Option<ToolApprovalDecision>,
     ) -> (LlmToolCallResult, Vec<ToolExecutionEventKind>, bool) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async move {
-            let gate = PendingToolApprovalGate::new();
-            let orchestrator = ToolOrchestrator::new(Arc::clone(&gate));
-            let recording = Arc::new(RecordingSink::default());
-            let sink: Arc<dyn ToolExecutionEventSink> = recording.clone();
-            let executed = Arc::new(Mutex::new(false));
-            let backend = FakeBackend {
-                decision,
-                preflight_ok,
-                executed: Arc::clone(&executed),
-            };
-            let cancellation = ToolCancellationToken::default();
-            let chat = ChatCancellationToken::default();
-            let arguments = json!({});
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let gate = PendingToolApprovalGate::new();
+        let orchestrator = ToolOrchestrator::new(Arc::clone(&gate), Arc::clone(&runtime));
+        let recording = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn ToolExecutionEventSink> = recording.clone();
+        let executed = Arc::new(Mutex::new(false));
+        let backend = FakeBackend {
+            decision,
+            preflight_ok,
+            executed: Arc::clone(&executed),
+        };
+        let cancellation = ToolCancellationToken::default();
+        let chat = ChatCancellationToken::default();
+        let arguments = json!({});
 
-            // Resolve a pending approval from another task, if requested.
-            if let Some(decision) = decide_after {
-                let gate = Arc::clone(&gate);
-                tokio::spawn(async move {
-                    for _ in 0..200 {
-                        if gate.decide("tc", decision.clone()) {
-                            break;
-                        }
-                        tokio::task::yield_now().await;
+        // Resolve a pending approval from another thread, if requested (the
+        // orchestrator blocks on the gate while it runs).
+        if let Some(decision) = decide_after {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    if gate.decide("tc", decision.clone()) {
+                        break;
                     }
-                });
-            }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+        }
 
-            let ctx = ToolCallContext {
-                tool_call_id: "tc",
-                run_id: Some("run"),
-                tool_name: "run_command",
-                kind: ToolKind::RunCommand,
-                arguments: &arguments,
-                cancellation: &cancellation,
-                chat_cancellation: &chat,
-            };
-            let result = orchestrator
-                .run(ctx, Some("project"), &backend, &sink)
-                .await;
-            let kinds = recording.kinds();
-            let executed = *executed.lock().unwrap();
-            (result, kinds, executed)
-        })
+        let ctx = ToolCallContext {
+            tool_call_id: "tc",
+            run_id: Some("run"),
+            tool_name: "run_command",
+            kind: ToolKind::RunCommand,
+            arguments: &arguments,
+            cancellation: &cancellation,
+            chat_cancellation: &chat,
+        };
+        let result = orchestrator.run(ctx, Some("project"), &backend, &sink);
+        let kinds = recording.kinds();
+        let executed = *executed.lock().unwrap();
+        (result, kinds, executed)
     }
 
     #[test]
