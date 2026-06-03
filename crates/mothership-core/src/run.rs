@@ -153,6 +153,7 @@ impl<'a> ChatRunService<'a> {
             chat: Some(run.chat.clone()),
             transport: None,
             tool_call_id: None,
+            removed_message_ids: run.removed_message_ids.clone(),
             error: None,
         });
 
@@ -175,6 +176,7 @@ impl<'a> ChatRunService<'a> {
                     chat: None,
                     transport: None,
                     tool_call_id: None,
+                    removed_message_ids: Vec::new(),
                     error: Some(error.to_string()),
                 });
             sink.emit(event);
@@ -228,11 +230,8 @@ impl<'a> ChatRunService<'a> {
         let project = database.chat_project(&run.chat.id)?;
 
         let cancellation = ChatCancellationToken::default();
-        let already_cancelled = registry.register(
-            &run.run_id,
-            provider_id.clone(),
-            cancellation.clone(),
-        );
+        let already_cancelled =
+            registry.register(&run.run_id, provider_id.clone(), cancellation.clone());
         if already_cancelled {
             schedule_cancel_fallback(
                 Arc::clone(&self.providers),
@@ -578,6 +577,7 @@ impl LlmChatCompletionEventSink for DbForwardingSink<'_> {
             chat: None,
             transport: None,
             tool_call_id: None,
+            removed_message_ids: Vec::new(),
             error: None,
         });
         if self.pending_delta.len() >= CHAT_DELTA_FLUSH_BYTES
@@ -609,6 +609,7 @@ impl LlmChatCompletionEventSink for DbForwardingSink<'_> {
                 chat: None,
                 transport: None,
                 tool_call_id: Some(tool_call_id.to_string()),
+                removed_message_ids: Vec::new(),
                 error: None,
             });
         }
@@ -722,6 +723,7 @@ mod tests {
             chat,
             user_message,
             assistant_message,
+            removed_message_ids: Vec::new(),
             context: Default::default(),
         }
     }
@@ -734,7 +736,8 @@ mod tests {
         let selected = database.selected_llm_model().expect("selected model");
         assert!(selected.model_id.trim().is_empty());
 
-        let run = run_handle(&database);
+        let mut run = run_handle(&database);
+        run.removed_message_ids = vec!["chat_message_old_failed".to_string()];
         let mut sink = CapturingSink::default();
         ChatRunService::new(&database, Arc::new(ProviderRuntimeManager::default())).run(
             &run,
@@ -745,6 +748,10 @@ mod tests {
         assert_eq!(
             sink.kinds(),
             vec![ChatRunEventKind::Started, ChatRunEventKind::Failed]
+        );
+        assert_eq!(
+            sink.events[0].removed_message_ids,
+            vec!["chat_message_old_failed"]
         );
         assert!(sink.error_text().contains("no LLM model selected"));
 

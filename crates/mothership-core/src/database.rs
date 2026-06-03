@@ -647,7 +647,12 @@ impl Database {
                 "no LLM model selected; connect a provider and choose a model first".to_string(),
             ));
         }
-        persist_chat_model(&tx, &chat.id, &selected_model.provider_id, &selected_model.model_id)?;
+        persist_chat_model(
+            &tx,
+            &chat.id,
+            &selected_model.provider_id,
+            &selected_model.model_id,
+        )?;
 
         let mut user_message = ChatMessage {
             id: generate_id("chat_message")?,
@@ -720,6 +725,7 @@ impl Database {
             chat: updated_chat,
             user_message,
             assistant_message,
+            removed_message_ids: Vec::new(),
             context: ChatRunContextSpec {
                 reasoning,
                 ..ChatRunContextSpec::default()
@@ -752,7 +758,12 @@ impl Database {
                 "no LLM model selected; connect a provider and choose a model first".to_string(),
             ));
         }
-        persist_chat_model(&tx, &chat.id, &selected_model.provider_id, &selected_model.model_id)?;
+        persist_chat_model(
+            &tx,
+            &chat.id,
+            &selected_model.provider_id,
+            &selected_model.model_id,
+        )?;
         let original_user_message = select_chat_message_by_id(&tx, message_id)?;
         if original_user_message.chat_id != chat_id {
             return Err(MothershipError::InvalidRequest(
@@ -772,6 +783,8 @@ impl Database {
 
         let messages_before_target =
             count_chat_messages_before(&tx, chat_id, original_user_message.position)?;
+        let removed_message_ids =
+            select_chat_message_ids_after_position(&tx, chat_id, original_user_message.position)?;
         tx.execute(
             "DELETE FROM chat_messages WHERE chat_id = ?1 AND rowid > ?2",
             params![chat_id, original_user_message.position],
@@ -846,6 +859,7 @@ impl Database {
             chat: updated_chat,
             user_message,
             assistant_message,
+            removed_message_ids,
             context: ChatRunContextSpec::default(),
         })
     }
@@ -939,9 +953,10 @@ impl Database {
         })
     }
 
-    /// Starts a fresh assistant attempt for the last failed assistant message,
-    /// reusing the original user prompt without deleting the failed partial
-    /// answer or its tool history.
+    /// Rolls the chat back to the user message that produced the latest failed
+    /// assistant run, then starts a fresh assistant attempt for that same user
+    /// message. Unlike "continue", retry removes the failed tail so the next run
+    /// behaves as if the user message was just sent again.
     pub fn begin_retry_run(&self, chat_id: &str) -> Result<SendChatMessageResult> {
         validate_identifier("chat_id", chat_id)?;
         let mut connection = self.connect()?;
@@ -958,7 +973,12 @@ impl Database {
                 "no LLM model selected; connect a provider and choose a model first".to_string(),
             ));
         }
-        persist_chat_model(&tx, &chat.id, &selected_model.provider_id, &selected_model.model_id)?;
+        persist_chat_model(
+            &tx,
+            &chat.id,
+            &selected_model.provider_id,
+            &selected_model.model_id,
+        )?;
 
         let assistant_message = select_last_message_by_role(&tx, chat_id, "assistant")?
             .ok_or_else(|| {
@@ -975,8 +995,16 @@ impl Database {
                     MothershipError::InvalidRequest("no user message to retry".to_string())
                 })?;
 
+        let removed_message_ids =
+            select_chat_message_ids_after_position(&tx, chat_id, user_message.position)?;
+        tx.execute(
+            "DELETE FROM chat_messages WHERE chat_id = ?1 AND rowid > ?2",
+            params![chat_id, user_message.position],
+        )?;
+        clear_chat_provider_state(&tx, chat_id)?;
+
         let now = current_timestamp();
-        let mut next_assistant_message = ChatMessage {
+        let mut assistant_message = ChatMessage {
             id: generate_id("chat_message")?,
             chat_id: chat_id.to_string(),
             position: 0,
@@ -988,14 +1016,15 @@ impl Database {
             provider_id: Some(selected_model.provider_id.clone()),
             model_id: Some(selected_model.model_id.clone()),
         };
-        next_assistant_message.position = insert_chat_message(&tx, &next_assistant_message)?;
+        assistant_message.position = insert_chat_message(&tx, &assistant_message)?;
 
+        let message_count = count_chat_messages(&tx, chat_id)?;
         let updated_chat = ChatThreadSummary {
             id: chat.id,
             project_id: chat.project_id,
             title: chat.title,
-            preview: chat.preview,
-            message_count: chat.message_count + 1,
+            preview: derive_chat_preview(&user_message.content),
+            message_count,
             provider_id: Some(selected_model.provider_id.clone()),
             model_id: Some(selected_model.model_id.clone()),
             created_at: chat.created_at,
@@ -1008,7 +1037,8 @@ impl Database {
             run_id: generate_id("chat_run")?,
             chat: updated_chat,
             user_message,
-            assistant_message: next_assistant_message,
+            assistant_message,
+            removed_message_ids,
             context: ChatRunContextSpec::default(),
         })
     }
@@ -1033,7 +1063,12 @@ impl Database {
                 "no LLM model selected; connect a provider and choose a model first".to_string(),
             ));
         }
-        persist_chat_model(&tx, &chat.id, &selected_model.provider_id, &selected_model.model_id)?;
+        persist_chat_model(
+            &tx,
+            &chat.id,
+            &selected_model.provider_id,
+            &selected_model.model_id,
+        )?;
         let failed_assistant_message = select_last_message_by_role(&tx, chat_id, "assistant")?
             .ok_or_else(|| {
                 MothershipError::InvalidRequest("no assistant message to continue".to_string())
@@ -1092,6 +1127,7 @@ impl Database {
             chat: updated_chat,
             user_message,
             assistant_message,
+            removed_message_ids: Vec::new(),
             context: ChatRunContextSpec {
                 include_failed_assistant_message_id: Some(failed_assistant_message.id),
                 reasoning: None,
@@ -1239,6 +1275,7 @@ impl Database {
                 chat: None,
                 transport: None,
                 tool_call_id: None,
+                removed_message_ids: Vec::new(),
                 error: None,
             });
         }
@@ -1267,6 +1304,7 @@ impl Database {
             chat: None,
             transport: None,
             tool_call_id: None,
+            removed_message_ids: Vec::new(),
             error: None,
         })
     }
@@ -1288,6 +1326,7 @@ impl Database {
             chat: None,
             transport: Some(transport.to_string()),
             tool_call_id: None,
+            removed_message_ids: Vec::new(),
             error: None,
         })
     }
@@ -1324,6 +1363,7 @@ impl Database {
             chat: Some(chat),
             transport: None,
             tool_call_id: None,
+            removed_message_ids: Vec::new(),
             error: None,
         })
     }
@@ -1369,6 +1409,7 @@ impl Database {
             chat: Some(chat),
             transport: None,
             tool_call_id: None,
+            removed_message_ids: Vec::new(),
             error: None,
         })
     }
@@ -1418,6 +1459,7 @@ impl Database {
             chat: Some(chat),
             transport: None,
             tool_call_id: None,
+            removed_message_ids: Vec::new(),
             error: Some(content),
         })
     }
@@ -2534,7 +2576,10 @@ fn copy_typed_tool_data(
     if tool_call_id_map.is_empty() {
         return Ok(());
     }
-    let source_ids = tool_call_id_map.keys().map(String::as_str).collect::<Vec<_>>();
+    let source_ids = tool_call_id_map
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     let placeholders = std::iter::repeat("?")
         .take(source_ids.len())
         .collect::<Vec<_>>()
@@ -2971,6 +3016,26 @@ fn select_last_user_message_before_position(
         .map_err(Into::into)
 }
 
+fn select_chat_message_ids_after_position(
+    connection: &Connection,
+    chat_id: &str,
+    position: i64,
+) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM chat_messages
+        WHERE chat_id = ?1
+          AND rowid > ?2
+        ORDER BY rowid ASC
+        ",
+    )?;
+
+    let rows = statement.query_map(params![chat_id, position], |row| row.get(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 fn update_chat_after_assistant(
     connection: &Connection,
     chat_id: &str,
@@ -3215,30 +3280,8 @@ fn typed_payload_and_artifacts(
 
     if event.tool_kind == Some(ToolKind::RunCommand) {
         if let (Some(command), Some(result)) = (&event.command, &event.result) {
-            let payload = serde_json::json!({
-                "program": command.program,
-                "args": command.args,
-                "exitCode": result.exit_code,
-                "stdoutPreview": result.stdout_preview,
-                "stderrPreview": result.stderr_preview,
-                "stdoutBytes": result.stdout_bytes,
-                "stderrBytes": result.stderr_bytes,
-                "truncated": result.truncated_for_display,
-                "logRef": result.log_ref,
-            });
-            let mut artifacts = Vec::new();
-            if result.stdout_bytes > 0 || result.log_ref.is_some() {
-                artifacts.push(ToolArtifact {
-                    artifact_id: "stdout".to_string(),
-                    kind: "output".to_string(),
-                    content_type: "text/plain".to_string(),
-                    preview: result.stdout_preview.clone(),
-                    log_ref: result.log_ref.clone(),
-                    size_bytes: result.stdout_bytes as u64,
-                    sha256: None,
-                    truncated: result.truncated_for_display,
-                });
-            }
+            let (payload, artifacts) =
+                crate::tools::run_command_typed_payload(command, result);
             return (Some(payload), artifacts);
         }
     }
@@ -3308,9 +3351,24 @@ fn truncate_summary(summary: &str) -> String {
 fn select_typed_tool_data(
     connection: &Connection,
     tool_call_ids: &[&str],
-) -> Result<HashMap<String, (Option<ToolKind>, Option<serde_json::Value>, Vec<ToolArtifact>)>> {
-    let mut out: HashMap<String, (Option<ToolKind>, Option<serde_json::Value>, Vec<ToolArtifact>)> =
-        HashMap::new();
+) -> Result<
+    HashMap<
+        String,
+        (
+            Option<ToolKind>,
+            Option<serde_json::Value>,
+            Vec<ToolArtifact>,
+        ),
+    >,
+> {
+    let mut out: HashMap<
+        String,
+        (
+            Option<ToolKind>,
+            Option<serde_json::Value>,
+            Vec<ToolArtifact>,
+        ),
+    > = HashMap::new();
     if tool_call_ids.is_empty() {
         return Ok(out);
     }
@@ -3583,9 +3641,9 @@ mod tests {
     }
 
     #[test]
-    fn retry_keeps_failed_assistant_and_starts_new_attempt() {
+    fn retry_rolls_back_failed_tail_and_starts_new_attempt() {
         let database_path =
-            temp_database_path("retry_keeps_failed_assistant_and_starts_new_attempt");
+            temp_database_path("retry_rolls_back_failed_tail_and_starts_new_attempt");
         let database = Database::open(database_path.clone()).expect("open database");
         database
             .set_selected_llm_model("openai", "test-model")
@@ -3625,23 +3683,59 @@ mod tests {
             .fail_chat_run(&run.run_id, &run.chat.id, &run.assistant_message.id, "boom")
             .expect("fail run");
 
+        let legacy_failed_2 = ChatMessage {
+            id: "chat_message_legacy_failed_2".to_string(),
+            chat_id: run.chat.id.clone(),
+            position: 0,
+            role: ChatMessageRole::Assistant,
+            content: "Failed retry 2".to_string(),
+            status: ChatMessageStatus::Failed,
+            created_at: current_timestamp(),
+            error: Some("boom 2".to_string()),
+            provider_id: Some("openai".to_string()),
+            model_id: Some("test-model".to_string()),
+        };
+        let legacy_failed_3 = ChatMessage {
+            id: "chat_message_legacy_failed_3".to_string(),
+            chat_id: run.chat.id.clone(),
+            position: 0,
+            role: ChatMessageRole::Assistant,
+            content: "Failed retry 3".to_string(),
+            status: ChatMessageStatus::Failed,
+            created_at: current_timestamp(),
+            error: Some("boom 3".to_string()),
+            provider_id: Some("openai".to_string()),
+            model_id: Some("test-model".to_string()),
+        };
+        let connection = database.connect().expect("connect database");
+        insert_chat_message(&connection, &legacy_failed_2).expect("insert legacy failed retry 2");
+        insert_chat_message(&connection, &legacy_failed_3).expect("insert legacy failed retry 3");
+        drop(connection);
+
         let retry = database.begin_retry_run(&run.chat.id).expect("begin retry");
         assert_ne!(retry.assistant_message.id, run.assistant_message.id);
         assert_eq!(retry.assistant_message.status, ChatMessageStatus::Sending);
         assert!(retry.assistant_message.content.is_empty());
-        // The original prompt is reused, not duplicated.
+        // The original prompt is reused, not duplicated, and the failed tail is
+        // removed so retry behaves like the user message was sent again.
         assert_eq!(retry.user_message.content, "Retry me");
+        assert_eq!(
+            retry.removed_message_ids,
+            vec![
+                run.assistant_message.id.clone(),
+                legacy_failed_2.id,
+                legacy_failed_3.id,
+            ]
+        );
         let conversation = database.get_chat(&run.chat.id, 200).expect("get chat");
-        assert_eq!(conversation.messages.len(), 3);
-        let failed = conversation
+        assert_eq!(conversation.messages.len(), 2);
+        assert_eq!(conversation.messages[0].id, retry.user_message.id);
+        assert_eq!(conversation.messages[1].id, retry.assistant_message.id);
+        assert!(conversation
             .messages
             .iter()
-            .find(|message| message.id == run.assistant_message.id)
-            .expect("failed assistant message");
-        assert_eq!(failed.status, ChatMessageStatus::Failed);
-        assert_eq!(failed.content, "Partial answer");
-        assert_eq!(failed.error.as_deref(), Some("boom"));
-        assert_eq!(conversation.tool_executions.len(), 1);
+            .all(|message| message.id != run.assistant_message.id));
+        assert!(conversation.tool_executions.is_empty());
 
         // Nothing to retry while the run is pending again.
         let error = database
@@ -4304,7 +4398,10 @@ mod tests {
         assert_eq!(conversation.tool_executions.len(), 1);
         let tool = &conversation.tool_executions[0];
         assert_eq!(tool.tool_kind, Some(ToolKind::EditFile));
-        let payload = tool.payload.as_ref().expect("typed payload survives reload");
+        let payload = tool
+            .payload
+            .as_ref()
+            .expect("typed payload survives reload");
         assert_eq!(payload["path"], "a.txt");
         assert_eq!(payload["status"], "modified");
         assert_eq!(tool.artifacts.len(), 1);
@@ -4374,10 +4471,7 @@ mod tests {
         // The output is referenced as an artifact (logRef), never inlined.
         assert_eq!(tool.artifacts.len(), 1);
         assert_eq!(tool.artifacts[0].artifact_id, "stdout");
-        assert_eq!(
-            tool.artifacts[0].log_ref.as_deref(),
-            Some("spill://stdout")
-        );
+        assert_eq!(tool.artifacts[0].log_ref.as_deref(), Some("spill://stdout"));
 
         let _ = fs::remove_file(database_path);
     }
@@ -4430,10 +4524,16 @@ mod tests {
 
         assert_eq!(branch.tool_executions.len(), 1);
         let tool = &branch.tool_executions[0];
-        assert_ne!(tool.tool_call_id, "tool_typed_branch", "branch remaps tool_call_id");
+        assert_ne!(
+            tool.tool_call_id, "tool_typed_branch",
+            "branch remaps tool_call_id"
+        );
         // The whole point: typed data survives the branch, not just the legacy feed.
         assert_eq!(tool.tool_kind, Some(ToolKind::EditFile));
-        let payload = tool.payload.as_ref().expect("typed payload survives branch");
+        let payload = tool
+            .payload
+            .as_ref()
+            .expect("typed payload survives branch");
         assert_eq!(payload["path"], "a.txt");
         assert_eq!(tool.artifacts.len(), 1);
         assert_eq!(tool.artifacts[0].artifact_id, "diff");

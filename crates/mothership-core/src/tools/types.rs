@@ -249,3 +249,38 @@ pub(crate) fn event(
         artifacts: Vec::new(),
     }
 }
+
+/// The typed `run_command` payload (program/args/exit/output) + an output
+/// artifact, derived from a command and its result. Shared by the command
+/// backend (so the live event carries it and the UI shows a semantic card) and
+/// the storage-layer synthesis (so a reload produces an identical card).
+pub fn run_command_typed_payload(
+    command: &ToolCommand,
+    result: &ToolExecutionResult,
+) -> (Value, Vec<ToolArtifact>) {
+    let payload = serde_json::json!({
+        "program": command.program,
+        "args": command.args,
+        "exitCode": result.exit_code,
+        "stdoutPreview": result.stdout_preview,
+        "stderrPreview": result.stderr_preview,
+        "stdoutBytes": result.stdout_bytes,
+        "stderrBytes": result.stderr_bytes,
+        "truncated": result.truncated_for_display,
+        "logRef": result.log_ref,
+    });
+    let mut artifacts = Vec::new();
+    if result.stdout_bytes > 0 || result.log_ref.is_some() {
+        artifacts.push(ToolArtifact {
+            artifact_id: "stdout".to_string(),
+            kind: "output".to_string(),
+            content_type: "text/plain".to_string(),
+            preview: result.stdout_preview.clone(),
+            log_ref: result.log_ref.clone(),
+            size_bytes: result.stdout_bytes as u64,
+            sha256: None,
+            truncated: result.truncated_for_display,
+        });
+    }
+    (payload, artifacts)
+}

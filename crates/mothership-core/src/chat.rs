@@ -111,6 +111,12 @@ pub struct SendChatMessageResult {
     pub chat: ChatThreadSummary,
     pub user_message: ChatMessage,
     pub assistant_message: ChatMessage,
+    /// Messages removed from the conversation before this run was created.
+    ///
+    /// Send/continue normally leave this empty. Edit/retry use it so thin
+    /// clients can reconcile local chat state before applying stream events.
+    #[serde(default)]
+    pub removed_message_ids: Vec<String>,
     #[serde(skip)]
     pub context: ChatRunContextSpec,
 }
@@ -151,6 +157,8 @@ pub struct ChatRunEvent {
     pub transport: Option<String>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub removed_message_ids: Vec<String>,
     pub error: Option<String>,
 }
 

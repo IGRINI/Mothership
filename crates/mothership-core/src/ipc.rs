@@ -114,8 +114,9 @@ pub enum CoreRequest {
         chat_id: String,
         message_id: String,
     },
-    /// Re-run the last failed assistant message in a chat without deleting the
-    /// failed partial answer. Like `SendChatMessage`, it streams `Event::ChatRun`s.
+    /// Re-run the failed tail by rolling the chat back to the previous user
+    /// message and starting a fresh assistant attempt. Like `SendChatMessage`,
+    /// it streams `Event::ChatRun`s.
     RetryChatMessage {
         chat_id: String,
     },
