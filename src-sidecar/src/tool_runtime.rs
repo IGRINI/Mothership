@@ -12,7 +12,8 @@ use std::time::Duration;
 use mothership_core::{
     check_write_file_content_precondition, classify_file_tool, file_tool_preview_diff,
     run_apply_patch_tool, run_edit_file_tool, run_list_files_tool, run_read_file_tool,
-    run_search_text_tool, run_write_file_tool_with_limit_and_observation,
+    run_command_typed_payload, run_search_text_tool,
+    run_write_file_tool_with_limit_and_observation,
     validate_file_tool_args_shallow, DEFAULT_MAX_WRITE_FILE_BYTES, tool_batch_plan,
     ChatCancellationToken, FileTool, FileToolOutcome, FileToolSpill, LlmToolCallHandler,
     LlmToolCallRequest, LlmToolCallResult, MothershipError, ApprovalPreview, BackendOutcome,
@@ -419,12 +420,24 @@ impl ToolBackend for CommandCall {
         self.supervisor
             .command_repeat_block(&self.request)
             .map(|block| {
-                command_backend_outcome(synthesized_command_result(
-                    &self.request,
-                    ToolExecutionStatus::LoopBlocked,
-                    block.message,
-                ))
+                command_backend_outcome(
+                    synthesized_command_result(
+                        &self.request,
+                        ToolExecutionStatus::LoopBlocked,
+                        block.message,
+                    ),
+                    &self.request.command,
+                )
             })
+    }
+
+    fn preview(&self, _ctx: &ToolCallContext<'_>, _capability: &ToolCapability) -> ApprovalPreview {
+        // Surface the actual command in the approval card so the human is not
+        // approving blind (the policy reason alone is not enough).
+        ApprovalPreview {
+            message: command_summary(&self.request),
+            artifacts: Vec::new(),
+        }
     }
 
     fn decide(&self, _ctx: &ToolCallContext<'_>, _capability: &ToolCapability) -> ToolDecision {
@@ -462,7 +475,7 @@ impl ToolBackend for CommandCall {
             ctx.cancellation,
             sink,
         ))?;
-        Ok(command_backend_outcome(result))
+        Ok(command_backend_outcome(result, &self.request.command))
     }
 
     fn record(&self, _ctx: &ToolCallContext<'_>, outcome: &BackendOutcome) {
@@ -485,14 +498,17 @@ fn command_summary(request: &ToolExecutionRequest) -> String {
 }
 
 /// Wrap a command [`ToolExecutionResult`] as the orchestrator's terminal outcome:
-/// the model sees the formatted text; the typed result carries the log ref.
-fn command_backend_outcome(result: ToolExecutionResult) -> BackendOutcome {
+/// the model sees the formatted text; the typed payload (program/args/exit/output)
+/// drives the UI's semantic run_command card live, and the output artifact carries
+/// the log ref.
+fn command_backend_outcome(result: ToolExecutionResult, command: &ToolCommand) -> BackendOutcome {
+    let (payload, artifacts) = run_command_typed_payload(command, &result);
     BackendOutcome {
         status: result.status,
         model_text: format_tool_result(&result),
-        payload: None,
+        payload: Some(payload),
         touched_paths: Vec::new(),
-        artifacts: Vec::new(),
+        artifacts,
         result,
     }
 }
