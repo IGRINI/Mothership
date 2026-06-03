@@ -273,8 +273,10 @@ typed storage, semantic UI, catalog stability, and a credential firewall.
   diff artifact (full diff via `log_ref`); `run_command`'s payload + output artifact are
   synthesized from command+result at the storage layer (supervisor untouched). Large content
   is always referenced via `log_ref`, never inlined. The read path enriches records from the
-  typed tables so a reloaded conversation still renders cards. No schema cap on
-  `write_file.content`.
+  typed tables so a reloaded conversation still renders cards. No JSON-schema cap on
+  `write_file.content`; instead a **policy ceiling** (`DEFAULT_MAX_WRITE_FILE_BYTES`, 10 MiB,
+  configurable via `write_file_with_limit`) refuses an oversized write up front
+  (`status: "too_large"` + `contentBytes`/`maxWriteBytes`) with no side effect.
 - **Phase 4 — semantic UI.** Per-tool semantic cards (SolidJS `ToolCards.tsx`) keyed on
   `toolKind`, a colored diff card, and a before-approval diff preview above Approve/Deny. The
   approval diff is a typed `diff-preview` artifact (persisted to `tool_artifacts`; sent to
@@ -290,12 +292,14 @@ typed storage, semantic UI, catalog stability, and a credential firewall.
   event sink scrubs **command args + env values**, event/result previews+tails, artifact
   previews, and string values in the typed payload. Durable spilled blobs (the content behind a
   `log_ref`: command stdout/stderr, file-tool diff/read/search) are scrubbed at rest by
-  `RedactingOutputStore` via a **bounded streaming redactor**: a no-newline torrent is
-  force-flushed in capped segments so memory stays bounded (no whole-line buffering); a secret
-  split across writes is caught via overlap + non-token cut points; and a multi-line
+  `RedactingOutputStore` via a **bounded rolling-window redactor**: it never emits the last
+  `MAX_SECRET_SCAN_WINDOW` (16 KiB) of its buffer and runs the patterns over that rolling window
+  (`CredentialGuard::safe_prefix_cut`), cutting *before* any match that would straddle the flush
+  boundary — so a token split across writes is caught whole, and a no-newline torrent is still
+  force-flushed down to the window (bounded memory, guaranteed progress). A multi-line
   `BEGIN…END` private-key block is held and redacted as a unit (a runaway block past the cap is
   force-redacted to a marker, never buffered or leaked). UTF-8 segments redacted, binary passed
-  through. Model-facing *result* text is intentionally not yet redacted (the model needs real
+  through byte-for-byte. Model-facing *result* text is intentionally not yet redacted (the model needs real
   file contents; known-secret files are already path-blocked); the trait is the seam for
   policy-driven model-visible redaction later.
 
@@ -314,7 +318,8 @@ typed storage, semantic UI, catalog stability, and a credential firewall.
 - Still later: OS sandbox/orchestrator for `run_command`; SSRF/url guard for future fetch
   tools; LSP/formatter post-write hooks; deferred-tools/`tool_search`; recall after
   compaction; workflow/subagent orchestration; model-visible credential redaction policy +
-  managed gateway; configurable `maxWriteBytes` policy-level (not schema) refusal.
+  managed gateway. (`write_file` policy ceiling + the rolling-window durable redactor are now
+  done.)
 
 ## Decision log (so it isn't re-litigated)
 
@@ -334,6 +339,8 @@ typed storage, semantic UI, catalog stability, and a credential firewall.
 | `edit_file` reads any-size file | **Rejected → >10 MiB guard** | edit_file must load the whole file (content-addressed edit); refuse >10 MiB and point at `apply_patch`/`run_command`. Mirrors the read_file ceiling. |
 | `write_file` full diff regardless of size | **Rejected → bounded** | Summary diff when old+new > 1 MiB (`MAX_DIFF_INPUT_BYTES`) — covers large-NEW content too, not just large-old. No schema cap on `content` (legit large writes; the diff was the real cost). |
 | apply_patch rollback covers files only | **Rejected → files + dirs** | Snapshot also records dirs the apply will create; rollback removes them deepest-first (empty-only). True "disk as before". |
+| `write_file` size: schema cap vs none | **Policy ceiling (not schema)** | `DEFAULT_MAX_WRITE_FILE_BYTES` (10 MiB) refused up front (`too_large`, no side effect); configurable via `write_file_with_limit`. A schema `maximum` would be a blunt protocol-level cap; a policy ceiling is overridable and returns a semantic status. |
+| Durable redactor: per-segment non-token cut vs rolling window | **Rolling window** | Per-segment cut + 1 KiB overlap could split a long/odd token at a force-flush. `MAX_SECRET_SCAN_WINDOW` (16 KiB) retained tail + `safe_prefix_cut` (cut before any straddling match) catches any secret ≤ window across boundaries; still bounded (force-flush down to one window). |
 | Disable Claude-native `Glob`/`Grep` now | **Deferred** | No typed search replacement yet; disabling would degrade search to `run_command`. Disable only after `list_files`/`search_text` land. Native `Read`/`Write`/`Edit`/`MultiEdit`/`NotebookEdit` ARE disabled when the Mothership file tools are bridged. |
 
 ## Open questions
