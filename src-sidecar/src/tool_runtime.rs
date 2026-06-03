@@ -12,7 +12,7 @@ use mothership_core::{
     classify_file_tool, file_tool_preview_diff, run_apply_patch_tool, run_edit_file_tool,
     run_list_files_tool, run_read_file_tool, run_search_text_tool,
     run_write_file_tool_with_limit, DEFAULT_MAX_WRITE_FILE_BYTES,
-    tool_batch_plan, ChatCancellationToken, FileTool,
+    tool_batch_plan, validate_file_tool_args_shallow, ChatCancellationToken, FileTool,
     FileToolOutcome,
     FileToolSpill, LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResult, MothershipError,
     PendingToolApprovalGate, Result, SpawnedToolProcess, StdFileSystem, ToolApprovalDecision,
@@ -473,6 +473,33 @@ impl FileToolExecutor {
                 };
             }
             ToolPermissionAction::Ask => {
+                if let Err(error) = validate_file_tool_args_shallow(tool, arguments) {
+                    let message = error.to_string();
+                    let result = synthesized_result(
+                        tool_call_id,
+                        ToolExecutionStatus::Failed,
+                        String::new(),
+                        Some(message.clone()),
+                    );
+                    self.emit_file_event(
+                        tool,
+                        tool_call_id,
+                        run_id,
+                        project_id,
+                        ToolExecutionEventKind::Failed,
+                        Some(message.clone()),
+                        Some(result),
+                        TypedEventExtras {
+                            touched_paths: capability.touched_paths.clone(),
+                            ..TypedEventExtras::default()
+                        },
+                    );
+                    return LlmToolCallResult {
+                        ok: false,
+                        content: message,
+                    };
+                }
+
                 // Surface the approval request (with a diff/summary preview) and
                 // block on the same gate the UI drives via `decide`. The diff is
                 // carried both as the message (fallback) and as a typed
@@ -1175,7 +1202,7 @@ impl SpawnedToolProcess for SpawnedProcessAdapter {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use serde_json::json;
@@ -1194,6 +1221,17 @@ mod tests {
         fn spill(&self, _tool_call_id: &str, content: &str) -> std::io::Result<String> {
             self.captured.lock().unwrap().push(content.to_string());
             Ok("spill://full-diff".to_string())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingEventSink {
+        events: Mutex<Vec<ToolExecutionEvent>>,
+    }
+
+    impl ToolExecutionEventSink for RecordingEventSink {
+        fn emit(&self, event: ToolExecutionEvent) {
+            self.events.lock().unwrap().push(event);
         }
     }
 
@@ -1281,6 +1319,63 @@ mod tests {
         let preview = bound_preview("write a.txt", diff);
         assert_eq!(preview, format!("write a.txt\n\n{diff}"));
         assert!(!preview.contains("preview truncated"));
+    }
+
+    #[test]
+    fn malformed_write_fails_preflight_without_permission_request() {
+        let root = temp_project_dir("malformed_write_preflight");
+        let workspace = Workspace::new(&root).expect("workspace");
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime"),
+        );
+        let sink = Arc::new(RecordingEventSink::default());
+        let sink_for_executor: Arc<dyn ToolExecutionEventSink> = sink.clone();
+        let executor = FileToolExecutor {
+            runtime,
+            sink: sink_for_executor,
+            project: Some(ToolProjectContext {
+                id: "project_preflight".to_string(),
+                root: root.clone(),
+            }),
+            approvals: PendingToolApprovalGate::new(),
+            file_system: StdFileSystem::new(),
+            output_store: None,
+            max_write_bytes: DEFAULT_MAX_WRITE_FILE_BYTES,
+        };
+        let cancellation = ToolCancellationToken::default();
+        let chat_cancellation = ChatCancellationToken::default();
+        let run_id = None;
+        let project_id = Some("project_preflight".to_string());
+
+        let result = executor.run_file_tool_inner(
+            FileTool::Write,
+            &json!({ "path": "out.txt" }),
+            &workspace,
+            "tc_malformed",
+            &run_id,
+            &project_id,
+            &cancellation,
+            &chat_cancellation,
+        );
+
+        assert!(!result.ok);
+        assert!(result.content.contains("content"), "got: {}", result.content);
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "expected one terminal event: {events:?}");
+        assert_eq!(events[0].kind, ToolExecutionEventKind::Failed);
+        assert_eq!(
+            events[0].result.as_ref().map(|result| result.status),
+            Some(ToolExecutionStatus::Failed)
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != ToolExecutionEventKind::PermissionRequested),
+            "malformed write must not ask for approval"
+        );
     }
 
     #[cfg(windows)]

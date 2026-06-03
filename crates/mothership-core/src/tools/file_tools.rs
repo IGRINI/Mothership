@@ -303,6 +303,22 @@ pub fn classify(
     }
 }
 
+/// Shallow, borrowed schema preflight for malformed calls that should fail before
+/// an approval prompt. This does not replace full typed parsing in handlers; it
+/// only rejects obvious invalid `write_file` calls without cloning `content`.
+pub fn validate_args_shallow(tool: FileTool, arguments: &Value) -> Result<(), FileToolError> {
+    if tool != FileTool::Write {
+        return Ok(());
+    }
+
+    arg_str(arguments, "path")?;
+    arg_str(arguments, "content")?;
+    optional_bool(arguments, "create")?;
+    optional_bool(arguments, "overwrite")?;
+    optional_string_any(arguments, &["expectedSha256", "expected_sha256"])?;
+    Ok(())
+}
+
 /// Compute a side-effect-free diff preview for a *mutating* file tool, for the
 /// approval card the UI shows before the Approve button. Returns `None` for
 /// `read_file` (nothing to preview) or when the change cannot be previewed
@@ -622,19 +638,11 @@ pub fn write_file_with_limit(
     fs: &dyn FileSystem,
     max_write_bytes: usize,
 ) -> Result<FileToolOutcome, FileToolError> {
-    // Policy ceiling, checked on the BORROWED content BEFORE `parse_args` clones
-    // the arguments — an oversized write is refused without ever cloning its
-    // content (no side effect, no memory blowup).
-    let content_bytes = arguments
-        .get("content")
-        .and_then(Value::as_str)
-        .map(str::len)
-        .unwrap_or(0);
+    // Policy ceiling, checked on BORROWED fields BEFORE `parse_args` clones the
+    // arguments — an oversized write is refused without ever cloning its content.
+    let path = arg_str(arguments, "path")?;
+    let content_bytes = arg_str(arguments, "content")?.len();
     if content_bytes > max_write_bytes {
-        let path = arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or("<unknown>");
         return Ok(FileToolOutcome::failure(
             format!(
                 "refused to write `{path}`: content is {content_bytes} bytes, over the {max_write_bytes}-byte write limit"
@@ -1350,6 +1358,28 @@ fn arg_str<'a>(arguments: &'a Value, field: &str) -> Result<&'a str, FileToolErr
         .get(field)
         .and_then(Value::as_str)
         .ok_or_else(|| FileToolError::InvalidArguments(format!("missing or non-string `{field}`")))
+}
+
+fn optional_bool(arguments: &Value, field: &str) -> Result<(), FileToolError> {
+    match arguments.get(field) {
+        Some(value) if !value.is_boolean() => Err(FileToolError::InvalidArguments(format!(
+            "`{field}` must be a boolean"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn optional_string_any(arguments: &Value, fields: &[&str]) -> Result<(), FileToolError> {
+    for field in fields {
+        if let Some(value) = arguments.get(*field) {
+            if !value.is_string() {
+                return Err(FileToolError::InvalidArguments(format!(
+                    "`{field}` must be a string"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The full set of paths a patch references (sources and move destinations).
@@ -2950,5 +2980,26 @@ mod tests {
         assert_eq!(capability.action, ToolPermissionAction::Ask);
         assert_eq!(capability.touched_paths, vec!["out.txt".to_string()]);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_write_shallow_rejects_malformed_without_full_parse() {
+        let missing_content =
+            validate_args_shallow(FileTool::Write, &json!({ "path": "out.txt" }))
+                .expect_err("missing content must fail before approval");
+        assert!(
+            missing_content.to_string().contains("content"),
+            "got: {missing_content}"
+        );
+
+        let wrong_optional_type = validate_args_shallow(
+            FileTool::Write,
+            &json!({ "path": "out.txt", "content": "", "overwrite": "yes" }),
+        )
+        .expect_err("wrong optional type must fail before approval");
+        assert!(
+            wrong_optional_type.to_string().contains("overwrite"),
+            "got: {wrong_optional_type}"
+        );
     }
 }
