@@ -13,12 +13,12 @@ use mothership_core::{
     check_write_file_content_precondition, classify_file_tool, file_tool_preview_diff,
     run_apply_patch_tool, run_edit_file_tool, run_list_files_tool, run_read_file_tool,
     run_search_text_tool, run_write_file_tool_with_limit_and_observation,
-    DEFAULT_MAX_WRITE_FILE_BYTES, tool_batch_plan, ChatCancellationToken, FileTool, FileToolOutcome,
-    FileToolSpill, LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResult, MothershipError,
-    PendingToolApprovalGate, Result, SpawnedToolProcess, StdFileSystem, ToolApprovalDecision,
-    ToolArtifact, ToolBatchPlan, ToolCallContext, ToolCancellationToken, ToolCommand,
-    ToolExecutionEvent,
-    ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest,
+    validate_file_tool_args_shallow, DEFAULT_MAX_WRITE_FILE_BYTES, tool_batch_plan,
+    ChatCancellationToken, FileTool, FileToolOutcome, FileToolSpill, LlmToolCallHandler,
+    LlmToolCallRequest, LlmToolCallResult, MothershipError, ApprovalPreview, BackendOutcome,
+    PendingToolApprovalGate, Result, SpawnedToolProcess, StdFileSystem, ToolArtifact, ToolBackend,
+    ToolBatchPlan, ToolCallContext, ToolCancellationToken, ToolCapability, ToolCommand, ToolDecision,
+    ToolOrchestrator, ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest,
     ToolExecutionResult, ToolExecutionStatus, ToolExecutor, ToolKind, ToolOutputPolicy,
     ToolOutputStore, ToolPermissionAction, ToolProcessExit, ToolProcessSandbox, ToolProcessSpec,
     ToolSupervisor, Workspace, MAX_TOOL_EVENT_BYTES,
@@ -283,7 +283,9 @@ impl SidecarLlmToolHandler {
         let result = if kind.is_process() {
             self.command_executor.execute(ctx)
         } else {
-            self.file_executor.execute(ctx)
+            // FileToolExecutor now implements both ToolExecutor (this dispatcher
+            // seam) and ToolBackend (the orchestrator seam); name the trait.
+            ToolExecutor::execute(&*self.file_executor, ctx)
         };
 
         finished.store(true, Ordering::SeqCst);
@@ -433,6 +435,242 @@ impl ToolExecutor for FileToolExecutor {
     }
 }
 
+/// The typed file/search backend for the unified [`ToolOrchestrator`]. Splits the
+/// former hand-rolled lifecycle into the orchestrator's phases: classify (intent
+/// + touched paths), preflight (shallow arg validation), decide (path policy +
+/// the write-observation precondition, surfaced as a typed `Reject`), preview
+/// (approval diff), and execute (the pure handler + bounding/spill + read
+/// observation recording). The orchestrator owns all event emission.
+impl ToolBackend for FileToolExecutor {
+    fn classify(&self, ctx: &ToolCallContext<'_>) -> Result<ToolCapability> {
+        let (tool, workspace) = self.tool_and_workspace(ctx)?;
+        let capability = classify_file_tool(tool, ctx.arguments, &workspace)
+            .map_err(|error| MothershipError::InvalidRequest(error.to_string()))?;
+        Ok(ToolCapability {
+            summary: capability.summary,
+            touched_paths: capability.touched_paths,
+            // File/search tools need no resource lease.
+            resource_request: None,
+        })
+    }
+
+    fn preflight(&self, ctx: &ToolCallContext<'_>) -> Result<()> {
+        let Some(tool) = ctx.kind.file_tool() else {
+            return Ok(());
+        };
+        validate_file_tool_args_shallow(tool, ctx.arguments)
+            .map_err(|error| MothershipError::InvalidRequest(error.to_string()))
+    }
+
+    fn decide(&self, ctx: &ToolCallContext<'_>, _capability: &ToolCapability) -> ToolDecision {
+        let (tool, workspace) = match self.tool_and_workspace(ctx) {
+            Ok(value) => value,
+            Err(error) => {
+                return ToolDecision::Deny {
+                    reason: error.to_string(),
+                }
+            }
+        };
+        let capability = match classify_file_tool(tool, ctx.arguments, &workspace) {
+            Ok(capability) => capability,
+            Err(error) => {
+                return ToolDecision::Deny {
+                    reason: error.to_string(),
+                }
+            }
+        };
+        if capability.action == ToolPermissionAction::Deny {
+            return ToolDecision::Deny {
+                reason: capability.summary,
+            };
+        }
+
+        // Write-observation precondition: refuse a blind overwrite BEFORE approval,
+        // carrying the typed failure payload via a Reject.
+        if tool == FileTool::Write {
+            let run_id = ctx.run_id.map(str::to_string);
+            let observed = self.observed_sha_for_write(ctx.arguments, &workspace, &run_id);
+            match check_write_file_content_precondition(
+                ctx.arguments,
+                &workspace,
+                &self.file_system,
+                observed.as_deref(),
+            ) {
+                Ok(Some(failure)) => {
+                    return ToolDecision::Reject(Box::new(file_failure_outcome(
+                        failure,
+                        ctx.tool_call_id,
+                        Vec::new(),
+                    )));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let mut outcome = bare_failure_outcome(ctx.tool_call_id, error.to_string());
+                    outcome.touched_paths = capability.touched_paths;
+                    return ToolDecision::Reject(Box::new(outcome));
+                }
+            }
+        }
+
+        match capability.action {
+            ToolPermissionAction::Ask => ToolDecision::Ask {
+                reason: capability.summary,
+            },
+            ToolPermissionAction::Allow => ToolDecision::Allow,
+            ToolPermissionAction::Deny => unreachable!("deny handled above"),
+        }
+    }
+
+    fn preview(&self, ctx: &ToolCallContext<'_>, _capability: &ToolCapability) -> ApprovalPreview {
+        let Ok((tool, workspace)) = self.tool_and_workspace(ctx) else {
+            return ApprovalPreview::default();
+        };
+        let Ok(capability) = classify_file_tool(tool, ctx.arguments, &workspace) else {
+            return ApprovalPreview::default();
+        };
+        let (message, artifacts) =
+            self.build_preview_parts(tool, ctx.arguments, &workspace, &capability.summary);
+        ApprovalPreview { message, artifacts }
+    }
+
+    fn execute(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        _sink: &Arc<dyn ToolExecutionEventSink>,
+    ) -> Result<BackendOutcome> {
+        let (tool, workspace) = self.tool_and_workspace(ctx)?;
+        let tool_call_id = ctx.tool_call_id;
+        let run_id = ctx.run_id.map(str::to_string);
+
+        let observed_write_sha = if tool == FileTool::Write {
+            self.observed_sha_for_write(ctx.arguments, &workspace, &run_id)
+        } else {
+            None
+        };
+
+        let spill = self.output_store.as_ref().map(|store| AsyncOutputStoreSpill {
+            store: Arc::clone(store),
+            runtime: Arc::clone(&self.runtime),
+        });
+        let spill_ref = spill.as_ref().map(|spill| spill as &dyn FileToolSpill);
+        let outcome = match tool {
+            FileTool::Read => run_read_file_tool(
+                ctx.arguments,
+                &workspace,
+                &self.file_system,
+                tool_call_id,
+                spill_ref,
+            ),
+            FileTool::Write => run_write_file_tool_with_limit_and_observation(
+                ctx.arguments,
+                &workspace,
+                &self.file_system,
+                self.max_write_bytes,
+                observed_write_sha.as_deref(),
+            ),
+            FileTool::Edit => run_edit_file_tool(ctx.arguments, &workspace, &self.file_system),
+            FileTool::ApplyPatch => {
+                run_apply_patch_tool(ctx.arguments, &workspace, &self.file_system)
+            }
+            FileTool::ListFiles => {
+                run_list_files_tool(ctx.arguments, &workspace, tool_call_id, spill_ref)
+            }
+            FileTool::SearchText => run_search_text_tool(
+                ctx.arguments,
+                &workspace,
+                &self.file_system,
+                tool_call_id,
+                spill_ref,
+            ),
+        };
+        let outcome = outcome.map_err(|error| MothershipError::Runtime(error.to_string()))?;
+        self.record_read_observation(tool, &outcome, &workspace, &run_id);
+
+        // Bound the event/DB payload (the full diff spills to a logRef) and shape
+        // the terminal outcome the orchestrator will emit.
+        let status = if outcome.ok {
+            ToolExecutionStatus::Completed
+        } else {
+            ToolExecutionStatus::Failed
+        };
+        let model_text = truncate_for_model(file_outcome_text(&outcome));
+        let bounded = bound_event_payload(&outcome, tool_call_id, spill_ref);
+        let mut artifacts = Vec::new();
+        if let Some(diff_preview) = bounded.diff.clone() {
+            let full_len = outcome
+                .diff
+                .as_deref()
+                .map(str::len)
+                .unwrap_or(diff_preview.len());
+            artifacts.push(ToolArtifact {
+                artifact_id: "diff".to_string(),
+                kind: "diff".to_string(),
+                content_type: "text/x-diff".to_string(),
+                preview: diff_preview,
+                log_ref: bounded.log_ref.clone(),
+                size_bytes: full_len as u64,
+                sha256: None,
+                truncated: bounded.truncated,
+            });
+        }
+        let mut result =
+            synthesized_result(tool_call_id, status, bounded.result_text, bounded.diff.clone());
+        result.log_ref = bounded.log_ref;
+        result.truncated_for_display = bounded.truncated;
+
+        Ok(BackendOutcome {
+            status,
+            result,
+            model_text,
+            payload: Some(outcome.data.clone()),
+            touched_paths: touched_paths_from_data(&outcome.data),
+            artifacts,
+        })
+    }
+}
+
+/// Build a terminal [`BackendOutcome`] from a file handler's failure outcome
+/// (carrying its typed payload), for a pre-approval reject.
+fn file_failure_outcome(
+    outcome: FileToolOutcome,
+    tool_call_id: &str,
+    extra_touched: Vec<String>,
+) -> BackendOutcome {
+    let message = file_outcome_text(&outcome);
+    let mut touched_paths = touched_paths_from_data(&outcome.data);
+    touched_paths.extend(extra_touched);
+    BackendOutcome {
+        status: ToolExecutionStatus::Failed,
+        result: synthesized_result(
+            tool_call_id,
+            ToolExecutionStatus::Failed,
+            String::new(),
+            Some(message.clone()),
+        ),
+        model_text: message,
+        payload: Some(outcome.data.clone()),
+        touched_paths,
+        artifacts: Vec::new(),
+    }
+}
+
+/// A bare failed [`BackendOutcome`] carrying only a message (no typed payload).
+fn bare_failure_outcome(tool_call_id: &str, message: String) -> BackendOutcome {
+    BackendOutcome {
+        status: ToolExecutionStatus::Failed,
+        result: synthesized_result(
+            tool_call_id,
+            ToolExecutionStatus::Failed,
+            String::new(),
+            Some(message.clone()),
+        ),
+        model_text: message,
+        payload: None,
+        touched_paths: Vec::new(),
+        artifacts: Vec::new(),
+    }
+}
+
 impl FileToolExecutor {
     fn observation_key_for_path(
         &self,
@@ -491,346 +729,56 @@ impl FileToolExecutor {
         observations.insert(key, sha256.to_string());
     }
 
+    /// Resolve the file tool kind and the project workspace for this call. The
+    /// workspace is rebuilt from the active project's root (the same source the
+    /// dispatcher used); a missing project or unusable root surfaces as
+    /// `InvalidRequest`.
+    fn tool_and_workspace(&self, ctx: &ToolCallContext<'_>) -> Result<(FileTool, Workspace)> {
+        let tool = ctx.kind.file_tool().ok_or_else(|| {
+            MothershipError::InvalidRequest(format!("not a file tool: {}", ctx.tool_name))
+        })?;
+        let project = self.project.as_ref().ok_or_else(|| {
+            MothershipError::InvalidRequest(
+                "file tools require an active project; none is associated with this chat"
+                    .to_string(),
+            )
+        })?;
+        let workspace = Workspace::new(&project.root).map_err(|error| {
+            MothershipError::InvalidRequest(format!("project root is unavailable: {error}"))
+        })?;
+        Ok((tool, workspace))
+    }
+
+    /// Thin adapter onto the unified [`ToolOrchestrator`]: build the call context
+    /// and drive the shared lifecycle (queued -> classify -> preflight ->
+    /// policy/approval -> started -> execute -> terminal) with `self` acting as the
+    /// file [`ToolBackend`]. The orchestrator owns every event emission and the
+    /// approval block; this method only shapes the context.
     #[allow(clippy::too_many_arguments)]
     fn run_file_tool_inner(
         &self,
         tool: FileTool,
         arguments: &Value,
-        workspace: &Workspace,
+        _workspace: &Workspace,
         tool_call_id: &str,
         run_id: &Option<String>,
         project_id: &Option<String>,
         cancellation: &ToolCancellationToken,
         chat_cancellation: &ChatCancellationToken,
     ) -> LlmToolCallResult {
-        // Classify capability (intent + touched paths + allow/ask/deny).
-        let capability = match classify_file_tool(tool, arguments, workspace) {
-            Ok(capability) => capability,
-            Err(error) => {
-                return LlmToolCallResult {
-                    ok: false,
-                    content: error.to_string(),
-                };
-            }
-        };
-
-        if capability.action == ToolPermissionAction::Deny {
-            let result = synthesized_result(
-                tool_call_id,
-                ToolExecutionStatus::PermissionDenied,
-                String::new(),
-                Some(capability.summary.clone()),
-            );
-            self.emit_file_event(
-                tool,
-                tool_call_id,
-                run_id,
-                project_id,
-                ToolExecutionEventKind::PermissionDenied,
-                Some(capability.summary.clone()),
-                Some(result),
-                TypedEventExtras::default(),
-            );
-            return LlmToolCallResult {
-                ok: false,
-                content: capability.summary,
-            };
-        }
-
-        let observed_write_sha = if tool == FileTool::Write {
-            let observed_sha = self.observed_sha_for_write(arguments, workspace, run_id);
-            match check_write_file_content_precondition(
-                arguments,
-                workspace,
-                &self.file_system,
-                observed_sha.as_deref(),
-            ) {
-                Ok(Some(outcome)) => {
-                    let message = file_outcome_text(&outcome);
-                    let result = synthesized_result(
-                        tool_call_id,
-                        ToolExecutionStatus::Failed,
-                        String::new(),
-                        Some(message.clone()),
-                    );
-                    self.emit_file_event(
-                        tool,
-                        tool_call_id,
-                        run_id,
-                        project_id,
-                        ToolExecutionEventKind::Failed,
-                        Some(message.clone()),
-                        Some(result),
-                        TypedEventExtras {
-                            payload: Some(outcome.data.clone()),
-                            touched_paths: touched_paths_from_data(&outcome.data),
-                            ..TypedEventExtras::default()
-                        },
-                    );
-                    return LlmToolCallResult {
-                        ok: false,
-                        content: message,
-                    };
-                }
-                Ok(None) => observed_sha,
-                Err(error) => {
-                    let message = error.to_string();
-                    let result = synthesized_result(
-                        tool_call_id,
-                        ToolExecutionStatus::Failed,
-                        String::new(),
-                        Some(message.clone()),
-                    );
-                    self.emit_file_event(
-                        tool,
-                        tool_call_id,
-                        run_id,
-                        project_id,
-                        ToolExecutionEventKind::Failed,
-                        Some(message.clone()),
-                        Some(result),
-                        TypedEventExtras {
-                            touched_paths: capability.touched_paths.clone(),
-                            ..TypedEventExtras::default()
-                        },
-                    );
-                    return LlmToolCallResult {
-                        ok: false,
-                        content: message,
-                    };
-                }
-            }
-        } else {
-            None
-        };
-
-        match capability.action {
-            ToolPermissionAction::Ask => {
-                // Surface the approval request (with a diff/summary preview) and
-                // block on the same gate the UI drives via `decide`. The diff is
-                // carried both as the message (fallback) and as a typed
-                // `diff-preview` artifact (the semantic source for the approval
-                // card / DB / remote).
-                let (preview, preview_artifacts) =
-                    self.build_preview_parts(tool, arguments, workspace, &capability.summary);
-                self.emit_file_event(
-                    tool,
-                    tool_call_id,
-                    run_id,
-                    project_id,
-                    ToolExecutionEventKind::PermissionRequested,
-                    Some(preview),
-                    None,
-                    TypedEventExtras {
-                        payload: None,
-                        touched_paths: Vec::new(),
-                        artifacts: preview_artifacts,
-                    },
-                );
-                let decision = self
-                    .runtime
-                    .block_on(self.approvals.request_decision(tool_call_id, cancellation));
-                if let ToolApprovalDecision::Denied { reason } = decision {
-                    let result = synthesized_result(
-                        tool_call_id,
-                        ToolExecutionStatus::PermissionDenied,
-                        String::new(),
-                        Some(reason.clone()),
-                    );
-                    self.emit_file_event(
-                        tool,
-                        tool_call_id,
-                        run_id,
-                        project_id,
-                        ToolExecutionEventKind::PermissionDenied,
-                        Some(reason.clone()),
-                        Some(result),
-                        TypedEventExtras::default(),
-                    );
-                    return LlmToolCallResult {
-                        ok: false,
-                        content: format!("tool call denied: {reason}"),
-                    };
-                }
-            }
-            ToolPermissionAction::Allow => {}
-            ToolPermissionAction::Deny => unreachable!("deny handled before preflight"),
-        }
-
-        // A chat cancelled during approval (or before execution) is reported as
-        // a cancellation rather than running the side effect.
-        if cancellation.is_cancelled() || chat_cancellation.is_cancelled() {
-            let result = synthesized_result(
-                tool_call_id,
-                ToolExecutionStatus::Cancelled,
-                String::new(),
-                Some("tool call was cancelled".to_string()),
-            );
-            self.emit_file_event(
-                tool,
-                tool_call_id,
-                run_id,
-                project_id,
-                ToolExecutionEventKind::Cancelled,
-                Some("tool call was cancelled".to_string()),
-                Some(result),
-                TypedEventExtras::default(),
-            );
-            return LlmToolCallResult {
-                ok: false,
-                content: "tool call was cancelled".to_string(),
-            };
-        }
-
-        self.emit_file_event(
-            tool,
+        let kind = ToolKind::from(tool);
+        let ctx = ToolCallContext {
             tool_call_id,
-            run_id,
-            project_id,
-            ToolExecutionEventKind::Started,
-            Some(capability.summary.clone()),
-            None,
-            TypedEventExtras::default(),
-        );
-
-        // Execute the pure handler through the injected filesystem port.
-        let spill = self.output_store.as_ref().map(|store| AsyncOutputStoreSpill {
-            store: Arc::clone(store),
-            runtime: Arc::clone(&self.runtime),
-        });
-        let outcome = match tool {
-            FileTool::Read => run_read_file_tool(
-                arguments,
-                workspace,
-                &self.file_system,
-                tool_call_id,
-                spill.as_ref().map(|spill| spill as &dyn FileToolSpill),
-            ),
-            FileTool::Write => run_write_file_tool_with_limit_and_observation(
-                arguments,
-                workspace,
-                &self.file_system,
-                self.max_write_bytes,
-                observed_write_sha.as_deref(),
-            ),
-            FileTool::Edit => run_edit_file_tool(arguments, workspace, &self.file_system),
-            FileTool::ApplyPatch => run_apply_patch_tool(arguments, workspace, &self.file_system),
-            // Read-only search tools: spill large results like read_file does.
-            FileTool::ListFiles => run_list_files_tool(
-                arguments,
-                workspace,
-                tool_call_id,
-                spill.as_ref().map(|spill| spill as &dyn FileToolSpill),
-            ),
-            FileTool::SearchText => run_search_text_tool(
-                arguments,
-                workspace,
-                &self.file_system,
-                tool_call_id,
-                spill.as_ref().map(|spill| spill as &dyn FileToolSpill),
-            ),
+            run_id: run_id.as_deref(),
+            tool_name: kind.as_str(),
+            kind,
+            arguments,
+            cancellation,
+            chat_cancellation,
         };
-
-        match outcome {
-            Ok(outcome) => {
-                self.record_read_observation(tool, &outcome, workspace, run_id);
-
-                let status = if outcome.ok {
-                    ToolExecutionStatus::Completed
-                } else {
-                    ToolExecutionStatus::Failed
-                };
-                // The model gets the full (160 KiB-capped) text. The event/DB
-                // payload is bounded separately to MAX_TOOL_EVENT_BYTES so a huge
-                // overwrite's diff cannot push megabytes into persistence/UI; the
-                // full diff is spilled to the output store (when available) and a
-                // logRef is attached to the stored result instead.
-                let model_response = truncate_for_model(file_outcome_text(&outcome));
-                let bounded = bound_event_payload(
-                    &outcome,
-                    tool_call_id,
-                    spill.as_ref().map(|spill| spill as &dyn FileToolSpill),
-                );
-
-                // Typed extras for storage + UI: the semantic payload (the
-                // handler's own `data`), the paths touched, and a diff artifact
-                // (bounded preview + logRef to the full diff) when there is one.
-                let mut artifacts = Vec::new();
-                if let Some(diff_preview) = bounded.diff.clone() {
-                    let full_len = outcome
-                        .diff
-                        .as_deref()
-                        .map(str::len)
-                        .unwrap_or(diff_preview.len());
-                    artifacts.push(ToolArtifact {
-                        artifact_id: "diff".to_string(),
-                        kind: "diff".to_string(),
-                        content_type: "text/x-diff".to_string(),
-                        preview: diff_preview,
-                        log_ref: bounded.log_ref.clone(),
-                        size_bytes: full_len as u64,
-                        sha256: None,
-                        truncated: bounded.truncated,
-                    });
-                }
-                let extras = TypedEventExtras {
-                    payload: Some(outcome.data.clone()),
-                    touched_paths: touched_paths_from_data(&outcome.data),
-                    artifacts,
-                };
-
-                let mut result = synthesized_result(
-                    tool_call_id,
-                    status,
-                    bounded.result_text,
-                    bounded.diff.clone(),
-                );
-                result.log_ref = bounded.log_ref;
-                result.truncated_for_display = bounded.truncated;
-                let kind = if outcome.ok {
-                    ToolExecutionEventKind::Completed
-                } else {
-                    ToolExecutionEventKind::Failed
-                };
-                self.emit_file_event(
-                    tool,
-                    tool_call_id,
-                    run_id,
-                    project_id,
-                    kind,
-                    bounded.diff,
-                    Some(result),
-                    extras,
-                );
-                LlmToolCallResult {
-                    ok: outcome.ok,
-                    content: model_response,
-                }
-            }
-            Err(error) => {
-                let message = error.to_string();
-                let result = synthesized_result(
-                    tool_call_id,
-                    ToolExecutionStatus::Failed,
-                    String::new(),
-                    Some(message.clone()),
-                );
-                self.emit_file_event(
-                    tool,
-                    tool_call_id,
-                    run_id,
-                    project_id,
-                    ToolExecutionEventKind::Failed,
-                    Some(message.clone()),
-                    Some(result),
-                    TypedEventExtras::default(),
-                );
-                LlmToolCallResult {
-                    ok: false,
-                    content: message,
-                }
-            }
-        }
+        let orchestrator =
+            ToolOrchestrator::new(Arc::clone(&self.approvals), Arc::clone(&self.runtime));
+        orchestrator.run(ctx, project_id.as_deref(), self, &self.sink)
     }
 
     /// Build the approval-card message: the capability summary, with a
@@ -879,48 +827,6 @@ impl FileToolExecutor {
             _ => (summary.to_string(), Vec::new()),
         }
     }
-
-    #[allow(clippy::too_many_arguments)]
-    fn emit_file_event(
-        &self,
-        tool: FileTool,
-        tool_call_id: &str,
-        run_id: &Option<String>,
-        project_id: &Option<String>,
-        kind: ToolExecutionEventKind,
-        message: Option<String>,
-        result: Option<ToolExecutionResult>,
-        extras: TypedEventExtras,
-    ) {
-        self.sink.emit(ToolExecutionEvent {
-            tool_call_id: tool_call_id.to_string(),
-            run_id: run_id.clone(),
-            project_id: project_id.clone(),
-            command: None,
-            kind,
-            stream: None,
-            chunk: None,
-            message,
-            result,
-            // Typed storage + UI routing: the kind is always known here, and the
-            // semantic payload / touched paths / artifacts are supplied by the
-            // terminal emit (default-empty for lifecycle transitions).
-            tool_kind: Some(ToolKind::from(tool)),
-            payload: extras.payload,
-            touched_paths: extras.touched_paths,
-            artifacts: extras.artifacts,
-        });
-    }
-}
-
-/// The typed extras a file-tool event may carry beyond the lifecycle basics:
-/// the semantic payload, the paths it touched, and any durable artifacts. Empty
-/// for lifecycle transitions; populated on the terminal completed/failed event.
-#[derive(Default)]
-struct TypedEventExtras {
-    payload: Option<Value>,
-    touched_paths: Vec<String>,
-    artifacts: Vec<ToolArtifact>,
 }
 
 /// Extract the workspace-relative paths a file-tool outcome touched, from its
@@ -1358,6 +1264,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    // Event/approval types used only by these tests (the non-test lifecycle now
+    // emits exclusively through the orchestrator, so the parent no longer needs
+    // them).
+    use mothership_core::{ToolApprovalDecision, ToolExecutionEvent, ToolExecutionEventKind};
 
     /// A [`FileToolSpill`] that records what it was asked to spill and returns a
     /// fixed reference, so tests can assert the full (untruncated) diff was sent
@@ -1523,17 +1433,18 @@ mod tests {
         assert!(!result.ok);
         assert!(result.content.contains("content"), "got: {}", result.content);
         let events = sink.events.lock().unwrap();
-        assert_eq!(events.len(), 1, "expected one terminal event: {events:?}");
-        assert_eq!(events[0].kind, ToolExecutionEventKind::Failed);
+        // The orchestrator emits Queued, then the preflight-failure terminal.
+        let terminal = events.last().expect("a terminal event");
+        assert_eq!(terminal.kind, ToolExecutionEventKind::Failed);
         assert_eq!(
-            events[0].result.as_ref().map(|result| result.status),
+            terminal.result.as_ref().map(|result| result.status),
             Some(ToolExecutionStatus::Failed)
         );
         assert!(
-            events
-                .iter()
-                .all(|event| event.kind != ToolExecutionEventKind::PermissionRequested),
-            "malformed write must not ask for approval"
+            events.iter().all(|event| event.kind
+                != ToolExecutionEventKind::PermissionRequested
+                && event.kind != ToolExecutionEventKind::Started),
+            "malformed write must not ask for approval or start execution"
         );
     }
 
@@ -1568,10 +1479,12 @@ mod tests {
         );
         assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"old\n");
         let events = sink.events.lock().unwrap();
-        assert_eq!(events.len(), 1, "expected one terminal event: {events:?}");
-        assert_eq!(events[0].kind, ToolExecutionEventKind::Failed);
+        // The orchestrator emits Queued, then the precondition-failure terminal
+        // (no approval, no start).
+        let terminal = events.last().expect("a terminal event");
+        assert_eq!(terminal.kind, ToolExecutionEventKind::Failed);
         assert_eq!(
-            events[0].payload.as_ref().and_then(|payload| payload.get("status")),
+            terminal.payload.as_ref().and_then(|payload| payload.get("status")),
             Some(&json!("precondition_required"))
         );
         assert!(
