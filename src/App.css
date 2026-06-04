@@ -1445,44 +1445,57 @@ kbd,
   padding: 2px 8px 10px 30px;
 }
 
-.inline-tool-call__label {
-  color: #8d9bab;
-  font-size: 12px;
-  font-weight: 750;
-}
-
-.inline-tool-call__command,
-.inline-tool-call__output {
+/* run_command fallback: a terminal command line. The "$" prompt grounds the
+   command (the kind icon lives up in the row, not here). */
+.inline-tool-call__command {
+  position: relative;
   margin: 0;
-  overflow: hidden;
-  border: 1px solid #1d2b3b;
+  padding: 8px 11px 8px 26px;
+  border: 1px solid #182838;
   border-radius: 7px;
-  background: #060d15;
-  color: #c4d0dd;
+  background: linear-gradient(180deg, #0b1622, #091420);
+  color: #8fe9b2;
   font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
-  font-size: 12px;
-  line-height: 1.45;
+  font-size: 12.5px;
+  line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
 }
 
-.inline-tool-call__command {
-  padding: 8px 10px;
-  color: #8fe9b2;
+.inline-tool-call__command::before {
+  content: "$";
+  position: absolute;
+  left: 11px;
+  color: #4d6a86;
+  font-weight: 700;
 }
 
+/* Output block — the same clean code block the semantic card uses. */
 .inline-tool-call__output {
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid #16222f;
+  border-radius: 7px;
+  padding: 9px 11px;
+  background: #050b12;
+  color: #b7c5d4;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.55;
   overflow-anchor: none;
   overscroll-behavior: contain;
-  padding: 9px;
-  scrollbar-color: #33465b transparent;
+  scrollbar-color: #2c3e52 transparent;
   scrollbar-width: thin;
+  tab-size: 4;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .inline-tool-call__output--scrollable {
-  --tool-output-lines: 10;
+  --tool-output-lines: 14;
 
-  max-height: calc((1em * 1.45 * var(--tool-output-lines)) + 18px);
+  max-height: calc((1em * 1.55 * var(--tool-output-lines)) + 20px);
   overflow: auto;
 }
 
@@ -3076,6 +3089,15 @@ kbd,
 
 .tool-card__path {
   color: #cbd6e3;
+}
+
+.tool-card__path-dir {
+  color: #6f8298;
+}
+
+.tool-card__path-name {
+  color: #e2edf7;
+  font-weight: 650;
 }
 
 .tool-card__pattern {

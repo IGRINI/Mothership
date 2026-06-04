@@ -145,10 +145,22 @@ function statusTone(status: string | undefined): string {
 }
 
 function PathLabel(props: { path?: string }) {
+  const slash = () => (props.path ?? "").lastIndexOf("/");
+  const dir = () => {
+    const at = slash();
+    return at >= 0 ? (props.path ?? "").slice(0, at + 1) : "";
+  };
+  const name = () => {
+    const at = slash();
+    return at >= 0 ? (props.path ?? "").slice(at + 1) : props.path ?? "";
+  };
   return (
     <Show when={props.path}>
       <code class="tool-card__path" title={props.path}>
-        {props.path}
+        <Show when={dir()}>
+          <span class="tool-card__path-dir">{dir()}</span>
+        </Show>
+        <span class="tool-card__path-name">{name()}</span>
       </code>
     </Show>
   );

@@ -2667,9 +2667,6 @@ function InlineToolCall(props: {
             fallback={
               <>
                 <Show when={command()}>
-                  <span class="inline-tool-call__label">
-                    {toolCommandLabel(props.tool.command)}
-                  </span>
                   <pre class="inline-tool-call__command">{command()}</pre>
                 </Show>
 
@@ -3954,24 +3951,6 @@ function formatToolHeadline(tool: ToolExecutionView) {
     default:
       return "Used tool";
   }
-}
-
-function toolCommandLabel(command?: ToolCommand | null) {
-  if (!command) {
-    return "Command";
-  }
-
-  return isPowerShellCommand(command.program) ? "PowerShell" : "Command";
-}
-
-function isPowerShellCommand(program: string) {
-  const normalized = program.toLowerCase();
-  return (
-    normalized === "powershell" ||
-    normalized === "powershell.exe" ||
-    normalized === "pwsh" ||
-    normalized === "pwsh.exe"
-  );
 }
 
 function formatToolOutput(tool: ToolExecutionView) {
