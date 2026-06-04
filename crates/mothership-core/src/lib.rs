@@ -65,7 +65,7 @@ pub use tools::{
     NoopToolExecutionEventSink, PathError, PatternCredentialGuard, PendingToolApprovalGate,
     RedactingOutputStore, ResourceLease, ResourceRequest, SpawnedToolProcess,
     StaticToolApprovalGate, StdFileSystem, ToolApprovalAnswer, ToolApprovalDecision,
-    ToolApprovalGate, ToolArtifact, ToolBackend, ToolBatchPlan, ToolCallContext,
+    ToolApprovalGate, ToolArtifact, ToolArtifactRange, ToolBackend, ToolBatchPlan, ToolCallContext,
     ToolCancellationToken, ToolCapability, ToolCommand, ToolConcurrency, ToolDecision,
     ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
     ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRecord, ToolExecutionRegistry,

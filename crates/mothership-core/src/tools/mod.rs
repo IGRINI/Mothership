@@ -65,7 +65,8 @@ pub use search::{classify_list_files, classify_search_text, list_files, search_t
 pub use supervisor::ToolSupervisor;
 pub use types::{
     run_command_typed_payload, NoopToolExecutionEventSink, ToolApprovalAnswer, ToolArtifact,
-    ToolCommand, ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
+    ToolArtifactRange, ToolCommand, ToolExecutionAccepted, ToolExecutionCancellationResult,
+    ToolExecutionEvent,
     ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRecord, ToolExecutionRequest,
     ToolExecutionResult, ToolExecutionStatus, ToolOutputPolicy, ToolOutputStream,
 };

@@ -161,6 +161,32 @@ pub struct ToolArtifact {
     pub truncated: bool,
 }
 
+/// A newline-aligned slice of a tool's persisted output artifact, served lazily
+/// to the UI. Lets the UI page the full blob on demand without ever pulling the
+/// whole thing into memory or history — and always from the *snapshot* the tool
+/// produced, never the (possibly changed) live file.
+///
+/// Offsets are byte positions in the underlying blob **file** (so a bounded read
+/// can `seek` straight to them); `content` is that window with the writer's
+/// stream-header lines stripped. Callers page by echoing `next_offset` back as
+/// the next `offset` — they never compute offsets in the stripped space.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolArtifactRange {
+    /// The decoded text for the requested range, with stream headers stripped.
+    pub content: String,
+    /// Byte offset into the blob FILE where this slice starts (a line boundary).
+    pub offset: u64,
+    /// Blob-file byte offset to pass back as the next `offset` to continue
+    /// paging, or `None` at EOF.
+    pub next_offset: Option<u64>,
+    /// Total size of the blob FILE in bytes (an upper bound on visible content;
+    /// it still includes the writer's stream-header bytes).
+    pub total_bytes: u64,
+    /// True when this slice reaches the end of the artifact.
+    pub eof: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionEvent {

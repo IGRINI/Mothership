@@ -26,8 +26,8 @@ use crate::connectors::{
 use crate::{
     ChatConversation, ChatRunCancellationResult, ChatRunEvent, ChatThreadSummary, ChatUpdatedEvent,
     DashboardSnapshot, MothershipError, ProjectSnapshot, ReasoningConfig, SendChatMessageResult,
-    SidecarStatus, ToolApprovalAnswer, ToolExecutionAccepted, ToolExecutionCancellationResult,
-    ToolExecutionEvent, ToolExecutionRequest,
+    SidecarStatus, ToolApprovalAnswer, ToolArtifactRange, ToolExecutionAccepted,
+    ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionRequest,
 };
 
 /// Bump the major when a change isn't backward compatible. The host refuses a
@@ -139,6 +139,21 @@ pub enum CoreRequest {
     CancelToolExecution {
         tool_call_id: String,
     },
+    /// Lazily read a newline-aligned slice of a tool call's persisted output
+    /// artifact (the snapshot taken at tool-call time), for on-demand UI paging.
+    GetToolArtifactRange {
+        tool_call_id: String,
+        log_ref: String,
+        offset: u64,
+        limit: u64,
+    },
+    /// Resolve a workspace-relative (or absolute) path against a project's root,
+    /// enforcing containment, so the host can open it externally. Returns the
+    /// canonical absolute path or an error if it escapes the workspace.
+    ResolveWorkspacePath {
+        project_id: String,
+        path: String,
+    },
     ConnectorSettings,
     SetSelectedModel {
         provider_id: String,
@@ -199,6 +214,10 @@ pub enum CoreResponse {
     ToolExecutionAccepted(ToolExecutionAccepted),
     ToolApproval(ToolApprovalAnswer),
     ToolExecutionCancellation(ToolExecutionCancellationResult),
+    /// A lazily-read slice of a tool's persisted output artifact.
+    ToolArtifactRange(ToolArtifactRange),
+    /// A canonical, containment-checked absolute path for external opening.
+    ResolvedPath(String),
     ConnectorSettings(ConnectorSettingsSnapshot),
     ProjectSnapshot(ProjectSnapshot),
     SidecarStatus(SidecarStatus),

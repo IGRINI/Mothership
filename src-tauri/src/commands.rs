@@ -12,11 +12,12 @@ use mothership_core::ipc::{CoreRequest, CoreResponse};
 use mothership_core::{
     AdapterSettingPatchValue, ChatConversation, ChatRunCancellationResult, ChatThreadSummary,
     ConnectorSettingsSnapshot, DashboardSnapshot, ProjectSnapshot, ReasoningConfig,
-    SendChatMessageResult, SidecarStatus, ToolApprovalAnswer, ToolExecutionAccepted,
-    ToolExecutionCancellationResult, ToolExecutionRequest,
+    SendChatMessageResult, SidecarStatus, ToolApprovalAnswer, ToolArtifactRange,
+    ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionRequest,
 };
-use tauri::{State, Window};
+use tauri::{AppHandle, State, Window};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
 
 use crate::state::AppState;
 
@@ -307,6 +308,50 @@ pub async fn cancel_tool_execution(
         .request(CoreRequest::CancelToolExecution { tool_call_id })
         .await?;
     expect_variant!(response, CoreResponse::ToolExecutionCancellation)
+}
+
+#[tauri::command]
+pub async fn get_tool_artifact_range(
+    state: State<'_, AppState>,
+    tool_call_id: String,
+    log_ref: String,
+    offset: u64,
+    limit: u64,
+) -> Result<ToolArtifactRange, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::GetToolArtifactRange {
+            tool_call_id,
+            log_ref,
+            offset,
+            limit,
+        })
+        .await?;
+    expect_variant!(response, CoreResponse::ToolArtifactRange)
+}
+
+/// Open a workspace path externally. Core resolves + contains the path against
+/// the owning project's root first; we never hand a raw UI string to the opener.
+#[tauri::command]
+pub async fn open_tool_path(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+    path: String,
+) -> Result<(), String> {
+    let Some(project_id) = project_id else {
+        return Err("cannot open a path without a project".to_string());
+    };
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::ResolveWorkspacePath { project_id, path })
+        .await?;
+    let resolved = expect_variant!(response, CoreResponse::ResolvedPath)?;
+    app.opener()
+        .open_path(resolved, None::<&str>)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

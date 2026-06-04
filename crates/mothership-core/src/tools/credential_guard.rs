@@ -274,6 +274,20 @@ impl ToolOutputStore for RedactingOutputStore {
             stderr: BoundedRedactor::new(Arc::clone(&self.guard)),
         }))
     }
+
+    // Reads pass straight through to the inner store: redaction already happened
+    // on the way to disk, so the persisted blob is safe to range-read as-is.
+    async fn read_range(
+        &self,
+        tool_call_id: &str,
+        log_ref: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<super::types::ToolArtifactRange> {
+        self.inner
+            .read_range(tool_call_id, log_ref, offset, limit)
+            .await
+    }
 }
 
 struct RedactingOutputWriter {

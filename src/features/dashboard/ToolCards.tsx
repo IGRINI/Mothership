@@ -1,34 +1,58 @@
-import { For, JSX, Show } from "solid-js";
+import { For, JSX, Show, createSignal } from "solid-js";
 import {
-  FileDiff,
-  FilePenLine,
   FilePlus,
   FileSearch,
   FileText,
   GitCompare,
   ListTree,
-  Replace,
   Terminal,
 } from "lucide-solid";
 
 import type { ToolArtifact, ToolKind } from "../../shared/api/mothership";
+import { CodeBlock } from "./components/CodeBlock";
+import { DiffBlock } from "./components/DiffBlock";
+import { OutputBlock } from "./components/OutputBlock";
+import { parseNumberedOutput, splitPath, type CodeLineModel } from "./components/code";
+import { highlightCommand } from "./components/highlight";
+import { diffStat, newSideLines } from "./components/diff";
+
+// Opens a workspace path in an external app. Goes through a capability-checked
+// Core/Tauri command — never a raw shell open of UI-supplied data.
+export type OpenPathFn = (path: string) => void;
+
+// Lazily fetches a byte range of a tool's *persisted* output artifact (the
+// snapshot taken at tool-call time), NOT the live file — which may have changed.
+// Keyed by tool_call_id + the artifact's durable logRef.
+export type LoadArtifactRangeFn = (args: {
+  toolCallId: string;
+  logRef: string;
+  offset: number;
+  limit: number;
+}) => Promise<{ content: string; nextOffset: number | null; eof: boolean }>;
+
+// One generous chunk is enough for the overwhelmingly common case (files under
+// a few hundred KB). Larger files load the first chunk and point at "Открыть".
+const FULL_LOAD_LIMIT = 256 * 1024;
 
 // Minimal structural view of a tool execution. Kept loose on purpose so this
 // module does not depend on Dashboard's internal `ToolExecutionView` shape — it
-// only reads the typed-tool fields it knows how to render.
+// only reads the fields it knows how to render.
 export interface ToolCardData {
   kind: string;
+  toolCallId?: string;
   toolKind?: ToolKind;
   payload?: Record<string, unknown> | null;
   touchedPaths?: string[];
   artifacts?: ToolArtifact[];
   message?: string | null;
+  /** Model-facing text (line-numbered read window, command stdout, …). */
+  output?: string;
 }
 
 // --- Defensive payload accessors -------------------------------------------
 // `payload` is `Record<string, unknown>`; never assume a field exists or has a
 // given type. These readers return undefined when the field is absent or the
-// wrong type, so cards can simply omit anything they cannot show.
+// wrong type, so cards simply omit anything they cannot show.
 
 function readString(
   payload: Record<string, unknown> | null | undefined,
@@ -43,9 +67,7 @@ function readNumber(
   key: string,
 ): number | undefined {
   const value = payload?.[key];
-  return typeof value === "number" && Number.isFinite(value)
-    ? value
-    : undefined;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function readBoolean(
@@ -104,9 +126,7 @@ function Chip(props: { label: string; value: JSX.Element }) {
 function StatusPill(props: { status?: string }) {
   return (
     <Show when={props.status}>
-      <span
-        class={`tool-card__pill tool-card__pill--${statusTone(props.status)}`}
-      >
+      <span class={`tool-card__pill tool-card__pill--${statusTone(props.status)}`}>
         {props.status}
       </span>
     </Show>
@@ -145,95 +165,16 @@ function statusTone(status: string | undefined): string {
 }
 
 function PathLabel(props: { path?: string }) {
-  const slash = () => (props.path ?? "").lastIndexOf("/");
-  const dir = () => {
-    const at = slash();
-    return at >= 0 ? (props.path ?? "").slice(0, at + 1) : "";
-  };
-  const name = () => {
-    const at = slash();
-    return at >= 0 ? (props.path ?? "").slice(at + 1) : props.path ?? "";
-  };
+  const parts = () => splitPath(props.path ?? "");
   return (
     <Show when={props.path}>
       <code class="tool-card__path" title={props.path}>
-        <Show when={dir()}>
-          <span class="tool-card__path-dir">{dir()}</span>
+        <Show when={parts().dir}>
+          <span class="tool-card__path-dir">{parts().dir}</span>
         </Show>
-        <span class="tool-card__path-name">{name()}</span>
+        <span class="tool-card__path-name">{parts().name}</span>
       </code>
     </Show>
-  );
-}
-
-// --- Diff rendering ---------------------------------------------------------
-
-interface DiffLine {
-  text: string;
-  tone: "add" | "remove" | "hunk" | "meta" | "context";
-}
-
-function classifyDiffLine(line: string): DiffLine["tone"] {
-  if (line.startsWith("@@")) {
-    return "hunk";
-  }
-  if (line.startsWith("+++") || line.startsWith("---")) {
-    return "meta";
-  }
-  if (line.startsWith("diff ") || line.startsWith("index ")) {
-    return "meta";
-  }
-  if (line.startsWith("+")) {
-    return "add";
-  }
-  if (line.startsWith("-")) {
-    return "remove";
-  }
-  return "context";
-}
-
-function toDiffLines(diff: string): DiffLine[] {
-  return diff.replace(/\r\n/g, "\n").split("\n").map((text) => ({
-    text,
-    tone: classifyDiffLine(text),
-  }));
-}
-
-export function DiffCard(props: {
-  diff: string;
-  truncated?: boolean;
-  logRef?: string | null;
-  sizeBytes?: number;
-}) {
-  const lines = () => toDiffLines(props.diff);
-  return (
-    <div class="tool-diff">
-      <pre class="tool-diff__body">
-        <For each={lines()}>
-          {(line) => (
-            <span class={`tool-diff__line tool-diff__line--${line.tone}`}>
-              {line.text.length > 0 ? line.text : " "}
-            </span>
-          )}
-        </For>
-      </pre>
-      <Show when={props.truncated}>
-        <div class="tool-diff__note">
-          diff truncated
-          <Show when={formatBytes(props.sizeBytes)}>
-            {(size) => <span> — full size {size()}</span>}
-          </Show>
-          <Show when={props.logRef}>
-            {(ref) => (
-              <span>
-                {" "}
-                · full diff at <code>{ref()}</code>
-              </span>
-            )}
-          </Show>
-        </div>
-      </Show>
-    </div>
   );
 }
 
@@ -246,23 +187,38 @@ function findDiffArtifact(
   return artifacts?.find((artifact) => artifact.kind === "diff");
 }
 
+/** Header diff-stat (+N −M and an op badge) for a mutating tool, when it carries
+ *  a diff artifact. Used by the row header in Dashboard's InlineToolCall. */
+export function toolDiffStat(
+  tool: ToolCardData,
+): { add: number; del: number; op?: "M" | "A" | "D" } | undefined {
+  const artifact = findDiffArtifact(tool.artifacts);
+  if (!artifact) {
+    return undefined;
+  }
+  const stat = diffStat(artifact.preview);
+  let op: "M" | "A" | "D" | undefined;
+  if (tool.toolKind === "edit_file") {
+    op = "M";
+  } else if (tool.toolKind === "write_file") {
+    // A brand-new file has no deletions (A); overwriting an existing one does (M).
+    op = stat.del > 0 ? "M" : "A";
+  }
+  return { ...stat, op };
+}
+
 // --- Before-approval preview ------------------------------------------------
 // When a tool is `permission_requested`, the backend packs a human-readable
 // preview into `message`: a summary, then (optionally) a blank line, then a
 // bounded unified diff. Split on the first blank line so the diff portion can
-// be syntax-colored; if there is no diff portion, render the whole thing as a
-// plain preview block.
+// be rendered structurally; otherwise show the whole thing as a plain preview.
 
-function splitApprovalPreview(message: string): {
-  summary: string;
-  diff?: string;
-} {
+function splitApprovalPreview(message: string): { summary: string; diff?: string } {
   const normalized = message.replace(/\r\n/g, "\n");
   const separator = normalized.indexOf("\n\n");
   if (separator === -1) {
     return { summary: normalized.trim() };
   }
-
   const summary = normalized.slice(0, separator).trim();
   const rest = normalized.slice(separator + 2);
   const looksLikeDiff = rest
@@ -274,7 +230,6 @@ function splitApprovalPreview(message: string): {
         line.startsWith("---") ||
         line.startsWith("diff "),
     );
-
   if (!looksLikeDiff) {
     return { summary: normalized.trim() };
   }
@@ -291,7 +246,6 @@ export function ApprovalPreview(props: {
   const previewArtifact = () =>
     props.artifacts?.find((artifact) => artifact.kind === "diff-preview");
   const parts = () => splitApprovalPreview(props.message);
-  const messageTruncated = () => /\[preview truncated/i.test(props.message);
   return (
     <div class="tool-card__approval">
       <div class="tool-card__approval-head">
@@ -310,7 +264,7 @@ export function ApprovalPreview(props: {
                 <Show when={parts().summary}>
                   <p class="tool-card__approval-summary">{parts().summary}</p>
                 </Show>
-                <DiffCard diff={diff()} truncated={messageTruncated()} />
+                <DiffBlock diff={diff()} />
               </>
             )}
           </Show>
@@ -321,12 +275,7 @@ export function ApprovalPreview(props: {
             <Show when={parts().summary}>
               <p class="tool-card__approval-summary">{parts().summary}</p>
             </Show>
-            <DiffCard
-              diff={artifact().preview}
-              truncated={artifact().truncated}
-              sizeBytes={artifact().sizeBytes}
-              logRef={artifact().logRef}
-            />
+            <DiffBlock diff={artifact().preview} />
           </>
         )}
       </Show>
@@ -334,9 +283,22 @@ export function ApprovalPreview(props: {
   );
 }
 
-// --- Per-kind semantic cards ------------------------------------------------
+// --- Per-kind semantic bodies ----------------------------------------------
 
-function RunCommandCard(props: { payload: Record<string, unknown> | null | undefined }) {
+function CommandLine(props: { text: string }) {
+  const tokens = () => highlightCommand(props.text);
+  return (
+    <div class="tool-cmd">
+      <For each={tokens()}>
+        {(token) => <span class={token.cls || undefined}>{token.text}</span>}
+      </For>
+    </div>
+  );
+}
+
+function RunCommandCard(props: {
+  payload: Record<string, unknown> | null | undefined;
+}) {
   const program = () => readString(props.payload, "program");
   const args = () => readStringArray(props.payload, "args") ?? [];
   const exitCode = () => readNumber(props.payload, "exitCode");
@@ -348,10 +310,9 @@ function RunCommandCard(props: { payload: Record<string, unknown> | null | undef
     [program() ?? "", ...args()].join(" ").trim() || "command";
 
   return (
-    <div class="tool-card">
-      <div class="tool-card__head">
-        <Terminal size={14} />
-        <code class="tool-card__cmd">{commandLine()}</code>
+    <div class="tool-body">
+      <div class="tool-body__head">
+        <CommandLine text={commandLine()} />
         <Show when={exitCode() !== undefined}>
           <span
             class={`tool-card__pill tool-card__pill--${
@@ -363,38 +324,41 @@ function RunCommandCard(props: { payload: Record<string, unknown> | null | undef
         </Show>
       </div>
       <Show when={stdout()}>
-        {(text) => <pre class="tool-card__stream">{text()}</pre>}
+        {(text) => <OutputBlock text={text()} />}
       </Show>
       <Show when={stderr()}>
-        {(text) => (
-          <pre class="tool-card__stream tool-card__stream--err">
-            [stderr]
-            {"\n"}
-            {text()}
-          </pre>
-        )}
+        {(text) => <OutputBlock text={text()} tone="err" />}
       </Show>
-      <div class="tool-card__chips">
-        <Show when={truncated()}>
-          <Chip label="output" value="truncated" />
-        </Show>
-        <Show when={logRef()}>
-          {(ref) => <Chip label="log" value={<code>{ref()}</code>} />}
-        </Show>
-      </div>
+      <Show when={truncated() || logRef()}>
+        <div class="tool-card__chips">
+          <Show when={truncated()}>
+            <Chip label="output" value="truncated" />
+          </Show>
+          <Show when={logRef()}>
+            {(ref) => <Chip label="log" value={<code>{ref()}</code>} />}
+          </Show>
+        </div>
+      </Show>
     </div>
   );
 }
 
-function ReadFileCard(props: { payload: Record<string, unknown> | null | undefined }) {
+function ReadFileCard(props: {
+  payload: Record<string, unknown> | null | undefined;
+  output?: string;
+  toolCallId?: string;
+  onOpen?: OpenPathFn;
+  loadArtifactRange?: LoadArtifactRangeFn;
+}) {
   const path = () => readString(props.payload, "path");
   const status = () => readString(props.payload, "status");
   const startLine = () =>
     readNumber(props.payload, "startLine") ?? readNumber(props.payload, "line");
   const endLine = () => readNumber(props.payload, "endLine");
-  const window = () => readString(props.payload, "window");
+  const totalLines = () => readNumber(props.payload, "totalLines");
+  const sha = () => shortSha(readString(props.payload, "sha256"));
   const lossy = () => readBoolean(props.payload, "lossy");
-  const partial = () => readBoolean(props.payload, "partial");
+  const logRef = () => readString(props.payload, "logRef");
   const lineRange = () => {
     const start = startLine();
     if (start === undefined) {
@@ -404,32 +368,99 @@ function ReadFileCard(props: { payload: Record<string, unknown> | null | undefin
     return end !== undefined && end !== start ? `${start}–${end}` : `${start}`;
   };
 
+  const windowLines = () => parseNumberedOutput(props.output ?? "");
+  // Paged lazy load of the persisted snapshot: accumulate chunks and keep the
+  // button alive (as "Загрузить ещё") until the backend reports EOF.
+  const [loadedLines, setLoadedLines] = createSignal<CodeLineModel[] | null>(null);
+  const [nextOffset, setNextOffset] = createSignal<number | null>(null);
+  const [started, setStarted] = createSignal(false);
+  const [loading, setLoading] = createSignal(false);
+  const lines = () => loadedLines() ?? windowLines();
+
+  const moreAvailable = () => !started() || nextOffset() !== null;
+  const canLoadMore = () =>
+    Boolean(logRef()) &&
+    Boolean(props.loadArtifactRange) &&
+    Boolean(props.toolCallId) &&
+    moreAvailable();
+
+  async function loadMore() {
+    const ref = logRef();
+    const id = props.toolCallId;
+    const fetcher = props.loadArtifactRange;
+    if (!ref || !id || !fetcher) {
+      return;
+    }
+    if (started() && nextOffset() === null) {
+      return; // already at EOF
+    }
+    const offset = started() ? nextOffset() ?? 0 : 0;
+    setLoading(true);
+    try {
+      const result = await fetcher({
+        toolCallId: id,
+        logRef: ref,
+        offset,
+        limit: FULL_LOAD_LIMIT,
+      });
+      // Mark the originally-read window so it stays highlighted; the rest is
+      // surrounding context.
+      const readNumbers = new Set(windowLines().map((line) => line.no));
+      const parsed = parseNumberedOutput(result.content).map((line) =>
+        readNumbers.has(line.no)
+          ? { ...line, read: true }
+          : { ...line, context: true },
+      );
+      setLoadedLines((prev) => (started() && prev ? [...prev, ...parsed] : parsed));
+      setNextOffset(result.eof ? null : result.nextOffset ?? null);
+      setStarted(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
-    <div class="tool-card">
-      <div class="tool-card__head">
-        <FileText size={14} />
+    <div class="tool-body">
+      <div class="tool-body__head">
+        <FileText size={13} />
         <PathLabel path={path()} />
         <StatusPill status={status()} />
       </div>
       <div class="tool-card__chips">
         <Show when={lineRange()}>
-          {(range) => <Chip label="lines" value={range()} />}
+          {(range) => <Chip label="строки" value={range()} />}
         </Show>
-        <Show when={window()}>
-          {(value) => <Chip label="window" value={value()} />}
+        <Show when={totalLines() !== undefined}>
+          <Chip label="всего" value={String(totalLines())} />
+        </Show>
+        <Show when={sha()}>
+          {(value) => <Chip label="sha" value={<code>{value()}</code>} />}
         </Show>
         <Show when={lossy()}>
-          <Chip label="encoding" value="lossy" />
-        </Show>
-        <Show when={partial()}>
-          <Chip label="read" value="partial" />
+          <Chip label="кодировка" value="lossy" />
         </Show>
       </div>
+      <Show when={lines().length > 0}>
+        <CodeBlock
+          lines={lines()}
+          path={path()}
+          title={path() ? splitPath(path() as string).name : undefined}
+          onOpen={props.onOpen}
+          onLoadMore={canLoadMore() ? loadMore : undefined}
+          loadMoreLabel={started() ? "Загрузить ещё" : "Загрузить весь файл"}
+          loading={loading()}
+          atEnd={started() && nextOffset() === null}
+        />
+      </Show>
     </div>
   );
 }
 
-function WriteFileCard(props: { payload: Record<string, unknown> | null | undefined }) {
+function WriteFileCard(props: {
+  payload: Record<string, unknown> | null | undefined;
+  artifacts?: ToolArtifact[];
+  onOpen?: OpenPathFn;
+}) {
   const path = () => readString(props.payload, "path");
   const status = () => readString(props.payload, "status");
   const bytes = () => readNumber(props.payload, "bytes");
@@ -437,17 +468,43 @@ function WriteFileCard(props: { payload: Record<string, unknown> | null | undefi
   // Present only on a `too_large` refusal.
   const contentBytes = () => readNumber(props.payload, "contentBytes");
   const maxWriteBytes = () => readNumber(props.payload, "maxWriteBytes");
+  // The written file is the NEW side of the diff artifact (a brand-new file's
+  // diff is all additions). Only reconstruct from a REAL unified diff — the
+  // backend emits a text summary (no `@@`) for large writes, which must not be
+  // shown as content. Bounded by the preview; the full file is via "Открыть".
+  const realDiff = () => {
+    const artifact = findDiffArtifact(props.artifacts);
+    return artifact && artifact.preview.includes("@@") ? artifact : undefined;
+  };
+  const lines = (): CodeLineModel[] => {
+    const artifact = realDiff();
+    return artifact ? newSideLines(artifact.preview) : [];
+  };
+  const previewPartial = () => Boolean(realDiff()?.truncated);
+  // A diff artifact exists but is a summary (large write) — no body to show.
+  const summaryOnly = () =>
+    Boolean(findDiffArtifact(props.artifacts)) && !realDiff();
 
   return (
-    <div class="tool-card">
-      <div class="tool-card__head">
-        <FilePlus size={14} />
+    <div class="tool-body">
+      <div class="tool-body__head">
+        <FilePlus size={13} />
         <PathLabel path={path()} />
         <StatusPill status={status()} />
+        <Show when={path() && props.onOpen}>
+          <button
+            class="code-block__open tool-body__open"
+            type="button"
+            title="Открыть во внешнем приложении"
+            onClick={() => props.onOpen?.(path() as string)}
+          >
+            Открыть
+          </button>
+        </Show>
       </div>
       <div class="tool-card__chips">
         <Show when={formatBytes(bytes())}>
-          {(value) => <Chip label="size" value={value()} />}
+          {(value) => <Chip label="размер" value={value()} />}
         </Show>
         <Show when={sha()}>
           {(value) => <Chip label="sha" value={<code>{value()}</code>} />}
@@ -459,35 +516,183 @@ function WriteFileCard(props: { payload: Record<string, unknown> | null | undefi
           {(value) => <Chip label="limit" value={value()} />}
         </Show>
       </div>
+      <Show when={lines().length > 0}>
+        <CodeBlock
+          lines={lines()}
+          path={path()}
+          title={path() ? splitPath(path() as string).name : undefined}
+          onOpen={props.onOpen}
+        />
+      </Show>
+      <Show when={previewPartial()}>
+        <p class="tool-body__note">
+          Показан фрагмент записанного файла — целиком через «Открыть».
+        </p>
+      </Show>
+      <Show when={summaryOnly()}>
+        <p class="tool-body__note">
+          Большой файл — предпросмотр содержимого недоступен, откройте через «Открыть».
+        </p>
+      </Show>
     </div>
   );
 }
 
-function EditFileCard(props: { payload: Record<string, unknown> | null | undefined }) {
+function EditFileCard(props: {
+  payload: Record<string, unknown> | null | undefined;
+  artifacts?: ToolArtifact[];
+  onOpen?: OpenPathFn;
+}) {
   const path = () => readString(props.payload, "path");
   const status = () => readString(props.payload, "status");
   const occurrences = () => readNumber(props.payload, "occurrences");
-  const strategy = () => readString(props.payload, "strategy");
-  const sha = () => shortSha(readString(props.payload, "sha256"));
+  const diff = () => findDiffArtifact(props.artifacts);
 
   return (
-    <div class="tool-card">
-      <div class="tool-card__head">
-        <FilePenLine size={14} />
+    <div class="tool-body">
+      <div class="tool-body__head">
+        <FileText size={13} />
         <PathLabel path={path()} />
         <StatusPill status={status()} />
-      </div>
-      <div class="tool-card__chips">
         <Show when={occurrences() !== undefined}>
-          <Chip label="edits" value={String(occurrences())} />
+          <span class="tool-body__hint">{occurrences()}×</span>
         </Show>
-        <Show when={strategy()}>
-          {(value) => <Chip label="strategy" value={value()} />}
-        </Show>
-        <Show when={sha()}>
-          {(value) => <Chip label="sha" value={<code>{value()}</code>} />}
+        <Show when={path() && props.onOpen}>
+          <button
+            class="code-block__open tool-body__open"
+            type="button"
+            title="Открыть во внешнем приложении"
+            onClick={() => props.onOpen?.(path() as string)}
+          >
+            Открыть
+          </button>
         </Show>
       </div>
+      <Show when={diff()}>
+        {(artifact) => <DiffBlock diff={artifact().preview} />}
+      </Show>
+    </div>
+  );
+}
+
+interface PatchFileMeta {
+  path: string;
+  op: string;
+  added: number;
+  removed: number;
+}
+
+// apply_patch records real per-file metadata in its payload. The diff artifact
+// is only a "# op path" summary (no hunks), so we deliberately do NOT render
+// fake per-file diffs — we show op + path + add/remove counts from the payload.
+// Real per-file hunks are a backend follow-up (emit a unified-diff artifact).
+function readPatchFiles(value: unknown): PatchFileMeta[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const out: PatchFileMeta[] = [];
+  for (const entry of value) {
+    if (entry && typeof entry === "object") {
+      const record = entry as Record<string, unknown>;
+      const path = record.path ?? record.file ?? record.name;
+      if (typeof path === "string") {
+        const op = record.op ?? record.status ?? record.kind;
+        out.push({
+          path,
+          op: typeof op === "string" ? op : "modify",
+          added: typeof record.added === "number" ? record.added : 0,
+          removed: typeof record.removed === "number" ? record.removed : 0,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+function patchOpBadge(op: string): "A" | "M" | "D" {
+  const normalized = op.toLowerCase();
+  if (normalized === "add" || normalized === "create" || normalized === "added") {
+    return "A";
+  }
+  if (
+    normalized === "remove" ||
+    normalized === "delete" ||
+    normalized === "removed"
+  ) {
+    return "D";
+  }
+  return "M";
+}
+
+function PatchFileRow(props: { file: PatchFileMeta }) {
+  const parts = () => splitPath(props.file.path);
+  const badge = () => patchOpBadge(props.file.op);
+  return (
+    <div class="tool-sub tool-sub--static">
+      <div class="tool-sub__summary tool-sub__summary--static">
+        <span class={`tool-sub__op tool-sub__op--${badge()}`}>{badge()}</span>
+        <code class="tool-sub__path">
+          <Show when={parts().dir}>
+            <span class="tool-sub__dir">{parts().dir}</span>
+          </Show>
+          <span class="tool-sub__name">{parts().name || "(файл)"}</span>
+        </code>
+        <span class="tool-sub__spacer" />
+        <span class="tool-sub__stat">
+          <Show when={props.file.added > 0}>
+            <span class="tool-stat__add">+{props.file.added}</span>
+          </Show>{" "}
+          <Show when={props.file.removed > 0}>
+            <span class="tool-stat__del">−{props.file.removed}</span>
+          </Show>
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function ApplyPatchCard(props: {
+  payload: Record<string, unknown> | null | undefined;
+  touchedPaths?: string[];
+}) {
+  const status = () => readString(props.payload, "status");
+  const files = () => readPatchFiles(props.payload?.files);
+  // Fallback list when there is no structured per-file metadata (legacy records).
+  const fallbackPaths = () => {
+    const fromPayload = normalizePatchFiles(props.payload?.files);
+    return fromPayload.length > 0 ? fromPayload : props.touchedPaths ?? [];
+  };
+
+  return (
+    <div class="tool-body">
+      <div class="tool-body__head">
+        <GitCompare size={13} />
+        <span class="tool-card__title">Патч</span>
+        <StatusPill status={status()} />
+        <Show when={files().length > 0}>
+          <span class="tool-body__hint">{files().length} файл(ов)</span>
+        </Show>
+      </div>
+      <Show
+        when={files().length > 0}
+        fallback={
+          <Show when={fallbackPaths().length > 0}>
+            <ul class="tool-card__files">
+              <For each={fallbackPaths()}>
+                {(file) => (
+                  <li>
+                    <code>{file}</code>
+                  </li>
+                )}
+              </For>
+            </ul>
+          </Show>
+        }
+      >
+        <div class="tool-subs">
+          <For each={files()}>{(file) => <PatchFileRow file={file} />}</For>
+        </div>
+      </Show>
     </div>
   );
 }
@@ -514,91 +719,56 @@ function normalizePatchFiles(value: unknown): string[] {
   return out;
 }
 
-function ApplyPatchCard(props: {
+function ListFilesCard(props: {
   payload: Record<string, unknown> | null | undefined;
-  touchedPaths?: string[];
+  output?: string;
 }) {
-  const status = () => readString(props.payload, "status");
-  const files = () => {
-    const fromPayload = normalizePatchFiles(props.payload?.files);
-    if (fromPayload.length > 0) {
-      return fromPayload;
-    }
-    return props.touchedPaths ?? [];
-  };
+  const count = () => readNumber(props.payload, "count");
+  const truncated = () => readBoolean(props.payload, "truncated");
+  const dir = () => readString(props.payload, "dir");
+  const glob = () => readString(props.payload, "glob");
+  const listing = () => (props.output ?? "").trim();
 
   return (
-    <div class="tool-card">
-      <div class="tool-card__head">
-        <GitCompare size={14} />
-        <span class="tool-card__title">Apply patch</span>
-        <StatusPill status={status()} />
+    <div class="tool-body">
+      <div class="tool-body__head">
+        <ListTree size={13} />
+        <span class="tool-card__title">Список</span>
+        <Show when={dir()}>{(value) => <PathLabel path={value()} />}</Show>
       </div>
       <div class="tool-card__chips">
-        <Chip label="files" value={String(files().length)} />
+        <Show when={count() !== undefined}>
+          <Chip label="файлов" value={String(count())} />
+        </Show>
+        <Show when={glob()}>
+          {(value) => <Chip label="glob" value={<code>{value()}</code>} />}
+        </Show>
+        <Show when={truncated()}>
+          <Chip label="результат" value="truncated" />
+        </Show>
       </div>
-      <Show when={files().length > 0}>
-        <ul class="tool-card__files">
-          <For each={files()}>
-            {(file) => (
-              <li>
-                <code>{file}</code>
-              </li>
-            )}
-          </For>
-        </ul>
+      <Show when={listing()}>
+        {(text) => <OutputBlock text={text()} />}
       </Show>
     </div>
   );
 }
 
-function ListFilesCard(props: { payload: Record<string, unknown> | null | undefined }) {
-  const count = () => readNumber(props.payload, "count");
-  const truncated = () => readBoolean(props.payload, "truncated");
-  const dir = () => readString(props.payload, "dir");
-  const glob = () => readString(props.payload, "glob");
-  const includeIgnored = () => readBoolean(props.payload, "includeIgnored");
-
-  return (
-    <div class="tool-card">
-      <div class="tool-card__head">
-        <ListTree size={14} />
-        <span class="tool-card__title">List files</span>
-        <Show when={dir()}>
-          {(value) => <PathLabel path={value()} />}
-        </Show>
-      </div>
-      <div class="tool-card__chips">
-        <Show when={count() !== undefined}>
-          <Chip label="count" value={String(count())} />
-        </Show>
-        <Show when={glob()}>
-          {(value) => <Chip label="glob" value={<code>{value()}</code>} />}
-        </Show>
-        <Show when={includeIgnored()}>
-          <Chip label="ignored" value="included" />
-        </Show>
-        <Show when={truncated()}>
-          <Chip label="result" value="truncated" />
-        </Show>
-      </div>
-    </div>
-  );
-}
-
-function SearchTextCard(props: { payload: Record<string, unknown> | null | undefined }) {
+function SearchTextCard(props: {
+  payload: Record<string, unknown> | null | undefined;
+  output?: string;
+}) {
   const pattern = () => readString(props.payload, "pattern");
   const count = () => readNumber(props.payload, "count");
   const filesWithMatches = () => readNumber(props.payload, "filesWithMatches");
   const truncated = () => readBoolean(props.payload, "truncated");
-  const partial = () => readBoolean(props.payload, "partial");
-  const cappedFileCount = () => readNumber(props.payload, "cappedFileCount");
+  const hits = () => (props.output ?? "").trim();
 
   return (
-    <div class="tool-card">
-      <div class="tool-card__head">
-        <FileSearch size={14} />
-        <span class="tool-card__title">Search</span>
+    <div class="tool-body">
+      <div class="tool-body__head">
+        <FileSearch size={13} />
+        <span class="tool-card__title">Поиск</span>
         <Show when={pattern()}>
           {(value) => (
             <code class="tool-card__pattern" title={value()}>
@@ -609,21 +779,16 @@ function SearchTextCard(props: { payload: Record<string, unknown> | null | undef
       </div>
       <div class="tool-card__chips">
         <Show when={count() !== undefined}>
-          <Chip label="matches" value={String(count())} />
+          <Chip label="совпадений" value={String(count())} />
         </Show>
         <Show when={filesWithMatches() !== undefined}>
-          <Chip label="files" value={String(filesWithMatches())} />
-        </Show>
-        <Show when={cappedFileCount() !== undefined}>
-          <Chip label="capped at" value={String(cappedFileCount())} />
-        </Show>
-        <Show when={partial()}>
-          <Chip label="scan" value="partial" />
+          <Chip label="файлов" value={String(filesWithMatches())} />
         </Show>
         <Show when={truncated()}>
-          <Chip label="result" value="truncated" />
+          <Chip label="результат" value="truncated" />
         </Show>
       </div>
+      <Show when={hits()}>{(text) => <OutputBlock text={text()} />}</Show>
     </div>
   );
 }
@@ -632,14 +797,14 @@ function GenericPayloadCard(props: {
   toolKind?: ToolKind;
   payload: Record<string, unknown> | null | undefined;
 }) {
-  // Fallback for an unrecognized toolKind that still carries a payload: show
-  // the kind plus a best-effort path/status so the card is never empty.
+  // Fallback for an unrecognized toolKind that still carries a payload: show the
+  // kind plus a best-effort path/status so the body is never empty.
   const path = () => readString(props.payload, "path");
   const status = () => readString(props.payload, "status");
   return (
-    <div class="tool-card">
-      <div class="tool-card__head">
-        <Replace size={14} />
+    <div class="tool-body">
+      <div class="tool-body__head">
+        <Terminal size={13} />
         <span class="tool-card__title">{props.toolKind ?? "tool"}</span>
         <StatusPill status={status()} />
       </div>
@@ -654,20 +819,45 @@ function GenericPayloadCard(props: {
 
 // --- Dispatcher -------------------------------------------------------------
 
-export function ToolCard(props: { tool: ToolCardData }) {
+export function ToolCard(props: {
+  tool: ToolCardData;
+  onOpenPath?: OpenPathFn;
+  loadArtifactRange?: LoadArtifactRangeFn;
+}) {
   const payload = () => props.tool.payload;
-  const diffArtifact = () => findDiffArtifact(props.tool.artifacts);
 
+  // A reactive accessor (not an IIFE): re-evaluates if `toolKind` resolves late
+  // during streaming, and keeps the fallback for unknown/incomplete payloads.
   const body = () => {
     switch (props.tool.toolKind) {
       case "run_command":
         return <RunCommandCard payload={payload()} />;
       case "read_file":
-        return <ReadFileCard payload={payload()} />;
+        return (
+          <ReadFileCard
+            payload={payload()}
+            output={props.tool.output}
+            toolCallId={props.tool.toolCallId}
+            onOpen={props.onOpenPath}
+            loadArtifactRange={props.loadArtifactRange}
+          />
+        );
       case "write_file":
-        return <WriteFileCard payload={payload()} />;
+        return (
+          <WriteFileCard
+            payload={payload()}
+            artifacts={props.tool.artifacts}
+            onOpen={props.onOpenPath}
+          />
+        );
       case "edit_file":
-        return <EditFileCard payload={payload()} />;
+        return (
+          <EditFileCard
+            payload={payload()}
+            artifacts={props.tool.artifacts}
+            onOpen={props.onOpenPath}
+          />
+        );
       case "apply_patch":
         return (
           <ApplyPatchCard
@@ -676,38 +866,15 @@ export function ToolCard(props: { tool: ToolCardData }) {
           />
         );
       case "list_files":
-        return <ListFilesCard payload={payload()} />;
+        return <ListFilesCard payload={payload()} output={props.tool.output} />;
       case "search_text":
-        return <SearchTextCard payload={payload()} />;
+        return <SearchTextCard payload={payload()} output={props.tool.output} />;
       default:
         return (
-          <GenericPayloadCard
-            toolKind={props.tool.toolKind}
-            payload={payload()}
-          />
+          <GenericPayloadCard toolKind={props.tool.toolKind} payload={payload()} />
         );
     }
   };
 
-  return (
-    <div class="tool-card-group">
-      {body()}
-      <Show when={diffArtifact()}>
-        {(artifact) => (
-          <div class="tool-card__diff-wrap">
-            <div class="tool-card__diff-head">
-              <FileDiff size={13} />
-              <span>Diff</span>
-            </div>
-            <DiffCard
-              diff={artifact().preview}
-              truncated={artifact().truncated}
-              logRef={artifact().logRef}
-              sizeBytes={artifact().sizeBytes}
-            />
-          </div>
-        )}
-      </Show>
-    </div>
-  );
+  return <>{body()}</>;
 }

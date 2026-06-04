@@ -344,9 +344,7 @@ button {
 .icon-button,
 .text-button,
 .recent-row,
-.project-row,
-.message-artifact,
-.artifact-row {
+.project-row {
   border: 0;
   color: inherit;
 }
@@ -597,41 +595,24 @@ kbd,
 }
 
 .project-row small,
-.project-row > span:not(.project-icon, .project-row__text, .branch-dot) {
+.project-row > span:not(.project-icon, .project-row__text) {
   color: #8d9bab;
   font-size: 12px;
 }
 
-.branch-dot,
-.artifact-dot,
 .provider-status-dot,
 .live-pill svg {
   border-radius: 999px;
   fill: currentColor;
 }
 
-.branch-dot,
-.artifact-dot,
 .provider-status-dot {
   width: 7px;
   height: 7px;
 }
 
-.branch-dot--green,
-.artifact-dot--ready {
+.provider-status-dot {
   background: #41d981;
-}
-
-.branch-dot--blue {
-  background: #4d8cff;
-}
-
-.branch-dot--yellow {
-  background: #e4aa43;
-}
-
-.artifact-dot--muted {
-  background: #526272;
 }
 
 .account-card {
@@ -1905,31 +1886,11 @@ kbd,
   color: #85efaa;
 }
 
-.message-artifact {
-  display: grid;
-  grid-template-columns: 24px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 12px;
-  width: min(520px, 100%);
-  min-height: 52px;
-  border: 1px solid #27394b;
-  border-radius: 8px;
-  padding: 0 12px;
-  background: #0e1823;
-  text-align: left;
-}
-
-.message-artifact span,
-.artifact-row span,
 .tool-call-row span {
   display: grid;
   min-width: 0;
 }
 
-.message-artifact strong,
-.message-artifact small,
-.artifact-row strong,
-.artifact-row small,
 .tool-call-row strong,
 .tool-call-row small {
   overflow: hidden;
@@ -1937,26 +1898,15 @@ kbd,
   white-space: nowrap;
 }
 
-.message-artifact strong,
-.artifact-row strong,
 .tool-call-row strong {
   color: #f2f6fb;
   font-size: 13px;
   font-weight: 800;
 }
 
-.message-artifact small,
-.artifact-row small,
 .tool-call-row small {
   color: #8795a5;
   font-size: 12px;
-}
-
-.message-artifact em {
-  color: #56df8f;
-  font-style: normal;
-  font-size: 13px;
-  font-weight: 800;
 }
 
 .composer {
@@ -1983,8 +1933,7 @@ kbd,
   line-height: 1.45;
 }
 
-.composer textarea::placeholder,
-.note-input::placeholder {
+.composer textarea::placeholder {
   color: #758495;
 }
 
@@ -2152,34 +2101,23 @@ kbd,
   background: linear-gradient(180deg, #081521, #06111b);
 }
 
-.inspector-tabs {
+.inspector-header {
   display: flex;
-  align-items: end;
-  gap: 26px;
+  align-items: center;
   border-bottom: 1px solid #1b2a3a;
   padding: 0 16px;
 }
 
-.app-frame--windows .inspector-tabs {
+.app-frame--windows .inspector-header {
   max-width: calc(100% - 150px);
   padding-right: 0;
 }
 
-.inspector-tab {
-  height: 100%;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  background: transparent;
-  color: #8e9bab;
-  font-size: 13px;
-  font-weight: 750;
-  -webkit-app-region: no-drag;
-  app-region: no-drag;
-}
-
-.inspector-tab--active {
-  border-bottom-color: #257bff;
+.inspector-header h2 {
+  margin: 0;
   color: #eef4fa;
+  font-size: 14px;
+  font-weight: 800;
 }
 
 .panel-empty {
@@ -2669,8 +2607,7 @@ kbd,
   contain: layout paint style;
 }
 
-.tool-call-list .virtual-list__row,
-.artifact-list .virtual-list__row {
+.tool-call-list .virtual-list__row {
   padding: 0;
 }
 
@@ -2684,9 +2621,7 @@ kbd,
   padding: 11px 14px;
 }
 
-.tool-call-row > svg,
-.artifact-row > svg,
-.message-artifact > svg {
+.tool-call-row > svg {
   color: #c6d2df;
 }
 
@@ -2779,43 +2714,6 @@ kbd,
 
 .tool-status--error {
   color: #ff9b9b;
-}
-
-.artifact-list {
-  height: 122px;
-  overflow: auto;
-  border: 1px solid #27394b;
-  border-radius: 8px;
-  background: #0d1722;
-  contain: layout paint style;
-}
-
-.artifact-row {
-  display: grid;
-  grid-template-columns: 20px minmax(0, 1fr) auto 7px;
-  align-items: center;
-  min-height: 60px;
-  gap: 10px;
-  border-bottom: 1px solid #1d2b3b;
-  padding: 0 14px;
-  background: transparent;
-  text-align: left;
-}
-
-.artifact-row time {
-  color: #9aa8b7;
-  font-size: 12px;
-}
-
-.note-input {
-  width: 100%;
-  min-height: 42px;
-  border: 1px solid #27394b;
-  border-radius: 8px;
-  padding: 0 12px;
-  outline: 0;
-  background: #0e1823;
-  color: #e8f0f8;
 }
 
 .virtual-list {
@@ -3347,4 +3245,466 @@ kbd,
   font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
   font-size: 10.5px;
   font-weight: 600;
+}
+
+/* === Tool spoiler shared primitives (CodeBlock / DiffBlock) =============== */
+
+/* Self-written highlighter tokens (highlight.ts). */
+.tok-com {
+  color: #5f7081;
+  font-style: italic;
+}
+
+.tok-str {
+  color: #9ad59b;
+}
+
+.tok-kw {
+  color: #cc91e6;
+}
+
+.tok-num {
+  color: #e0a87a;
+}
+
+.tok-flag {
+  color: #7fb0e0;
+}
+
+/* CodeBlock — line-numbered viewer with a read-region highlight. */
+.code-block {
+  display: grid;
+  gap: 5px;
+}
+
+.code-block__head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #8b99a9;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+}
+
+.code-block__head svg {
+  flex: 0 0 auto;
+  color: #5e7a93;
+}
+
+.code-block__title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.code-block__open {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: #7fa6d8;
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.code-block__open:hover {
+  text-decoration: underline;
+}
+
+.code-block__code {
+  max-height: 360px;
+  overflow: auto;
+  border: 1px solid #16222f;
+  border-radius: 8px;
+  padding: 6px 0;
+  background: #050b12;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  scrollbar-color: #2c3e52 transparent;
+  scrollbar-width: thin;
+  tab-size: 4;
+}
+
+.code-line {
+  display: flex;
+  min-width: max-content;
+}
+
+.code-line__no {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  flex: 0 0 auto;
+  min-width: 44px;
+  padding: 0 9px;
+  border-right: 1px solid #14202d;
+  background: #070f18;
+  color: #445466;
+  text-align: right;
+  user-select: none;
+}
+
+.code-line__text {
+  flex: 1 1 auto;
+  padding: 0 12px;
+  color: #c2cedb;
+  white-space: pre;
+}
+
+.code-line--ctx .code-line__text {
+  color: #7c8a98;
+}
+
+.code-line--read {
+  background: rgb(208 224 244 / 5.5%);
+}
+
+.code-line--read .code-line__no {
+  border-right-color: #33536f;
+  background: #0b1726;
+  color: #7196c0;
+}
+
+.code-block__more,
+.diff-block__more {
+  justify-self: start;
+  padding: 2px 4px;
+  border: 0;
+  background: transparent;
+  color: #7fa6d8;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.code-block__more:hover,
+.diff-block__more:hover {
+  text-decoration: underline;
+}
+
+.code-block__more:disabled {
+  color: #5d6b7a;
+  text-decoration: none;
+  cursor: default;
+}
+
+/* DiffBlock — double line-number gutter (old / new). */
+.diff-block {
+  display: grid;
+  gap: 5px;
+}
+
+.diff-block__body {
+  max-height: 360px;
+  overflow: auto;
+  border: 1px solid #14202d;
+  border-radius: 7px;
+  padding: 5px 0;
+  background: #060d15;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  scrollbar-color: #2c3e52 transparent;
+  scrollbar-width: thin;
+  tab-size: 4;
+}
+
+.diff-line {
+  display: flex;
+  min-width: max-content;
+}
+
+.diff-line__gutter {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  display: flex;
+  flex: 0 0 auto;
+  border-right: 1px solid #11202d;
+  background: #070f18;
+  user-select: none;
+}
+
+.diff-line__gutter i {
+  width: 34px;
+  padding: 0 6px;
+  color: #41505f;
+  font-style: normal;
+  text-align: right;
+}
+
+.diff-line__text {
+  flex: 1 1 auto;
+  padding: 0 10px;
+  color: #aab8c6;
+  white-space: pre;
+}
+
+.diff-line--add {
+  background: rgb(74 221 134 / 9%);
+}
+
+.diff-line--add .diff-line__text {
+  color: #86e0a4;
+}
+
+.diff-line--del {
+  background: rgb(255 120 120 / 9%);
+}
+
+.diff-line--del .diff-line__text {
+  color: #ff9b9b;
+}
+
+.diff-line--hunk {
+  background: #0a1622;
+}
+
+.diff-line--hunk .diff-line__text {
+  color: #7fa6d8;
+}
+
+.diff-line--ctx .diff-line__text {
+  color: #8593a3;
+}
+
+.diff-line--meta .diff-line__text {
+  color: #6f8094;
+}
+
+/* === Linear tool bodies (per-kind) ======================================= */
+
+.tool-body {
+  display: grid;
+  gap: 9px;
+}
+
+.tool-body__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tool-body__head svg {
+  flex: 0 0 auto;
+  color: #5e7a93;
+}
+
+.tool-body__hint {
+  flex: 0 0 auto;
+  color: #6f8294;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+}
+
+.tool-body__open {
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
+.tool-body__note {
+  margin: 0;
+  color: #c8b88e;
+  font-size: 12px;
+}
+
+/* run_command — `$` prompt + flag highlighting. */
+.tool-cmd {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 8px 11px 8px 26px;
+  border: 1px solid #182838;
+  border-radius: 7px;
+  background: linear-gradient(180deg, #0b1622, #091420);
+  color: #8fe9b2;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tool-cmd::before {
+  content: "$";
+  position: absolute;
+  left: 11px;
+  color: #4d6a86;
+  font-weight: 700;
+}
+
+/* Header diff-stat (+N −M + op badge). */
+.tool-stat {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  font-weight: 700;
+}
+
+.tool-stat__add {
+  color: #5fcf90;
+}
+
+.tool-stat__del {
+  color: #ff8a8a;
+}
+
+.tool-stat__op,
+.tool-sub__op {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 3px;
+  border-radius: 4px;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.tool-stat__op--M,
+.tool-sub__op--M {
+  background: #e8c15a;
+  color: #0c0f08;
+}
+
+.tool-stat__op--A,
+.tool-sub__op--A {
+  background: #5fcf90;
+  color: #06120b;
+}
+
+.tool-stat__op--D,
+.tool-sub__op--D {
+  background: #ff8a8a;
+  color: #1a0808;
+}
+
+/* OutputBlock — plain bounded stdout / stderr / listing. */
+.output-block {
+  display: grid;
+  gap: 5px;
+}
+
+.output-block__body {
+  margin: 0;
+  max-height: 300px;
+  overflow: auto;
+  border: 1px solid #16222f;
+  border-radius: 8px;
+  padding: 9px 11px;
+  background: #050b12;
+  color: #b7c5d4;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  scrollbar-color: #2c3e52 transparent;
+  scrollbar-width: thin;
+  tab-size: 4;
+}
+
+.output-block__body--err {
+  color: #ffb0b0;
+}
+
+/* Nested sub-spoilers — per-file patch diffs. */
+.tool-subs {
+  display: grid;
+  gap: 5px;
+}
+
+.tool-sub {
+  overflow: hidden;
+  border: 1px solid #14202d;
+  border-radius: 7px;
+  background: #070e17;
+}
+
+.tool-sub__summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 9px;
+  border: 0;
+  background: transparent;
+  color: #c4d0dd;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.tool-sub__summary:hover {
+  background: #0c1722;
+}
+
+.tool-sub__path {
+  min-width: 0;
+  overflow: hidden;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-sub__dir {
+  color: #6f8298;
+}
+
+.tool-sub__name {
+  color: #e2edf7;
+  font-weight: 600;
+}
+
+.tool-sub__spacer {
+  flex: 1 1 auto;
+}
+
+.tool-sub__stat {
+  flex: 0 0 auto;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.tool-sub__chevron {
+  flex: 0 0 auto;
+  color: #54657a;
+  transition: transform 120ms ease;
+}
+
+.tool-sub__chevron--open {
+  transform: rotate(180deg);
+}
+
+.tool-sub__body {
+  padding: 0 8px 8px;
+}
+
+/* Static (non-expandable) per-file patch rows — metadata only. */
+.tool-sub__summary--static {
+  cursor: default;
+}
+
+.tool-sub--static .tool-sub__summary--static:hover {
+  background: transparent;
+}
+
+.tool-body__error {
+  margin: 0;
+  color: #ff9b9b;
+  font-size: 12px;
 }

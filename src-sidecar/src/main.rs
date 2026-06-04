@@ -36,7 +36,7 @@ use mothership_core::{
     ToolApprovalDecision, ToolCancellationToken, ToolExecutionAccepted,
     ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionEventSink,
     ToolExecutionRegistry, ToolExecutionRequest, ToolRepeatGuard, ToolResourceLimits,
-    ToolSupervisor,
+    ToolSupervisor, Workspace,
 };
 use sha2::{Digest, Sha256};
 
@@ -518,6 +518,34 @@ fn handle_request(
         );
         return;
     }
+    // Lazy artifact paging needs the output store + the async runtime to block on
+    // the store read, so it is handled here rather than in the sync `compute`.
+    if let CoreRequest::GetToolArtifactRange {
+        tool_call_id,
+        log_ref,
+        offset,
+        limit,
+    } = &request
+    {
+        let result = match &tool_output_store {
+            Some(store) => async_runtime
+                .block_on(store.read_range(tool_call_id, log_ref, *offset, *limit))
+                .map_err(CoreError::from),
+            None => Err(CoreError::new(
+                "artifact_unavailable",
+                "no tool output store is configured",
+                false,
+            )),
+        };
+        let _ = match result {
+            Ok(range) => outbox.send(ServerFrame::Response {
+                id,
+                result: CoreResponse::ToolArtifactRange(range),
+            }),
+            Err(error) => outbox.send(ServerFrame::Error { id, error }),
+        };
+        return;
+    }
 
     let result = compute(
         request,
@@ -686,15 +714,39 @@ fn compute(
         CoreRequest::SidecarStatus => {
             response(CoreResponse::SidecarStatus(database.sidecar_status()?))
         }
-        // Streaming cases handled in `handle_request` before reaching here.
+        CoreRequest::ResolveWorkspacePath { project_id, path } => response(
+            CoreResponse::ResolvedPath(resolve_workspace_path(database, &project_id, &path)?),
+        ),
+        // Streaming + store-backed cases handled in `handle_request` before here.
         CoreRequest::SendChatMessage { .. }
         | CoreRequest::EditChatUserMessage { .. }
         | CoreRequest::RetryChatMessage { .. }
         | CoreRequest::ContinueChatMessage { .. }
-        | CoreRequest::RunToolCommand { .. } => {
-            unreachable!("handled as a streaming request")
+        | CoreRequest::RunToolCommand { .. }
+        | CoreRequest::GetToolArtifactRange { .. } => {
+            unreachable!("handled before the uniform request path")
         }
     })
+}
+
+/// Resolve a (workspace-relative or absolute) path against a project's root,
+/// enforcing containment, and return the canonical absolute path for external
+/// opening. Rejects anything outside the workspace (capability + containment).
+fn resolve_workspace_path(
+    database: &Database,
+    project_id: &str,
+    path: &str,
+) -> Result<String, CoreError> {
+    let root = database
+        .project_root(project_id)?
+        .ok_or_else(|| CoreError::new("project_not_found", "unknown project", false))?;
+    let workspace = Workspace::new(&root)
+        .map_err(|error| CoreError::new("workspace_unavailable", error.to_string(), false))?;
+    let resolved = workspace
+        .resolve(path)
+        .map_err(|error| CoreError::new("path_outside_workspace", error.to_string(), false))?;
+    let canonical = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 fn run_tool_command(

@@ -3,7 +3,6 @@ import {
   createMemo,
   createSignal,
   For,
-  JSX,
   Match,
   onCleanup,
   onMount,
@@ -15,15 +14,8 @@ import {
   BrainCircuit,
   Check,
   ChevronDown,
-  Circle,
-  Clock,
-  FileText,
   Folder,
-  GitBranch,
-  MoreVertical,
-  Paperclip,
   Play,
-  Plus,
   RefreshCw,
   Search,
   Send,
@@ -51,12 +43,8 @@ import {
   ReasoningOption,
   SendChatMessageResult,
   ToolArtifact,
-  ToolCommand,
   ToolExecutionEvent,
-  ToolExecutionEventKind,
   ToolExecutionRecord,
-  ToolExecutionResult,
-  ToolKind,
   approveToolExecution,
   branchChatFromMessage,
   cancelChatRun,
@@ -68,17 +56,34 @@ import {
   getConnectorSettings,
   listChats,
   listProjects,
+  getToolArtifactRange,
   openProject,
+  openToolPath,
   pickProjectDirectory,
   retryChatMessage,
   sendChatMessage,
   setChatModel,
   setSelectedModel,
 } from "../../shared/api/mothership";
-import { ApprovalPreview, ToolCard } from "./ToolCards";
+import { ApprovalPreview, ToolCard, toolDiffStat } from "./ToolCards";
 import { VirtualList } from "../../shared/ui/VirtualList";
 import { startWindowDrag } from "../../shared/window-drag";
-import mothershipLogoUrl from "../../assets/mothership-logo-sm.png";
+import { BrandMark } from "./components/BrandMark";
+import { Composer, type ReasoningOptionId } from "./components/Composer";
+import { InspectorPane } from "./components/InspectorPane";
+import { Sidebar } from "./components/Sidebar";
+import { ToolKindIcon } from "./components/ToolKindIcon";
+import {
+  countTextLines,
+  formatToolCommand,
+  formatToolHeadline,
+  formatToolOutput,
+  isTerminalToolKind,
+  shouldShowInlineToolOutput,
+  toolStatusLabel,
+  toolTone,
+} from "./tool-format";
+import type { ToolExecutionView } from "./types";
 
 const CHAT_MESSAGE_PAGE_SIZE = 60;
 const CHAT_SCROLL_BOTTOM_THRESHOLD_PX = 8;
@@ -86,8 +91,6 @@ const CHAT_SCROLL_TOP_PADDING_PX = 12;
 const CHAT_SCROLL_BOTTOM_PADDING_PX = 32;
 const CHAT_SCROLL_RESTORE_FRAMES = 12;
 const TOOL_OUTPUT_MAX_VISIBLE_LINES = 10;
-
-type ReasoningOptionId = string;
 
 interface ChatScrollPosition {
   top: number;
@@ -1160,153 +1163,6 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   );
 }
 
-function Sidebar(props: {
-  activeChatId?: string;
-  activeProjectId?: string;
-  chats: ChatThreadSummary[];
-  isLoadingChats: boolean;
-  isLoadingProjects: boolean;
-  isOpeningProject: boolean;
-  onNewChat: () => void;
-  onOpenChat: (chatId: string) => void;
-  onOpenProject: () => void;
-  onOpenSettings?: () => void;
-  onSelectProject: (projectId: string) => void;
-  projects: ProjectSummary[];
-}) {
-  return (
-    <aside class="sidebar" aria-label="Workspace navigation">
-      <div class="sidebar__brand" onMouseDown={startWindowDrag}>
-        <BrandMark />
-        <strong>Mothership</strong>
-        <button
-          class="icon-button"
-          type="button"
-          title="Open project"
-          disabled={props.isOpeningProject}
-          onClick={props.onOpenProject}
-        >
-          <Folder size={16} />
-        </button>
-      </div>
-
-      <button
-        class="new-chat-button"
-        type="button"
-        disabled={!props.activeProjectId}
-        onClick={props.onNewChat}
-      >
-        <Plus size={18} />
-        <span>New Chat</span>
-        <kbd>Ctrl+K</kbd>
-      </button>
-
-      <section class="sidebar-section sidebar-section--recent">
-        <SectionHeader
-          title="Recent"
-          action={
-            <button class="icon-button icon-button--ghost" type="button" title="Search chats">
-              <Search size={16} />
-            </button>
-          }
-        />
-        <VirtualList
-          ariaLabel="Recent chats"
-          class="recent-list"
-          empty={
-            <div class="list-empty">
-              {props.isLoadingChats
-                ? "Loading chats..."
-                : props.activeProjectId
-                  ? "No chats yet"
-                  : "Open a project first"}
-            </div>
-          }
-          estimateSize={42}
-          getItemKey={(chat) => chat.id}
-          items={props.chats}
-          overscan={8}
-        >
-          {(item) => (
-            <RecentChatRow
-              item={item}
-              selected={item.id === props.activeChatId}
-              onClick={() => props.onOpenChat(item.id)}
-            />
-          )}
-        </VirtualList>
-        <button class="text-button" type="button" onClick={props.onNewChat}>
-          Start chat
-          <ChevronDown size={14} />
-        </button>
-      </section>
-
-      <section class="sidebar-section sidebar-section--projects">
-        <SectionHeader
-          title="Projects"
-          action={
-            <button
-              class="icon-button icon-button--ghost"
-              type="button"
-              title="Open project"
-              disabled={props.isOpeningProject}
-              onClick={props.onOpenProject}
-            >
-              <Plus size={16} />
-            </button>
-          }
-        />
-        <button
-          class="project-open-button"
-          type="button"
-          disabled={props.isOpeningProject}
-          onClick={props.onOpenProject}
-        >
-          <Folder size={16} />
-          <span>{props.isOpeningProject ? "Opening..." : "Open folder"}</span>
-        </button>
-        <VirtualList
-          ariaLabel="Projects"
-          class="project-list"
-          empty={
-            <div class="list-empty">
-              {props.isLoadingProjects ? "Loading projects..." : "No projects"}
-            </div>
-          }
-          estimateSize={64}
-          getItemKey={(project) => project.id}
-          items={props.projects}
-          overscan={6}
-        >
-          {(project) => (
-            <ProjectRow
-              project={project}
-              selected={project.id === props.activeProjectId}
-              onClick={() => props.onSelectProject(project.id)}
-            />
-          )}
-        </VirtualList>
-      </section>
-
-      <div class="account-card">
-        <div class="avatar avatar--user">MS</div>
-        <div>
-          <strong>Local Profile</strong>
-          <span>Desktop Core</span>
-        </div>
-        <button
-          class="icon-button icon-button--ghost"
-          type="button"
-          title="Settings"
-          onClick={props.onOpenSettings}
-        >
-          <MoreVertical size={16} />
-        </button>
-      </div>
-    </aside>
-  );
-}
-
 function ConversationPane(props: {
   activeChat: ChatThreadSummary | null;
   activeProject: ProjectSummary | null;
@@ -1396,13 +1252,6 @@ function ConversationPane(props: {
       <header class="conversation-header" onMouseDown={startWindowDrag}>
         <div class="conversation-header__title">
           <h1>{props.activeChat?.title ?? "New chat"}</h1>
-          <button
-            class="icon-button icon-button--ghost"
-            type="button"
-            title="Rename chat"
-          >
-            <FileText size={15} />
-          </button>
         </div>
 
         <Show when={props.activeProject}>
@@ -1503,6 +1352,7 @@ function ConversationPane(props: {
         onDraftChange={props.onDraftChange}
         onReasoningOptionChange={props.onReasoningOptionChange}
         onSend={props.onSendMessage}
+        ReasoningSelector={ReasoningSelector}
       />
     </section>
   );
@@ -2430,182 +2280,6 @@ function missingRequiredAdapterSettings(provider: ConnectorProviderSummary) {
     .map((field) => field.label);
 }
 
-function InspectorPane(props: {
-  activeChat: ChatThreadSummary | null;
-  messageCount: number;
-  toolExecutions: ToolExecutionView[];
-  onApproveTool: (toolCallId: string) => void;
-  onCancelTool: (toolCallId: string) => void;
-  onDenyTool: (toolCallId: string) => void;
-}) {
-  const activeTools = () =>
-    props.toolExecutions.filter((tool) => !isTerminalToolKind(tool.kind)).length;
-
-  return (
-    <aside class="inspector-pane" aria-label="Run inspector">
-      <div
-        class="inspector-tabs"
-        role="tablist"
-        aria-label="Inspector tabs"
-        onMouseDown={startWindowDrag}
-      >
-        <button class="inspector-tab inspector-tab--active" type="button">
-          Inspector
-        </button>
-        <button class="inspector-tab" type="button">
-          Context
-        </button>
-      </div>
-
-      <div class="inspector-scroll">
-        <InspectorSection
-          title="Current Run"
-          action={
-            <span class="live-pill">
-              <Circle size={8} />
-              {activeTools() > 0 ? "Tools" : "Idle"}
-            </span>
-          }
-        >
-          <div class="run-summary">
-            <div class="run-summary__title">
-              <Terminal size={16} />
-              <strong>No active run</strong>
-            </div>
-            <span>
-              {activeTools() > 0
-                ? `${activeTools()} tool job${activeTools() === 1 ? "" : "s"} active`
-                : "Chat persistence is enabled"}
-            </span>
-            <div class="progress-track">
-              <div class="progress-track__fill" style={{ width: "0%" }} />
-            </div>
-            <div class="run-summary__footer">
-              <span>{props.activeChat?.title ?? "No chat selected"}</span>
-              <span>{props.messageCount} messages</span>
-            </div>
-          </div>
-        </InspectorSection>
-
-        <InspectorSection
-          title="Tool Calls"
-          action={
-            <button class="count-button" type="button">
-              {props.toolExecutions.length} <ChevronDown size={13} />
-            </button>
-          }
-        >
-          <Show
-            when={props.toolExecutions.length > 0}
-            fallback={<div class="panel-empty">Tool calls will appear here.</div>}
-          >
-            <div class="tool-call-list">
-              <For each={props.toolExecutions}>
-                {(tool) => (
-                  <ToolCallRow
-                    tool={tool}
-                    onApprove={() => props.onApproveTool(tool.toolCallId)}
-                    onCancel={() => props.onCancelTool(tool.toolCallId)}
-                    onDeny={() => props.onDenyTool(tool.toolCallId)}
-                  />
-                )}
-              </For>
-            </div>
-          </Show>
-        </InspectorSection>
-
-        <InspectorSection
-          title="Artifacts"
-          action={
-            <button class="count-button" type="button">
-              0 <ChevronDown size={13} />
-            </button>
-          }
-        >
-          <div class="panel-empty">No artifacts in this chat.</div>
-        </InspectorSection>
-
-        <InspectorSection title="Notes">
-          <input class="note-input" placeholder="Add a note..." />
-        </InspectorSection>
-      </div>
-    </aside>
-  );
-}
-
-function ToolCallRow(props: {
-  tool: ToolExecutionView;
-  onApprove: () => void;
-  onCancel: () => void;
-  onDeny: () => void;
-}) {
-  const command = () => formatToolCommand(props.tool);
-  const headline = () => formatToolHeadline(props.tool);
-  const canApprove = () => props.tool.kind === "permission_requested";
-  const canCancel = () =>
-    !canApprove() && !isTerminalToolKind(props.tool.kind);
-
-  return (
-    <div class="tool-call-row">
-      <Terminal size={16} />
-      <div class="tool-call-row__body">
-        <strong title={command() || headline()}>{headline()}</strong>
-        <span class={`tool-status tool-status--${toolTone(props.tool.kind)}`}>
-          {toolStatusLabel(props.tool.kind)}
-        </span>
-        <Show when={props.tool.message}>
-          <small>{props.tool.message}</small>
-        </Show>
-        <Show when={props.tool.output}>
-          <pre class="tool-call-row__output">{props.tool.output}</pre>
-        </Show>
-      </div>
-      <div class="tool-call-row__actions">
-        <Show when={canApprove()}>
-          <button type="button" title="Approve tool" onClick={props.onApprove}>
-            <Check size={14} />
-          </button>
-          <button type="button" title="Deny tool" onClick={props.onDeny}>
-            <X size={14} />
-          </button>
-        </Show>
-        <Show when={canCancel()}>
-          <button type="button" title="Cancel tool" onClick={props.onCancel}>
-            <Square size={12} />
-          </button>
-        </Show>
-      </div>
-    </div>
-  );
-}
-
-// A small, kind-specific glyph for a tool-call spoiler row (the terminal icon
-// doubles as the "ran" verb for run_command).
-function ToolKindIcon(props: { kind?: ToolKind }) {
-  return (
-    <Switch fallback={<Terminal size={14} />}>
-      <Match when={props.kind === "list_files"}>
-        <Folder size={14} />
-      </Match>
-      <Match when={props.kind === "search_text"}>
-        <Search size={14} />
-      </Match>
-      <Match when={props.kind === "apply_patch"}>
-        <GitBranch size={14} />
-      </Match>
-      <Match
-        when={
-          props.kind === "read_file" ||
-          props.kind === "write_file" ||
-          props.kind === "edit_file"
-        }
-      >
-        <FileText size={14} />
-      </Match>
-    </Switch>
-  );
-}
-
 function InlineToolCall(props: {
   expanded: boolean;
   tool: ToolExecutionView;
@@ -2626,6 +2300,45 @@ function InlineToolCall(props: {
   // kind and a payload; otherwise fall back to the generic text rendering.
   const hasSemanticCard = () =>
     Boolean(props.tool.toolKind && props.tool.payload);
+  // Header diff-stat for a completed edit/patch (+N −M and an op badge).
+  const headerStat = () =>
+    props.tool.kind === "completed" ? toolDiffStat(props.tool) : undefined;
+
+  // Open a workspace path via the capability-checked Core command. Surface a
+  // rejection (containment refused / opener failed) instead of swallowing it.
+  const [openError, setOpenError] = createSignal<string | undefined>();
+  const handleOpenPath = (path: string) => {
+    setOpenError(undefined);
+    openToolPath(props.tool.projectId, path).catch((error: unknown) => {
+      const message =
+        typeof error === "string"
+          ? error
+          : error instanceof Error
+            ? error.message
+            : "не удалось открыть файл";
+      setOpenError(message);
+    });
+  };
+  // Lazily fetch a range of the call's persisted output artifact (the snapshot,
+  // not the live file).
+  const loadArtifactRange = async (args: {
+    toolCallId: string;
+    logRef: string;
+    offset: number;
+    limit: number;
+  }) => {
+    const range = await getToolArtifactRange(
+      args.toolCallId,
+      args.logRef,
+      args.offset,
+      args.limit,
+    );
+    return {
+      content: range.content,
+      nextOffset: range.nextOffset ?? null,
+      eof: range.eof,
+    };
+  };
 
   return (
     <div class="inline-tool-call">
@@ -2644,12 +2357,36 @@ function InlineToolCall(props: {
         >
           {formatToolHeadline(props.tool)}
         </span>
-        {/* A successful "Completed" is implied by the row; only surface a status
-            that actually needs attention (running, denied, failed, cancelled). */}
-        <Show when={props.tool.kind !== "completed"}>
-          <span class={`tool-status tool-status--${toolTone(props.tool.kind)}`}>
-            {toolStatusLabel(props.tool.kind)}
-          </span>
+        {/* A completed edit/patch shows a diff-stat (+N −M); otherwise surface a
+            status that needs attention (running, denied, failed). A plain
+            "Completed" is implied by the row, so it shows nothing. */}
+        <Show
+          when={headerStat()}
+          fallback={
+            <Show when={props.tool.kind !== "completed"}>
+              <span
+                class={`tool-status tool-status--${toolTone(props.tool.kind)}`}
+              >
+                {toolStatusLabel(props.tool.kind)}
+              </span>
+            </Show>
+          }
+        >
+          {(stat) => (
+            <span class="tool-stat">
+              <Show when={stat().add}>
+                <span class="tool-stat__add">+{stat().add}</span>
+              </Show>
+              <Show when={stat().del}>
+                <span class="tool-stat__del">−{stat().del}</span>
+              </Show>
+              <Show when={stat().op}>
+                <span class={`tool-stat__op tool-stat__op--${stat().op}`}>
+                  {stat().op}
+                </span>
+              </Show>
+            </span>
+          )}
         </Show>
         <ChevronDown
           classList={{
@@ -2689,7 +2426,15 @@ function InlineToolCall(props: {
               </>
             }
           >
-            <ToolCard tool={props.tool} />
+            <ToolCard
+              tool={props.tool}
+              onOpenPath={handleOpenPath}
+              loadArtifactRange={loadArtifactRange}
+            />
+          </Show>
+
+          <Show when={openError()}>
+            {(message) => <p class="tool-body__error">{message()}</p>}
           </Show>
 
           {/* Show the pending change prominently before the human approves it,
@@ -3022,89 +2767,6 @@ function ErrorCard(props: {
   );
 }
 
-function Composer(props: {
-  activeRunId?: string;
-  draft: string;
-  hasProject: boolean;
-  isSending: boolean;
-  model?: LlmModel;
-  reasoningOptionId?: ReasoningOptionId;
-  onCancelRun: () => void;
-  onDraftChange: (value: string) => void;
-  onReasoningOptionChange: (optionId: ReasoningOptionId) => void;
-  onSend: () => void;
-}) {
-  const canSend = () =>
-    props.hasProject && props.draft.trim().length > 0 && !props.isSending;
-
-  return (
-    <form
-      class="composer"
-      onSubmit={(event) => {
-        event.preventDefault();
-        props.onSend();
-      }}
-    >
-      <textarea
-        rows={2}
-        placeholder={props.hasProject ? "Ask Mothership anything..." : "Open a project..."}
-        value={props.draft}
-        disabled={!props.hasProject}
-        onInput={(event) => props.onDraftChange(event.currentTarget.value)}
-        onKeyDown={(event) => {
-          // Enter sends; Shift+Enter inserts a newline. (`isComposing` guards IME.)
-          if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
-            event.preventDefault();
-            props.onSend();
-          }
-        }}
-      />
-      <div class="composer__actions">
-        <ReasoningSelector
-          disabled={props.isSending || Boolean(props.activeRunId)}
-          model={props.model}
-          value={props.reasoningOptionId}
-          onChange={props.onReasoningOptionChange}
-        />
-        <button class="icon-button" type="button" title="Attach file">
-          <Paperclip size={17} />
-        </button>
-        <Show
-          when={props.activeRunId}
-          fallback={
-            <button
-              class="send-button"
-              disabled={!canSend()}
-              type="submit"
-              title="Send message"
-            >
-              <Send size={16} />
-            </button>
-          }
-        >
-          <button
-            class="send-button send-button--stop"
-            type="button"
-            title="Stop response"
-            onClick={props.onCancelRun}
-          >
-            <Square size={13} />
-          </button>
-        </Show>
-      </div>
-    </form>
-  );
-}
-
-function SectionHeader(props: { action?: JSX.Element; title: string }) {
-  return (
-    <div class="section-header">
-      <span>{props.title}</span>
-      {props.action}
-    </div>
-  );
-}
-
 function ReasoningSelector(props: {
   disabled: boolean;
   model?: LlmModel;
@@ -3301,83 +2963,6 @@ function firstSelectableReasoningOptionIndex(options: ReasoningSelectorOption[])
   return options.length > 0 ? 0 : -1;
 }
 
-function InspectorSection(props: {
-  action?: JSX.Element;
-  children: JSX.Element;
-  title: string;
-}) {
-  return (
-    <section class="inspector-section">
-      <div class="inspector-section__header">
-        <h2>{props.title}</h2>
-        {props.action}
-      </div>
-      {props.children}
-    </section>
-  );
-}
-
-function RecentChatRow(props: {
-  item: ChatThreadSummary;
-  onClick: () => void;
-  selected: boolean;
-}) {
-  return (
-    <button
-      classList={{
-        "recent-row": true,
-        "recent-row--selected": props.selected,
-      }}
-      type="button"
-      onClick={props.onClick}
-    >
-      <RecentIcon status={props.selected ? "active" : "clock"} />
-      <span>{props.item.title}</span>
-      <time>{formatRelativeTime(props.item.updatedAt)}</time>
-    </button>
-  );
-}
-
-function RecentIcon(props: { status: RecentStatus }) {
-  if (props.status === "branch") {
-    return <GitBranch size={14} />;
-  }
-
-  if (props.status === "clock") {
-    return <Clock size={14} />;
-  }
-
-  return <Circle size={14} />;
-}
-
-function ProjectRow(props: {
-  onClick: () => void;
-  project: ProjectSummary;
-  selected: boolean;
-}) {
-  return (
-    <button
-      classList={{
-        "project-row": true,
-        "project-row--selected": props.selected,
-      }}
-      type="button"
-      onClick={props.onClick}
-    >
-      <span class="project-icon">
-        <Folder size={18} />
-      </span>
-      <span class="project-row__text">
-        <strong>{props.project.name}</strong>
-        <small>{props.project.path}</small>
-      </span>
-      <span class="branch-dot branch-dot--green" />
-      <span>{props.project.chatCount}</span>
-      <ChevronDown size={14} />
-    </button>
-  );
-}
-
 function Avatar(props: { role: "assistant" | "user"; iconUrl?: string | null }) {
   if (props.role === "user") {
     return <div class="avatar avatar--message avatar--user">You</div>;
@@ -3394,20 +2979,6 @@ function Avatar(props: { role: "assistant" | "user"; iconUrl?: string | null }) 
         />
       </Show>
     </div>
-  );
-}
-
-function BrandMark(props: { compact?: boolean }) {
-  return (
-    <span
-      classList={{
-        "brand-mark": true,
-        "brand-mark--compact": Boolean(props.compact),
-      }}
-      aria-hidden="true"
-    >
-      <img src={mothershipLogoUrl} alt="" draggable={false} />
-    </span>
   );
 }
 
@@ -3776,30 +3347,6 @@ function thinkingLabel(transport?: string) {
   return `Thinking via ${label[transport] ?? transport}...`;
 }
 
-function formatRelativeTime(timestamp: string) {
-  const seconds = Math.max(
-    0,
-    Math.floor((Date.now() - unixTimestampToDate(timestamp).getTime()) / 1000),
-  );
-
-  if (seconds < 60) {
-    return "now";
-  }
-
-  if (seconds < 3600) {
-    return `${Math.floor(seconds / 60)}m ago`;
-  }
-
-  if (seconds < 86_400) {
-    return `${Math.floor(seconds / 3600)}h ago`;
-  }
-
-  return unixTimestampToDate(timestamp).toLocaleDateString([], {
-    month: "short",
-    day: "numeric",
-  });
-}
-
 function unixTimestampToDate(timestamp: string) {
   const numericTimestamp = Number(timestamp);
   return new Date(
@@ -3888,163 +3435,9 @@ function appendToolOutput(
   return next.length > max ? `... output trimmed ...\n${next.slice(-max)}` : next;
 }
 
-// The full `program arg1 arg2 …` line for a run_command call. Sourced from the
-// legacy `command` field when present, otherwise from the typed `payload`
-// (program/args) — the unified orchestrator carries the command in the payload,
-// not the legacy field, so reading only `command` showed nothing.
-function formatToolCommand(tool: ToolExecutionView): string {
-  if (tool.command) {
-    return [tool.command.program, ...(tool.command.args ?? [])].join(" ");
-  }
-  const program = toolProgram(tool);
-  if (!program) {
-    return "";
-  }
-  return [program, ...toolPayloadArgs(tool)].join(" ").trim();
-}
-
-// The program a run_command call ran, from the legacy command field or the typed
-// payload (the payload arrives on the terminal event; command is null on the new
-// orchestrator path).
-function toolProgram(tool: ToolExecutionView): string | undefined {
-  if (tool.command?.program) {
-    return tool.command.program;
-  }
-  const program = tool.payload?.["program"];
-  return typeof program === "string" && program ? program : undefined;
-}
-
-function toolPayloadArgs(tool: ToolExecutionView): string[] {
-  const args = tool.payload?.["args"];
-  return Array.isArray(args)
-    ? args.filter((arg): arg is string => typeof arg === "string")
-    : [];
-}
-
-function toolPath(tool: ToolExecutionView): string | undefined {
-  const path = tool.payload?.["path"];
-  return typeof path === "string" && path ? path : undefined;
-}
-
-// A compact, single-line label for a tool-call spoiler row: the command line for
-// run_command (the terminal icon is the implicit verb), or "verb + path" for the
-// file/search tools, falling back to a generic verb when the target is unknown.
-function formatToolHeadline(tool: ToolExecutionView) {
-  if (tool.toolKind === "run_command" || tool.command) {
-    return formatToolCommand(tool) || "Ran command";
-  }
-
-  const path = toolPath(tool);
-  switch (tool.toolKind) {
-    case "read_file":
-      return path ? `Read ${path}` : "Read file";
-    case "write_file":
-      return path ? `Wrote ${path}` : "Wrote file";
-    case "edit_file":
-      return path ? `Edited ${path}` : "Edited file";
-    case "apply_patch":
-      return "Applied patch";
-    case "list_files":
-      return "Listed files";
-    case "search_text":
-      return "Searched";
-    default:
-      return "Used tool";
-  }
-}
-
-function formatToolOutput(tool: ToolExecutionView) {
-  if (tool.output) {
-    return tool.output;
-  }
-
-  if (!tool.result) {
-    return "";
-  }
-
-  const stdout = (tool.result.stdoutPreview || tool.result.stdoutTail || "").trim();
-  const stderr = (tool.result.stderrPreview || tool.result.stderrTail || "").trim();
-
-  // The result message is rendered on its own line (inline-tool-call__message),
-  // so it must NOT be repeated inside the output block — otherwise a denied /
-  // failed tool shows its reason twice.
-  return [stdout, stderr ? `[stderr]\n${stderr}` : ""]
-    .filter(Boolean)
-    .join("\n\n");
-}
-
-function countTextLines(text: string) {
-  const visibleText = text.replace(/(?:\r\n|\r|\n)+$/, "");
-  if (visibleText.length === 0) {
-    return 1;
-  }
-
-  return visibleText.split(/\r\n|\r|\n/).length;
-}
-
-function shouldShowInlineToolOutput(tool: ToolExecutionView, output: string) {
-  if (output.trim().length > 0) {
-    return true;
-  }
-
-  return tool.kind === "started" || tool.kind === "output";
-}
-
-function isTerminalToolKind(kind: ToolExecutionEventKind) {
-  return (
-    kind === "completed" ||
-    kind === "failed" ||
-    kind === "cancelled" ||
-    kind === "timed_out" ||
-    kind === "permission_denied" ||
-    kind === "loop_blocked"
-  );
-}
-
-function toolStatusLabel(kind: ToolExecutionEventKind) {
-  const labels: Record<ToolExecutionEventKind, string> = {
-    queued: "Queued",
-    permission_requested: "Needs approval",
-    permission_denied: "Denied",
-    waiting_for_resource: "Waiting",
-    started: "Running",
-    output: "Running",
-    completed: "Completed",
-    failed: "Failed",
-    cancelled: "Cancelled",
-    timed_out: "Timed out",
-    loop_blocked: "Blocked",
-  };
-  return labels[kind];
-}
-
-function toolTone(kind: ToolExecutionEventKind) {
-  if (kind === "completed") {
-    return "done";
-  }
-  if (
-    kind === "failed" ||
-    kind === "permission_denied" ||
-    kind === "timed_out" ||
-    kind === "cancelled"
-  ) {
-    return "error";
-  }
-  if (
-    kind === "permission_requested" ||
-    kind === "waiting_for_resource" ||
-    kind === "loop_blocked"
-  ) {
-    return "pending";
-  }
-  return "running";
-}
-
 function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
-
-type RecentStatus = "active" | "branch" | "clock";
 
 type ConversationTimelineItem = MessageTimelineItem;
 
@@ -4056,25 +3449,6 @@ interface MessageTimelineItem {
   id: string;
   kind: "message";
   messageId: string;
-}
-
-interface ToolExecutionView {
-  toolCallId: string;
-  runId?: string | null;
-  chatId?: string | null;
-  messageId?: string | null;
-  projectId?: string | null;
-  command?: ToolCommand | null;
-  kind: ToolExecutionEventKind;
-  message?: string | null;
-  output: string;
-  result?: ToolExecutionResult | null;
-  toolKind?: ToolKind;
-  payload?: Record<string, unknown> | null;
-  touchedPaths?: string[];
-  artifacts?: ToolArtifact[];
-  createdAt: number;
-  updatedAt: number;
 }
 
 interface MessagePartView {

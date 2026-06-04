@@ -717,6 +717,64 @@ export function cancelToolExecution(
   });
 }
 
+/** A newline-aligned slice of a tool's persisted output artifact (the snapshot
+ * captured at tool-call time, NOT the live file). `offset`/`nextOffset` are
+ * opaque byte positions in the blob file — to page, echo `nextOffset` back as
+ * the next `offset`; do not compute them yourself. */
+export interface ToolArtifactRange {
+  content: string;
+  offset: number;
+  nextOffset?: number | null;
+  totalBytes: number;
+  eof: boolean;
+}
+
+/**
+ * Lazily fetch a byte range of a tool call's durable output artifact. The Core
+ * resolves `logRef` against its own tool-output store and refuses anything that
+ * escapes it — the UI can never read an arbitrary path, nor the (possibly
+ * changed) live file.
+ */
+export function getToolArtifactRange(
+  toolCallId: string,
+  logRef: string,
+  offset: number,
+  limit: number,
+): Promise<ToolArtifactRange> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve({
+      content: "",
+      offset,
+      nextOffset: null,
+      totalBytes: 0,
+      eof: true,
+    });
+  }
+
+  return invoke<ToolArtifactRange>("get_tool_artifact_range", {
+    toolCallId,
+    logRef,
+    offset,
+    limit,
+  });
+}
+
+/**
+ * Open a workspace path in the OS default application. The Core resolves the
+ * path against the owning project's workspace root and refuses anything outside
+ * it (capability + containment) — never a raw shell open of UI-supplied data.
+ */
+export function openToolPath(
+  projectId: string | null | undefined,
+  path: string,
+): Promise<void> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve();
+  }
+
+  return invoke<void>("open_tool_path", { projectId, path });
+}
+
 export function getConnectorSettings(): Promise<ConnectorSettingsSnapshot> {
   if (!isTauriRuntime()) {
     return Promise.resolve(

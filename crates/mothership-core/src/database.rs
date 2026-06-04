@@ -196,6 +196,22 @@ impl Database {
         select_chat_project(&connection, chat_id)
     }
 
+    /// The on-disk root of a project, by id. Used to resolve + contain a path
+    /// before opening it externally. `None` when the project is unknown.
+    pub fn project_root(&self, project_id: &str) -> Result<Option<String>> {
+        validate_identifier("project_id", project_id)?;
+
+        let connection = self.connect()?;
+        let path = connection
+            .query_row(
+                "SELECT path FROM projects WHERE id = ?1",
+                params![project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(path)
+    }
+
     pub fn chat_provider_state(
         &self,
         chat_id: &str,

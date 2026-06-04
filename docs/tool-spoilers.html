@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mothership — Linear tool spoilers (developed)</title>
+<style>
+  :root{
+    --bg:#070c12; --ink:#cad5e0; --muted:#8b99a9; --faint:#5d6b7a;
+    --green:#8fe9b2; --add:#5fcf90; --del:#ff8a8a; --amber:#e8c15a; --blue:#74a9ff;
+    --mono:ui-monospace,"Cascadia Code","JetBrains Mono",Consolas,monospace;
+    --sans:-apple-system,"Segoe UI",Roboto,Inter,system-ui,sans-serif;
+    --k-run:#4ad07e; --k-read:#5aa0ff; --k-write:#36c6c0; --k-edit:#e0a13a;
+    --k-patch:#a07bff; --k-list:#7d93ab; --k-search:#b07bff; --k-fetch:#3fb6e8; --k-todo:#4ad07e;
+  }
+  *{box-sizing:border-box} html,body{margin:0}
+  body{background:radial-gradient(1200px 600px at 30% -10%,#0e1a28 0%,transparent 60%),var(--bg);
+    color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  a{color:var(--blue)}
+  .wrap{max-width:1240px;margin:0 auto;padding:34px 22px 120px}
+  .top h1{margin:0 0 6px;font-size:22px;letter-spacing:-.01em}
+  .top p{margin:0;color:var(--muted);max-width:84ch}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0 0}
+  .ctl{font:inherit;font-size:12.5px;font-weight:600;color:#cdd9e6;background:#0e1825;border:1px solid #1d2a39;border-radius:8px;padding:6px 12px;cursor:pointer}
+  .ctl:hover{background:#132235;border-color:#2a3c50}
+
+  .grid{display:grid;grid-template-columns:minmax(0,1fr) 392px;gap:26px;margin-top:22px;align-items:start}
+  @media(max-width:1080px){.grid{grid-template-columns:1fr}}
+
+  .ic{width:15px;height:15px;flex:0 0 auto;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+  .chev{width:14px;height:14px;color:#4f5f6f;transition:transform .15s ease;flex:0 0 auto}
+  .open>[data-sp] .chev,.d-sub.open .chev{transform:rotate(180deg)}
+  .body{display:none} .open>.body{display:grid;gap:9px}
+  .grow{flex:1 1 auto} .mono{font-family:var(--mono)}
+  .trunc{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  /* linear row */
+  .sp{border-radius:8px}
+  .sp+.sp{border-top:1px solid #101b27}
+  [data-sp]{display:flex;align-items:center;gap:10px;width:100%;padding:8px 9px;cursor:pointer;color:var(--ink);background:transparent;border:0;text-align:left;font:inherit;border-radius:8px}
+  [data-sp]:hover{background:#0d1925}
+  .lab{font-weight:650}
+  .tgt{color:var(--muted);font-family:var(--mono);font-size:12.5px}
+  .meta{color:var(--faint);font-family:var(--mono);font-size:11.5px;white-space:nowrap}
+  .body{margin:0 0 9px 17px;padding-left:14px;border-left:2px solid #18283a}
+
+  .st{font-size:11.5px;font-weight:700;white-space:nowrap}
+  .st.denied,.st.err{color:#ff9b9b} .st.wait{color:var(--amber)} .st.ok{color:#5fcf90}
+
+  /* diff stat in header */
+  .stat{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11.5px;font-weight:700}
+  .stat .add{color:var(--add)} .stat .del{color:var(--del)}
+  .stat .op{display:inline-flex;align-items:center;justify-content:center;min-width:16px;height:16px;border-radius:4px;font-size:10.5px;padding:0 3px}
+  .stat .op.M{color:#0c0f08;background:var(--amber)} .stat .op.A{color:#06120b;background:var(--add)} .stat .op.D{color:#1a0808;background:var(--del)}
+
+  /* detail blocks */
+  .d-cmd{position:relative;font-family:var(--mono);font-size:12.5px;color:var(--green);white-space:pre-wrap;word-break:break-word;padding:8px 11px 8px 26px;border:1px solid #182838;border-radius:7px;background:linear-gradient(180deg,#0b1622,#091420)}
+  .d-cmd::before{content:"$";position:absolute;left:11px;color:#4d6a86;font-weight:700}
+  .d-reason{color:#c8b88e;font-size:12.5px}
+  .d-chips{display:flex;flex-wrap:wrap;gap:6px}
+  .d-chip{display:inline-flex;gap:5px;align-items:center;font-size:11.5px;padding:2px 8px;border-radius:6px;border:1px solid #213245;background:#0c1722}
+  .d-chip b{color:#7e8d9d;font-weight:700} .d-chip span{color:#d4dfeb;font-family:var(--mono)}
+
+  /* code block: line-number gutter + simple highlight + open-external link */
+  .code-wrap{display:grid;gap:5px}
+  .d-codehead{display:flex;align-items:center;gap:7px;font-size:11.5px;color:#8b99a9;font-family:var(--mono)}
+  .d-codehead .ic{width:13px;height:13px;color:#5e7a93}
+  .code-open{margin-left:auto;display:inline-flex;align-items:center;gap:4px;color:#7fa6d8;text-decoration:none;font-family:var(--sans);font-size:11.5px}
+  .code-open:hover{text-decoration:underline}
+  .code-open .ic{width:12px;height:12px}
+  .code{max-height:360px;overflow:auto;border-radius:8px;border:1px solid #16222f;background:#050b12;font-family:var(--mono);font-size:12px;line-height:1.6;scrollbar-width:thin;scrollbar-color:#2c3e52 transparent;tab-size:4;padding:6px 0}
+  .cl{display:flex;min-width:max-content}
+  .cl .ln{position:sticky;left:0;z-index:1;flex:0 0 auto;min-width:40px;padding:0 9px;text-align:right;color:#445466;background:#070f18;border-right:1px solid #14202d;user-select:none}
+  .cl .lc{padding:0 12px;white-space:pre;color:#c2cedb;flex:1 1 auto}
+  .cl.ctx .lc{color:#7c8a98}
+  .cl.read{background:rgba(208,224,244,.055)}
+  .cl.read .ln{color:#7196c0;background:#0b1726;border-right-color:#33536f}
+  .cls-rest{display:none}
+  .code-wrap.show-all .cls-rest{display:block}
+  .code-wrap.show-all .code-more{display:none}
+  .code-more{justify-self:start;font:inherit;font-size:12px;color:#7fa6d8;background:transparent;border:0;cursor:pointer;padding:2px 4px;font-family:var(--mono)}
+  .code-more:hover{text-decoration:underline}
+  .t-com{color:#5f7081;font-style:italic} .t-str{color:#9ad59b} .t-kw{color:#cc91e6} .t-num{color:#e0a87a} .t-flag{color:#7fb0e0}
+  .d-out{margin:0;max-height:300px;overflow:auto;border-radius:8px;border:1px solid #16222f;background:#050b12;padding:9px 11px;color:#b7c5d4;font-family:var(--mono);font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word;font-weight:400;scrollbar-width:thin;scrollbar-color:#2c3e52 transparent;tab-size:4}
+
+  .d-diff{font-family:var(--mono);font-size:12px;line-height:1.6;border-radius:7px;overflow:auto;max-height:360px;border:1px solid #14202d;background:#060d15;scrollbar-width:thin;scrollbar-color:#2c3e52 transparent;tab-size:4;padding:5px 0}
+  .dl{display:flex;min-width:max-content}
+  .dl .dg{position:sticky;left:0;z-index:1;flex:0 0 auto;display:flex;background:#070f18;border-right:1px solid #11202d;user-select:none}
+  .dl .dg i{width:34px;padding:0 6px;text-align:right;color:#41505f;font-style:normal}
+  .dl .dlc{padding:0 10px;white-space:pre;flex:1 1 auto;color:#aab8c6}
+  .dl.add{background:rgb(74 221 134 / 9%)} .dl.add .dlc{color:#86e0a4}
+  .dl.del{background:rgb(255 120 120 / 9%)} .dl.del .dlc{color:#ff9b9b}
+  .dl.hunk{background:#0a1622} .dl.hunk .dlc{color:#7fa6d8}
+  .dl.ctx .dlc{color:#8593a3}
+
+  /* file list with show-more */
+  .d-list{display:grid;gap:2px}
+  .d-file{display:flex;align-items:center;gap:8px;padding:2px 4px;border-radius:5px}
+  .d-file:hover{background:#0c1722}
+  .d-file .ic{width:13px;height:13px;color:#5d748c}
+  .d-file code{font-family:var(--mono);font-size:12px;color:#cbd6e3}
+  .d-list-rest{display:none;gap:2px;grid-auto-flow:row}
+  .d-list.show-all .d-list-rest{display:grid}
+  .d-list.show-all .d-more{display:none}
+  .d-more{justify-self:start;font:inherit;font-size:12px;color:#7fa6d8;background:transparent;border:0;cursor:pointer;padding:3px 4px;font-family:var(--mono)}
+  .d-more:hover{text-decoration:underline}
+
+  /* nested sub-spoilers (edits / patch files / file content) */
+  .d-subs{display:grid;gap:5px}
+  .d-sub{border:1px solid #14202d;border-radius:7px;background:#070e17;overflow:hidden}
+  .d-sub-sum{display:flex;align-items:center;gap:8px;width:100%;padding:6px 9px;cursor:pointer;background:transparent;border:0;color:#c4d0dd;font:inherit;font-size:12px;text-align:left}
+  .d-sub-sum:hover{background:#0c1722}
+  .d-sub-op{font-family:var(--mono);font-weight:700;width:14px;text-align:center;flex:0 0 auto}
+  .d-sub-op.A{color:var(--add)} .d-sub-op.M{color:var(--amber)} .d-sub-op.D{color:var(--del)}
+  .d-sub-path{font-family:var(--mono);font-size:12px;color:#cbd6e3;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .d-sub-dir{color:#6f8298} .d-sub-name{color:#e2edf7;font-weight:600}
+  .d-sub-stat{font-family:var(--mono);font-size:11px;font-weight:700;flex:0 0 auto}
+  .d-sub-stat .add{color:var(--add)} .d-sub-stat .del{color:var(--del)}
+  .d-sub-body{display:none;padding:0 8px 8px} .d-sub.open .d-sub-body{display:block}
+
+  .d-todos{display:grid;gap:5px;margin:0;padding:0;list-style:none;font-size:12.5px}
+  .d-todos li{display:flex;gap:8px;align-items:center}
+  .d-todos .box{width:13px;height:13px;border-radius:4px;border:1.5px solid #3a4d61;flex:0 0 auto}
+  .d-todos .done .box{background:var(--add);border-color:var(--add)}
+  .d-todos .doing .box{border-color:var(--amber);box-shadow:inset 0 0 0 3px var(--amber)}
+  .d-todos .done span{text-decoration:line-through;color:#74828f}
+
+  .btn{font:inherit;font-size:12px;font-weight:650;padding:6px 12px;border-radius:7px;border:1px solid #27394b;background:#101b27;color:#dce7f3;cursor:pointer;display:inline-flex;gap:6px;align-items:center}
+  .btn.ok{border-color:rgb(74 221 134 / 35%);background:rgb(74 221 134 / 12%);color:#8ff0b4}
+  .btn.no{border-color:rgb(255 140 140 / 30%);background:rgb(255 120 120 / 10%);color:#ffb1b1}
+  .d-approve{display:flex;gap:8px}
+
+  /* chat */
+  .chat-col{position:sticky;top:18px}
+  .chat-card{border:1px solid #16222f;border-radius:14px;background:#0a1019;overflow:hidden}
+  .chat-bar{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid #14202d;background:#0c1521}
+  .chat-bar .title{font-weight:700;font-size:13px}
+  .chat-scroll{padding:14px;display:grid;gap:13px;max-height:80vh;overflow:auto;scrollbar-width:thin;scrollbar-color:#243446 transparent}
+  .msg-user{justify-self:end;max-width:84%;background:#16314e;border:1px solid #245078;border-radius:13px 13px 4px 13px;padding:8px 12px;font-size:13px}
+  .msg-asst{font-size:13.5px;color:#d4dee9;line-height:1.55}
+  .msg-asst code{font-family:var(--mono);font-size:12px;background:#101c29;border:1px solid #1c2b3a;border-radius:5px;padding:1px 5px}
+  .hint{color:var(--faint);font-size:12px;margin-top:14px}
+  .badge-note{display:inline-block;font-size:11px;color:#9fb3c9;background:#10202e;border:1px solid #1d3142;border-radius:6px;padding:2px 7px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-term" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M10.4 16.6 14 13l1.6 1.6-3.6 3.6H10.4z"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="12" x2="12" y2="18"/><line x1="9" y1="15" x2="15" y2="15"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+    <symbol id="i-patch" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M9 11l3 3L20 6"/><path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></symbol>
+    <symbol id="i-chev" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+    <symbol id="i-ext" viewBox="0 0 24 24"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></symbol>
+  </svg>
+
+  <div class="top">
+    <h1>Линейный — развитый</h1>
+    <p>Diff-стат (<b style="color:#5fcf90">+N</b> <b style="color:#ff8a8a">−M</b> + бейдж <b style="background:#e8c15a;color:#0c0f08;border-radius:3px;padding:0 4px">M</b>/<b style="background:#5fcf90;color:#06120b;border-radius:3px;padding:0 4px">A</b>/<b style="background:#ff8a8a;color:#1a0808;border-radius:3px;padding:0 4px">D</b>) в хедере · простая самописная подсветка (без либ) · <b>номера строк</b> везде — в файлах и в диффах (старый/новый) · контекст сверху/снизу (прочитанное подсвечено, контекст приглушён) · всё режется до <b>10 строк</b>, дальше «… ещё N строк» <b>лениво подгружает</b> остаток (имитация — в реале это запрос к диску) · ссылка <b>«Открыть»</b> во внешнем приложении · <code class="mono">read</code>/<code class="mono">wrote</code>/<code class="mono">edit</code>/<code class="mono">multi-edit</code>/<code class="mono">patch</code>. По умолчанию свёрнуто.</p>
+    <div class="controls">
+      <button class="ctl" data-all="open">Развернуть всё</button>
+      <button class="ctl" data-all="close">Свернуть всё</button>
+      <span class="badge-note">терминал — за фиче-флагом, не дефолт</span>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="stack" id="gallery"></div>
+    <div class="chat-col">
+      <div class="chat-card">
+        <div class="chat-bar"><svg class="ic" style="color:#6d8095"><use href="#i-term"/></svg><span class="title">Как это в чате</span></div>
+        <div class="chat-scroll" id="chat"></div>
+      </div>
+      <p class="hint">Свёрнутая строка понятна и не-технарю; вся техничка — внутри, по клику.</p>
+    </div>
+  </div>
+</div>
+
+<script>
+const KIND={
+  run:{ic:"i-term",accent:"var(--k-run)"}, read:{ic:"i-file",accent:"var(--k-read)"},
+  write:{ic:"i-plus",accent:"var(--k-write)"}, edit:{ic:"i-edit",accent:"var(--k-edit)"},
+  multiedit:{ic:"i-edit",accent:"var(--k-edit)"}, patch:{ic:"i-patch",accent:"var(--k-patch)"},
+  list:{ic:"i-folder",accent:"var(--k-list)"}, search:{ic:"i-search",accent:"var(--k-search)"},
+  fetch:{ic:"i-globe",accent:"var(--k-fetch)"}, websearch:{ic:"i-search",accent:"var(--k-fetch)"},
+  todo:{ic:"i-check",accent:"var(--k-todo)"},
+};
+const esc=s=>String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const icon=(id,cls="ic")=>`<svg class="${cls}"><use href="#${id}"/></svg>`;
+const splitPath=p=>{const i=p.lastIndexOf("/");return i>=0?[p.slice(0,i+1),p.slice(i+1)]:["",p];};
+// 10-line cap: show first 10 rows, rest behind a "ещё N строк" link
+const capInner=rows=>rows.length<=10?rows.join(""):rows.slice(0,10).join("")+`<div class="cls-rest">${rows.slice(10).join("")}</div>`;
+const capMore=rows=>rows.length<=10?"":`<button class="code-more" data-more>… ещё ${rows.length-10} строк</button>`;
+// diff with old/new line-number gutter + 10-line cap. `start` = first code line no.
+function diffBlock(diff, start){
+  let o=start||1, n=start||1;
+  const rows=diff.map(([t,x])=>{
+    let oi="",ni="";
+    if(t==="ctx"){oi=o++;ni=n++;}
+    else if(t==="del"){oi=o++;}
+    else if(t==="add"){ni=n++;}
+    return `<div class="dl ${t}"><span class="dg"><i>${oi}</i><i>${ni}</i></span><span class="dlc">${esc(x)}</span></div>`;
+  });
+  return `<div class="code-wrap"><div class="d-diff">${capInner(rows)}</div>${capMore(rows)}</div>`;
+}
+
+const GO=`func (e *Engine) Start(ctx context.Context) error {
+\trouter := chi.NewRouter()
+\trouter.Use(middleware.RealIP)
+\trouter.Use(middleware.Logger)
+\trouter.Mount("/api", e.api)
+
+\tsrv := &http.Server{Addr: e.cfg.Addr, Handler: router}
+\tgo func() {
+\t\t<-ctx.Done()
+\t\tsd, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+\t\tdefer cancel()
+\t\t_ = srv.Shutdown(sd)
+\t}()
+\treturn srv.ListenAndServe()
+}`;
+const TSX=`import { createSignal } from "solid-js";
+
+export default function App() {
+  const [count, setCount] = createSignal(0);
+  return (
+    <main class="app">
+      <h1>Idle Dashboard</h1>
+      <button onClick={() => setCount(count() + 1)}>
+        clicks: {count()}
+      </button>
+    </main>
+  );
+}`;
+const LS=["engine.go","main.go","persistence.go","admin_auth.go","cache.go","config.go","router.go",
+  "handlers.go","models.go","store.go","metrics.go","ws.go","payments.go","compat.go","session.go",
+  "engine_test.go","auth_test.go","cache_test.go","go.mod","go.sum","Dockerfile",".env.example",
+  "migrations/001_init.sql","migrations/002_payments.sql","static/admin.html","README.md","Makefile",
+  "internal/idle/loop.go","internal/idle/reward.go","internal/dota/bridge.go","internal/dota/events.go",
+  "internal/log/log.go","internal/cfg/cfg.go"];
+
+const TOOLS=[
+  {kind:"run",label:"Ran command",target:"cmd /c dir /s /b",status:"ok",meta:"exit 0",
+    d:{command:{lang:"bash",text:"cmd /c dir /s /b game\\scripts\\vscripts content\\panorama"},
+       output:"E:\\grin\\dota_idle\\game\\scripts\\vscripts\\addon_game_mode.lua\nE:\\grin\\dota_idle\\game\\scripts\\vscripts\\dota_idle\\backend_client.lua\nE:\\grin\\dota_idle\\content\\panorama\\layout\\custom_game\\hud.xml\n… ещё 214 строк"}},
+  {kind:"read",label:"Read",target:"backend/engine.go",status:"ok",meta:"строки 144–150",
+    d:{chips:[["lines","144–150"],["of","260"],["sha","a91f…3c"]],
+       content:{title:"engine.go", text:GO, startLine:138, readFrom:144, readTo:150}}},
+  {kind:"read",label:"Read",target:"game/…/runtime.lua",status:"denied",meta:"Denied",
+    d:{reason:"path is outside the project workspace"}},
+  {kind:"write",label:"Wrote",target:"admin/src/App.tsx",status:"ok",meta:"4.2 KB",stat:{add:84,op:"A"},
+    d:{chips:[["size","4.2 KB"],["sha","7b3e…d1"]], content:{lang:"typescript",text:TSX,title:"App.tsx · записано"}}},
+  {kind:"edit",label:"Edited",target:"backend/main.go",status:"ok",stat:{add:2,del:1,op:"M"},
+    d:{start:203, diff:[
+      ["hunk","@@ -203,5 +203,6 @@ func setupRouter() *chi.Mux {"],
+      ["ctx","  r := chi.NewRouter()"],
+      ["ctx","  r.Use(middleware.RequestID)"],
+      ["del","- r.Use(middleware.Logger)"],
+      ["add","+ r.Use(middleware.RealIP)"],
+      ["add","+ r.Use(middleware.Logger)"],
+      ["ctx","  r.Mount(\"/api\", api)"],
+      ["ctx","  return r"]]}},
+  {kind:"multiedit",label:"Multi-edit",target:"backend/engine.go",status:"ok",stat:{add:6,del:4,op:"M"},
+    d:{edits:[
+      {title:"middleware order",add:2,del:1,start:61,diff:[
+        ["ctx","  r := chi.NewRouter()"],["del","- r.Use(middleware.Logger)"],
+        ["add","+ r.Use(middleware.RealIP)"],["add","+ r.Use(middleware.Logger)"],["ctx","  r.Mount(\"/api\", api)"]]},
+      {title:"compat cache key",add:1,del:1,start:139,diff:[
+        ["ctx","  func cacheKey(pid int, v string) string {"],["del","-   return strconv.Itoa(pid)"],
+        ["add","+   return strconv.Itoa(pid) + \":\" + v"],["ctx","  }"]]},
+      {title:"error wrapping",add:1,del:1,start:88,diff:[
+        ["ctx","  sess, err := e.store.Session(ctx, pid)"],["del","- return err"],
+        ["add","+ return fmt.Errorf(\"engine: %w\", err)"],["ctx","  return sess, nil"]]},
+      {title:"shutdown timeout",add:1,del:1,start:201,diff:[
+        ["ctx","  go func() {"],["del","- ctx := context.Background()"],
+        ["add","+ ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)"],["ctx","  defer cancel()"]]},
+    ]}},
+  {kind:"patch",label:"Applied patch",target:"3 files",status:"ok",stat:{add:58,del:12},
+    d:{patchFiles:[
+      {op:"M",path:"backend/engine.go",add:18,del:7,start:60,diff:[
+        ["hunk","@@ -60,5 +60,6 @@ func setupRouter() {"],["ctx","  r := chi.NewRouter()"],
+        ["del","- r.Use(middleware.Logger)"],["add","+ r.Use(middleware.RealIP)"],
+        ["add","+ r.Use(middleware.Logger)"],["ctx","  r.Mount(\"/api\", api)"]]},
+      {op:"A",path:"backend/cache.go",add:34,del:0,start:1,diff:[
+        ["hunk","@@ -0,0 +1,5 @@ (новый файл)"],["add","+ package backend"],["add","+"],
+        ["add","+ type Cache struct { m map[string][]byte }"],["add","+"],
+        ["add","+ func NewCache() *Cache { return &Cache{m: map[string][]byte{}} }"]]},
+      {op:"M",path:"backend/main.go",add:6,del:5,start:42,diff:[
+        ["ctx","  srv := &http.Server{"],["del","-   Addr: \":8080\","],
+        ["add","+   Addr: cfg.Addr,"],["ctx","    Handler: r,"],["ctx","  }"]]},
+    ]}},
+  {kind:"list",label:"Listed",target:"backend/",status:"ok",meta:"33 files",
+    d:{list:{files:LS,show:6}}},
+  {kind:"search",label:"Searched",target:"/TODO/",status:"ok",meta:"80 matches",
+    d:{chips:[["matches","80"],["files","32"],["result","truncated"]],
+       output:"backend/engine.go:142:  // TODO: cache compatibility lookups\nbackend/admin_auth.go:31:  // TODO: rate-limit failed logins\ncontent/panorama/hud.xml:8:  <!-- TODO: idle reward popup -->"}},
+  {kind:"fetch",label:"Fetched",target:"pkg.go.dev/net/http",status:"ok",meta:"200",
+    d:{chips:[["status","200"],["type","text/html"],["size","142 KB"]]}},
+  {kind:"websearch",label:"Web search",target:"chi router middleware order",status:"ok",meta:"8 results",
+    d:{output:"1. Making a RESTful JSON API in Go — go-chi/chi\n2. Middleware ordering in chi — stackoverflow\n3. net/http middleware patterns — The Go Blog"}},
+  {kind:"todo",label:"Updated plan",target:"3 tasks",status:"ok",meta:"1 done",
+    d:{todos:[["done","Map the backend"],["doing","Audit the Dota-side"],["todo","Estimate the key parts"]]}},
+  {kind:"run",label:"Ran command",target:"rm -rf build",status:"wait",meta:"Awaiting approval",
+    d:{command:{lang:"bash",text:"rm -rf build"},reason:"shell command — requires approval",approval:true}},
+];
+
+// --- tiny dependency-free highlighter (comments / strings / keywords / numbers)
+const HL=/(\/\/[^\n]*|#[^\n]*|<!--[\s\S]*?-->)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)|\b(func|return|if|else|for|range|package|import|const|var|type|struct|interface|map|chan|go|defer|switch|case|break|continue|let|export|function|class|new|await|async|nil|null|undefined|true|false)\b|\b\d[\w.]*\b/g;
+function hlLine(line){
+  let out="",last=0,m; HL.lastIndex=0;
+  while((m=HL.exec(line))){
+    out+=esc(line.slice(last,m.index));
+    if(m[1])      out+=`<span class="t-com">${esc(m[1])}</span>`;
+    else if(m[2]) out+=`<span class="t-str">${esc(m[2])}</span>`;
+    else if(m[3]) out+=`<span class="t-kw">${esc(m[3])}</span>`;
+    else          out+=`<span class="t-num">${esc(m[0])}</span>`;
+    last=m.index+m[0].length;
+  }
+  return out+esc(line.slice(last));
+}
+const hlCmd=t=>esc(t).replace(/(^|\s)(\/[A-Za-z]+|--?[A-Za-z][\w-]*)/g,'$1<span class="t-flag">$2</span>');
+// file code: line-number gutter + simple highlight + "open externally" link
+function codeBlock(c){
+  const lines=c.lines||c.text.split("\n");
+  const start=c.startLine||1;
+  // each line is its own row so we can highlight the read region and dim context
+  const rows=lines.map((ln,i)=>{
+    const no=start+i;
+    const isRead=c.readFrom!=null && no>=c.readFrom && no<=c.readTo;
+    const cls=isRead?"cl read":(c.readFrom!=null?"cl ctx":"cl");
+    return `<div class="${cls}"><span class="ln">${no}</span><code class="lc">${hlLine(ln)}</code></div>`;
+  });
+  return `<div class="code-wrap"><div class="d-codehead">${icon("i-file")}<span>${esc(c.title||"")}</span>
+    <a class="code-open" href="#" onclick="return false" title="Открыть во внешнем приложении">${icon("i-ext")}Открыть</a></div>
+    <div class="code">${capInner(rows)}</div>${capMore(rows)}</div>`;
+}
+function fileRow(name){return `<div class="d-file">${icon("i-file")}<code>${esc(name)}</code></div>`;}
+function listBlock(l){
+  const head=l.files.slice(0,l.show).map(fileRow).join("");
+  const rest=l.files.slice(l.show).map(fileRow).join("");
+  return `<div class="d-list">${head}<button class="d-more" data-more>… ещё ${l.files.length-l.show}</button><div class="d-list-rest">${rest}</div></div>`;
+}
+function subEdit(e,open){
+  return `<div class="d-sub${open?" open":""}"><button class="d-sub-sum" data-sub>
+    <span class="d-sub-op M">±</span><span class="d-sub-path">${esc(e.title)}</span><span class="grow"></span>
+    <span class="d-sub-stat"><span class="add">+${e.add}</span> <span class="del">−${e.del}</span></span>${icon("i-chev","chev")}</button>
+    <div class="d-sub-body">${diffBlock(e.diff, e.start)}</div></div>`;
+}
+function subFile(f,open){
+  const [dir,name]=splitPath(f.path);
+  return `<div class="d-sub${open?" open":""}"><button class="d-sub-sum" data-sub>
+    <span class="d-sub-op ${f.op}">${f.op}</span>
+    <code class="d-sub-path"><span class="d-sub-dir">${esc(dir)}</span><span class="d-sub-name">${esc(name)}</span></code>
+    <span class="grow"></span><span class="d-sub-stat"><span class="add">+${f.add}</span> <span class="del">−${f.del}</span></span>${icon("i-chev","chev")}</button>
+    <div class="d-sub-body">${diffBlock(f.diff, f.start)}</div></div>`;
+}
+function detailHTML(d){
+  let h="";
+  if(d.command)  h+=`<div class="d-cmd">${hlCmd(d.command.text)}</div>`;
+  if(d.reason)   h+=`<div class="d-reason">${esc(d.reason)}</div>`;
+  if(d.chips)    h+=`<div class="d-chips">${d.chips.map(([k,v])=>`<span class="d-chip"><b>${esc(k)}</b><span>${esc(v)}</span></span>`).join("")}</div>`;
+  if(d.content)  h+=codeBlock(d.content);
+  if(d.diff)     h+=diffBlock(d.diff, d.start);
+  if(d.edits)    h+=`<div class="d-subs">${d.edits.map((e,i)=>subEdit(e,i===0)).join("")}</div>`;
+  if(d.patchFiles)h+=`<div class="d-subs">${d.patchFiles.map((f,i)=>subFile(f,i===0)).join("")}</div>`;
+  if(d.list)     h+=listBlock(d.list);
+  if(d.todos)    h+=`<ul class="d-todos">${d.todos.map(([s,t])=>`<li class="${s}"><span class="box"></span><span>${esc(t)}</span></li>`).join("")}</ul>`;
+  if(d.output)   h+=`<pre class="d-out">${esc(d.output)}</pre>`;
+  if(d.approval) h+=`<div class="d-approve"><button class="btn ok">${icon("i-check")}Approve</button><button class="btn no">Deny</button></div>`;
+  return h;
+}
+function headMeta(t){
+  if(t.stat){
+    const s=t.stat; let h="";
+    if(s.add) h+=`<span class="add">+${s.add}</span>`;
+    if(s.del) h+=`<span class="del">−${s.del}</span>`;
+    if(s.op)  h+=`<span class="op ${s.op}">${s.op}</span>`;
+    return `<span class="stat">${h}</span>`;
+  }
+  if(t.status!=="ok") return `<span class="st ${t.status}">${esc(t.meta)}</span>`;
+  return `<span class="meta">${esc(t.meta)}</span>`;
+}
+function row(t){
+  const k=KIND[t.kind];
+  return `<div class="sp${t.open?" open":""}">
+    <button data-sp><svg class="ic" style="color:${k.accent}"><use href="#${k.ic}"/></svg>
+      <span class="lab">${esc(t.label)}</span><span class="tgt trunc">${esc(t.target)}</span>
+      <span class="grow"></span>${headMeta(t)}${icon("i-chev","chev")}</button>
+    <div class="body">${detailHTML(t.d)}</div></div>`;
+}
+
+document.getElementById("gallery").innerHTML=TOOLS.map(row).join("");
+
+const CHAT=[
+  {role:"user",text:"Глянь структуру проекта и оцени масштаб — это MVP или что-то взрослое?"},
+  {role:"asst",html:"Гляну ключевые файлы и структуру."},
+  {role:"tools",items:[0,7,1]},
+  {role:"asst",html:"Папки <code>game/</code> и <code>content/</code> есть; пройдусь поиском по TODO и правлю старт движка."},
+  {role:"tools",items:[8,5,6]},
+  {role:"asst",html:"Проект <b>взрослее MVP</b>: backend + admin + Dota-side, есть TODO-карта и платёжный модуль."},
+];
+document.getElementById("chat").innerHTML=CHAT.map(m=>{
+  if(m.role==="user")return `<div class="msg-user">${esc(m.text)}</div>`;
+  if(m.role==="asst")return `<div class="msg-asst">${m.html}</div>`;
+  return `<div class="stack">${m.items.map(i=>row(TOOLS[i])).join("")}</div>`;
+}).join("");
+
+
+document.addEventListener("click",e=>{
+  const more=e.target.closest("[data-more]");
+  if(more){
+    // Mockup simulates the real behavior: the full content is NOT preloaded —
+    // clicking fetches it lazily (here: a short delay), then reveals.
+    const code=more.closest(".code-wrap");
+    if(code){ more.textContent="загрузка…"; setTimeout(()=>code.classList.add("show-all"),300); }
+    else more.closest(".d-list").classList.add("show-all");
+    return;
+  }
+  const sub=e.target.closest("[data-sub]");
+  if(sub){ sub.parentElement.classList.toggle("open"); return; }
+  const s=e.target.closest("[data-sp]");
+  if(s){ s.parentElement.classList.toggle("open"); }
+});
+document.querySelector(".controls").addEventListener("click",e=>{
+  const b=e.target.closest("[data-all]"); if(!b) return;
+  const open=b.dataset.all==="open";
+  document.querySelectorAll(".sp [data-sp], .d-sub").forEach(x=>{
+    const box = x.matches("[data-sp]") ? x.parentElement : x;
+    box.classList.toggle("open",open);
+  });
+});
+</script>
+</body>
+</html>
