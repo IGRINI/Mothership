@@ -3964,13 +3964,11 @@ function formatToolOutput(tool: ToolExecutionView) {
 
   const stdout = (tool.result.stdoutPreview || tool.result.stdoutTail || "").trim();
   const stderr = (tool.result.stderrPreview || tool.result.stderrTail || "").trim();
-  const message = tool.result.message?.trim() ?? "";
 
-  return [
-    stdout,
-    stderr ? `[stderr]\n${stderr}` : "",
-    message,
-  ]
+  // The result message is rendered on its own line (inline-tool-call__message),
+  // so it must NOT be repeated inside the output block — otherwise a denied /
+  // failed tool shows its reason twice.
+  return [stdout, stderr ? `[stderr]\n${stderr}` : ""]
     .filter(Boolean)
     .join("\n\n");
 }
