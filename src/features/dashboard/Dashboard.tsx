@@ -2579,6 +2579,33 @@ function ToolCallRow(props: {
   );
 }
 
+// A small, kind-specific glyph for a tool-call spoiler row (the terminal icon
+// doubles as the "ran" verb for run_command).
+function ToolKindIcon(props: { kind?: ToolKind }) {
+  return (
+    <Switch fallback={<Terminal size={14} />}>
+      <Match when={props.kind === "list_files"}>
+        <Folder size={14} />
+      </Match>
+      <Match when={props.kind === "search_text"}>
+        <Search size={14} />
+      </Match>
+      <Match when={props.kind === "apply_patch"}>
+        <GitBranch size={14} />
+      </Match>
+      <Match
+        when={
+          props.kind === "read_file" ||
+          props.kind === "write_file" ||
+          props.kind === "edit_file"
+        }
+      >
+        <FileText size={14} />
+      </Match>
+    </Switch>
+  );
+}
+
 function InlineToolCall(props: {
   expanded: boolean;
   tool: ToolExecutionView;
@@ -2608,6 +2635,22 @@ function InlineToolCall(props: {
         aria-expanded={props.expanded}
         onClick={props.onToggle}
       >
+        <span class="inline-tool-call__icon">
+          <ToolKindIcon kind={props.tool.toolKind} />
+        </span>
+        <span
+          class="inline-tool-call__title"
+          title={formatToolHeadline(props.tool)}
+        >
+          {formatToolHeadline(props.tool)}
+        </span>
+        {/* A successful "Completed" is implied by the row; only surface a status
+            that actually needs attention (running, denied, failed, cancelled). */}
+        <Show when={props.tool.kind !== "completed"}>
+          <span class={`tool-status tool-status--${toolTone(props.tool.kind)}`}>
+            {toolStatusLabel(props.tool.kind)}
+          </span>
+        </Show>
         <ChevronDown
           classList={{
             "inline-tool-call__chevron": true,
@@ -2615,13 +2658,6 @@ function InlineToolCall(props: {
           }}
           size={14}
         />
-        <Terminal size={15} />
-        <span class="inline-tool-call__title" title={command()}>
-          {formatToolHeadline(props.tool)}
-        </span>
-        <span class={`tool-status tool-status--${toolTone(props.tool.kind)}`}>
-          {toolStatusLabel(props.tool.kind)}
-        </span>
       </button>
 
       <Show when={props.expanded}>
@@ -3888,31 +3924,36 @@ function toolPayloadArgs(tool: ToolExecutionView): string[] {
     : [];
 }
 
-const TOOL_KIND_HEADLINES: Record<ToolKind, string> = {
-  run_command: "Ran command",
-  read_file: "Read file",
-  write_file: "Wrote file",
-  edit_file: "Edited file",
-  apply_patch: "Applied patch",
-  list_files: "Listed files",
-  search_text: "Searched",
-};
+function toolPath(tool: ToolExecutionView): string | undefined {
+  const path = tool.payload?.["path"];
+  return typeof path === "string" && path ? path : undefined;
+}
 
+// A compact, single-line label for a tool-call spoiler row: the command line for
+// run_command (the terminal icon is the implicit verb), or "verb + path" for the
+// file/search tools, falling back to a generic verb when the target is unknown.
 function formatToolHeadline(tool: ToolExecutionView) {
-  // run_command: name the actual program so the user sees "Used PowerShell" /
-  // "Ran git" rather than a generic label.
   if (tool.toolKind === "run_command" || tool.command) {
-    const program = toolProgram(tool);
-    if (program) {
-      return isPowerShellCommand(program) ? "Used PowerShell" : `Ran ${program}`;
-    }
+    return formatToolCommand(tool) || "Ran command";
   }
 
-  if (tool.toolKind) {
-    return TOOL_KIND_HEADLINES[tool.toolKind];
+  const path = toolPath(tool);
+  switch (tool.toolKind) {
+    case "read_file":
+      return path ? `Read ${path}` : "Read file";
+    case "write_file":
+      return path ? `Wrote ${path}` : "Wrote file";
+    case "edit_file":
+      return path ? `Edited ${path}` : "Edited file";
+    case "apply_patch":
+      return "Applied patch";
+    case "list_files":
+      return "Listed files";
+    case "search_text":
+      return "Searched";
+    default:
+      return "Used tool";
   }
-
-  return "Used tool";
 }
 
 function toolCommandLabel(command?: ToolCommand | null) {
