@@ -8,13 +8,13 @@ const VISIBLE_CAP = 10;
 
 /**
  * A line-numbered code viewer with a self-written highlighter, a read-region
- * highlight, a 10-line cap, and an optional "Открыть" link.
+ * highlight, a 10-line preview cap, and an optional "Открыть" link.
  *
- * Lazy loading: the component renders ONLY the lines it is handed. When more
- * content exists beyond what is loaded, the host passes `onLoadMore` (e.g. a
- * Core artifact-range query) — the cap button then fetches the rest on click
- * instead of revealing preloaded lines. Nothing past the window is pulled into
- * memory until the user asks.
+ * The preview shows the first {@link VISIBLE_CAP} lines; "Раскрыть весь файл"
+ * reveals the rest. Lazy loading: the component renders ONLY the lines it is
+ * handed. When more content exists beyond what is loaded, the host passes
+ * `onLoadMore` (e.g. a Core artifact-range query) — expanding then also fetches
+ * the rest. Nothing past the window is pulled into memory until the user asks.
  */
 export function CodeBlock(props: {
   lines: CodeLineModel[];
@@ -23,7 +23,7 @@ export function CodeBlock(props: {
   onOpen?: (path: string) => void;
   /** Called when the user asks for content beyond what is loaded. */
   onLoadMore?: () => void;
-  /** Label for the lazy-load button (defaults to "Загрузить весь файл"). */
+  /** Label for the lazy-load button once expanded (defaults to "Загрузить ещё"). */
   loadMoreLabel?: string;
   /** True while a lazy load is in flight. */
   loading?: boolean;
@@ -35,8 +35,21 @@ export function CodeBlock(props: {
     showAll() ? props.lines : props.lines.slice(0, VISIBLE_CAP);
   const hiddenLoaded = () =>
     showAll() ? 0 : Math.max(0, props.lines.length - VISIBLE_CAP);
-  const canLazyLoad = () =>
-    hiddenLoaded() === 0 && Boolean(props.onLoadMore) && !props.atEnd;
+  // More content can be lazily fetched (the file is larger than the loaded window).
+  const canLazyLoad = () => Boolean(props.onLoadMore) && !props.atEnd;
+  // Collapsed and there is anything more to reveal (hidden loaded lines or more
+  // to fetch) — show the single "Раскрыть весь файл" button.
+  const collapsedHasMore = () =>
+    !showAll() && (hiddenLoaded() > 0 || canLazyLoad());
+
+  // Reveal the loaded lines and, if the file is larger than the window, kick off
+  // the lazy fetch of the rest.
+  const expand = () => {
+    setShowAll(true);
+    if (canLazyLoad()) {
+      props.onLoadMore?.();
+    }
+  };
 
   return (
     <div class="code-block">
@@ -77,23 +90,19 @@ export function CodeBlock(props: {
         </For>
       </div>
 
-      <Show when={hiddenLoaded() > 0}>
-        <button
-          class="code-block__more"
-          type="button"
-          onClick={() => setShowAll(true)}
-        >
-          … ещё {hiddenLoaded()} строк
+      <Show when={collapsedHasMore()}>
+        <button class="code-block__more" type="button" onClick={expand}>
+          Раскрыть весь файл
         </button>
       </Show>
-      <Show when={canLazyLoad()}>
+      <Show when={showAll() && canLazyLoad()}>
         <button
           class="code-block__more"
           type="button"
           disabled={props.loading}
           onClick={() => props.onLoadMore?.()}
         >
-          {props.loading ? "загрузка…" : props.loadMoreLabel ?? "Загрузить весь файл"}
+          {props.loading ? "загрузка…" : props.loadMoreLabel ?? "Загрузить ещё"}
         </button>
       </Show>
     </div>

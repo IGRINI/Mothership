@@ -1740,6 +1740,80 @@ fn migrate(connection: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_tool_artifacts_call
             ON tool_artifacts (tool_call_id);
+
+        -- Workspace Change Journal (the user-facing rollback layer). SQLite owns
+        -- the metadata and relationships; the actual before/after file bytes live
+        -- in the content-addressed blob store (referenced here only by hash).
+        -- chat_id/message_id are plain columns (not FKs) on purpose: change-set
+        -- retention/pruning is an explicit, observable later slice, not implicit
+        -- cascade.
+        CREATE TABLE IF NOT EXISTS change_sets (
+            id TEXT PRIMARY KEY,
+            project_id TEXT,
+            run_id TEXT,
+            chat_id TEXT,
+            message_id TEXT,
+            tool_call_id TEXT,
+            status TEXT NOT NULL,
+            tool_failed INTEGER NOT NULL DEFAULT 0,
+            file_count INTEGER NOT NULL DEFAULT 0,
+            additions INTEGER NOT NULL DEFAULT 0,
+            deletions INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_change_sets_message
+            ON change_sets (message_id, id);
+
+        CREATE INDEX IF NOT EXISTS idx_change_sets_chat
+            ON change_sets (chat_id, id);
+
+        CREATE TABLE IF NOT EXISTS change_files (
+            id TEXT PRIMARY KEY,
+            change_set_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            old_path TEXT,
+            op TEXT NOT NULL,
+            additions INTEGER NOT NULL DEFAULT 0,
+            deletions INTEGER NOT NULL DEFAULT 0,
+            before_hash TEXT,
+            after_hash TEXT,
+            is_binary INTEGER NOT NULL DEFAULT 0,
+            is_large INTEGER NOT NULL DEFAULT 0,
+            position INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(change_set_id) REFERENCES change_sets(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_change_files_set
+            ON change_files (change_set_id, position);
+
+        CREATE TABLE IF NOT EXISTS change_reverts (
+            id TEXT PRIMARY KEY,
+            change_set_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            error TEXT,
+            FOREIGN KEY(change_set_id) REFERENCES change_sets(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_change_reverts_set
+            ON change_reverts (change_set_id, id);
+
+        CREATE TABLE IF NOT EXISTS change_conflicts (
+            id TEXT PRIMARY KEY,
+            revert_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            expected_hash TEXT,
+            actual_hash TEXT,
+            details TEXT,
+            FOREIGN KEY(revert_id) REFERENCES change_reverts(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_change_conflicts_revert
+            ON change_conflicts (revert_id);
         ",
     )?;
 
@@ -1802,6 +1876,12 @@ fn migrate(connection: &Connection) -> Result<()> {
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
         params![11_i64, current_timestamp()],
+    )?;
+    // v12: workspace change journal (change_sets / change_files / change_reverts
+    // / change_conflicts).
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+        params![12_i64, current_timestamp()],
     )?;
 
     Ok(())
@@ -3296,8 +3376,7 @@ fn typed_payload_and_artifacts(
 
     if event.tool_kind == Some(ToolKind::RunCommand) {
         if let (Some(command), Some(result)) = (&event.command, &event.result) {
-            let (payload, artifacts) =
-                crate::tools::run_command_typed_payload(command, result);
+            let (payload, artifacts) = crate::tools::run_command_typed_payload(command, result);
             return (Some(payload), artifacts);
         }
     }

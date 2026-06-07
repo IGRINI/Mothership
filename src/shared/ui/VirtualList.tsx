@@ -161,7 +161,12 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
   const rowItem = (index: number) => stableItems()[index];
   const rowIndex = (virtualIndex: number) => virtualIndex;
 
-  const measureRow = (element: HTMLDivElement) => {
+  const measureRow = (element: HTMLDivElement, index: number) => {
+    // TanStack reads the row index from `data-index` when measuring. In Solid the
+    // ref can fire before the reactive `data-index` attribute is applied, so write
+    // it synchronously here first — otherwise measureElement logs "Missing
+    // attribute name 'data-index'" and skips measuring the row.
+    element.setAttribute("data-index", String(index));
     virtualizer.measureElement(element);
   };
 
@@ -196,7 +201,7 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
             <For each={virtualItems()}>
               {(virtualItem) => (
                 <div
-                  ref={measureRow}
+                  ref={(element) => measureRow(element, virtualItem.index)}
                   class="virtual-list__row"
                   data-index={virtualItem.index}
                   role="listitem"

@@ -65,6 +65,10 @@ use std::fmt;
 /// flooded when `old_text` appears very many times.
 const MAX_AMBIGUOUS_SNIPPETS: usize = 5;
 
+/// Maximum rendered text bytes for one ambiguous-match snippet. A minified
+/// one-line file can otherwise put megabytes into a diagnostic payload.
+const MAX_AMBIGUOUS_SNIPPET_BYTES: usize = 512;
+
 /// A successfully computed edit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditApplied {
@@ -686,8 +690,7 @@ fn build_result(
     }
     new_content.push_str(&content[cursor..]);
 
-    let first = spans.first().copied().unwrap_or(Span { start: 0, end: 0 });
-    let diff = render_diff(&content[first.start..first.end], new_text);
+    let diff = whole_file_diff(content, &new_content);
 
     EditApplied {
         new_content,
@@ -700,26 +703,20 @@ fn build_result(
 /// Build the result for the quote-normalized stage. Each `span` is replaced with
 /// a *style-preserved* rendering of `new_text` derived from that span's own
 /// original quote style, so differently-quoted matches under `replace_all` each
-/// keep their own typography. The diff shows the first span's change.
+/// keep their own typography. The diff is the real whole-file diff.
 fn build_result_quote_preserving(content: &str, spans: &[Span], new_text: &str) -> EditApplied {
     let mut new_content = String::with_capacity(content.len());
     let mut cursor = 0usize;
-    let mut first_replacement: Option<String> = None;
     for span in spans {
         let actual_old = &content[span.start..span.end];
         let replacement = preserve_quote_style(actual_old, new_text);
         new_content.push_str(&content[cursor..span.start]);
         new_content.push_str(&replacement);
         cursor = span.end;
-        if first_replacement.is_none() {
-            first_replacement = Some(replacement);
-        }
     }
     new_content.push_str(&content[cursor..]);
 
-    let first = spans.first().copied().unwrap_or(Span { start: 0, end: 0 });
-    let first_replacement = first_replacement.unwrap_or_default();
-    let diff = render_diff(&content[first.start..first.end], &first_replacement);
+    let diff = whole_file_diff(content, &new_content);
 
     EditApplied {
         new_content,
@@ -747,67 +744,42 @@ fn snippet_at(content: &str, lines: &[Line], at: usize) -> String {
         // A span can start exactly at `end` of the previous line only when it is
         // an empty line; using [start, end) here keeps each offset on one line.
         if at >= line.start && at < line.end {
-            let text = content[line.start..line.content_end].trim();
+            let text = bounded_snippet_text(content[line.start..line.content_end].trim());
             return format!("line {}: {}", idx + 1, text);
         }
     }
     // Offset at the very end of the file (e.g. content does not end in newline
     // and the match is the trailing segment): attribute to the last line.
     if let Some((idx, line)) = lines.iter().enumerate().next_back() {
-        let text = content[line.start..line.content_end].trim();
+        let text = bounded_snippet_text(content[line.start..line.content_end].trim());
         return format!("line {}: {}", idx + 1, text);
     }
     String::new()
 }
 
-/// Render a minimal unified-diff-style string for replacing `old` with `new`.
-///
-/// Every line of `old` is emitted with a `-` prefix and every line of `new`
-/// with a `+` prefix, under a single `@@` hunk header. This is dependency-free
-/// and intended only to give a UI enough to show +/- lines; it is not a
-/// byte-exact patch format.
-fn render_diff(old: &str, new: &str) -> String {
-    let old_lines = diff_lines(old);
-    let new_lines = diff_lines(new);
+fn bounded_snippet_text(text: &str) -> String {
+    if text.len() <= MAX_AMBIGUOUS_SNIPPET_BYTES {
+        return text.to_string();
+    }
 
-    let mut out = String::new();
-    out.push_str(&format!(
-        "@@ -1,{} +1,{} @@\n",
-        old_lines.len(),
-        new_lines.len()
-    ));
-    for line in &old_lines {
-        out.push('-');
-        out.push_str(line);
-        out.push('\n');
+    let mut end = MAX_AMBIGUOUS_SNIPPET_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
     }
-    for line in &new_lines {
-        out.push('+');
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
+    format!("{} ... [truncated]", &text[..end])
 }
 
-/// Split a fragment into lines for diff rendering, stripping a trailing `\r`
-/// from each so CRLF fragments render cleanly. An empty fragment yields a single
-/// empty line so the diff still shows a removed/added blank.
-fn diff_lines(text: &str) -> Vec<&str> {
-    let mut lines: Vec<&str> = text
-        .split('\n')
-        .map(|l| l.strip_suffix('\r').unwrap_or(l))
-        .collect();
-    // `split` on a string with a trailing newline yields a trailing empty
-    // element; drop it so a fragment ending in "\n" doesn't render a spurious
-    // extra blank line. Keep a genuinely empty fragment as one empty line.
-    if lines.len() > 1 {
-        if let Some(last) = lines.last() {
-            if last.is_empty() {
-                lines.pop();
-            }
-        }
-    }
-    lines
+/// Lines of context kept around each change in the tool-card diff.
+const DIFF_CONTEXT_LINES: usize = 3;
+
+/// A real unified diff of the WHOLE file before/after the edit: LCS-based, with
+/// true file line numbers and a few lines of context around each change. Reuses
+/// Core's change-journal differ so the tool card matches the workspace diff
+/// exactly (real positions, not a snippet rendered as if it were line 1).
+fn whole_file_diff(old: &str, new: &str) -> String {
+    crate::changes::diff::unified_diff_with_context(old, new, DIFF_CONTEXT_LINES)
+        .lines
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -861,6 +833,25 @@ mod tests {
             EditError::Ambiguous { count, snippets } => {
                 assert_eq!(count, 10);
                 assert_eq!(snippets.len(), MAX_AMBIGUOUS_SNIPPETS);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ambiguous_snippet_text_is_bounded() {
+        let long = format!("{} target {} target", "x".repeat(4096), "я".repeat(512));
+        let err = apply_edit(&long, "target", "changed", false).unwrap_err();
+        match err {
+            EditError::Ambiguous { snippets, .. } => {
+                assert_eq!(snippets.len(), 2);
+                assert!(snippets[0].contains("[truncated]"));
+                assert!(
+                    snippets[0].len() <= MAX_AMBIGUOUS_SNIPPET_BYTES + 64,
+                    "snippet should be bounded, got {} bytes",
+                    snippets[0].len()
+                );
+                assert!(snippets[0].is_char_boundary(snippets[0].len()));
             }
             other => panic!("expected Ambiguous, got {other:?}"),
         }
@@ -1117,8 +1108,33 @@ mod tests {
         assert!(diff.contains("+x"), "diff: {diff}");
         assert!(diff.contains("+y"), "diff: {diff}");
         assert!(diff.contains("+z"), "diff: {diff}");
-        // Hunk header reflects the line counts (2 removed, 3 added).
-        assert!(diff.contains("@@ -1,2 +1,3 @@"), "diff: {diff}");
+        // A whole-file diff with real line numbers: the file goes from 3 to 4
+        // lines, and the unchanged trailing "c" is kept as context.
+        assert!(diff.contains("@@ -1,3 +1,4 @@"), "diff: {diff}");
+        assert!(diff.contains(" c"), "context line missing: {diff}");
+    }
+
+    #[test]
+    fn one_line_edit_at_top_keeps_context_not_bare_snippet() {
+        // A one-line edit at the top of a multi-line file must NOT render as the
+        // old snippet "@@ -1,1 +1,1 @@" — it carries real context lines.
+        let content = "line1\nline2\nline3\nline4\nline5\n";
+        let res = applied(content, "line1", "LINE1", false);
+        assert!(!res.diff.contains("@@ -1,1 +1,1 @@"), "diff: {}", res.diff);
+        assert!(res.diff.contains("@@ -1,4 +1,4 @@"), "diff: {}", res.diff);
+        assert!(res.diff.contains("-line1"), "diff: {}", res.diff);
+        assert!(res.diff.contains("+LINE1"), "diff: {}", res.diff);
+        assert!(res.diff.contains(" line2"), "context missing: {}", res.diff);
+    }
+
+    #[test]
+    fn one_line_edit_deep_in_file_uses_real_line_number() {
+        // A change deep in a long file must be positioned at its real line, not 1.
+        let lines: Vec<String> = (1..=50).map(|n| format!("line{n}")).collect();
+        let content = format!("{}\n", lines.join("\n"));
+        let res = applied(&content, "line30", "LINE30", false);
+        assert!(res.diff.contains("@@ -27,7 +27,7 @@"), "diff: {}", res.diff);
+        assert!(!res.diff.contains("@@ -1,"), "diff anchored at line 1: {}", res.diff);
     }
 
     #[test]

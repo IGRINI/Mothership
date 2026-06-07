@@ -19,6 +19,7 @@ import {
   RefreshCw,
   Search,
   Send,
+  ShieldCheck,
   Square,
   Terminal,
   X,
@@ -33,6 +34,9 @@ import {
   ChatMessagePart,
   ChatThreadSummary,
   ChatUpdatedEvent,
+  ChangeSetEvent,
+  ChangeSetSummary,
+  RevertOutcome,
   ConnectorSettingsEvent,
   ConnectorProviderSummary,
   ConnectorSettingsSnapshot,
@@ -43,6 +47,7 @@ import {
   ReasoningOption,
   SendChatMessageResult,
   ToolArtifact,
+  ToolApprovalMode,
   ToolExecutionEvent,
   ToolExecutionRecord,
   approveToolExecution,
@@ -53,7 +58,9 @@ import {
   createChat,
   editChatUserMessage,
   getChat,
+  getChatChangeSets,
   getConnectorSettings,
+  getToolApprovalMode,
   listChats,
   listProjects,
   getToolArtifactRange,
@@ -61,12 +68,16 @@ import {
   openToolPath,
   pickProjectDirectory,
   retryChatMessage,
+  revertChangeSet,
   sendChatMessage,
   setChatModel,
+  setToolApprovalMode,
   setSelectedModel,
 } from "../../shared/api/mothership";
 import { ApprovalPreview, ToolCard, toolDiffStat } from "./ToolCards";
+import { ChangeSetGroup } from "./components/ChangeSetGroup";
 import { VirtualList } from "../../shared/ui/VirtualList";
+import { FileActions, onFileContextMenu } from "../../shared/ui/FileActions";
 import { startWindowDrag } from "../../shared/window-drag";
 import { BrandMark } from "./components/BrandMark";
 import { Composer, type ReasoningOptionId } from "./components/Composer";
@@ -107,6 +118,8 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   >({});
   const [connectorSettings, setConnectorSettings] =
     createSignal<ConnectorSettingsSnapshot>();
+  const [toolApprovalMode, setToolApprovalModeSignal] =
+    createSignal<ToolApprovalMode>("manual");
   const [activeChatId, setActiveChatId] = createSignal<string>();
   const [draft, setDraft] = createSignal("");
   const [error, setError] = createSignal("");
@@ -134,10 +147,16 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   const [expandedInlineTools, setExpandedInlineTools] = createSignal<
     Record<string, boolean>
   >({});
+  // Workspace change sets for the ACTIVE chat, keyed by change-set id. Hydrated
+  // on chat open and kept live via `change-set-event`. Bounded to one chat.
+  const [changeSets, setChangeSets] = createSignal<
+    Record<string, ChangeSetSummary>
+  >({});
   let unlistenChatRun: (() => void) | undefined;
   let unlistenConnectorSettings: (() => void) | undefined;
   let unlistenToolExecution: (() => void) | undefined;
   let unlistenChatUpdated: (() => void) | undefined;
+  let unlistenChangeSet: (() => void) | undefined;
   let messageScrollElement: HTMLDivElement | undefined;
   let restoreScrollFrame = 0;
   let openChatRequestId = 0;
@@ -181,6 +200,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   onMount(() => {
     void loadProjectScope();
     void loadConnectorSettings();
+    void loadToolApprovalMode();
 
     if (isTauriRuntime()) {
       let disposed = false;
@@ -227,6 +247,16 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         }
       });
 
+      void listen<ChangeSetEvent>("change-set-event", (event) => {
+        applyChangeSetEvent(event.payload);
+      }).then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          unlistenChangeSet = unlisten;
+        }
+      });
+
       onCleanup(() => {
         disposed = true;
       });
@@ -239,6 +269,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     unlistenConnectorSettings?.();
     unlistenToolExecution?.();
     unlistenChatUpdated?.();
+    unlistenChangeSet?.();
   });
 
   async function loadProjectScope() {
@@ -331,6 +362,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     setMessageParts({});
     setIsLoadingMessages(false);
     setToolExecutions({});
+    setChangeSets({});
     setExpandedInlineTools({});
     setEditingMessageId(undefined);
     setEditingDraft("");
@@ -360,6 +392,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     setMessageParts({});
     setIsLoadingMessages(false);
     setToolExecutions({});
+    setChangeSets({});
     setExpandedInlineTools({});
     await loadChats(projectId);
   }
@@ -390,6 +423,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     setActiveChatId(chatId);
     setMessages([]);
     setMessageParts({});
+    setChangeSets({});
     setEditingMessageId(undefined);
     setEditingDraft("");
     setIsLoadingMessages(true);
@@ -404,6 +438,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
       setMessages(normalizeMessages(conversation.messages));
       setMessageParts(messagePartsByMessageId(conversation.messageParts ?? []));
       hydrateToolExecutions(conversation.toolExecutions ?? []);
+      void loadChatChangeSets(chatId, requestId);
       restoreChatScroll(chatId);
     } catch (caughtError) {
       if (requestId === openChatRequestId) {
@@ -414,6 +449,43 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         setIsLoadingMessages(false);
       }
     }
+  }
+
+  function applyChangeSetEvent(event: ChangeSetEvent) {
+    const summary = event.summary;
+    // Only track change sets for the chat currently open; others are loaded on
+    // demand when their chat is opened, so memory stays bounded to one chat.
+    if (summary.chatId && summary.chatId !== activeChatId()) {
+      return;
+    }
+    setChangeSets((current) => ({ ...current, [summary.id]: summary }));
+  }
+
+  async function loadChatChangeSets(chatId: string, requestId: number) {
+    try {
+      const sets = await getChatChangeSets(chatId);
+      if (requestId !== openChatRequestId || activeChatId() !== chatId) {
+        return;
+      }
+      const indexed: Record<string, ChangeSetSummary> = {};
+      for (const set of sets) {
+        indexed[set.id] = set;
+      }
+      setChangeSets(indexed);
+    } catch {
+      // A failed change-set hydrate must never block opening the chat.
+    }
+  }
+
+  async function handleRevertChangeSet(
+    changeSetId: string,
+  ): Promise<RevertOutcome> {
+    const outcome = await revertChangeSet(changeSetId);
+    setChangeSets((current) => ({
+      ...current,
+      [outcome.changeSet.id]: outcome.changeSet,
+    }));
+    return outcome;
   }
 
   async function handleNewChat() {
@@ -674,6 +746,26 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     try {
       setConnectorSettings(await getConnectorSettings());
     } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    }
+  }
+
+  async function loadToolApprovalMode() {
+    try {
+      setToolApprovalModeSignal(await getToolApprovalMode());
+    } catch (caughtError) {
+      setError(errorMessage(caughtError));
+    }
+  }
+
+  async function handleToolApprovalModeChange(mode: ToolApprovalMode) {
+    const previous = toolApprovalMode();
+    setError("");
+    setToolApprovalModeSignal(mode);
+    try {
+      setToolApprovalModeSignal(await setToolApprovalMode(mode));
+    } catch (caughtError) {
+      setToolApprovalModeSignal(previous);
       setError(errorMessage(caughtError));
     }
   }
@@ -1100,6 +1192,28 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     return grouped;
   });
 
+  const changeSetsByMessageId = createMemo(() => {
+    const messageIds = new Set(messages().map((message) => message.id));
+    const grouped: Record<string, ChangeSetSummary[]> = {};
+
+    for (const set of Object.values(changeSets())) {
+      const messageId = set.messageId;
+      if (!messageId || !messageIds.has(messageId)) {
+        continue;
+      }
+      (grouped[messageId] ??= []).push(set);
+    }
+
+    for (const list of Object.values(grouped)) {
+      list.sort(
+        (a, b) =>
+          Number(a.createdAt) - Number(b.createdAt) || a.id.localeCompare(b.id),
+      );
+    }
+
+    return grouped;
+  });
+
   return (
     <main class="workspace-shell">
       <Sidebar
@@ -1129,11 +1243,14 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         messages={messages()}
         runTransports={runTransports()}
         activeRunId={activeRunId()}
+        toolApprovalMode={toolApprovalMode()}
         reasoningOptionId={reasoningOptionId()}
         expandedInlineTools={expandedInlineTools()}
         messagePartsByMessageId={messageParts()}
         toolExecutionsByMessageId={toolExecutionsByMessageId()}
+        changeSetsByMessageId={changeSetsByMessageId()}
         onApproveTool={handleApproveTool}
+        onRevertChangeSet={handleRevertChangeSet}
         onMessageScrollElement={handleMessageScrollElement}
         onCancelRun={handleCancelRun}
         onCancelTool={handleCancelTool}
@@ -1146,6 +1263,9 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
         onRetry={handleRetry}
         onReasoningOptionChange={setReasoningOptionId}
         onSelectModel={handleSelectModel}
+        onToolApprovalModeChange={(mode) =>
+          void handleToolApprovalModeChange(mode)
+        }
         onSendMessage={handleSendMessage}
         onStartEdit={handleStartEdit}
         onSubmitEdit={(messageId) => void handleSubmitEdit(messageId)}
@@ -1179,8 +1299,11 @@ function ConversationPane(props: {
   messages: ChatMessage[];
   reasoningOptionId?: ReasoningOptionId;
   runTransports: Record<string, string>;
+  toolApprovalMode: ToolApprovalMode;
   toolExecutionsByMessageId: Record<string, ToolExecutionView[]>;
+  changeSetsByMessageId: Record<string, ChangeSetSummary[]>;
   onApproveTool: (toolCallId: string) => void;
+  onRevertChangeSet: (changeSetId: string) => Promise<RevertOutcome>;
   onBranchMessage: (message: ChatMessage) => void;
   onCancelEdit: () => void;
   onCancelRun: () => void;
@@ -1193,6 +1316,7 @@ function ConversationPane(props: {
   onReasoningOptionChange: (optionId: ReasoningOptionId) => void;
   onRetry: () => void;
   onSelectModel: (providerId: string, modelId: string) => void;
+  onToolApprovalModeChange: (mode: ToolApprovalMode) => void;
   onSendMessage: () => void;
   onStartEdit: (message: ChatMessage) => void;
   onSubmitEdit: (messageId: string) => void;
@@ -1277,6 +1401,11 @@ function ConversationPane(props: {
             onSelectModel={props.onSelectModel}
           />
         </div>
+
+        <ApprovalModeSelector
+          mode={props.toolApprovalMode}
+          onChange={props.onToolApprovalModeChange}
+        />
       </header>
 
       <VirtualList
@@ -1308,29 +1437,36 @@ function ConversationPane(props: {
           // they all read the shared by-id map.
           const message = createMemo(() => messagesById()[item.messageId]);
           return (
-            <MessageRow
-              message={message()}
-              transport={props.runTransports[item.messageId]}
-              expandedInlineTools={props.expandedInlineTools}
-              editingDraft={props.editingDraft}
-              isEditing={props.editingMessageId === item.messageId}
-              isBusy={props.isSending}
-              parts={props.messagePartsByMessageId[item.messageId] ?? []}
-              onBranchMessage={props.onBranchMessage}
-              onCancelEdit={props.onCancelEdit}
-              onCancelTool={props.onCancelTool}
-              onContinue={props.onContinue}
-              onDenyTool={props.onDenyTool}
-              onEditDraftChange={props.onEditDraftChange}
-              onRetry={props.onRetry}
-              settings={props.connectorSettings}
-              onStartEdit={props.onStartEdit}
-              onSubmitEdit={props.onSubmitEdit}
-              onApproveTool={props.onApproveTool}
-              onToggleInlineTool={props.onToggleInlineTool}
-              tools={props.toolExecutionsByMessageId[item.messageId] ?? []}
-              toolsById={toolsById()}
-            />
+            <Show when={message()}>
+              {(rowMessage) => (
+                <MessageRow
+                  message={rowMessage()}
+                  projectId={props.activeProject?.id}
+                  transport={props.runTransports[item.messageId]}
+                  expandedInlineTools={props.expandedInlineTools}
+                  editingDraft={props.editingDraft}
+                  isEditing={props.editingMessageId === item.messageId}
+                  isBusy={props.isSending}
+                  parts={props.messagePartsByMessageId[item.messageId] ?? []}
+                  onBranchMessage={props.onBranchMessage}
+                  onCancelEdit={props.onCancelEdit}
+                  onCancelTool={props.onCancelTool}
+                  onContinue={props.onContinue}
+                  onDenyTool={props.onDenyTool}
+                  onEditDraftChange={props.onEditDraftChange}
+                  onRetry={props.onRetry}
+                  settings={props.connectorSettings}
+                  onStartEdit={props.onStartEdit}
+                  onSubmitEdit={props.onSubmitEdit}
+                  onApproveTool={props.onApproveTool}
+                  onToggleInlineTool={props.onToggleInlineTool}
+                  tools={props.toolExecutionsByMessageId[item.messageId] ?? []}
+                  toolsById={toolsById()}
+                  changeSets={props.changeSetsByMessageId[item.messageId] ?? []}
+                  onRevertChangeSet={props.onRevertChangeSet}
+                />
+              )}
+            </Show>
           );
         }}
       </VirtualList>
@@ -1398,6 +1534,63 @@ function ConversationState(props: {
         </div>
       </Match>
     </Switch>
+  );
+}
+
+const TOOL_APPROVAL_MODE_OPTIONS: Array<{
+  mode: ToolApprovalMode;
+  label: string;
+  title: string;
+}> = [
+  {
+    mode: "manual",
+    label: "Manual",
+    title: "Ask before mutating tools and non-read-only commands.",
+  },
+  {
+    mode: "auto_safe",
+    label: "Auto",
+    title:
+      "Auto-run ordinary future approval checks; keep prompts for dangerous commands.",
+  },
+  {
+    mode: "yolo",
+    label: "YOLO",
+    title: "Run without approval prompts and approve currently pending prompts.",
+  },
+];
+
+function ApprovalModeSelector(props: {
+  mode: ToolApprovalMode;
+  onChange: (mode: ToolApprovalMode) => void;
+}) {
+  return (
+    <div
+      classList={{
+        "approval-mode": true,
+        "approval-mode--auto": props.mode === "auto_safe",
+        "approval-mode--yolo": props.mode === "yolo",
+      }}
+      title={TOOL_APPROVAL_MODE_OPTIONS.find((item) => item.mode === props.mode)
+        ?.title}
+    >
+      <ShieldCheck size={15} />
+      <For each={TOOL_APPROVAL_MODE_OPTIONS}>
+        {(option) => (
+          <button
+            classList={{
+              "approval-mode__option": true,
+              "approval-mode__option--active": props.mode === option.mode,
+            }}
+            type="button"
+            title={option.title}
+            onClick={() => props.onChange(option.mode)}
+          >
+            {option.label}
+          </button>
+        )}
+      </For>
+    </div>
   );
 }
 
@@ -2283,12 +2476,28 @@ function missingRequiredAdapterSettings(provider: ConnectorProviderSummary) {
 function InlineToolCall(props: {
   expanded: boolean;
   tool: ToolExecutionView;
+  changeSets?: ChangeSetSummary[];
   onApprove: () => void;
   onCancel: () => void;
   onDeny: () => void;
   onToggle: () => void;
 }) {
   const command = () => formatToolCommand(props.tool);
+  // The change file (in the journal) recording THIS tool call's edit to a path,
+  // so the card shows the live, foldable per-edit diff (its own before/after
+  // snapshot) instead of a frozen compact one. Undefined → fall back to the
+  // stored artifact diff.
+  const findChangeFileId = (path: string): string | undefined => {
+    for (const set of props.changeSets ?? []) {
+      if (set.toolCallId && set.toolCallId === props.tool.toolCallId) {
+        const file = set.files?.find((entry) => entry.path === path);
+        if (file) {
+          return file.id;
+        }
+      }
+    }
+    return undefined;
+  };
   const output = () => formatToolOutput(props.tool);
   const outputLineCount = () => countTextLines(output());
   const isOutputScrollable = () =>
@@ -2319,6 +2528,14 @@ function InlineToolCall(props: {
       setOpenError(message);
     });
   };
+  // The file this tool touched (read/write/edit payload path, else the first
+  // patched path) — drives the row's hover actions + right-click menu.
+  const primaryPath = (): string | undefined => {
+    const payload = props.tool.payload;
+    const fromPayload =
+      payload && typeof payload.path === "string" ? payload.path : undefined;
+    return fromPayload ?? props.tool.touchedPaths?.[0];
+  };
   // Lazily fetch a range of the call's persisted output artifact (the snapshot,
   // not the live file).
   const loadArtifactRange = async (args: {
@@ -2342,21 +2559,47 @@ function InlineToolCall(props: {
 
   return (
     <div class="inline-tool-call">
-      <button
-        class="inline-tool-call__summary"
-        type="button"
-        aria-expanded={props.expanded}
-        onClick={props.onToggle}
+      <div
+        class="inline-tool-call__row"
+        onContextMenu={(event) => {
+          const path = primaryPath();
+          if (path) {
+            onFileContextMenu(event, {
+              projectId: props.tool.projectId ?? undefined,
+              path,
+              onOpen: handleOpenPath,
+            });
+          }
+        }}
       >
-        <span class="inline-tool-call__icon">
-          <ToolKindIcon kind={props.tool.toolKind} />
-        </span>
-        <span
-          class="inline-tool-call__title"
-          title={formatToolHeadline(props.tool)}
+        <button
+          class="inline-tool-call__summary"
+          type="button"
+          aria-expanded={props.expanded}
+          onClick={props.onToggle}
         >
-          {formatToolHeadline(props.tool)}
-        </span>
+          <span class="inline-tool-call__icon">
+            <ToolKindIcon kind={props.tool.toolKind} />
+          </span>
+          <span
+            class="inline-tool-call__title"
+            title={formatToolHeadline(props.tool)}
+          >
+            {formatToolHeadline(props.tool)}
+          </span>
+        </button>
+        {/* Hover file actions sit to the LEFT of the diff-stat — identical to the
+            change-set rows. */}
+        <Show when={primaryPath()}>
+          {(path) => (
+            <FileActions
+              class="inline-tool-call__file-actions"
+              projectId={props.tool.projectId ?? undefined}
+              path={path()}
+              onOpen={handleOpenPath}
+            />
+          )}
+        </Show>
         {/* A completed edit/patch shows a diff-stat (+N −M); otherwise surface a
             status that needs attention (running, denied, failed). A plain
             "Completed" is implied by the row, so it shows nothing. */}
@@ -2388,14 +2631,21 @@ function InlineToolCall(props: {
             </span>
           )}
         </Show>
-        <ChevronDown
-          classList={{
-            "inline-tool-call__chevron": true,
-            "inline-tool-call__chevron--open": props.expanded,
-          }}
-          size={14}
-        />
-      </button>
+        <button
+          class="inline-tool-call__toggle"
+          type="button"
+          aria-label={props.expanded ? "Свернуть" : "Развернуть"}
+          onClick={props.onToggle}
+        >
+          <ChevronDown
+            classList={{
+              "inline-tool-call__chevron": true,
+              "inline-tool-call__chevron--open": props.expanded,
+            }}
+            size={14}
+          />
+        </button>
+      </div>
 
       <Show when={props.expanded}>
         <div class="inline-tool-call__body">
@@ -2430,6 +2680,7 @@ function InlineToolCall(props: {
               tool={props.tool}
               onOpenPath={handleOpenPath}
               loadArtifactRange={loadArtifactRange}
+              findChangeFileId={findChangeFileId}
             />
           </Show>
 
@@ -2476,6 +2727,7 @@ function InlineToolCall(props: {
 
 function MessageRow(props: {
   message: ChatMessage;
+  projectId?: string;
   transport?: string;
   expandedInlineTools: Record<string, boolean>;
   editingDraft: string;
@@ -2484,7 +2736,9 @@ function MessageRow(props: {
   parts: MessagePartView[];
   tools: ToolExecutionView[];
   toolsById: Record<string, ToolExecutionView>;
+  changeSets: ChangeSetSummary[];
   onApproveTool: (toolCallId: string) => void;
+  onRevertChangeSet: (changeSetId: string) => Promise<RevertOutcome>;
   onBranchMessage: (message: ChatMessage) => void;
   onCancelEdit: () => void;
   onCancelTool: (toolCallId: string) => void;
@@ -2552,6 +2806,7 @@ function MessageRow(props: {
                 <MessageParts
                   expandedInlineTools={props.expandedInlineTools}
                   parts={assistantParts()}
+                  changeSets={props.changeSets}
                   onApproveTool={props.onApproveTool}
                   onCancelTool={props.onCancelTool}
                   onDenyTool={props.onDenyTool}
@@ -2570,6 +2825,15 @@ function MessageRow(props: {
             onSubmit={props.onSubmitEdit}
           />
         </Show>
+        <Show when={!isUser() && props.changeSets.length > 0}>
+          <div class="change-sets">
+            <ChangeSetGroup
+              changeSets={props.changeSets}
+              projectId={props.projectId}
+              onRevert={props.onRevertChangeSet}
+            />
+          </div>
+        </Show>
         <Show when={isFailed()}>
           <ErrorCard
             error={message().error ?? "The run failed before Core recorded an error."}
@@ -2586,6 +2850,7 @@ function MessageRow(props: {
 function MessageParts(props: {
   expandedInlineTools: Record<string, boolean>;
   parts: RenderableMessagePart[];
+  changeSets?: ChangeSetSummary[];
   onApproveTool: (toolCallId: string) => void;
   onCancelTool: (toolCallId: string) => void;
   onDenyTool: (toolCallId: string) => void;
@@ -2628,6 +2893,7 @@ function MessageParts(props: {
                       props.expandedInlineTools[tool().toolCallId],
                     )}
                     tool={tool()}
+                    changeSets={props.changeSets}
                     onApprove={() => props.onApproveTool(tool().toolCallId)}
                     onCancel={() => props.onCancelTool(tool().toolCallId)}
                     onDeny={() => props.onDenyTool(tool().toolCallId)}
@@ -3004,14 +3270,20 @@ function bumpChat(
 }
 
 function mergeMessages(
-  current: ChatMessage[],
-  incoming: ChatMessage[],
+  current: readonly unknown[],
+  incoming: readonly unknown[],
 ): ChatMessage[] {
   const messagesById = new Map<string, ChatMessage>();
   for (const message of current) {
+    if (!isChatMessage(message)) {
+      continue;
+    }
     messagesById.set(message.id, message);
   }
   for (const message of incoming) {
+    if (!isChatMessage(message)) {
+      continue;
+    }
     messagesById.set(message.id, message);
   }
 
@@ -3290,15 +3562,37 @@ function compareToolExecutions(
 }
 
 function buildConversationTimeline(messages: ChatMessage[]): ConversationTimelineItem[] {
-  return messages.map((message) => ({
-    id: `message:${message.id}`,
-    kind: "message",
-    messageId: message.id,
-  }));
+  return messages
+    .filter(isChatMessage)
+    .map((message) => ({
+      id: `message:${message.id}`,
+      kind: "message",
+      messageId: message.id,
+    }));
 }
 
 function normalizeMessages(messages: ChatMessage[]) {
   return mergeMessages([], messages);
+}
+
+function isChatMessage(value: unknown): value is ChatMessage {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const message = value as Partial<ChatMessage>;
+  return (
+    typeof message.id === "string" &&
+    typeof message.chatId === "string" &&
+    typeof message.position === "number" &&
+    (message.role === "user" || message.role === "assistant") &&
+    typeof message.content === "string" &&
+    (message.status === "complete" ||
+      message.status === "cancelled" ||
+      message.status === "failed" ||
+      message.status === "sending") &&
+    typeof message.createdAt === "string"
+  );
 }
 
 function limitChatMessages(messages: ChatMessage[]) {

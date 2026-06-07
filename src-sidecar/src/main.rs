@@ -27,16 +27,17 @@ use mothership_core::ipc::{
 };
 use mothership_core::{
     default_credential_guard, redact_event, schedule_cancel_fallback,
-    trusted_built_in_adapter_sha256, AdapterPool, AuthProcessRegistry,
-    ChatRunCancellationResult, ChatRunEvent, ChatRunEventSink, ChatRunRegistry, ChatRunService,
-    ChatUpdatedEvent, ConnectorManager, ConnectorSettingsEvent, ConnectorSettingsEventKind,
-    ConservativeCommandPermissionPolicy, Database, FileToolOutputStore, LlmToolCallHandler,
-    PendingToolApprovalGate, ProviderRuntimeManager, RedactingOutputStore, SendChatMessageResult,
-    ToolApprovalAnswer,
-    ToolApprovalDecision, ToolCancellationToken, ToolExecutionAccepted,
-    ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionEventSink,
-    ToolExecutionRegistry, ToolExecutionRequest, ToolRepeatGuard, ToolResourceLimits,
-    ToolSupervisor, Workspace,
+    trusted_built_in_adapter_sha256, AdapterPool, AuthProcessRegistry, ChangeEventSink,
+    ChangeRecorder, ChangeSetEvent, ChangeSetEventKind, ChangesService, ChatRunCancellationResult,
+    ChatRunEvent, ChatRunEventSink, ChatRunRegistry, ChatRunService, ChatUpdatedEvent,
+    ConnectorManager, ConnectorSettingsEvent, ConnectorSettingsEventKind, Database, FileBlobStore,
+    FileToolOutputStore, LlmToolCallHandler, ModeAwareCommandPermissionPolicy,
+    PendingToolApprovalGate, ProviderRuntimeManager, RedactingOutputStore, RevertOutcome,
+    SendChatMessageResult, SnapshotBlobStore, StdFileSystem, ToolApprovalAnswer,
+    ToolApprovalDecision, ToolApprovalMode, ToolApprovalModeStore, ToolCancellationToken,
+    ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
+    ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest, ToolRepeatGuard,
+    ToolResourceLimits, ToolSupervisor, Workspace,
 };
 use sha2::{Digest, Sha256};
 
@@ -159,6 +160,7 @@ fn serve() -> anyhow::Result<()> {
             .build()?,
     );
     let tool_approvals = PendingToolApprovalGate::new();
+    let tool_approval_mode = ToolApprovalModeStore::new(ToolApprovalMode::Manual);
     let tool_repeat_guard = Arc::new(ToolRepeatGuard::default());
     // Shared output store: the supervisor uses it to spill command output, and
     // the file-tool runner reuses it to spill oversized read_file content.
@@ -174,6 +176,16 @@ fn serve() -> anyhow::Result<()> {
                 Arc::new(mothership_core::PatternCredentialGuard::new()),
             )) as Arc<dyn mothership_core::ToolOutputStore>
         });
+    // Content-addressed snapshot store for the change journal. Lives beside the
+    // database (never inside the user's `.git`); per-project sharding is handled
+    // by the store itself.
+    let change_blob_store: Arc<dyn SnapshotBlobStore> = {
+        let base = db_path
+            .parent()
+            .map(|parent| parent.join("changes").join("blobs"))
+            .unwrap_or_else(|| PathBuf::from("changes/blobs"));
+        Arc::new(FileBlobStore::new(base))
+    };
     let tool_supervisor = Arc::new(
         ToolSupervisor::new(
             Arc::new(tool_runtime::ProcessSandboxToolAdapter::new(
@@ -182,7 +194,9 @@ fn serve() -> anyhow::Result<()> {
             tool_output_store.clone(),
             ToolResourceLimits::default(),
         )
-        .with_policy(Arc::new(ConservativeCommandPermissionPolicy))
+        .with_policy(Arc::new(ModeAwareCommandPermissionPolicy::new(Arc::clone(
+            &tool_approval_mode,
+        ))))
         .with_repeat_guard(tool_repeat_guard),
     );
     let tool_registry = Arc::new(ToolExecutionRegistry::new());
@@ -222,6 +236,8 @@ fn serve() -> anyhow::Result<()> {
                 let tool_registry = Arc::clone(&tool_registry);
                 let async_runtime = Arc::clone(&async_runtime);
                 let chat_registry = Arc::clone(&chat_registry);
+                let change_blob_store = Arc::clone(&change_blob_store);
+                let tool_approval_mode = Arc::clone(&tool_approval_mode);
                 thread::spawn(move || {
                     handle_request(
                         id,
@@ -237,6 +253,8 @@ fn serve() -> anyhow::Result<()> {
                         tool_registry,
                         async_runtime,
                         chat_registry,
+                        change_blob_store,
+                        tool_approval_mode,
                     )
                 });
             }
@@ -419,6 +437,8 @@ fn handle_request(
     tool_registry: Arc<ToolExecutionRegistry>,
     async_runtime: Arc<tokio::runtime::Runtime>,
     chat_registry: Arc<ChatRunRegistry>,
+    change_blob_store: Arc<dyn SnapshotBlobStore>,
+    tool_approval_mode: Arc<ToolApprovalModeStore>,
 ) {
     // Streaming requests answer immediately with the persisted placeholder, then
     // stream the run; handle them before the uniform request/response path.
@@ -447,6 +467,8 @@ fn handle_request(
             tool_registry,
             async_runtime,
             chat_registry,
+            change_blob_store,
+            Arc::clone(&tool_approval_mode),
         );
         return;
     }
@@ -469,6 +491,8 @@ fn handle_request(
             tool_registry,
             async_runtime,
             chat_registry,
+            change_blob_store,
+            Arc::clone(&tool_approval_mode),
         );
         return;
     }
@@ -486,6 +510,8 @@ fn handle_request(
             tool_registry,
             async_runtime,
             chat_registry,
+            change_blob_store,
+            Arc::clone(&tool_approval_mode),
         );
         return;
     }
@@ -503,6 +529,8 @@ fn handle_request(
             tool_registry,
             async_runtime,
             chat_registry,
+            change_blob_store,
+            Arc::clone(&tool_approval_mode),
         );
         return;
     }
@@ -547,6 +575,18 @@ fn handle_request(
         return;
     }
 
+    if matches!(
+        request,
+        CoreRequest::GetChatChangeSets { .. }
+            | CoreRequest::GetMessageChangeSummary { .. }
+            | CoreRequest::GetChangeFileDiff { .. }
+            | CoreRequest::ListChangeSetFiles { .. }
+            | CoreRequest::RevertChangeSet { .. }
+    ) {
+        run_change_request(id, request, database, outbox, change_blob_store);
+        return;
+    }
+
     let result = compute(
         request,
         &database,
@@ -556,6 +596,7 @@ fn handle_request(
         &tool_approvals,
         &tool_registry,
         &chat_registry,
+        &tool_approval_mode,
     );
     let _ = match result {
         Ok(outcome) => {
@@ -587,6 +628,7 @@ fn compute(
     tool_approvals: &Arc<PendingToolApprovalGate>,
     tool_registry: &Arc<ToolExecutionRegistry>,
     chat_registry: &Arc<ChatRunRegistry>,
+    tool_approval_mode: &Arc<ToolApprovalModeStore>,
 ) -> Result<RequestOutcome, CoreError> {
     Ok(match request {
         CoreRequest::DashboardSnapshot => response(CoreResponse::Dashboard(database.snapshot()?)),
@@ -651,6 +693,16 @@ fn compute(
                     accepted,
                 },
             ))
+        }
+        CoreRequest::GetToolApprovalMode => {
+            response(CoreResponse::ToolApprovalMode(tool_approval_mode.mode()))
+        }
+        CoreRequest::SetToolApprovalMode { mode } => {
+            let mode = tool_approval_mode.set_mode(mode);
+            if mode == ToolApprovalMode::Yolo {
+                tool_approvals.decide_all(ToolApprovalDecision::Approved);
+            }
+            response(CoreResponse::ToolApprovalMode(mode))
         }
         CoreRequest::ConnectorSettings => response_with_connector_refresh(
             CoreResponse::ConnectorSettings(connector_manager.snapshot()?),
@@ -723,7 +775,12 @@ fn compute(
         | CoreRequest::RetryChatMessage { .. }
         | CoreRequest::ContinueChatMessage { .. }
         | CoreRequest::RunToolCommand { .. }
-        | CoreRequest::GetToolArtifactRange { .. } => {
+        | CoreRequest::GetToolArtifactRange { .. }
+        | CoreRequest::GetChatChangeSets { .. }
+        | CoreRequest::GetMessageChangeSummary { .. }
+        | CoreRequest::GetChangeFileDiff { .. }
+        | CoreRequest::ListChangeSetFiles { .. }
+        | CoreRequest::RevertChangeSet { .. } => {
             unreachable!("handled before the uniform request path")
         }
     })
@@ -880,6 +937,8 @@ fn run_chat_message(
     tool_registry: Arc<ToolExecutionRegistry>,
     async_runtime: Arc<tokio::runtime::Runtime>,
     chat_registry: Arc<ChatRunRegistry>,
+    change_blob_store: Arc<dyn SnapshotBlobStore>,
+    tool_approval_mode: Arc<ToolApprovalModeStore>,
 ) {
     match started {
         Ok(started) => {
@@ -894,6 +953,22 @@ fn run_chat_message(
                 chat_id: Some(started.chat.id.clone()),
                 message_id: Some(started.assistant_message.id.clone()),
             });
+            // Bind the change journal to this run: mutating tools record their
+            // workspace changes through this recorder, which emits change-set
+            // events onto the same outbox the chat run uses.
+            let change_recorder: Option<Arc<ChangeRecorder>> = {
+                let service = ChangesService::new(database.clone(), Arc::clone(&change_blob_store));
+                let events: Arc<dyn ChangeEventSink> = Arc::new(ProtocolChangeEventSink {
+                    outbox: outbox.clone(),
+                });
+                Some(Arc::new(ChangeRecorder::new(
+                    service,
+                    events,
+                    project.as_ref().map(|project| project.id.clone()),
+                    started.chat.id.clone(),
+                    started.assistant_message.id.clone(),
+                )))
+            };
             let tool_handler: Arc<dyn LlmToolCallHandler> =
                 Arc::new(tool_runtime::SidecarLlmToolHandler::new(
                     tool_supervisor,
@@ -903,6 +978,8 @@ fn run_chat_message(
                     project.map(|project| (project.id, PathBuf::from(project.path))),
                     tool_approvals,
                     tool_output_store,
+                    change_recorder,
+                    tool_approval_mode,
                 ));
             let mut sink = ProtocolChatRunSink { outbox };
             ChatRunService::new(&database, provider_manager)
@@ -957,4 +1034,119 @@ impl ToolExecutionEventSink for ProtocolToolExecutionSink {
             event: CoreEvent::ToolExecution(event),
         });
     }
+}
+
+/// Forwards change-journal events to the host as `Event::ChangeSet` frames.
+struct ProtocolChangeEventSink {
+    outbox: Outbox,
+}
+
+impl ChangeEventSink for ProtocolChangeEventSink {
+    fn emit(&self, event: ChangeSetEvent) {
+        let _ = self.outbox.send(ServerFrame::Event {
+            event: CoreEvent::ChangeSet(event),
+        });
+    }
+}
+
+/// Handle the change-journal requests (summaries, lazy per-file diff, revert).
+/// These need the snapshot blob store — and, for revert, the project workspace —
+/// so they are dispatched here rather than in the sync `compute`. A revert also
+/// emits a `change_set` event so every client updates live.
+fn run_change_request(
+    id: u64,
+    request: CoreRequest,
+    database: Database,
+    outbox: Outbox,
+    change_blob_store: Arc<dyn SnapshotBlobStore>,
+) {
+    let service = ChangesService::new(database.clone(), change_blob_store);
+    let result = compute_change_request(request, &service, &database);
+    let _ = match result {
+        Ok(outcome) => {
+            let response_result = outbox.send(ServerFrame::Response {
+                id,
+                result: outcome.response,
+            });
+            if response_result.is_ok() {
+                if let Some(event) = outcome.event {
+                    let _ = outbox.send(ServerFrame::Event { event });
+                }
+            }
+            response_result
+        }
+        Err(error) => outbox.send(ServerFrame::Error { id, error }),
+    };
+}
+
+fn compute_change_request(
+    request: CoreRequest,
+    service: &ChangesService,
+    database: &Database,
+) -> Result<RequestOutcome, CoreError> {
+    Ok(match request {
+        CoreRequest::GetChatChangeSets { chat_id } => {
+            response(CoreResponse::ChangeSets(service.chat_summaries(&chat_id)?))
+        }
+        CoreRequest::GetMessageChangeSummary { message_id } => response(CoreResponse::ChangeSets(
+            service.message_summaries(&message_id)?,
+        )),
+        CoreRequest::GetChangeFileDiff {
+            change_file_id,
+            offset,
+            limit,
+            full,
+        } => response(CoreResponse::ChangeFileDiff(service.file_diff(
+            &change_file_id,
+            offset.unwrap_or(0),
+            limit.unwrap_or(0),
+            full.unwrap_or(false),
+        )?)),
+        CoreRequest::ListChangeSetFiles {
+            change_set_id,
+            offset,
+            limit,
+        } => response(CoreResponse::ChangeFiles(service.list_change_set_files(
+            &change_set_id,
+            offset.unwrap_or(0),
+            limit.unwrap_or(0),
+        )?)),
+        CoreRequest::RevertChangeSet { change_set_id } => {
+            let outcome = revert_change_set(service, database, &change_set_id)?;
+            let kind = if outcome.reverted {
+                ChangeSetEventKind::Reverted
+            } else {
+                ChangeSetEventKind::Conflicted
+            };
+            RequestOutcome {
+                response: CoreResponse::ChangeSetReverted(outcome.clone()),
+                event: Some(CoreEvent::ChangeSet(ChangeSetEvent {
+                    kind,
+                    summary: outcome.change_set,
+                })),
+                connector_refresh: None,
+            }
+        }
+        _ => unreachable!("compute_change_request only handles change requests"),
+    })
+}
+
+/// Resolve the project workspace for a change set and run its conflict-aware
+/// revert. Path containment is enforced by `Workspace`; the std filesystem is the
+/// same one the file tools use.
+fn revert_change_set(
+    service: &ChangesService,
+    database: &Database,
+    change_set_id: &str,
+) -> Result<RevertOutcome, CoreError> {
+    let project_id = service
+        .change_set_project_id(change_set_id)?
+        .ok_or_else(|| CoreError::new("project_not_found", "change set has no project", false))?;
+    let root = database.project_root(&project_id)?.ok_or_else(|| {
+        CoreError::new("project_not_found", "unknown project for change set", false)
+    })?;
+    let workspace = Workspace::new(&root)
+        .map_err(|error| CoreError::new("workspace_unavailable", error.to_string(), false))?;
+    let fs = StdFileSystem::new();
+    Ok(service.revert(change_set_id, &workspace, &fs)?)
 }

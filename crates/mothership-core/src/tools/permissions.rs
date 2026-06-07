@@ -17,6 +17,48 @@ pub enum ToolPermissionAction {
     Deny,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalMode {
+    /// Current conservative behavior: ask for every non-read-only command and
+    /// mutating file tool.
+    Manual,
+    /// Auto-run ordinary writes/commands, but keep prompts for commands that are
+    /// likely to destroy data, rewrite repository history, or alter OS state.
+    AutoSafe,
+    /// No approval prompts. Preflight, cancellation, workspace containment, and
+    /// tool-specific runtime guards still run; this mode only bypasses approval.
+    Yolo,
+}
+
+impl Default for ToolApprovalMode {
+    fn default() -> Self {
+        Self::Manual
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ToolApprovalModeStore {
+    mode: Mutex<ToolApprovalMode>,
+}
+
+impl ToolApprovalModeStore {
+    pub fn new(mode: ToolApprovalMode) -> Arc<Self> {
+        Arc::new(Self {
+            mode: Mutex::new(mode),
+        })
+    }
+
+    pub fn mode(&self) -> ToolApprovalMode {
+        *self.mode.lock().unwrap()
+    }
+
+    pub fn set_mode(&self, mode: ToolApprovalMode) -> ToolApprovalMode {
+        *self.mode.lock().unwrap() = mode;
+        mode
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolPermissionEvaluation {
@@ -34,6 +76,62 @@ pub struct ConservativeCommandPermissionPolicy;
 impl ToolPermissionPolicy for ConservativeCommandPermissionPolicy {
     fn evaluate(&self, request: &ToolExecutionRequest) -> ToolPermissionEvaluation {
         classify_command(&request.command)
+    }
+}
+
+#[derive(Debug)]
+pub struct ModeAwareCommandPermissionPolicy {
+    mode: Arc<ToolApprovalModeStore>,
+}
+
+impl ModeAwareCommandPermissionPolicy {
+    pub fn new(mode: Arc<ToolApprovalModeStore>) -> Self {
+        Self { mode }
+    }
+}
+
+impl ToolPermissionPolicy for ModeAwareCommandPermissionPolicy {
+    fn evaluate(&self, request: &ToolExecutionRequest) -> ToolPermissionEvaluation {
+        command_permission_for_mode(self.mode.mode(), request)
+    }
+}
+
+pub fn command_permission_for_mode(
+    mode: ToolApprovalMode,
+    request: &ToolExecutionRequest,
+) -> ToolPermissionEvaluation {
+    let program = normalized(&request.command.program);
+    if program.is_empty() {
+        return deny("empty command program");
+    }
+
+    match mode {
+        ToolApprovalMode::Manual => classify_command(&request.command),
+        ToolApprovalMode::AutoSafe => {
+            let base = classify_command(&request.command);
+            if base.action == ToolPermissionAction::Deny {
+                return base;
+            }
+            if command_requires_manual_approval(&request.command) {
+                return ask("dangerous command requires approval in auto mode");
+            }
+            allow("auto-safe mode approved command")
+        }
+        ToolApprovalMode::Yolo => allow("yolo mode approved command"),
+    }
+}
+
+pub fn file_permission_action_for_mode(
+    mode: ToolApprovalMode,
+    action: ToolPermissionAction,
+) -> ToolPermissionAction {
+    match (mode, action) {
+        (_, ToolPermissionAction::Allow) => ToolPermissionAction::Allow,
+        (_, ToolPermissionAction::Deny) => ToolPermissionAction::Deny,
+        (ToolApprovalMode::Manual, ToolPermissionAction::Ask) => ToolPermissionAction::Ask,
+        (ToolApprovalMode::AutoSafe | ToolApprovalMode::Yolo, ToolPermissionAction::Ask) => {
+            ToolPermissionAction::Allow
+        }
     }
 }
 
@@ -81,6 +179,15 @@ impl PendingToolApprovalGate {
             return false;
         };
         sender.send(decision).is_ok()
+    }
+
+    pub fn decide_all(&self, decision: ToolApprovalDecision) -> usize {
+        let pending = std::mem::take(&mut *self.pending.lock().unwrap());
+        let count = pending.len();
+        for sender in pending.into_values() {
+            let _ = sender.send(decision.clone());
+        }
+        count
     }
 }
 
@@ -197,11 +304,35 @@ fn classify_command(command: &ToolCommand) -> ToolPermissionEvaluation {
         return classify_git(command);
     }
 
+    if is_script_interpreter(program.as_str()) {
+        if is_safe_interpreter_probe(program.as_str(), &command.args) {
+            return allow("read-only interpreter probe");
+        }
+        return ask("script interpreter command requires approval");
+    }
+
     if is_read_only_program(program.as_str()) {
         return allow("read-only command");
     }
 
     ask("command is not known to be read-only")
+}
+
+fn command_requires_manual_approval(command: &ToolCommand) -> bool {
+    let program = normalized(&command.program);
+    if is_hard_blocked_program(&program) {
+        return true;
+    }
+    if program == "git" {
+        return git_requires_manual_approval(command);
+    }
+    if is_script_interpreter(&program) {
+        return !is_safe_interpreter_probe(&program, &command.args);
+    }
+    if is_shell(&program) {
+        return shell_script_requires_manual_approval(command);
+    }
+    false
 }
 
 fn classify_git(command: &ToolCommand) -> ToolPermissionEvaluation {
@@ -216,6 +347,182 @@ fn classify_git(command: &ToolCommand) -> ToolPermissionEvaluation {
         | "merge" | "rebase" => ask("git command can modify repository state"),
         _ => ask("git subcommand is not known to be read-only"),
     }
+}
+
+fn git_requires_manual_approval(command: &ToolCommand) -> bool {
+    let Some(subcommand) = command.args.first().map(|arg| normalized(arg)) else {
+        return true;
+    };
+    let args = command
+        .args
+        .iter()
+        .skip(1)
+        .map(|arg| arg.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    match subcommand.as_str() {
+        "clean" | "restore" | "rebase" | "merge" => true,
+        "reset" => args.iter().any(|arg| arg == "--hard"),
+        "checkout" | "switch" => args
+            .iter()
+            .any(|arg| arg == "-f" || arg == "--force" || arg == "--"),
+        "push" => args.iter().any(|arg| {
+            arg == "-f" || arg == "--force" || arg == "--force-with-lease" || arg == "--mirror"
+        }),
+        "branch" => args.iter().any(|arg| arg == "-d" || arg == "-D"),
+        _ => false,
+    }
+}
+
+fn shell_script_requires_manual_approval(command: &ToolCommand) -> bool {
+    let program = normalized(&command.program);
+    if is_powershell_shell(&program)
+        && command
+            .args
+            .iter()
+            .any(|arg| is_powershell_encoded_flag(&arg.to_ascii_lowercase()))
+    {
+        return true;
+    }
+
+    let script = shell_script_text(command);
+    let tokens = shell_tokens(&script);
+    if tokens.is_empty() {
+        return false;
+    }
+
+    if tokens.iter().any(|token| is_dangerous_shell_program(token)) {
+        return true;
+    }
+
+    if shell_invokes_encoded_powershell(&tokens) {
+        return true;
+    }
+
+    for (index, token) in tokens.iter().enumerate() {
+        if is_shell_delete_command(token) {
+            return true;
+        }
+        if (token == "reg" || token == "reg.exe")
+            && tokens.get(index + 1).is_some_and(|subcommand| {
+                matches!(subcommand.as_str(), "add" | "delete" | "import")
+            })
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn shell_script_text(command: &ToolCommand) -> String {
+    let program = normalized(&command.program);
+    let command_flags = match program.as_str() {
+        "cmd" | "cmd.exe" => &["/c", "/k"][..],
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => &["-command", "-c", "/c"][..],
+        "bash" | "sh" | "zsh" => &["-c"][..],
+        _ => &[][..],
+    };
+
+    for (index, arg) in command.args.iter().enumerate() {
+        if command_flags
+            .iter()
+            .any(|flag| arg.eq_ignore_ascii_case(flag))
+        {
+            return command.args[index + 1..].join(" ");
+        }
+    }
+    command.args.join(" ")
+}
+
+fn shell_tokens(script: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+
+    for ch in script.chars() {
+        match quote {
+            Some(active) if ch == active => {
+                quote = None;
+            }
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+            }
+            None if ch.is_whitespace() || matches!(ch, '&' | '|' | ';' | '(' | ')') => {
+                push_shell_token(&mut tokens, &mut current);
+            }
+            None => current.push(ch),
+        }
+    }
+
+    push_shell_token(&mut tokens, &mut current);
+    tokens
+}
+
+fn push_shell_token(tokens: &mut Vec<String>, current: &mut String) {
+    let token = current
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | ',' | '.'))
+        .to_ascii_lowercase();
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    current.clear();
+}
+
+fn shell_invokes_encoded_powershell(tokens: &[String]) -> bool {
+    let has_powershell = tokens.iter().any(|token| is_powershell_shell(token));
+    has_powershell && tokens.iter().any(|token| is_powershell_encoded_flag(token))
+}
+
+fn is_powershell_shell(program: &str) -> bool {
+    matches!(
+        program,
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
+    )
+}
+
+fn is_powershell_encoded_flag(token: &str) -> bool {
+    matches!(
+        token,
+        "-encodedcommand" | "/encodedcommand" | "-enc" | "/enc" | "-e" | "/e"
+    )
+}
+
+fn is_dangerous_shell_program(token: &str) -> bool {
+    matches!(
+        token,
+        "diskpart"
+            | "diskpart.exe"
+            | "format"
+            | "format.com"
+            | "shutdown"
+            | "shutdown.exe"
+            | "reboot"
+            | "bcdedit"
+            | "bcdedit.exe"
+            | "cipher"
+            | "cipher.exe"
+            | "set-executionpolicy"
+            | "takeown"
+            | "takeown.exe"
+    )
+}
+
+fn is_shell_delete_command(token: &str) -> bool {
+    matches!(
+        token,
+        "rm" | "rm.exe"
+            | "del"
+            | "del.exe"
+            | "erase"
+            | "erase.exe"
+            | "rd"
+            | "rd.exe"
+            | "rmdir"
+            | "rmdir.exe"
+            | "remove-item"
+            | "ri"
+    )
 }
 
 fn is_shell(program: &str) -> bool {
@@ -251,18 +558,28 @@ fn is_hard_blocked_program(program: &str) -> bool {
 fn is_read_only_program(program: &str) -> bool {
     matches!(
         program,
-        "pwd"
-            | "ls"
-            | "dir"
-            | "cat"
-            | "type"
-            | "findstr"
-            | "where"
-            | "whoami"
-            | "node"
-            | "python"
-            | "python3"
+        "pwd" | "ls" | "dir" | "cat" | "type" | "findstr" | "where" | "whoami"
     )
+}
+
+fn is_script_interpreter(program: &str) -> bool {
+    matches!(
+        program,
+        "node" | "node.exe" | "python" | "python.exe" | "python3" | "python3.exe"
+    )
+}
+
+fn is_safe_interpreter_probe(program: &str, args: &[String]) -> bool {
+    let [flag] = args else {
+        return false;
+    };
+    match program {
+        "node" | "node.exe" => matches!(flag.as_str(), "--version" | "-v"),
+        "python" | "python.exe" | "python3" | "python3.exe" => {
+            matches!(flag.as_str(), "--version" | "-V" | "-VV")
+        }
+        _ => false,
+    }
 }
 
 fn normalized(value: &str) -> String {
@@ -360,6 +677,33 @@ mod tests {
         assert!(!gate.decide("tool_approval_2", ToolApprovalDecision::Approved));
     }
 
+    #[tokio::test]
+    async fn pending_gate_can_resolve_all_waiters() {
+        let gate = PendingToolApprovalGate::new();
+        let request = request("tool_approval_all");
+        let cancellation = ToolCancellationToken::default();
+        let evaluation = ToolPermissionEvaluation {
+            action: ToolPermissionAction::Ask,
+            reason: "needs approval".to_string(),
+        };
+
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            let request = request.clone();
+            let evaluation = evaluation.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                gate.request_approval(&request, &evaluation, &cancellation)
+                    .await
+                    .unwrap()
+            })
+        };
+
+        tokio::task::yield_now().await;
+        assert_eq!(gate.decide_all(ToolApprovalDecision::Approved), 1);
+        assert_eq!(waiter.await.unwrap(), ToolApprovalDecision::Approved);
+    }
+
     fn request(tool_call_id: &str) -> ToolExecutionRequest {
         ToolExecutionRequest {
             tool_call_id: tool_call_id.to_string(),
@@ -374,5 +718,115 @@ mod tests {
             timeout_ms: None,
             output_policy: ToolOutputPolicy::default(),
         }
+    }
+
+    fn command_request(program: &str, args: &[&str]) -> ToolExecutionRequest {
+        ToolExecutionRequest {
+            tool_call_id: "tool_command".to_string(),
+            run_id: None,
+            project_id: Some("project_1".to_string()),
+            cwd: None,
+            command: ToolCommand {
+                program: program.to_string(),
+                args: args.iter().map(|arg| arg.to_string()).collect(),
+                env: BTreeMap::new(),
+            },
+            timeout_ms: None,
+            output_policy: ToolOutputPolicy::default(),
+        }
+    }
+
+    #[test]
+    fn auto_safe_allows_ordinary_commands_without_prompt() {
+        let request = command_request("npm", &["test"]);
+        let evaluation = command_permission_for_mode(ToolApprovalMode::AutoSafe, &request);
+        assert_eq!(evaluation.action, ToolPermissionAction::Allow);
+    }
+
+    #[test]
+    fn auto_safe_keeps_destructive_commands_on_approval_path() {
+        let request = command_request("powershell.exe", &["-Command", "Remove-Item -Recurse src"]);
+        let evaluation = command_permission_for_mode(ToolApprovalMode::AutoSafe, &request);
+        assert_eq!(evaluation.action, ToolPermissionAction::Ask);
+
+        let request = command_request("git", &["reset", "--hard", "HEAD"]);
+        let evaluation = command_permission_for_mode(ToolApprovalMode::AutoSafe, &request);
+        assert_eq!(evaluation.action, ToolPermissionAction::Ask);
+    }
+
+    #[test]
+    fn auto_safe_keeps_shell_bypass_forms_on_approval_path() {
+        let cases = [
+            (
+                "powershell.exe",
+                &["-EncodedCommand", "UgBlAG0AbwB2AGUALQBJAHQAZQBtAA=="][..],
+            ),
+            ("cmd.exe", &["/c", "rd /q /s target"][..]),
+            ("cmd.exe", &["/c", "del /q /s *.tmp"][..]),
+            ("bash", &["-c", "rm -r -f target"][..]),
+            ("cmd.exe", &["/c", "powershell -EncodedCommand AAAA"][..]),
+        ];
+
+        for (program, args) in cases {
+            let request = command_request(program, args);
+            let evaluation = command_permission_for_mode(ToolApprovalMode::AutoSafe, &request);
+            assert_eq!(
+                evaluation.action,
+                ToolPermissionAction::Ask,
+                "{program} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn script_interpreters_require_approval_except_version_probes() {
+        for (program, args) in [
+            ("python", &["-c", "open('x', 'w').write('y')"][..]),
+            ("node", &["-e", "require('fs').writeFileSync('x', 'y')"][..]),
+        ] {
+            let request = command_request(program, args);
+            let evaluation = command_permission_for_mode(ToolApprovalMode::AutoSafe, &request);
+            assert_eq!(
+                evaluation.action,
+                ToolPermissionAction::Ask,
+                "{program} {args:?}"
+            );
+        }
+
+        for (program, args) in [("python", &["--version"][..]), ("node", &["-v"][..])] {
+            let request = command_request(program, args);
+            let evaluation = command_permission_for_mode(ToolApprovalMode::AutoSafe, &request);
+            assert_eq!(
+                evaluation.action,
+                ToolPermissionAction::Allow,
+                "{program} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_safe_preserves_hard_denies() {
+        let request = command_request("diskpart", &[]);
+        let evaluation = command_permission_for_mode(ToolApprovalMode::AutoSafe, &request);
+        assert_eq!(evaluation.action, ToolPermissionAction::Deny);
+    }
+
+    #[test]
+    fn yolo_allows_commands_that_manual_policy_would_block() {
+        let request = command_request("diskpart", &[]);
+        let evaluation = command_permission_for_mode(ToolApprovalMode::Yolo, &request);
+        assert_eq!(evaluation.action, ToolPermissionAction::Allow);
+    }
+
+    #[test]
+    fn approval_mode_rewrites_file_asks_but_not_denies() {
+        assert_eq!(
+            file_permission_action_for_mode(ToolApprovalMode::AutoSafe, ToolPermissionAction::Ask),
+            ToolPermissionAction::Allow
+        );
+        assert_eq!(
+            file_permission_action_for_mode(ToolApprovalMode::Yolo, ToolPermissionAction::Deny),
+            ToolPermissionAction::Deny
+        );
     }
 }

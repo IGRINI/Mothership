@@ -36,10 +36,7 @@ impl ClaudeAgentSettings {
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
-        let custom_models = values
-            .get(CUSTOM_MODELS_KEY)
-            .cloned()
-            .unwrap_or_default();
+        let custom_models = values.get(CUSTOM_MODELS_KEY).cloned().unwrap_or_default();
         let hidden_builtin_models = values
             .get(HIDDEN_BUILTIN_MODELS_KEY)
             .cloned()
@@ -91,7 +88,7 @@ pub(crate) fn settings_schema() -> Vec<SettingsField> {
     vec![
         SettingsField {
             key: OAUTH_TOKEN_KEY.to_string(),
-            label: "Claude credentials JSON".to_string(),
+            label: "Claude setup-token or credentials JSON".to_string(),
             kind: SettingsFieldKind::Secret,
             required: false,
             options: Vec::new(),

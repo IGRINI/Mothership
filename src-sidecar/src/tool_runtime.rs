@@ -10,20 +10,20 @@ use std::thread;
 use std::time::Duration;
 
 use mothership_core::{
-    check_write_file_content_precondition, classify_file_tool, file_tool_preview_diff,
-    run_apply_patch_tool, run_edit_file_tool, run_list_files_tool, run_read_file_tool,
-    run_command_typed_payload, run_search_text_tool,
-    run_write_file_tool_with_limit_and_observation,
-    validate_file_tool_args_shallow, DEFAULT_MAX_WRITE_FILE_BYTES, tool_batch_plan,
-    ChatCancellationToken, FileTool, FileToolOutcome, FileToolSpill, LlmToolCallHandler,
-    LlmToolCallRequest, LlmToolCallResult, MothershipError, ApprovalPreview, BackendOutcome,
+    check_write_file_content_precondition, classify_file_tool, file_permission_action_for_mode,
+    file_tool_preview_diff, run_apply_patch_tool, run_command_typed_payload, run_edit_file_tool,
+    run_list_files_tool, run_read_file_tool, run_search_text_tool,
+    run_write_file_tool_with_limit_and_observation, tool_batch_plan,
+    validate_file_tool_args_shallow, ApprovalPreview, BackendOutcome, ChangeRecorder,
+    ChatCancellationToken, FileSystem, FileTool, FileToolOutcome, FileToolSpill,
+    LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResult, MothershipError,
     PendingToolApprovalGate, ResourceLease, ResourceRequest, Result, SpawnedToolProcess,
-    StdFileSystem, ToolApprovalGate, ToolArtifact, ToolBackend,
-    ToolBatchPlan, ToolCallContext, ToolCancellationToken, ToolCapability, ToolCommand, ToolDecision,
-    ToolOrchestrator, ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest,
-    ToolExecutionResult, ToolExecutionStatus, ToolExecutor, ToolKind, ToolOutputPolicy,
-    ToolOutputStore, ToolPermissionAction, ToolProcessExit, ToolProcessSandbox, ToolProcessSpec,
-    ToolSupervisor, Workspace, MAX_TOOL_EVENT_BYTES,
+    StdFileSystem, ToolApprovalGate, ToolApprovalModeStore, ToolArtifact, ToolBackend,
+    ToolBatchPlan, ToolCallContext, ToolCancellationToken, ToolCapability, ToolCommand,
+    ToolDecision, ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest,
+    ToolExecutionResult, ToolExecutionStatus, ToolExecutor, ToolKind, ToolOrchestrator,
+    ToolOutputPolicy, ToolOutputStore, ToolPermissionAction, ToolProcessExit, ToolProcessSandbox,
+    ToolProcessSpec, ToolSupervisor, Workspace, DEFAULT_MAX_WRITE_FILE_BYTES, MAX_TOOL_EVENT_BYTES,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -180,6 +180,11 @@ struct FileToolExecutor {
     /// default is [`DEFAULT_MAX_WRITE_FILE_BYTES`]).
     max_write_bytes: usize,
     observations: Arc<Mutex<HashMap<FileObservationKey, String>>>,
+    approval_mode: Arc<ToolApprovalModeStore>,
+    /// Records workspace changes produced by mutating tools into the change
+    /// journal. `None` when no journal is wired (e.g. the standalone
+    /// `run_command` protocol path), in which case capture is skipped.
+    change_recorder: Option<Arc<ChangeRecorder>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -213,6 +218,8 @@ impl SidecarLlmToolHandler {
         project: Option<(String, PathBuf)>,
         approvals: Arc<PendingToolApprovalGate>,
         output_store: Option<Arc<dyn ToolOutputStore>>,
+        change_recorder: Option<Arc<ChangeRecorder>>,
+        approval_mode: Arc<ToolApprovalModeStore>,
     ) -> Self {
         let project = project.map(|(id, root)| ToolProjectContext { id, root });
         let command_executor = Arc::new(CommandToolExecutor {
@@ -231,6 +238,8 @@ impl SidecarLlmToolHandler {
             output_store,
             max_write_bytes: DEFAULT_MAX_WRITE_FILE_BYTES,
             observations: Arc::new(Mutex::new(HashMap::new())),
+            approval_mode,
+            change_recorder,
         });
         Self {
             command_executor,
@@ -458,11 +467,12 @@ impl ToolBackend for CommandCall {
         ctx: &ToolCallContext<'_>,
         sink: &Arc<dyn ToolExecutionEventSink>,
     ) -> Result<ResourceLease> {
-        self.runtime.block_on(self.supervisor.acquire_command_resources(
-            &self.request,
-            ctx.cancellation,
-            sink,
-        ))
+        self.runtime
+            .block_on(self.supervisor.acquire_command_resources(
+                &self.request,
+                ctx.cancellation,
+                sink,
+            ))
     }
 
     fn execute(
@@ -687,6 +697,7 @@ impl ToolBackend for FileToolExecutor {
             ) {
                 Ok(Some(failure)) => {
                     return ToolDecision::Reject(Box::new(file_failure_outcome(
+                        FileTool::Write,
                         failure,
                         ctx.tool_call_id,
                         Vec::new(),
@@ -701,7 +712,8 @@ impl ToolBackend for FileToolExecutor {
             }
         }
 
-        match capability.action {
+        let action = file_permission_action_for_mode(self.approval_mode.mode(), capability.action);
+        match action {
             ToolPermissionAction::Ask => ToolDecision::Ask {
                 reason: capability.summary,
             },
@@ -737,43 +749,70 @@ impl ToolBackend for FileToolExecutor {
             None
         };
 
-        let spill = self.output_store.as_ref().map(|store| AsyncOutputStoreSpill {
-            store: Arc::clone(store),
-            runtime: Arc::clone(&self.runtime),
-        });
+        let spill = self
+            .output_store
+            .as_ref()
+            .map(|store| AsyncOutputStoreSpill {
+                store: Arc::clone(store),
+                runtime: Arc::clone(&self.runtime),
+            });
         let spill_ref = spill.as_ref().map(|spill| spill as &dyn FileToolSpill);
+
+        // For a mutating tool, wrap the filesystem so the change journal records
+        // each touched path's before-state; the writes themselves are delegated
+        // unchanged. Non-mutating tools run against the plain filesystem.
+        let capture = if matches!(
+            tool,
+            FileTool::Write | FileTool::Edit | FileTool::ApplyPatch
+        ) {
+            self.change_recorder.as_ref().map(|recorder| {
+                recorder.begin_capture(Arc::new(self.file_system), workspace.root())
+            })
+        } else {
+            None
+        };
+        let fs_for_tool: &dyn FileSystem = match capture.as_ref() {
+            Some(capture) => capture,
+            None => &self.file_system,
+        };
+
         let outcome = match tool {
             FileTool::Read => run_read_file_tool(
                 ctx.arguments,
                 &workspace,
-                &self.file_system,
+                fs_for_tool,
                 tool_call_id,
                 spill_ref,
             ),
             FileTool::Write => run_write_file_tool_with_limit_and_observation(
                 ctx.arguments,
                 &workspace,
-                &self.file_system,
+                fs_for_tool,
                 self.max_write_bytes,
                 observed_write_sha.as_deref(),
             ),
-            FileTool::Edit => run_edit_file_tool(ctx.arguments, &workspace, &self.file_system),
-            FileTool::ApplyPatch => {
-                run_apply_patch_tool(ctx.arguments, &workspace, &self.file_system)
-            }
+            FileTool::Edit => run_edit_file_tool(ctx.arguments, &workspace, fs_for_tool),
+            FileTool::ApplyPatch => run_apply_patch_tool(ctx.arguments, &workspace, fs_for_tool),
             FileTool::ListFiles => {
                 run_list_files_tool(ctx.arguments, &workspace, tool_call_id, spill_ref)
             }
             FileTool::SearchText => run_search_text_tool(
                 ctx.arguments,
                 &workspace,
-                &self.file_system,
+                fs_for_tool,
                 tool_call_id,
                 spill_ref,
             ),
         };
         let outcome = outcome.map_err(|error| MothershipError::Runtime(error.to_string()))?;
         self.record_read_observation(tool, &outcome, &workspace, &run_id);
+
+        // Persist the change set a mutating tool produced. Created even when the
+        // tool reported failure (`!outcome.ok`) so partial writes stay reviewable
+        // and revertible. A journal hiccup never fails the tool.
+        if let (Some(recorder), Some(capture)) = (self.change_recorder.as_ref(), capture.as_ref()) {
+            recorder.record(ctx.run_id, tool_call_id, capture, !outcome.ok);
+        }
 
         // Bound the event/DB payload (the full diff spills to a logRef) and shape
         // the terminal outcome the orchestrator will emit.
@@ -782,7 +821,7 @@ impl ToolBackend for FileToolExecutor {
         } else {
             ToolExecutionStatus::Failed
         };
-        let model_text = truncate_for_model(file_outcome_text(&outcome));
+        let model_text = truncate_for_model(file_outcome_text(tool, &outcome));
         let bounded = bound_event_payload(&outcome, tool_call_id, spill_ref);
         let mut artifacts = Vec::new();
         if let Some(diff_preview) = bounded.diff.clone() {
@@ -802,8 +841,12 @@ impl ToolBackend for FileToolExecutor {
                 truncated: bounded.truncated,
             });
         }
-        let mut result =
-            synthesized_result(tool_call_id, status, bounded.result_text, bounded.diff.clone());
+        let mut result = synthesized_result(
+            tool_call_id,
+            status,
+            bounded.result_text,
+            bounded.diff.clone(),
+        );
         result.log_ref = bounded.log_ref;
         result.truncated_for_display = bounded.truncated;
 
@@ -821,11 +864,12 @@ impl ToolBackend for FileToolExecutor {
 /// Build a terminal [`BackendOutcome`] from a file handler's failure outcome
 /// (carrying its typed payload), for a pre-approval reject.
 fn file_failure_outcome(
+    tool: FileTool,
     outcome: FileToolOutcome,
     tool_call_id: &str,
     extra_touched: Vec<String>,
 ) -> BackendOutcome {
-    let message = file_outcome_text(&outcome);
+    let message = file_outcome_text(tool, &outcome);
     let mut touched_paths = touched_paths_from_data(&outcome.data);
     touched_paths.extend(extra_touched);
     BackendOutcome {
@@ -990,8 +1034,13 @@ impl FileToolExecutor {
         workspace: &Workspace,
         summary: &str,
     ) -> (String, Vec<ToolArtifact>) {
-        match file_tool_preview_diff(tool, arguments, workspace, &self.file_system, self.max_write_bytes)
-        {
+        match file_tool_preview_diff(
+            tool,
+            arguments,
+            workspace,
+            &self.file_system,
+            self.max_write_bytes,
+        ) {
             Some(diff) if !diff.is_empty() => {
                 // The message keeps the bounded summary+diff string for legacy /
                 // fallback rendering, but the diff is ALSO emitted as a typed
@@ -1098,10 +1147,18 @@ fn synthesized_result(
     }
 }
 
-/// The text returned to the model for a file-tool outcome: the handler's
-/// `model_text`, with the diff appended for a mutating success so the model sees
-/// what changed.
-fn file_outcome_text(outcome: &FileToolOutcome) -> String {
+/// The text returned to the model for a file-tool outcome. Mutating file tools
+/// already carry the intended change in their arguments, so returning the diff
+/// back to the model duplicates that payload in the transcript. Diffs stay in
+/// typed artifacts/events for UI review; the model gets the concise status.
+fn file_outcome_text(tool: FileTool, outcome: &FileToolOutcome) -> String {
+    if matches!(
+        tool,
+        FileTool::Write | FileTool::Edit | FileTool::ApplyPatch
+    ) {
+        return outcome.model_text.clone();
+    }
+
     match (&outcome.diff, outcome.ok) {
         (Some(diff), true) if !diff.is_empty() => {
             format!("{}\n\n{}", outcome.model_text, diff)
@@ -1456,7 +1513,9 @@ mod tests {
     // Event/approval types used only by these tests (the non-test lifecycle now
     // emits exclusively through the orchestrator, so the parent no longer needs
     // them).
-    use mothership_core::{ToolApprovalDecision, ToolExecutionEvent, ToolExecutionEventKind};
+    use mothership_core::{
+        ToolApprovalDecision, ToolApprovalMode, ToolExecutionEvent, ToolExecutionEventKind,
+    };
 
     /// A [`FileToolSpill`] that records what it was asked to spill and returns a
     /// fixed reference, so tests can assert the full (untruncated) diff was sent
@@ -1508,6 +1567,8 @@ mod tests {
             output_store: None,
             max_write_bytes: DEFAULT_MAX_WRITE_FILE_BYTES,
             observations: Arc::new(Mutex::new(HashMap::new())),
+            approval_mode: Arc::new(ToolApprovalModeStore::default()),
+            change_recorder: None,
         }
     }
 
@@ -1522,6 +1583,39 @@ mod tests {
     }
 
     #[test]
+    fn write_file_model_text_omits_full_diff() {
+        let diff = "@@ -1,1 +1,2 @@\n-old\n+new\n+more\n".to_string();
+        let outcome = outcome_with_diff(diff.clone());
+
+        let text = file_outcome_text(FileTool::Write, &outcome);
+
+        assert_eq!(text, outcome.model_text);
+        assert!(!text.contains(&diff));
+    }
+
+    #[test]
+    fn edit_file_model_text_omits_diff() {
+        let diff = "@@ -1,1 +1,1 @@\n-old\n+new\n".to_string();
+        let outcome = outcome_with_diff(diff.clone());
+
+        let text = file_outcome_text(FileTool::Edit, &outcome);
+
+        assert_eq!(text, outcome.model_text);
+        assert!(!text.contains(&diff));
+    }
+
+    #[test]
+    fn apply_patch_model_text_omits_diff() {
+        let diff = "# update a.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n".to_string();
+        let outcome = outcome_with_diff(diff.clone());
+
+        let text = file_outcome_text(FileTool::ApplyPatch, &outcome);
+
+        assert_eq!(text, outcome.model_text);
+        assert!(!text.contains(&diff));
+    }
+
+    #[test]
     fn bounded_event_payload_truncates_large_diff_and_spills_full() {
         // A diff far larger than MAX_TOOL_EVENT_BYTES must be truncated for the
         // event/result and the full diff written to the spill with a logRef.
@@ -1531,7 +1625,10 @@ mod tests {
 
         let bounded = bound_event_payload(&outcome, "tc_big", Some(&spill));
 
-        assert!(bounded.truncated, "oversized diff must be flagged truncated");
+        assert!(
+            bounded.truncated,
+            "oversized diff must be flagged truncated"
+        );
         let event_diff = bounded.diff.expect("diff present");
         assert!(
             event_diff.len() < big_diff.len(),
@@ -1598,6 +1695,47 @@ mod tests {
     }
 
     #[test]
+    fn auto_safe_write_runs_without_permission_request() {
+        let root = temp_project_dir("auto_safe_write");
+        let workspace = Workspace::new(&root).expect("workspace");
+        let sink = Arc::new(RecordingEventSink::default());
+        let mut executor = test_file_executor(&root, sink.clone(), PendingToolApprovalGate::new());
+        executor.approval_mode = ToolApprovalModeStore::new(ToolApprovalMode::AutoSafe);
+        let cancellation = ToolCancellationToken::default();
+        let chat_cancellation = ChatCancellationToken::default();
+        let run_id = Some("run_auto_safe".to_string());
+        let project_id = Some("project_auto_safe".to_string());
+
+        let result = executor.run_file_tool_inner(
+            FileTool::Write,
+            &json!({ "path": "auto.txt", "content": "ok\n" }),
+            &workspace,
+            "tc_auto_safe_write",
+            &run_id,
+            &project_id,
+            &cancellation,
+            &chat_cancellation,
+        );
+
+        assert!(result.ok, "{}", result.content);
+        assert_eq!(fs::read_to_string(root.join("auto.txt")).unwrap(), "ok\n");
+        let events = sink.events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != ToolExecutionEventKind::PermissionRequested),
+            "auto-safe write must not ask for approval"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == ToolExecutionEventKind::Completed
+                    && event.tool_call_id == "tc_auto_safe_write"),
+            "auto-safe write should complete"
+        );
+    }
+
+    #[test]
     fn malformed_write_fails_preflight_without_permission_request() {
         let root = temp_project_dir("malformed_write_preflight");
         let workspace = Workspace::new(&root).expect("workspace");
@@ -1620,7 +1758,11 @@ mod tests {
         );
 
         assert!(!result.ok);
-        assert!(result.content.contains("content"), "got: {}", result.content);
+        assert!(
+            result.content.contains("content"),
+            "got: {}",
+            result.content
+        );
         let events = sink.events.lock().unwrap();
         // The orchestrator emits Queued, then the preflight-failure terminal.
         let terminal = events.last().expect("a terminal event");
@@ -1630,9 +1772,10 @@ mod tests {
             Some(ToolExecutionStatus::Failed)
         );
         assert!(
-            events.iter().all(|event| event.kind
-                != ToolExecutionEventKind::PermissionRequested
-                && event.kind != ToolExecutionEventKind::Started),
+            events.iter().all(
+                |event| event.kind != ToolExecutionEventKind::PermissionRequested
+                    && event.kind != ToolExecutionEventKind::Started
+            ),
             "malformed write must not ask for approval or start execution"
         );
     }
@@ -1673,14 +1816,17 @@ mod tests {
         let terminal = events.last().expect("a terminal event");
         assert_eq!(terminal.kind, ToolExecutionEventKind::Failed);
         assert_eq!(
-            terminal.payload.as_ref().and_then(|payload| payload.get("status")),
+            terminal
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("status")),
             Some(&json!("precondition_required"))
         );
         assert!(
-            events
-                .iter()
-                .all(|event| event.kind != ToolExecutionEventKind::PermissionRequested
-                    && event.kind != ToolExecutionEventKind::Started),
+            events.iter().all(
+                |event| event.kind != ToolExecutionEventKind::PermissionRequested
+                    && event.kind != ToolExecutionEventKind::Started
+            ),
             "blind write must not ask approval or start execution"
         );
     }
@@ -1799,10 +1945,13 @@ mod tests {
         assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"old\nsecond\n");
         let events = sink.events.lock().unwrap();
         assert!(
-            events.iter().filter(|event| event.tool_call_id == "tc_write_after_partial").all(
-                |event| event.kind != ToolExecutionEventKind::PermissionRequested
-                    && event.kind != ToolExecutionEventKind::Started
-            ),
+            events
+                .iter()
+                .filter(|event| event.tool_call_id == "tc_write_after_partial")
+                .all(
+                    |event| event.kind != ToolExecutionEventKind::PermissionRequested
+                        && event.kind != ToolExecutionEventKind::Started
+                ),
             "partial read must not authorize write approval/execution"
         );
     }
@@ -1991,13 +2140,15 @@ mod tests {
 
         fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
             self.stdout.take().map(|bytes| {
-                Box::new(std::io::Cursor::new(bytes)) as Box<dyn tokio::io::AsyncRead + Send + Unpin>
+                Box::new(std::io::Cursor::new(bytes))
+                    as Box<dyn tokio::io::AsyncRead + Send + Unpin>
             })
         }
 
         fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
             self.stderr.take().map(|bytes| {
-                Box::new(std::io::Cursor::new(bytes)) as Box<dyn tokio::io::AsyncRead + Send + Unpin>
+                Box::new(std::io::Cursor::new(bytes))
+                    as Box<dyn tokio::io::AsyncRead + Send + Unpin>
             })
         }
 
@@ -2080,7 +2231,12 @@ mod tests {
         ));
         let approvals = PendingToolApprovalGate::new();
         let sink = Arc::new(RecordingEventSink::default());
-        let request = command_request("tool_cmd_2", "npm", &["install"], ToolOutputPolicy::default());
+        let request = command_request(
+            "tool_cmd_2",
+            "npm",
+            &["install"],
+            ToolOutputPolicy::default(),
+        );
 
         let handle = {
             let supervisor = Arc::clone(&supervisor);
@@ -2124,9 +2280,18 @@ mod tests {
     #[test]
     fn non_zero_exit_is_a_failed_command_terminal() {
         let sandbox = Arc::new(FakeSandbox::new(b"bad".to_vec(), Vec::new(), Some(2)));
-        let supervisor = Arc::new(ToolSupervisor::new(sandbox, None, ToolResourceLimits::default()));
+        let supervisor = Arc::new(ToolSupervisor::new(
+            sandbox,
+            None,
+            ToolResourceLimits::default(),
+        ));
         let sink = Arc::new(RecordingEventSink::default());
-        let request = command_request("tool_cmd_3", "git", &["status"], ToolOutputPolicy::default());
+        let request = command_request(
+            "tool_cmd_3",
+            "git",
+            &["status"],
+            ToolOutputPolicy::default(),
+        );
         let sink_dyn: Arc<dyn ToolExecutionEventSink> = sink.clone();
         run_command_via_orchestrator(
             request,
@@ -2159,8 +2324,12 @@ mod tests {
         let sink = Arc::new(RecordingEventSink::default());
 
         for tool_call_id in ["tool_rep_1", "tool_rep_2", "tool_rep_3"] {
-            let request =
-                command_request(tool_call_id, "git", &["status"], ToolOutputPolicy::default());
+            let request = command_request(
+                tool_call_id,
+                "git",
+                &["status"],
+                ToolOutputPolicy::default(),
+            );
             let sink_dyn: Arc<dyn ToolExecutionEventSink> = sink.clone();
             run_command_via_orchestrator(
                 request,
@@ -2198,8 +2367,12 @@ mod tests {
         let sink = Arc::new(RecordingEventSink::default());
 
         let run_with_decision = |tool_call_id: &str, decision: ToolApprovalDecision| {
-            let request =
-                command_request(tool_call_id, "npm", &["install"], ToolOutputPolicy::default());
+            let request = command_request(
+                tool_call_id,
+                "npm",
+                &["install"],
+                ToolOutputPolicy::default(),
+            );
             let supervisor = Arc::clone(&supervisor);
             let approvals_for_thread = Arc::clone(&approvals);
             let sink_dyn: Arc<dyn ToolExecutionEventSink> = sink.clone();

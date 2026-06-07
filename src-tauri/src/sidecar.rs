@@ -296,6 +296,9 @@ fn forward_event(app: &AppHandle, event: CoreEvent) {
         CoreEvent::ChatUpdated(chat_event) => {
             let _ = app.emit("chat-updated", chat_event);
         }
+        CoreEvent::ChangeSet(change_event) => {
+            let _ = app.emit("change-set-event", change_event);
+        }
         CoreEvent::Unknown => {}
     }
 }

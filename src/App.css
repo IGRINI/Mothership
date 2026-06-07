@@ -92,6 +92,28 @@ button {
   line-height: 1.45;
 }
 
+.startup-error__reload {
+  justify-self: start;
+  min-height: 32px;
+  border: 1px solid #a84249;
+  border-radius: 7px;
+  padding: 0 12px;
+  background: #8f2f37;
+  color: #fff4f4;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.startup-error__reload:hover {
+  background: #a83a43;
+  color: #ffffff;
+}
+
+.startup-error__reload:focus-visible {
+  outline: 2px solid #ff9aa0;
+  outline-offset: 2px;
+}
+
 .app-titlebar {
   position: absolute;
   top: 0;
@@ -737,7 +759,8 @@ kbd,
 
 .conversation-header button,
 .conversation-header .project-badge,
-.conversation-header .agent-status-chip {
+.conversation-header .agent-status-chip,
+.conversation-header .approval-mode {
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
@@ -805,6 +828,67 @@ kbd,
   color: #dce7f3;
   font-size: 13px;
   font-weight: 700;
+}
+
+.approval-mode {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  height: 34px;
+  gap: 3px;
+  border: 1px solid #27394b;
+  border-radius: 8px;
+  padding: 3px 4px 3px 8px;
+  background: #0f1a26;
+  color: #9fb2c6;
+}
+
+.approval-mode--auto {
+  border-color: rgb(65 217 129 / 38%);
+  background: rgb(65 217 129 / 8%);
+  color: #83eba8;
+}
+
+.approval-mode--yolo {
+  border-color: rgb(255 126 83 / 52%);
+  background: rgb(255 126 83 / 11%);
+  color: #ffb08d;
+}
+
+.approval-mode__option {
+  display: inline-grid;
+  min-width: 54px;
+  height: 26px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 8px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 850;
+  letter-spacing: 0;
+}
+
+.approval-mode__option:hover {
+  background: rgb(255 255 255 / 7%);
+  color: #f2f7fd;
+}
+
+.approval-mode__option--active {
+  background: #203247;
+  color: #f3f8ff;
+}
+
+.approval-mode--auto .approval-mode__option--active {
+  background: rgb(65 217 129 / 20%);
+  color: #eafff0;
+}
+
+.approval-mode--yolo .approval-mode__option--active {
+  background: rgb(255 126 83 / 24%);
+  color: #fff3ec;
 }
 
 .provider-status-dot {
@@ -1093,8 +1177,13 @@ kbd,
   align-items: flex-start;
 }
 
+/* Assistant rows use a "drop cap" layout: the avatar floats into the top-left
+   like an illuminated capital and the model name + body text wrap around it,
+   reclaiming the full width once the text runs past the avatar's bottom.
+   flow-root so the row contains the floated avatar instead of letting it bleed
+   into the next row. */
 .message-row--assistant {
-  justify-content: flex-start;
+  display: flow-root;
 }
 
 .message-row--user {
@@ -1126,6 +1215,34 @@ kbd,
   flex: 1 1 0;
   width: auto;
   max-width: none;
+}
+
+/* The avatar is the "drop cap" initial: pulled out of flow so the model name and
+   the body text wrap to its right, then run full width once they clear its
+   bottom — like text hugging an illuminated capital. */
+.message-row--assistant > .avatar--message {
+  float: left;
+  margin: 0 12px 4px 0;
+}
+
+/* For text to wrap AROUND the floated avatar, the body must flow as normal
+   blocks. The default grid is a formatting-context box, so it would sit beside
+   the float instead of letting its line boxes hug it. Switch to block flow and
+   restore the inter-part gap with margins. */
+.message-row--assistant .message-parts {
+  display: block;
+}
+
+.message-row--assistant .message-part + .message-part {
+  margin-top: 10px;
+}
+
+/* Non-text blocks shouldn't squeeze into the narrow gutter beside the avatar:
+   drop tool cards, change sets and error cards below it so they stay full width. */
+.message-row--assistant .message-part--tool,
+.message-row--assistant .change-sets,
+.message-row--assistant .chat-error-card {
+  clear: left;
 }
 
 /* User messages: right-aligned chat bubble. Solid accent fill, no blurred shadow
@@ -1379,8 +1496,7 @@ kbd,
   transition: background 120ms ease, color 120ms ease;
 }
 
-.inline-tool-call__summary:hover {
-  background: rgb(255 255 255 / 4%);
+.inline-tool-call__row:hover .inline-tool-call__summary {
   color: #e4edf5;
 }
 
@@ -1390,7 +1506,7 @@ kbd,
   color: #647a90;
 }
 
-.inline-tool-call__summary:hover .inline-tool-call__icon {
+.inline-tool-call__row:hover .inline-tool-call__icon {
   color: #93a9bf;
 }
 
@@ -2887,11 +3003,41 @@ kbd,
   .agent-status-chip {
     display: none;
   }
+
+  .approval-mode {
+    gap: 2px;
+    padding: 3px;
+  }
+
+  .approval-mode__option {
+    min-width: 0;
+    padding: 0 6px;
+    font-size: 10.5px;
+  }
 }
 
 @media (max-width: 820px) {
   .workspace-shell {
     grid-template-columns: 1fr;
+  }
+
+  .conversation-header {
+    gap: 8px;
+    padding-inline: 12px;
+  }
+
+  .project-badge {
+    max-width: 132px;
+  }
+
+  .approval-mode {
+    height: 32px;
+  }
+
+  .approval-mode__option {
+    height: 24px;
+    padding: 0 5px;
+    font-size: 10px;
   }
 
   .sidebar {
@@ -3360,8 +3506,10 @@ kbd,
   color: #7c8a98;
 }
 
+/* The portion of the file that was actually read — tinted gray to stand out
+   from the surrounding context lines. */
 .code-line--read {
-  background: rgb(208 224 244 / 5.5%);
+  background: rgb(154 166 182 / 14%);
 }
 
 .code-line--read .code-line__no {
@@ -3414,9 +3562,16 @@ kbd,
   tab-size: 4;
 }
 
+/* Sized to the widest line; every row fills it so tone backgrounds span the full
+   line width (not just under the text) and the body scrolls horizontally all the
+   way to the end of the longest line. */
+.diff-block__lines {
+  width: max-content;
+  min-width: 100%;
+}
+
 .diff-line {
   display: flex;
-  min-width: max-content;
 }
 
 .diff-line__gutter {
@@ -3475,6 +3630,41 @@ kbd,
 
 .diff-line--meta .diff-line__text {
   color: #6f8094;
+}
+
+/* GitHub-style "unfold" row for a collapsed run of unchanged lines. */
+.diff-expander {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 2px 0;
+  background: #0a1622;
+  border-block: 1px solid #11202d;
+  color: #6f8aa8;
+  font-size: 11.5px;
+  user-select: none;
+}
+
+.diff-expander__btn {
+  border: 0;
+  padding: 1px 8px;
+  border-radius: 5px;
+  background: transparent;
+  color: #7fa6d8;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.diff-expander__btn:hover {
+  background: rgb(127 166 216 / 14%);
+  color: #a9c6ef;
+}
+
+.diff-expander__count {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
 }
 
 /* === Linear tool bodies (per-kind) ======================================= */
@@ -3703,8 +3893,493 @@ kbd,
   background: transparent;
 }
 
+.tool-sub__summary--clickable {
+  cursor: pointer;
+}
+
+.tool-sub__chevron {
+  flex: 0 0 auto;
+  color: #54657a;
+  transform: rotate(-90deg);
+  transition: transform 120ms ease;
+}
+
+.tool-sub__chevron--open {
+  transform: rotate(0deg);
+}
+
+.tool-sub__diff {
+  padding: 0 9px 8px;
+}
+
 .tool-body__error {
   margin: 0;
   color: #ff9b9b;
   font-size: 12px;
+}
+
+/* === Workspace Change Journal — per-message change-set summary ============ */
+
+.change-sets {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.change-set {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #1b2a3a;
+  border-left: 2px solid #2f4a66;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #081320;
+}
+
+.change-set--reverted {
+  border-left-color: #4d6378;
+  opacity: 0.82;
+}
+
+.change-set--conflicted {
+  border-left-color: #e8c15a;
+}
+
+.change-set__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.change-set__title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #e4edf5;
+}
+
+.change-set__stat,
+.change-set__file-stat {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  font-weight: 700;
+}
+
+.change-set__add {
+  color: #5fcf90;
+}
+
+.change-set__del {
+  color: #ff8a8a;
+}
+
+.change-set__badge {
+  margin-left: auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #122234;
+  color: #9fb3c7;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.change-set__badge--warn {
+  background: #2a230f;
+  color: #e8c15a;
+}
+
+.change-set__files {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.change-set__file-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #b7c5d4;
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.change-set__file-row:hover {
+  background: rgb(255 255 255 / 4%);
+}
+
+.change-set__op {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 3px;
+  border-radius: 4px;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.change-set__op--A {
+  background: #5fcf90;
+  color: #06120b;
+}
+
+.change-set__op--M {
+  background: #e8c15a;
+  color: #0c0f08;
+}
+
+.change-set__op--D {
+  background: #ff8a8a;
+  color: #1a0808;
+}
+
+.change-set__op--R {
+  background: #7fa6d8;
+  color: #060d15;
+}
+
+.change-set__path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.change-set__file-stat {
+  flex: 0 0 auto;
+}
+
+.change-set__diff {
+  padding: 4px 6px 8px 31px;
+}
+
+.change-set__note {
+  margin: 0;
+  color: #7f93a6;
+  font-size: 12px;
+}
+
+.change-set__more {
+  justify-self: start;
+  border: 0;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: transparent;
+  color: #7fa6d8;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.change-set__more:hover {
+  background: rgb(127 166 216 / 12%);
+}
+
+.change-set__conflicts {
+  display: grid;
+  gap: 3px;
+  border: 1px solid #4a3a14;
+  border-radius: 7px;
+  padding: 8px 10px;
+  background: #1c1707;
+}
+
+.change-set__conflicts-head {
+  margin: 0;
+  color: #e8c15a;
+  font-size: 12px;
+}
+
+.change-set__conflict {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  color: #d6c79a;
+}
+
+.change-set__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.change-set__btn {
+  padding: 4px 12px;
+  border: 1px solid #243648;
+  border-radius: 7px;
+  background: #0d1a28;
+  color: #cdd9e6;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.change-set__btn:hover {
+  background: #122335;
+  border-color: #2f4658;
+}
+
+.change-set__btn--danger {
+  color: #ff9b9b;
+}
+
+.change-set__btn--danger:hover {
+  background: #221012;
+  border-color: #5a2a2a;
+}
+
+.change-set__btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* --- File actions + custom context menu ---------------------------------- */
+
+/* Inline "Открыть" / "В папке" link-buttons next to a file. */
+.file-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.file-actions__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #7fa6d8;
+  font-size: 11.5px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.file-actions__btn:hover {
+  background: rgb(127 166 216 / 14%);
+  color: #a9c6ef;
+}
+
+/* Reveal only while the row is hovered. display:none (not opacity) so the links
+   reserve no space — the flexible path column absorbs the width, keeping +/-
+   anchored — and so a click-focused row never leaves them stuck visible (no
+   :focus-within, which kept showing after opening/closing the spoiler). */
+.change-set__file-actions,
+.tool-sub__actions,
+.tool-card__file-actions {
+  display: none;
+}
+
+/* The fallback patch list has no +/- column, so push its links to the right. */
+.tool-card__file-actions {
+  margin-left: auto;
+}
+
+.change-set__file:hover .change-set__file-actions,
+.tool-sub:hover .tool-sub__actions,
+.tool-card__file:hover .tool-card__file-actions {
+  display: inline-flex;
+}
+
+.change-set__file-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.change-set__file-head > .change-set__file-row {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.tool-card__file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The app-wide custom right-click menu (file actions, etc.). */
+.context-menu {
+  position: fixed;
+  z-index: 2000;
+  min-width: 184px;
+  padding: 4px;
+  display: grid;
+  gap: 1px;
+  border: 1px solid #24364a;
+  border-radius: 9px;
+  background: #0d1a28;
+  box-shadow: 0 12px 30px rgb(0 0 0 / 48%);
+}
+
+.context-menu__item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #cdd9e6;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.context-menu__item:hover {
+  background: #18293c;
+}
+
+.context-menu__item--danger {
+  color: #ff9b9b;
+}
+
+.context-menu__item--danger:hover {
+  background: #221012;
+}
+
+/* Tool spoiler header: toggle button + hover actions + diff-stat + chevron on
+   one row. Hover actions sit left of the stat, same as the change-set rows. */
+.inline-tool-call__row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 8px;
+  transition: background 120ms ease;
+}
+
+.inline-tool-call__row:hover {
+  background: rgb(255 255 255 / 4%);
+}
+
+.inline-tool-call__row > .inline-tool-call__summary {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.inline-tool-call__summary:hover,
+.inline-tool-call__toggle:hover {
+  background: transparent;
+}
+
+.tool-stat {
+  flex: 0 0 auto;
+}
+
+.inline-tool-call__file-actions {
+  display: none;
+  flex: 0 0 auto;
+}
+
+.inline-tool-call__row:hover .inline-tool-call__file-actions {
+  display: inline-flex;
+}
+
+.inline-tool-call__toggle {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  padding: 3px 8px 3px 2px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+/* Expandable file tree (list_files result). */
+.file-tree {
+  max-height: 360px;
+  overflow: auto;
+  border: 1px solid #16222f;
+  border-radius: 8px;
+  padding: 4px 0;
+  background: #060d15;
+  scrollbar-color: #2c3e52 transparent;
+  scrollbar-width: thin;
+}
+
+.file-tree__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 2px 8px;
+  border: 0;
+  background: transparent;
+  color: #b7c5d4;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+button.file-tree__row {
+  cursor: pointer;
+}
+
+.file-tree__row:hover {
+  background: rgb(255 255 255 / 4%);
+}
+
+.file-tree__chevron,
+.file-tree__spacer {
+  flex: 0 0 auto;
+  width: 13px;
+}
+
+.file-tree__chevron {
+  color: #5d6b7a;
+  transition: transform 120ms ease;
+}
+
+.file-tree__chevron--open {
+  transform: rotate(90deg);
+}
+
+.file-tree__icon {
+  flex: 0 0 auto;
+  color: #6f8094;
+}
+
+.file-tree__row--dir .file-tree__icon {
+  color: #c8a24a;
+}
+
+.file-tree__name {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-tree__count {
+  flex: 0 0 auto;
+  color: #5d6b7a;
+  font-size: 10.5px;
+}
+
+.file-tree__actions {
+  margin-left: auto;
+  display: none;
+}
+
+.file-tree__row--file:hover .file-tree__actions {
+  display: inline-flex;
 }

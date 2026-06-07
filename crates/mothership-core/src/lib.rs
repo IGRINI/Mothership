@@ -1,6 +1,7 @@
 pub mod adapter_pool;
 pub mod agentic;
 pub mod auth;
+pub mod changes;
 pub mod chat;
 pub mod connectors;
 pub mod database;
@@ -20,6 +21,12 @@ pub use adapter_pool::AdapterPool;
 pub use agentic::{
     AgenticLoopPolicy, DEFAULT_FALLBACK_MESSAGE, DEFAULT_FINAL_SYNTHESIS_PROMPT,
     DEFAULT_MAX_AGENTIC_ROUNDS,
+};
+pub use changes::{
+    sha256_hex as change_blob_sha256_hex, CaptureFileSystem, ChangeConflict, ChangeContext,
+    ChangeEventSink, ChangeFileDiff, ChangeFileSummary, ChangeOp, ChangeRecorder, ChangeSetEvent,
+    ChangeSetEventKind, ChangeSetStatus, ChangeSetSummary, ChangesService, ConflictReason,
+    FileBlobStore, NoopChangeEventSink, RevertOutcome, RevertStatus, SnapshotBlobStore,
 };
 pub use chat::{
     ChatCancellationToken, ChatConversation, ChatMessage, ChatMessagePart, ChatMessagePartKind,
@@ -53,24 +60,25 @@ pub use tools::{
     apply_patch as run_apply_patch_tool, canonical_catalog_bytes, canonical_json,
     catalog_fingerprint, check_write_content_precondition as check_write_file_content_precondition,
     classify as classify_file_tool, default_credential_guard, edit_file as run_edit_file_tool,
-    list_files as run_list_files_tool, preview_diff as file_tool_preview_diff,
-    read_file as run_read_file_tool, redact_event, run_command_typed_payload,
-    search_text as run_search_text_tool,
-    tool_batch_plan, validate_args_shallow as validate_file_tool_args_shallow,
-    write_file as run_write_file_tool, write_file_with_limit as run_write_file_tool_with_limit,
+    file_permission_action_for_mode, list_files as run_list_files_tool,
+    preview_diff as file_tool_preview_diff, read_file as run_read_file_tool, redact_event,
+    run_command_typed_payload, search_text as run_search_text_tool, tool_batch_plan,
+    validate_args_shallow as validate_file_tool_args_shallow, write_file as run_write_file_tool,
+    write_file_with_limit as run_write_file_tool_with_limit,
     write_file_with_limit_and_observation as run_write_file_tool_with_limit_and_observation,
     ApprovalPreview, BackendOutcome, CatalogDrift, CatalogPin, ConservativeCommandPermissionPolicy,
     CredentialGuard, FileMetadata, FileSystem, FileTool, FileToolCapability, FileToolError,
-    FileToolOutcome, FileToolOutputStore, FileToolSpill, NoopCredentialGuard,
-    NoopToolExecutionEventSink, PathError, PatternCredentialGuard, PendingToolApprovalGate,
-    RedactingOutputStore, ResourceLease, ResourceRequest, SpawnedToolProcess,
-    StaticToolApprovalGate, StdFileSystem, ToolApprovalAnswer, ToolApprovalDecision,
-    ToolApprovalGate, ToolArtifact, ToolArtifactRange, ToolBackend, ToolBatchPlan, ToolCallContext,
-    ToolCancellationToken, ToolCapability, ToolCommand, ToolConcurrency, ToolDecision,
-    ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
-    ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRecord, ToolExecutionRegistry,
-    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolExecutor, ToolKind,
-    ToolOrchestrator, ToolOutputPolicy, ToolOutputStore, ToolOutputStream, ToolPermissionAction,
+    FileToolOutcome, FileToolOutputStore, FileToolSpill, ModeAwareCommandPermissionPolicy,
+    NoopCredentialGuard, NoopToolExecutionEventSink, PathError, PatternCredentialGuard,
+    PendingToolApprovalGate, RedactingOutputStore, ResourceLease, ResourceRequest,
+    SpawnedToolProcess, StaticToolApprovalGate, StdFileSystem, ToolApprovalAnswer,
+    ToolApprovalDecision, ToolApprovalGate, ToolApprovalMode, ToolApprovalModeStore, ToolArtifact,
+    ToolArtifactRange, ToolBackend, ToolBatchPlan, ToolCallContext, ToolCancellationToken,
+    ToolCapability, ToolCommand, ToolConcurrency, ToolDecision, ToolExecutionAccepted,
+    ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionEventKind,
+    ToolExecutionEventSink, ToolExecutionRecord, ToolExecutionRegistry, ToolExecutionRequest,
+    ToolExecutionResult, ToolExecutionStatus, ToolExecutor, ToolKind, ToolOrchestrator,
+    ToolOutputPolicy, ToolOutputStore, ToolOutputStream, ToolPermissionAction,
     ToolPermissionEvaluation, ToolPermissionPolicy, ToolProcessExit, ToolProcessSandbox,
     ToolProcessSpec, ToolRepeatBlock, ToolRepeatGuard, ToolRepeatGuardConfig, ToolResourceLimits,
     ToolSupervisor, Workspace, APPLY_PATCH_TOOL_NAME, DEFAULT_MAX_WRITE_FILE_BYTES,

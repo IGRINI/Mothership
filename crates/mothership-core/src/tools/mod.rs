@@ -51,9 +51,10 @@ pub use orchestrator::{
 };
 pub use output::{FileToolOutputStore, ToolOutputStore};
 pub use permissions::{
-    ConservativeCommandPermissionPolicy, PendingToolApprovalGate, StaticToolApprovalGate,
-    ToolApprovalDecision, ToolApprovalGate, ToolPermissionAction, ToolPermissionEvaluation,
-    ToolPermissionPolicy,
+    command_permission_for_mode, file_permission_action_for_mode,
+    ConservativeCommandPermissionPolicy, ModeAwareCommandPermissionPolicy, PendingToolApprovalGate,
+    StaticToolApprovalGate, ToolApprovalDecision, ToolApprovalGate, ToolApprovalMode,
+    ToolApprovalModeStore, ToolPermissionAction, ToolPermissionEvaluation, ToolPermissionPolicy,
 };
 pub use pipeline::{ToolCallContext, ToolExecutor, ToolKind};
 pub use process::{SpawnedToolProcess, ToolProcessExit, ToolProcessSandbox, ToolProcessSpec};
@@ -66,7 +67,7 @@ pub use supervisor::ToolSupervisor;
 pub use types::{
     run_command_typed_payload, NoopToolExecutionEventSink, ToolApprovalAnswer, ToolArtifact,
     ToolArtifactRange, ToolCommand, ToolExecutionAccepted, ToolExecutionCancellationResult,
-    ToolExecutionEvent,
-    ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRecord, ToolExecutionRequest,
-    ToolExecutionResult, ToolExecutionStatus, ToolOutputPolicy, ToolOutputStream,
+    ToolExecutionEvent, ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRecord,
+    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolOutputPolicy,
+    ToolOutputStream,
 };

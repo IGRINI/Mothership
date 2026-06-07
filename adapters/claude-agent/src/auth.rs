@@ -30,25 +30,25 @@ struct TempClaudeConfig {
 
 impl ClaudeAuthRuntime {
     pub(crate) fn prepare(settings: &ClaudeAgentSettings) -> anyhow::Result<Self> {
-        if let Some(credentials) = credentials_json(settings.credential_payload())? {
-            let temp_config = TempClaudeConfig::create(credentials)?;
+        let credential_payload = settings.credential_payload().trim();
+        if !credential_payload.is_empty() {
+            if let Some(credentials) = credentials_json(credential_payload)? {
+                let temp_config = TempClaudeConfig::create(credentials)?;
+                return Ok(Self {
+                    source: ClaudeAuthSource::ConfigDir(temp_config.path.clone()),
+                    temp_config: Some(temp_config),
+                });
+            }
+
             return Ok(Self {
-                source: ClaudeAuthSource::ConfigDir(temp_config.path.clone()),
-                temp_config: Some(temp_config),
+                source: ClaudeAuthSource::EnvOauthToken(credential_payload.to_string()),
+                temp_config: None,
             });
         }
 
         if let Some(path) = configured_config_dir(settings) {
             return Ok(Self {
                 source: ClaudeAuthSource::ConfigDir(path),
-                temp_config: None,
-            });
-        }
-
-        let token = settings.credential_payload().trim();
-        if !token.is_empty() {
-            return Ok(Self {
-                source: ClaudeAuthSource::EnvOauthToken(token.to_string()),
                 temp_config: None,
             });
         }
@@ -212,6 +212,28 @@ mod tests {
     #[test]
     fn credentials_json_treats_plain_token_as_env_token() {
         assert!(credentials_json("token").expect("plain token").is_none());
+    }
+
+    #[test]
+    fn prepare_prefers_explicit_plain_token_over_config_dir() {
+        let settings = ClaudeAgentSettings::from_values(BTreeMap::from([
+            (OAUTH_TOKEN_KEY.to_string(), "token".to_string()),
+            (
+                settings::CONFIG_DIR_KEY.to_string(),
+                "this-path-must-not-be-read".to_string(),
+            ),
+        ]));
+        let runtime = ClaudeAuthRuntime::prepare(&settings).expect("runtime");
+
+        match runtime.source {
+            ClaudeAuthSource::EnvOauthToken(token) => assert_eq!(token, "token"),
+            ClaudeAuthSource::ConfigDir(path) => {
+                panic!(
+                    "expected explicit token to win, got config dir {}",
+                    path.display()
+                )
+            }
+        }
     }
 
     #[test]

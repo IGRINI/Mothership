@@ -1,5 +1,6 @@
-import { For, JSX, Show, createSignal } from "solid-js";
+import { For, JSX, Match, Show, Switch, createSignal, createEffect } from "solid-js";
 import {
+  ChevronDown,
   FilePlus,
   FileSearch,
   FileText,
@@ -8,9 +9,18 @@ import {
   Terminal,
 } from "lucide-solid";
 
-import type { ToolArtifact, ToolKind } from "../../shared/api/mothership";
+import {
+  getChangeFileDiff,
+  type ChangeFileDiff,
+  type ToolArtifact,
+  type ToolExecutionResult,
+  type ToolKind,
+} from "../../shared/api/mothership";
+import { FileActions, onFileContextMenu } from "../../shared/ui/FileActions";
 import { CodeBlock } from "./components/CodeBlock";
+import { CollapsibleDiff } from "./components/CollapsibleDiff";
 import { DiffBlock } from "./components/DiffBlock";
+import { FileTree } from "./components/FileTree";
 import { OutputBlock } from "./components/OutputBlock";
 import { parseNumberedOutput, splitPath, type CodeLineModel } from "./components/code";
 import { highlightCommand } from "./components/highlight";
@@ -19,6 +29,41 @@ import { diffStat, newSideLines } from "./components/diff";
 // Opens a workspace path in an external app. Goes through a capability-checked
 // Core/Tauri command — never a raw shell open of UI-supplied data.
 export type OpenPathFn = (path: string) => void;
+
+// Given a touched path, the id of the change file recording THIS tool call's
+// edit to it (so the card can show the live, foldable per-edit diff from the
+// change journal instead of a frozen compact diff). Undefined if not recorded.
+export type FindChangeFileId = (path: string) => string | undefined;
+
+// Loads a change file's whole-file diff (its own before/after snapshot, so it
+// stays a faithful record of that specific edit) and renders it GitHub-style:
+// changes ± context, unchanged gaps collapsed into unfold rows.
+function ChangeFileDiffView(props: { changeFileId: string }) {
+  const [diff, setDiff] = createSignal<ChangeFileDiff | null>(null);
+  const [state, setState] = createSignal<"loading" | "ready" | "error">(
+    "loading",
+  );
+  createEffect(() => {
+    const id = props.changeFileId;
+    setState("loading");
+    getChangeFileDiff(id, 0, 0, true)
+      .then((value) => {
+        setDiff(value);
+        setState(value.unavailable ? "error" : "ready");
+      })
+      .catch(() => setState("error"));
+  });
+  return (
+    <Switch fallback={<p class="tool-body__note">Загрузка diff…</p>}>
+      <Match when={state() === "error"}>
+        <p class="tool-body__note">Не удалось загрузить diff.</p>
+      </Match>
+      <Match when={state() === "ready" && diff()}>
+        {(value) => <CollapsibleDiff diff={value().lines.join("\n")} />}
+      </Match>
+    </Switch>
+  );
+}
 
 // Lazily fetches a byte range of a tool's *persisted* output artifact (the
 // snapshot taken at tool-call time), NOT the live file — which may have changed.
@@ -41,6 +86,8 @@ export interface ToolCardData {
   kind: string;
   toolCallId?: string;
   toolKind?: ToolKind;
+  projectId?: string | null;
+  result?: ToolExecutionResult | null;
   payload?: Record<string, unknown> | null;
   touchedPaths?: string[];
   artifacts?: ToolArtifact[];
@@ -264,7 +311,7 @@ export function ApprovalPreview(props: {
                 <Show when={parts().summary}>
                   <p class="tool-card__approval-summary">{parts().summary}</p>
                 </Show>
-                <DiffBlock diff={diff()} />
+                <DiffBlock diff={diff()} maxRows={10} />
               </>
             )}
           </Show>
@@ -275,7 +322,7 @@ export function ApprovalPreview(props: {
             <Show when={parts().summary}>
               <p class="tool-card__approval-summary">{parts().summary}</p>
             </Show>
-            <DiffBlock diff={artifact().preview} />
+            <DiffBlock diff={artifact().preview} maxRows={10} />
           </>
         )}
       </Show>
@@ -347,6 +394,7 @@ function ReadFileCard(props: {
   payload: Record<string, unknown> | null | undefined;
   output?: string;
   toolCallId?: string;
+  projectId?: string;
   onOpen?: OpenPathFn;
   loadArtifactRange?: LoadArtifactRangeFn;
 }) {
@@ -368,7 +416,13 @@ function ReadFileCard(props: {
     return end !== undefined && end !== start ? `${start}–${end}` : `${start}`;
   };
 
-  const windowLines = () => parseNumberedOutput(props.output ?? "");
+  // Mark the originally-read window so its lines carry the read highlight even
+  // before the surrounding file is lazily loaded as context.
+  const windowLines = () =>
+    parseNumberedOutput(props.output ?? "").map((line) => ({
+      ...line,
+      read: true,
+    }));
   // Paged lazy load of the persisted snapshot: accumulate chunks and keep the
   // button alive (as "Загрузить ещё") until the backend reports EOF.
   const [loadedLines, setLoadedLines] = createSignal<CodeLineModel[] | null>(null);
@@ -421,7 +475,19 @@ function ReadFileCard(props: {
 
   return (
     <div class="tool-body">
-      <div class="tool-body__head">
+      <div
+        class="tool-body__head"
+        onContextMenu={(event) => {
+          const target = path();
+          if (target) {
+            onFileContextMenu(event, {
+              projectId: props.projectId,
+              path: target,
+              onOpen: props.onOpen,
+            });
+          }
+        }}
+      >
         <FileText size={13} />
         <PathLabel path={path()} />
         <StatusPill status={status()} />
@@ -447,7 +513,7 @@ function ReadFileCard(props: {
           title={path() ? splitPath(path() as string).name : undefined}
           onOpen={props.onOpen}
           onLoadMore={canLoadMore() ? loadMore : undefined}
-          loadMoreLabel={started() ? "Загрузить ещё" : "Загрузить весь файл"}
+          loadMoreLabel="Загрузить ещё"
           loading={loading()}
           atEnd={started() && nextOffset() === null}
         />
@@ -459,6 +525,7 @@ function ReadFileCard(props: {
 function WriteFileCard(props: {
   payload: Record<string, unknown> | null | undefined;
   artifacts?: ToolArtifact[];
+  projectId?: string;
   onOpen?: OpenPathFn;
 }) {
   const path = () => readString(props.payload, "path");
@@ -487,20 +554,22 @@ function WriteFileCard(props: {
 
   return (
     <div class="tool-body">
-      <div class="tool-body__head">
+      <div
+        class="tool-body__head"
+        onContextMenu={(event) => {
+          const target = path();
+          if (target) {
+            onFileContextMenu(event, {
+              projectId: props.projectId,
+              path: target,
+              onOpen: props.onOpen,
+            });
+          }
+        }}
+      >
         <FilePlus size={13} />
         <PathLabel path={path()} />
         <StatusPill status={status()} />
-        <Show when={path() && props.onOpen}>
-          <button
-            class="code-block__open tool-body__open"
-            type="button"
-            title="Открыть во внешнем приложении"
-            onClick={() => props.onOpen?.(path() as string)}
-          >
-            Открыть
-          </button>
-        </Show>
       </div>
       <div class="tool-card__chips">
         <Show when={formatBytes(bytes())}>
@@ -541,35 +610,53 @@ function WriteFileCard(props: {
 function EditFileCard(props: {
   payload: Record<string, unknown> | null | undefined;
   artifacts?: ToolArtifact[];
+  projectId?: string;
   onOpen?: OpenPathFn;
+  findChangeFileId?: FindChangeFileId;
 }) {
   const path = () => readString(props.payload, "path");
   const status = () => readString(props.payload, "status");
   const occurrences = () => readNumber(props.payload, "occurrences");
   const diff = () => findDiffArtifact(props.artifacts);
+  // Prefer the live, foldable diff from the change journal (whole-file context,
+  // real positions, GitHub-style unfold). Fall back to the frozen compact diff
+  // artifact when the change file isn't known (e.g. not yet recorded).
+  const changeFileId = () => {
+    const target = path();
+    return target ? props.findChangeFileId?.(target) : undefined;
+  };
 
   return (
     <div class="tool-body">
-      <div class="tool-body__head">
+      <div
+        class="tool-body__head"
+        onContextMenu={(event) => {
+          const target = path();
+          if (target) {
+            onFileContextMenu(event, {
+              projectId: props.projectId,
+              path: target,
+              onOpen: props.onOpen,
+            });
+          }
+        }}
+      >
         <FileText size={13} />
         <PathLabel path={path()} />
         <StatusPill status={status()} />
         <Show when={occurrences() !== undefined}>
           <span class="tool-body__hint">{occurrences()}×</span>
         </Show>
-        <Show when={path() && props.onOpen}>
-          <button
-            class="code-block__open tool-body__open"
-            type="button"
-            title="Открыть во внешнем приложении"
-            onClick={() => props.onOpen?.(path() as string)}
-          >
-            Открыть
-          </button>
-        </Show>
       </div>
-      <Show when={diff()}>
-        {(artifact) => <DiffBlock diff={artifact().preview} />}
+      <Show
+        when={changeFileId()}
+        fallback={
+          <Show when={diff()}>
+            {(artifact) => <DiffBlock diff={artifact().preview} maxRows={10} />}
+          </Show>
+        }
+      >
+        {(id) => <ChangeFileDiffView changeFileId={id()} />}
       </Show>
     </div>
   );
@@ -624,12 +711,72 @@ function patchOpBadge(op: string): "A" | "M" | "D" {
   return "M";
 }
 
-function PatchFileRow(props: { file: PatchFileMeta }) {
+// Split the combined patch diff (`# op path` header per file, then that file's
+// unified diff) into per-path diff text. A real diff line never starts with a
+// bare "# " (context/+/− lines are prefixed), so the headers are unambiguous.
+function parsePatchDiffs(combined: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  let path: string | null = null;
+  let buffer: string[] = [];
+  const flush = () => {
+    if (path !== null) out[path] = buffer.join("\n");
+  };
+  for (const line of combined.split("\n")) {
+    const match = /^# \S+ (.+)$/.exec(line);
+    if (match) {
+      flush();
+      path = match[1];
+      buffer = [];
+    } else if (path !== null) {
+      buffer.push(line);
+    }
+  }
+  flush();
+  return out;
+}
+
+function PatchFileRow(props: {
+  file: PatchFileMeta;
+  projectId?: string;
+  diff?: string;
+  changeFileId?: string;
+}) {
+  const [open, setOpen] = createSignal(false);
   const parts = () => splitPath(props.file.path);
   const badge = () => patchOpBadge(props.file.op);
+  const hasDiff = () =>
+    Boolean(props.changeFileId) ||
+    Boolean(props.diff && props.diff.trim().length > 0);
   return (
-    <div class="tool-sub tool-sub--static">
-      <div class="tool-sub__summary tool-sub__summary--static">
+    <div
+      class="tool-sub"
+      classList={{ "tool-sub--static": !hasDiff() }}
+      onContextMenu={(event) =>
+        onFileContextMenu(event, {
+          projectId: props.projectId,
+          path: props.file.path,
+        })
+      }
+    >
+      <div
+        class="tool-sub__summary"
+        classList={{
+          "tool-sub__summary--static": !hasDiff(),
+          "tool-sub__summary--clickable": hasDiff(),
+        }}
+        onClick={() => {
+          if (hasDiff()) setOpen(!open());
+        }}
+      >
+        <Show when={hasDiff()}>
+          <ChevronDown
+            classList={{
+              "tool-sub__chevron": true,
+              "tool-sub__chevron--open": open(),
+            }}
+            size={13}
+          />
+        </Show>
         <span class={`tool-sub__op tool-sub__op--${badge()}`}>{badge()}</span>
         <code class="tool-sub__path">
           <Show when={parts().dir}>
@@ -638,6 +785,11 @@ function PatchFileRow(props: { file: PatchFileMeta }) {
           <span class="tool-sub__name">{parts().name || "(файл)"}</span>
         </code>
         <span class="tool-sub__spacer" />
+        <FileActions
+          class="tool-sub__actions"
+          projectId={props.projectId}
+          path={props.file.path}
+        />
         <span class="tool-sub__stat">
           <Show when={props.file.added > 0}>
             <span class="tool-stat__add">+{props.file.added}</span>
@@ -647,6 +799,16 @@ function PatchFileRow(props: { file: PatchFileMeta }) {
           </Show>
         </span>
       </div>
+      <Show when={open() && hasDiff()}>
+        <div class="tool-sub__diff">
+          <Show
+            when={props.changeFileId}
+            fallback={<DiffBlock diff={props.diff} maxRows={10} />}
+          >
+            {(id) => <ChangeFileDiffView changeFileId={id()} />}
+          </Show>
+        </div>
+      </Show>
     </div>
   );
 }
@@ -654,9 +816,18 @@ function PatchFileRow(props: { file: PatchFileMeta }) {
 function ApplyPatchCard(props: {
   payload: Record<string, unknown> | null | undefined;
   touchedPaths?: string[];
+  projectId?: string;
+  artifacts?: ToolArtifact[];
+  findChangeFileId?: FindChangeFileId;
 }) {
   const status = () => readString(props.payload, "status");
   const files = () => readPatchFiles(props.payload?.files);
+  // Per-file unified diffs, parsed from the combined diff artifact (real line
+  // numbers + context) so each row can expand to its actual changes.
+  const diffByPath = () => {
+    const artifact = findDiffArtifact(props.artifacts);
+    return artifact ? parsePatchDiffs(artifact.preview) : {};
+  };
   // Fallback list when there is no structured per-file metadata (legacy records).
   const fallbackPaths = () => {
     const fromPayload = normalizePatchFiles(props.payload?.files);
@@ -680,8 +851,21 @@ function ApplyPatchCard(props: {
             <ul class="tool-card__files">
               <For each={fallbackPaths()}>
                 {(file) => (
-                  <li>
+                  <li
+                    class="tool-card__file"
+                    onContextMenu={(event) =>
+                      onFileContextMenu(event, {
+                        projectId: props.projectId,
+                        path: file,
+                      })
+                    }
+                  >
                     <code>{file}</code>
+                    <FileActions
+                      class="tool-card__file-actions"
+                      projectId={props.projectId}
+                      path={file}
+                    />
                   </li>
                 )}
               </For>
@@ -690,7 +874,16 @@ function ApplyPatchCard(props: {
         }
       >
         <div class="tool-subs">
-          <For each={files()}>{(file) => <PatchFileRow file={file} />}</For>
+          <For each={files()}>
+            {(file) => (
+              <PatchFileRow
+                file={file}
+                projectId={props.projectId}
+                diff={diffByPath()[file.path]}
+                changeFileId={props.findChangeFileId?.(file.path)}
+              />
+            )}
+          </For>
         </div>
       </Show>
     </div>
@@ -722,12 +915,18 @@ function normalizePatchFiles(value: unknown): string[] {
 function ListFilesCard(props: {
   payload: Record<string, unknown> | null | undefined;
   output?: string;
+  projectId?: string;
 }) {
   const count = () => readNumber(props.payload, "count");
   const truncated = () => readBoolean(props.payload, "truncated");
   const dir = () => readString(props.payload, "dir");
   const glob = () => readString(props.payload, "glob");
   const listing = () => (props.output ?? "").trim();
+  const paths = () =>
+    listing()
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
 
   return (
     <div class="tool-body">
@@ -744,11 +943,22 @@ function ListFilesCard(props: {
           {(value) => <Chip label="glob" value={<code>{value()}</code>} />}
         </Show>
         <Show when={truncated()}>
-          <Chip label="результат" value="truncated" />
+          <Chip label="список" value="обрезан" />
         </Show>
       </div>
-      <Show when={listing()}>
-        {(text) => <OutputBlock text={text()} />}
+      <Show
+        when={paths().length > 0}
+        fallback={
+          <Show when={listing()}>{(text) => <OutputBlock text={text()} />}</Show>
+        }
+      >
+        <FileTree paths={paths()} projectId={props.projectId} />
+      </Show>
+      <Show when={truncated()}>
+        <p class="tool-body__note">
+          Показаны первые {count() ?? paths().length} — список обрезан по лимиту,
+          в каталоге есть ещё файлы.
+        </p>
       </Show>
     </div>
   );
@@ -785,7 +995,7 @@ function SearchTextCard(props: {
           <Chip label="файлов" value={String(filesWithMatches())} />
         </Show>
         <Show when={truncated()}>
-          <Chip label="результат" value="truncated" />
+          <Chip label="результат" value="обрезан" />
         </Show>
       </div>
       <Show when={hits()}>{(text) => <OutputBlock text={text()} />}</Show>
@@ -823,6 +1033,7 @@ export function ToolCard(props: {
   tool: ToolCardData;
   onOpenPath?: OpenPathFn;
   loadArtifactRange?: LoadArtifactRangeFn;
+  findChangeFileId?: FindChangeFileId;
 }) {
   const payload = () => props.tool.payload;
 
@@ -836,8 +1047,11 @@ export function ToolCard(props: {
         return (
           <ReadFileCard
             payload={payload()}
-            output={props.tool.output}
+            output={
+              props.tool.output || props.tool.result?.stdoutPreview || ""
+            }
             toolCallId={props.tool.toolCallId}
+            projectId={props.tool.projectId ?? undefined}
             onOpen={props.onOpenPath}
             loadArtifactRange={props.loadArtifactRange}
           />
@@ -847,6 +1061,7 @@ export function ToolCard(props: {
           <WriteFileCard
             payload={payload()}
             artifacts={props.tool.artifacts}
+            projectId={props.tool.projectId ?? undefined}
             onOpen={props.onOpenPath}
           />
         );
@@ -855,7 +1070,9 @@ export function ToolCard(props: {
           <EditFileCard
             payload={payload()}
             artifacts={props.tool.artifacts}
+            projectId={props.tool.projectId ?? undefined}
             onOpen={props.onOpenPath}
+            findChangeFileId={props.findChangeFileId}
           />
         );
       case "apply_patch":
@@ -863,10 +1080,19 @@ export function ToolCard(props: {
           <ApplyPatchCard
             payload={payload()}
             touchedPaths={props.tool.touchedPaths}
+            projectId={props.tool.projectId ?? undefined}
+            artifacts={props.tool.artifacts}
+            findChangeFileId={props.findChangeFileId}
           />
         );
       case "list_files":
-        return <ListFilesCard payload={payload()} output={props.tool.output} />;
+        return (
+          <ListFilesCard
+            payload={payload()}
+            output={props.tool.output}
+            projectId={props.tool.projectId ?? undefined}
+          />
+        );
       case "search_text":
         return <SearchTextCard payload={payload()} output={props.tool.output} />;
       default:

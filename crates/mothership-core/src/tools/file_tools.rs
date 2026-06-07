@@ -1135,10 +1135,23 @@ pub fn apply_patch(
             ));
         }
         let op = planned_kind_name(&file.op);
+        // A real per-file unified diff (true line numbers + context) for the UI,
+        // from the captured pre-apply content and the planned content — so the
+        // patch card can show the actual changes, not just a file list.
+        let before = snapshot_before(&snapshot, workspace, &file.path);
+        let after = file.new_content.as_deref().unwrap_or("");
+        let file_diff =
+            crate::changes::diff::unified_diff_with_context(&before, after, 3)
+                .lines
+                .join("\n");
         if !combined_diff.is_empty() {
             combined_diff.push('\n');
         }
         combined_diff.push_str(&format!("# {op} {}\n", file.path));
+        if !file_diff.is_empty() {
+            combined_diff.push_str(&file_diff);
+            combined_diff.push('\n');
+        }
         applied_files.push(json!({
             "path": file.path,
             "op": op,
@@ -1286,6 +1299,22 @@ fn capture_snapshot(
         files,
         created_dirs,
     })
+}
+
+/// The captured pre-apply content of `path` (workspace-relative), decoded
+/// lossily — empty when the file did not exist (an Add). Used to render each
+/// patched file's diff against its planned content.
+fn snapshot_before(snapshot: &PatchSnapshot, workspace: &Workspace, path: &str) -> String {
+    let Ok(resolved) = resolve_for_apply(workspace, path) else {
+        return String::new();
+    };
+    snapshot
+        .files
+        .iter()
+        .find(|entry| entry.path == resolved)
+        .and_then(|entry| entry.prior.as_deref())
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default()
 }
 
 /// Compute the set of directories that do not currently exist but will be created
@@ -1653,9 +1682,9 @@ fn detect_crlf(text: &str) -> bool {
     crlf >= lone_lf
 }
 
-/// Render a minimal unified-diff-style preview replacing the whole old content
-/// with the whole new content (used by `write_file`). Cheap and dependency-free;
-/// only meant to feed an approval/UI card.
+/// Render a whole-file preview for `write_file`: the new content is the entire
+/// file, so its line numbers ARE the file's (1..N). The card shows the new side
+/// via `newSideLines`; every old line is `-`, every new line `+` under one hunk.
 fn render_full_diff(old: &str, new: &str) -> String {
     let old_lines: Vec<&str> = if old.is_empty() {
         Vec::new()

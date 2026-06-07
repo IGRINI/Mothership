@@ -10,10 +10,11 @@ use std::collections::BTreeMap;
 
 use mothership_core::ipc::{CoreRequest, CoreResponse};
 use mothership_core::{
-    AdapterSettingPatchValue, ChatConversation, ChatRunCancellationResult, ChatThreadSummary,
-    ConnectorSettingsSnapshot, DashboardSnapshot, ProjectSnapshot, ReasoningConfig,
-    SendChatMessageResult, SidecarStatus, ToolApprovalAnswer, ToolArtifactRange,
-    ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionRequest,
+    AdapterSettingPatchValue, ChangeFileDiff, ChangeFileSummary, ChangeSetSummary,
+    ChatConversation, ChatRunCancellationResult, ChatThreadSummary, ConnectorSettingsSnapshot,
+    DashboardSnapshot, ProjectSnapshot, ReasoningConfig, RevertOutcome, SendChatMessageResult,
+    SidecarStatus, ToolApprovalAnswer, ToolApprovalMode, ToolArtifactRange, ToolExecutionAccepted,
+    ToolExecutionCancellationResult, ToolExecutionRequest,
 };
 use tauri::{AppHandle, State, Window};
 use tauri_plugin_dialog::DialogExt;
@@ -311,6 +312,31 @@ pub async fn cancel_tool_execution(
 }
 
 #[tauri::command]
+pub async fn get_tool_approval_mode(
+    state: State<'_, AppState>,
+) -> Result<ToolApprovalMode, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::GetToolApprovalMode)
+        .await?;
+    expect_variant!(response, CoreResponse::ToolApprovalMode)
+}
+
+#[tauri::command]
+pub async fn set_tool_approval_mode(
+    state: State<'_, AppState>,
+    mode: ToolApprovalMode,
+) -> Result<ToolApprovalMode, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::SetToolApprovalMode { mode })
+        .await?;
+    expect_variant!(response, CoreResponse::ToolApprovalMode)
+}
+
+#[tauri::command]
 pub async fn get_tool_artifact_range(
     state: State<'_, AppState>,
     tool_call_id: String,
@@ -351,6 +377,30 @@ pub async fn open_tool_path(
     let resolved = expect_variant!(response, CoreResponse::ResolvedPath)?;
     app.opener()
         .open_path(resolved, None::<&str>)
+        .map_err(|error| error.to_string())
+}
+
+/// Reveal a workspace path in the OS file manager (Explorer / Finder). Like
+/// [`open_tool_path`], Core resolves + contains the path against the owning
+/// project's root before it reaches the opener.
+#[tauri::command]
+pub async fn reveal_tool_path(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+    path: String,
+) -> Result<(), String> {
+    let Some(project_id) = project_id else {
+        return Err("cannot reveal a path without a project".to_string());
+    };
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::ResolveWorkspacePath { project_id, path })
+        .await?;
+    let resolved = expect_variant!(response, CoreResponse::ResolvedPath)?;
+    app.opener()
+        .reveal_item_in_dir(resolved)
         .map_err(|error| error.to_string())
 }
 
@@ -466,4 +516,83 @@ pub async fn run_sidecar_status(state: State<'_, AppState>) -> Result<SidecarSta
         .request(CoreRequest::SidecarStatus)
         .await?;
     expect_variant!(response, CoreResponse::SidecarStatus)
+}
+
+#[tauri::command]
+pub async fn get_chat_change_sets(
+    state: State<'_, AppState>,
+    chat_id: String,
+) -> Result<Vec<ChangeSetSummary>, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::GetChatChangeSets { chat_id })
+        .await?;
+    expect_variant!(response, CoreResponse::ChangeSets)
+}
+
+#[tauri::command]
+pub async fn get_message_change_summary(
+    state: State<'_, AppState>,
+    message_id: String,
+) -> Result<Vec<ChangeSetSummary>, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::GetMessageChangeSummary { message_id })
+        .await?;
+    expect_variant!(response, CoreResponse::ChangeSets)
+}
+
+#[tauri::command]
+pub async fn get_change_file_diff(
+    state: State<'_, AppState>,
+    change_file_id: String,
+    offset: Option<u64>,
+    limit: Option<u64>,
+    full: Option<bool>,
+) -> Result<ChangeFileDiff, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::GetChangeFileDiff {
+            change_file_id,
+            offset,
+            limit,
+            full,
+        })
+        .await?;
+    expect_variant!(response, CoreResponse::ChangeFileDiff)
+}
+
+#[tauri::command]
+pub async fn revert_change_set(
+    state: State<'_, AppState>,
+    change_set_id: String,
+) -> Result<RevertOutcome, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::RevertChangeSet { change_set_id })
+        .await?;
+    expect_variant!(response, CoreResponse::ChangeSetReverted)
+}
+
+#[tauri::command]
+pub async fn list_change_set_files(
+    state: State<'_, AppState>,
+    change_set_id: String,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<Vec<ChangeFileSummary>, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::ListChangeSetFiles {
+            change_set_id,
+            offset,
+            limit,
+        })
+        .await?;
+    expect_variant!(response, CoreResponse::ChangeFiles)
 }

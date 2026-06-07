@@ -258,6 +258,10 @@ These hold on `feat/typed-tool-layer` as of the 4th review round. They supersede
 - **Bounded events/DB/approval.** Diff/result text persisted/streamed and the
   PermissionRequested *preview* diff are bounded to `MAX_TOOL_EVENT_BYTES` (64 KiB), spilling
   the full diff to a `logRef`. `expectedSha256` gives optimistic-concurrency conflict checks.
+- **Model-facing mutation results are summary-only.** `write_file`, `edit_file`, and
+  `apply_patch` do not echo their diff back to the model after success. The model already
+  supplied the replacement/edit/patch payload; diffs remain typed UI artifacts/events for
+  review and audit.
 - **write_file cannot blind-overwrite existing files.** Existing-file writes require either
   `expectedSha256` or a fresh complete `read_file` observation from the same run. The sidecar
   records observations as `(run_id, resolved_path) -> sha256` only when `read_file` returned the

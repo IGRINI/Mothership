@@ -264,14 +264,11 @@ impl ConnectorManager {
     pub fn ensure_model_supported(&self, provider_id: &str, model_id: &str) -> Result<()> {
         let support = {
             let state = self.state.lock().unwrap();
-            state
-                .catalogs
-                .get(provider_id)
-                .map(|catalog| {
-                    let catalog_match = catalog.models.iter().any(|model| model.id == model_id);
-                    let custom_allowed = model_management_accepts_custom_ids(catalog.management);
-                    (catalog_match, custom_allowed)
-                })
+            state.catalogs.get(provider_id).map(|catalog| {
+                let catalog_match = catalog.models.iter().any(|model| model.id == model_id);
+                let custom_allowed = model_management_accepts_custom_ids(catalog.management);
+                (catalog_match, custom_allowed)
+            })
         };
 
         match support {
@@ -1075,7 +1072,9 @@ fn is_valid_custom_model_id(model_id: &str) -> bool {
     !trimmed.is_empty()
         && trimmed == model_id
         && trimmed.len() <= 256
-        && !trimmed.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+        && !trimmed
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
 }
 
 fn sanitized_adapter_settings(

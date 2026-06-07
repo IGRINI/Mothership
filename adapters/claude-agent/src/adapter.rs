@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Context as _;
 use mothership_adapter_sdk::protocol::{
-    AuthKind, AuthStatus, AuthStatusKind, Model, ModelManagement, SettingsField,
+    AuthKind, AuthStatus, Model, ModelManagement, SettingsField,
 };
 use mothership_adapter_sdk::{ChatRequest, ChatRoundOutcome, ChatSink, Context, ProviderAdapter};
 
@@ -26,21 +26,18 @@ impl ProviderAdapter for ClaudeAgentAdapter {
 
     fn auth_schema(&self) -> AuthKind {
         AuthKind::ApiKey {
-            label: "Claude credentials".to_string(),
+            label: "Claude auth token".to_string(),
         }
     }
 
     fn auth_status(&self) -> AuthStatus {
         if self.settings.has_credentials() {
-            AuthStatus {
-                kind: AuthStatusKind::Configured,
-                account_label: None,
-                expires_at: None,
-                detail: Some("Claude credentials are configured".to_string()),
-            }
+            AuthStatus::configured(
+                "Claude credentials are present; chat requests are validated by Claude Agent SDK at runtime",
+            )
         } else {
             AuthStatus::missing(
-                "Paste Claude credentials JSON or configure a Claude config directory",
+                "Paste a `claude setup-token` token or configure a Claude config directory",
             )
         }
     }
@@ -72,7 +69,7 @@ impl ProviderAdapter for ClaudeAgentAdapter {
     ) -> anyhow::Result<ChatRoundOutcome> {
         if !self.settings.has_credentials() {
             anyhow::bail!(
-                "missing Claude credentials (paste credentials JSON or configure a Claude config directory)"
+                "missing Claude credentials (paste a `claude setup-token` token or configure a Claude config directory)"
             );
         }
         cli::stream_chat(&self.settings, request, ctx, sink).await

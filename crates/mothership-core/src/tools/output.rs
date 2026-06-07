@@ -686,8 +686,7 @@ mod range_tests {
     #[test]
     fn strip_stream_headers_rejoins_a_line_split_across_appends() {
         // A redactor flush split "  1→foo" mid-line, inserting a second header.
-        let raw = "\n--- stdout 5 bytes ---\n  1\u{2192}fo\n--- stdout 3 bytes ---\no\n"
-            .as_bytes();
+        let raw = "\n--- stdout 5 bytes ---\n  1\u{2192}fo\n--- stdout 3 bytes ---\no\n".as_bytes();
         let content = strip_stream_headers(raw);
         assert_eq!(content, "  1\u{2192}foo\n");
     }
@@ -719,7 +718,9 @@ mod range_tests {
         let root = std::env::temp_dir().join(format!("mship_artifact_{nanos}"));
         let store = FileToolOutputStore::new(&root);
 
-        let body: String = (1..=40).map(|n| format!("{n:6}\u{2192}line {n}\n")).collect();
+        let body: String = (1..=40)
+            .map(|n| format!("{n:6}\u{2192}line {n}\n"))
+            .collect();
         let log_ref = {
             let mut writer = store.open("call-1").await.unwrap();
             writer
@@ -730,7 +731,10 @@ mod range_tests {
         };
 
         // Full read: headers stripped, content intact, EOF reported.
-        let full = store.read_range("call-1", &log_ref, 0, 1 << 20).await.unwrap();
+        let full = store
+            .read_range("call-1", &log_ref, 0, 1 << 20)
+            .await
+            .unwrap();
         assert!(!full.content.contains("--- stdout"));
         assert_eq!(full.content, body);
         assert!(full.eof);
@@ -740,7 +744,10 @@ mod range_tests {
         let mut assembled = String::new();
         let mut offset = 0_u64;
         loop {
-            let chunk = store.read_range("call-1", &log_ref, offset, 64).await.unwrap();
+            let chunk = store
+                .read_range("call-1", &log_ref, offset, 64)
+                .await
+                .unwrap();
             assembled.push_str(&chunk.content);
             match chunk.next_offset {
                 Some(next) => offset = next,

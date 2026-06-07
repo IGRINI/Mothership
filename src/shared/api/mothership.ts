@@ -183,6 +183,8 @@ export interface ToolApprovalAnswer {
   accepted: boolean;
 }
 
+export type ToolApprovalMode = "manual" | "auto_safe" | "yolo";
+
 export type ToolOutputStream = "stdout" | "stderr";
 
 export type ToolKind =
@@ -717,6 +719,25 @@ export function cancelToolExecution(
   });
 }
 
+export function getToolApprovalMode(): Promise<ToolApprovalMode> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve(previewToolApprovalMode);
+  }
+
+  return invoke<ToolApprovalMode>("get_tool_approval_mode");
+}
+
+export function setToolApprovalMode(
+  mode: ToolApprovalMode,
+): Promise<ToolApprovalMode> {
+  if (!isTauriRuntime()) {
+    previewToolApprovalMode = mode;
+    return Promise.resolve(previewToolApprovalMode);
+  }
+
+  return invoke<ToolApprovalMode>("set_tool_approval_mode", { mode });
+}
+
 /** A newline-aligned slice of a tool's persisted output artifact (the snapshot
  * captured at tool-call time, NOT the live file). `offset`/`nextOffset` are
  * opaque byte positions in the blob file — to page, echo `nextOffset` back as
@@ -759,6 +780,183 @@ export function getToolArtifactRange(
   });
 }
 
+// --- Workspace Change Journal ----------------------------------------------
+
+export type ChangeOp = "A" | "M" | "D" | "R";
+export type ChangeSetStatus =
+  | "active"
+  | "reverted"
+  | "restored"
+  | "conflicted"
+  | "stale";
+export type ConflictReason =
+  | "current_hash_mismatch"
+  | "missing_file"
+  | "unexpected_file"
+  | "permission_denied"
+  | "outside_workspace"
+  | "missing_snapshot";
+export type ChangeSetEventKind =
+  | "created"
+  | "updated"
+  | "reverted"
+  | "restored"
+  | "conflicted";
+
+export interface ChangeFileSummary {
+  id: string;
+  path: string;
+  oldPath?: string | null;
+  op: ChangeOp;
+  additions: number;
+  deletions: number;
+  isBinary: boolean;
+  isLarge: boolean;
+}
+
+export interface ChangeSetSummary {
+  id: string;
+  status: ChangeSetStatus;
+  chatId?: string | null;
+  messageId?: string | null;
+  runId?: string | null;
+  toolCallId?: string | null;
+  toolFailed: boolean;
+  fileCount: number;
+  additions: number;
+  deletions: number;
+  files: ChangeFileSummary[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChangeFileDiff {
+  changeFileId: string;
+  path: string;
+  op: ChangeOp;
+  isBinary: boolean;
+  isLarge: boolean;
+  lines: string[];
+  offset: number;
+  totalLines: number;
+  additions: number;
+  deletions: number;
+  unavailable: boolean;
+}
+
+export interface ChangeConflict {
+  path: string;
+  reason: ConflictReason;
+  expectedHash?: string | null;
+  actualHash?: string | null;
+  details?: string | null;
+}
+
+export interface RevertOutcome {
+  changeSet: ChangeSetSummary;
+  conflicts: ChangeConflict[];
+  reverted: boolean;
+}
+
+export interface ChangeSetEvent {
+  kind: ChangeSetEventKind;
+  summary: ChangeSetSummary;
+}
+
+/** All change sets recorded in a chat (to hydrate a reopened conversation). */
+export function getChatChangeSets(chatId: string): Promise<ChangeSetSummary[]> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve([]);
+  }
+  return invoke<ChangeSetSummary[]>("get_chat_change_sets", { chatId });
+}
+
+/** Change sets attributed to one assistant message. */
+export function getMessageChangeSummary(
+  messageId: string,
+): Promise<ChangeSetSummary[]> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve([]);
+  }
+  return invoke<ChangeSetSummary[]>("get_message_change_summary", { messageId });
+}
+
+/**
+ * Lazily fetch a window of a single change file's unified diff. `limit = 0`
+ * returns the whole diff from `offset`. With `full`, the diff is rendered with
+ * whole-file context (the entire file with edits marked in place) instead of
+ * just the changed hunks.
+ */
+export function getChangeFileDiff(
+  changeFileId: string,
+  offset = 0,
+  limit = 0,
+  full = false,
+): Promise<ChangeFileDiff> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve({
+      changeFileId,
+      path: "",
+      op: "M",
+      isBinary: false,
+      isLarge: false,
+      lines: [],
+      offset: 0,
+      totalLines: 0,
+      additions: 0,
+      deletions: 0,
+      unavailable: true,
+    });
+  }
+  return invoke<ChangeFileDiff>("get_change_file_diff", {
+    changeFileId,
+    offset,
+    limit,
+    full,
+  });
+}
+
+/**
+ * A page of a change set's files, beyond the inline preview its summary carries.
+ * `limit = 0` returns all remaining files from `offset`.
+ */
+export function listChangeSetFiles(
+  changeSetId: string,
+  offset = 0,
+  limit = 0,
+): Promise<ChangeFileSummary[]> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve([]);
+  }
+  return invoke<ChangeFileSummary[]>("list_change_set_files", {
+    changeSetId,
+    offset,
+    limit,
+  });
+}
+
+/** Revert a change set (conflict-aware; Core refuses to clobber user edits). */
+export function revertChangeSet(changeSetId: string): Promise<RevertOutcome> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve({
+      changeSet: {
+        id: changeSetId,
+        status: "reverted",
+        toolFailed: false,
+        fileCount: 0,
+        additions: 0,
+        deletions: 0,
+        files: [],
+        createdAt: "",
+        updatedAt: "",
+      },
+      conflicts: [],
+      reverted: true,
+    });
+  }
+  return invoke<RevertOutcome>("revert_change_set", { changeSetId });
+}
+
 /**
  * Open a workspace path in the OS default application. The Core resolves the
  * path against the owning project's workspace root and refuses anything outside
@@ -773,6 +971,21 @@ export function openToolPath(
   }
 
   return invoke<void>("open_tool_path", { projectId, path });
+}
+
+/**
+ * Reveal a workspace path in the OS file manager (Explorer / Finder). Same
+ * Core-side resolution + containment as {@link openToolPath}.
+ */
+export function revealToolPath(
+  projectId: string | null | undefined,
+  path: string,
+): Promise<void> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve();
+  }
+
+  return invoke<void>("reveal_tool_path", { projectId, path });
 }
 
 export function getConnectorSettings(): Promise<ConnectorSettingsSnapshot> {
@@ -872,6 +1085,7 @@ let previewChats: ChatThreadSummary[] | null = null;
 const previewMessages = new Map<string, ChatMessage[]>();
 let previewConnectorSettings: ConnectorSettingsSnapshot | null = null;
 let previewProjectSnapshot: ProjectSnapshot | null = null;
+let previewToolApprovalMode: ToolApprovalMode = "manual";
 let previewChatSequence = 0;
 let previewMessageSequence = 0;
 

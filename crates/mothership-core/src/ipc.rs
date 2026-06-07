@@ -24,10 +24,12 @@ use crate::connectors::{
     AdapterSettingPatchValue, ConnectorSettingsEvent, ConnectorSettingsSnapshot,
 };
 use crate::{
-    ChatConversation, ChatRunCancellationResult, ChatRunEvent, ChatThreadSummary, ChatUpdatedEvent,
-    DashboardSnapshot, MothershipError, ProjectSnapshot, ReasoningConfig, SendChatMessageResult,
-    SidecarStatus, ToolApprovalAnswer, ToolArtifactRange, ToolExecutionAccepted,
-    ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionRequest,
+    ChangeFileDiff, ChangeFileSummary, ChangeSetEvent, ChangeSetSummary, ChatConversation,
+    ChatRunCancellationResult, ChatRunEvent, ChatThreadSummary, ChatUpdatedEvent,
+    DashboardSnapshot, MothershipError, ProjectSnapshot, ReasoningConfig, RevertOutcome,
+    SendChatMessageResult, SidecarStatus, ToolApprovalAnswer, ToolApprovalMode, ToolArtifactRange,
+    ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
+    ToolExecutionRequest,
 };
 
 /// Bump the major when a change isn't backward compatible. The host refuses a
@@ -139,6 +141,10 @@ pub enum CoreRequest {
     CancelToolExecution {
         tool_call_id: String,
     },
+    GetToolApprovalMode,
+    SetToolApprovalMode {
+        mode: ToolApprovalMode,
+    },
     /// Lazily read a newline-aligned slice of a tool call's persisted output
     /// artifact (the snapshot taken at tool-call time), for on-demand UI paging.
     GetToolArtifactRange {
@@ -189,6 +195,35 @@ pub enum CoreRequest {
         project_id: String,
     },
     SidecarStatus,
+    /// All change sets recorded in a chat, to hydrate a reopened conversation
+    /// with its workspace-change summaries.
+    GetChatChangeSets {
+        chat_id: String,
+    },
+    /// Change sets attributed to one assistant message.
+    GetMessageChangeSummary {
+        message_id: String,
+    },
+    /// A lazily-loaded, range-based window of one change file's unified diff.
+    /// `full` renders whole-file context (the entire file with edits in place)
+    /// instead of just the changed hunks.
+    GetChangeFileDiff {
+        change_file_id: String,
+        offset: Option<u64>,
+        limit: Option<u64>,
+        full: Option<bool>,
+    },
+    /// Revert a change set (conflict-aware, Core-owned). User-initiated.
+    RevertChangeSet {
+        change_set_id: String,
+    },
+    /// A page of a change set's files, beyond the inline preview its summary
+    /// carries (so opening a chat with large patches stays bounded).
+    ListChangeSetFiles {
+        change_set_id: String,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    },
 }
 
 /// Terminal success payloads, one per [`CoreRequest`] shape.
@@ -213,6 +248,7 @@ pub enum CoreResponse {
     ChatRunCancellation(ChatRunCancellationResult),
     ToolExecutionAccepted(ToolExecutionAccepted),
     ToolApproval(ToolApprovalAnswer),
+    ToolApprovalMode(ToolApprovalMode),
     ToolExecutionCancellation(ToolExecutionCancellationResult),
     /// A lazily-read slice of a tool's persisted output artifact.
     ToolArtifactRange(ToolArtifactRange),
@@ -221,6 +257,14 @@ pub enum CoreResponse {
     ConnectorSettings(ConnectorSettingsSnapshot),
     ProjectSnapshot(ProjectSnapshot),
     SidecarStatus(SidecarStatus),
+    /// Change-set summaries for a chat or a message.
+    ChangeSets(Vec<ChangeSetSummary>),
+    /// A lazily-loaded window of a change file's unified diff.
+    ChangeFileDiff(ChangeFileDiff),
+    /// The result of a conflict-aware revert.
+    ChangeSetReverted(RevertOutcome),
+    /// A page of change-file summaries (the "show more" beyond a summary preview).
+    ChangeFiles(Vec<ChangeFileSummary>),
 }
 
 /// Streamed, domain-correlated updates. Each variant carries its own identity
@@ -236,6 +280,8 @@ pub enum CoreEvent {
     ToolExecution(ToolExecutionEvent),
     ConnectorSettings(ConnectorSettingsEvent),
     ChatUpdated(ChatUpdatedEvent),
+    /// A workspace change set was created/updated/reverted/restored.
+    ChangeSet(ChangeSetEvent),
     #[serde(other)]
     Unknown,
 }
