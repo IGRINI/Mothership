@@ -66,6 +66,16 @@ export interface ChatThreadSummary {
    * modelId, which is the immutable attribution of an already-produced answer. */
   providerId?: string | null;
   modelId?: string | null;
+  /** Per-chat tool approval mode (`manual`/`auto_safe`/`yolo`). Null => default. */
+  approvalMode?: string | null;
+  /** Per-chat, per-model reasoning: a JSON map `{ "<providerId>/<modelId>":
+   * optionId }`, so each model keeps its own reasoning within the chat. Opaque
+   * to the backend (stored as-is and copied to new chats). Null => no overrides. */
+  reasoning?: string | null;
+  /** Per-chat fast-mode preference for future runs. Null/false => standard speed. */
+  fastMode?: boolean | null;
+  /** The chat's unsent composer text, restored on reopen. Null/empty => none. */
+  draft?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -288,6 +298,7 @@ export interface LlmModel {
   description: string;
   capabilities: string[];
   reasoning?: ReasoningCapabilities | null;
+  fastMode?: FastModeCapabilities | null;
   recommended: boolean;
 }
 
@@ -317,6 +328,12 @@ export interface ReasoningCapabilities {
   supportsBudget: boolean;
   supportsExclusion: boolean;
   supportsSummary: boolean;
+}
+
+export interface FastModeCapabilities {
+  supported: boolean;
+  label: string;
+  description?: string | null;
 }
 
 export interface ReasoningConfig {
@@ -423,6 +440,10 @@ export interface ProviderRuntimeStatus {
 export interface ConnectorProviderSummary {
   id: string;
   label: string;
+  /** User-controlled on/off switch. Disabled providers are hidden from model
+   * selection in chat but stay visible in Connectors so they can be re-enabled
+   * or configured. Defaults to enabled. */
+  enabled: boolean;
   runtimeKind: ProviderRuntimeKind;
   /** The adapter's own icon as a data URI, if it ships one. */
   icon?: string | null;
@@ -451,11 +472,48 @@ export type ConnectorSettingsEventKind =
   | "adapter_settings_saved"
   | "authentication_finished"
   | "authentication_cancelled"
-  | "logged_out";
+  | "logged_out"
+  | "provider_enabled_changed";
 
 export interface ConnectorSettingsEvent {
   kind: ConnectorSettingsEventKind;
   snapshot: ConnectorSettingsSnapshot;
+}
+
+/** A provider-scoped custom-instruction override. */
+export interface ProviderInstruction {
+  providerId: string;
+  content: string;
+}
+
+/** A provider+model-scoped custom-instruction override. */
+export interface ModelInstruction {
+  providerId: string;
+  modelId: string;
+  content: string;
+}
+
+/**
+ * User-authored additions to the base system prompt. The `global` text applies
+ * to every run; `providers`/`models` layer more specific overrides on top (all
+ * applicable scopes are appended, broad → specific).
+ */
+export interface PersonalizationSettings {
+  global: string;
+  providers: ProviderInstruction[];
+  models: ModelInstruction[];
+}
+
+/**
+ * User command allow/deny lists plus disabled typed tools. `commandAllow`
+ * programs are auto-approved, `commandDeny` programs are always blocked, and
+ * `disabledTools` holds wire tool names (`run_command`, `read_file`, …) the
+ * agent may not use. Stored normalized (basename, lowercase) by the backend.
+ */
+export interface ToolPolicySettings {
+  commandAllow: string[];
+  commandDeny: string[];
+  disabledTools: string[];
 }
 
 export function getDashboardSnapshot(): Promise<DashboardSnapshot> {
@@ -561,6 +619,36 @@ export function setChatModel(
   });
 }
 
+/**
+ * Persists a chat's per-chat session state — approval mode, reasoning option,
+ * fast mode, and the unsent composer draft. Blank values clear that field. Returns the
+ * refreshed summary.
+ */
+export function setChatState(
+  chatId: string,
+  approvalMode: string | null,
+  reasoning: string | null,
+  fastMode: boolean | null,
+  draft: string | null,
+): Promise<ChatThreadSummary> {
+  if (!isTauriRuntime()) {
+    const chat = findPreviewChat(chatId);
+    chat.approvalMode = approvalMode?.trim() ? approvalMode : null;
+    chat.reasoning = reasoning?.trim() ? reasoning : null;
+    chat.fastMode = fastMode ? true : null;
+    chat.draft = draft && draft.trim() ? draft : null;
+    return Promise.resolve(copyChat(chat));
+  }
+
+  return invoke<ChatThreadSummary>("set_chat_state", {
+    chatId,
+    approvalMode,
+    reasoning,
+    fastMode,
+    draft,
+  });
+}
+
 export function listChats(
   limit = 100,
   projectId?: string | null,
@@ -574,13 +662,16 @@ export function listChats(
   return invoke<ChatThreadSummary[]>("list_chats", { limit, projectId });
 }
 
-export function createChat(projectId: string): Promise<ChatConversation> {
+export function createChat(
+  projectId: string,
+  copyFromChatId?: string | null,
+): Promise<ChatConversation> {
   if (!isTauriRuntime()) {
-    const chat = createPreviewChat(projectId);
+    const chat = createPreviewChat(projectId, copyFromChatId);
     return Promise.resolve({ chat: copyChat(chat), messages: [] });
   }
 
-  return invoke<ChatConversation>("create_chat", { projectId });
+  return invoke<ChatConversation>("create_chat", { projectId, copyFromChatId });
 }
 
 export function getChat(
@@ -603,9 +694,10 @@ export function sendChatMessage(
   content: string,
   projectId?: string | null,
   reasoning?: ReasoningConfig | null,
+  fastMode = false,
 ): Promise<SendChatMessageResult> {
   if (!isTauriRuntime()) {
-    return Promise.resolve(sendPreviewChatMessage(chatId, content, projectId));
+    return Promise.resolve(sendPreviewChatMessage(chatId, content, projectId, fastMode));
   }
 
   return invoke<SendChatMessageResult>("send_chat_message", {
@@ -613,6 +705,7 @@ export function sendChatMessage(
     projectId,
     content,
     reasoning,
+    fastMode,
   });
 }
 
@@ -1019,6 +1112,25 @@ export function setSelectedModel(
   });
 }
 
+export function setProviderEnabled(
+  providerId: string,
+  enabled: boolean,
+): Promise<ConnectorSettingsSnapshot> {
+  if (!isTauriRuntime()) {
+    const snapshot = getPreviewConnectorSettings();
+    snapshot.providers = snapshot.providers.map((provider) =>
+      provider.id === providerId ? { ...provider, enabled } : provider,
+    );
+    previewConnectorSettings = markSelectedModel(snapshot);
+    return Promise.resolve(copyConnectorSettings(previewConnectorSettings));
+  }
+
+  return invoke<ConnectorSettingsSnapshot>("set_provider_enabled", {
+    providerId,
+    enabled,
+  });
+}
+
 export function saveAdapterSettings(
   providerId: string,
   patch: Record<string, AdapterSettingPatchValue>,
@@ -1080,12 +1192,64 @@ export function logoutAdapter(
   return invoke<ConnectorSettingsSnapshot>("logout_adapter", { providerId });
 }
 
+export function getPersonalization(): Promise<PersonalizationSettings> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve(copyPersonalization(getPreviewPersonalization()));
+  }
+
+  return invoke<PersonalizationSettings>("get_personalization");
+}
+
+/**
+ * Save (or clear, when `content` is blank) the custom instruction for one scope:
+ * global (`providerId`/`modelId` both null), a provider (`providerId` only), or
+ * a provider+model (both). Returns the refreshed full view.
+ */
+export function setPersonalization(
+  providerId: string | null,
+  modelId: string | null,
+  content: string,
+): Promise<PersonalizationSettings> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve(
+      setPreviewPersonalization(providerId, modelId, content),
+    );
+  }
+
+  return invoke<PersonalizationSettings>("set_personalization", {
+    providerId,
+    modelId,
+    content,
+  });
+}
+
+export function getToolPolicy(): Promise<ToolPolicySettings> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve(copyToolPolicy(getPreviewToolPolicy()));
+  }
+
+  return invoke<ToolPolicySettings>("get_tool_policy");
+}
+
+export function setToolPolicy(
+  settings: ToolPolicySettings,
+): Promise<ToolPolicySettings> {
+  if (!isTauriRuntime()) {
+    previewToolPolicy = copyToolPolicy(settings);
+    return Promise.resolve(copyToolPolicy(previewToolPolicy));
+  }
+
+  return invoke<ToolPolicySettings>("set_tool_policy", { settings });
+}
+
 let previewSnapshot: DashboardSnapshot | null = null;
 let previewChats: ChatThreadSummary[] | null = null;
 const previewMessages = new Map<string, ChatMessage[]>();
 let previewConnectorSettings: ConnectorSettingsSnapshot | null = null;
 let previewProjectSnapshot: ProjectSnapshot | null = null;
 let previewToolApprovalMode: ToolApprovalMode = "manual";
+let previewPersonalization: PersonalizationSettings | null = null;
+let previewToolPolicy: ToolPolicySettings | null = null;
 let previewChatSequence = 0;
 let previewMessageSequence = 0;
 
@@ -1228,10 +1392,13 @@ function getPreviewChats(projectId?: string | null) {
   return previewChats.filter((chat) => chat.projectId === projectId);
 }
 
-function createPreviewChat(projectId: string) {
+function createPreviewChat(projectId: string, copyFromChatId?: string | null) {
   if (!getPreviewProjectSnapshot().projects.some((project) => project.id === projectId)) {
     throw new Error(`project not found: ${projectId}`);
   }
+  const source = copyFromChatId
+    ? (previewChats ?? []).find((item) => item.id === copyFromChatId)
+    : undefined;
   const now = currentTimestamp();
   const chat: ChatThreadSummary = {
     id: `preview-chat-${++previewChatSequence}`,
@@ -1239,6 +1406,13 @@ function createPreviewChat(projectId: string) {
     title: "New chat",
     preview: "",
     messageCount: 0,
+    // New chat inherits the source chat's settings (NOT its draft).
+    providerId: source?.providerId ?? null,
+    modelId: source?.modelId ?? null,
+    approvalMode: source?.approvalMode ?? null,
+    reasoning: source?.reasoning ?? null,
+    fastMode: source?.fastMode ?? null,
+    draft: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -1271,6 +1445,7 @@ function sendPreviewChatMessage(
   chatId: string | undefined,
   content: string,
   projectId?: string | null,
+  fastMode = false,
 ): SendChatMessageResult {
   const message = content.trim();
   if (!message) {
@@ -1315,6 +1490,7 @@ function sendPreviewChatMessage(
       : chat.title;
   chat.preview = derivePreviewPreview(message);
   chat.messageCount += 2;
+  chat.fastMode = fastMode ? true : null;
   chat.updatedAt = now;
   previewChats = [
     chat,
@@ -1496,6 +1672,7 @@ function getPreviewConnectorSettings() {
       {
         id: "codex",
         label: "Codex",
+        enabled: true,
         runtimeKind: "core_managed",
         settingsSchema: {
           modelManagement: {
@@ -1533,6 +1710,7 @@ function getPreviewConnectorSettings() {
       {
         id: "openrouter",
         label: "OpenRouter",
+        enabled: true,
         runtimeKind: "core_managed",
         settingsSchema: {
           modelManagement: {
@@ -1680,9 +1858,15 @@ const previewReasoning: ReasoningCapabilities = {
   supportsSummary: true,
 };
 
+const previewFastMode: FastModeCapabilities = {
+  supported: true,
+  label: "Fast",
+  description: "1.5x speed, increased usage",
+};
+
 const previewModels: LlmModel[] = [
   {
-    providerId: "openai",
+    providerId: "codex",
     providerLabel: "OpenAI",
     id: "gpt-5.5",
     label: "GPT-5.5",
@@ -1690,10 +1874,11 @@ const previewModels: LlmModel[] = [
     description: "Current high-capability Codex model for complex agent work.",
     capabilities: ["text", "reasoning", "tools", "code"],
     reasoning: previewReasoning,
+    fastMode: previewFastMode,
     recommended: true,
   },
   {
-    providerId: "openai",
+    providerId: "codex",
     providerLabel: "OpenAI",
     id: "gpt-5.4",
     label: "GPT-5.4",
@@ -1701,10 +1886,11 @@ const previewModels: LlmModel[] = [
     description: "Balanced Codex model for everyday coding sessions.",
     capabilities: ["text", "reasoning", "tools", "code"],
     reasoning: previewReasoning,
+    fastMode: previewFastMode,
     recommended: false,
   },
   {
-    providerId: "openai",
+    providerId: "codex",
     providerLabel: "OpenAI",
     id: "gpt-5.4-mini",
     label: "GPT-5.4 Mini",
@@ -1716,7 +1902,7 @@ const previewModels: LlmModel[] = [
     recommended: false,
   },
   {
-    providerId: "openai",
+    providerId: "codex",
     providerLabel: "OpenAI",
     id: "gpt-5.3-codex",
     label: "GPT-5.3 Codex",
@@ -1728,7 +1914,7 @@ const previewModels: LlmModel[] = [
     recommended: false,
   },
   {
-    providerId: "openai",
+    providerId: "codex",
     providerLabel: "OpenAI",
     id: "gpt-5.3-codex-spark",
     label: "GPT-5.3 Codex Spark",
@@ -1739,7 +1925,7 @@ const previewModels: LlmModel[] = [
     recommended: false,
   },
   {
-    providerId: "openai",
+    providerId: "codex",
     providerLabel: "OpenAI",
     id: "gpt-5.2",
     label: "GPT-5.2",
@@ -1792,6 +1978,7 @@ function copyConnectorSettings(
               })),
             }
           : model.reasoning,
+        fastMode: model.fastMode ? { ...model.fastMode } : model.fastMode,
       })),
       adapterSettings: provider.adapterSettings
         ? {
@@ -1813,4 +2000,60 @@ function copySecretSettings(
   return Object.fromEntries(
     Object.entries(secrets ?? {}).map(([key, state]) => [key, { ...state }]),
   );
+}
+
+function getPreviewPersonalization(): PersonalizationSettings {
+  previewPersonalization ??= { global: "", providers: [], models: [] };
+  return previewPersonalization;
+}
+
+function setPreviewPersonalization(
+  providerId: string | null,
+  modelId: string | null,
+  content: string,
+): PersonalizationSettings {
+  const settings = getPreviewPersonalization();
+  const trimmed = content.trim();
+  if (providerId && modelId) {
+    settings.models = settings.models.filter(
+      (model) => !(model.providerId === providerId && model.modelId === modelId),
+    );
+    if (trimmed) {
+      settings.models.push({ providerId, modelId, content: trimmed });
+    }
+  } else if (providerId) {
+    settings.providers = settings.providers.filter(
+      (provider) => provider.providerId !== providerId,
+    );
+    if (trimmed) {
+      settings.providers.push({ providerId, content: trimmed });
+    }
+  } else {
+    settings.global = trimmed;
+  }
+  previewPersonalization = settings;
+  return copyPersonalization(settings);
+}
+
+function copyPersonalization(
+  settings: PersonalizationSettings,
+): PersonalizationSettings {
+  return {
+    global: settings.global,
+    providers: settings.providers.map((provider) => ({ ...provider })),
+    models: settings.models.map((model) => ({ ...model })),
+  };
+}
+
+function getPreviewToolPolicy(): ToolPolicySettings {
+  previewToolPolicy ??= { commandAllow: [], commandDeny: [], disabledTools: [] };
+  return previewToolPolicy;
+}
+
+function copyToolPolicy(settings: ToolPolicySettings): ToolPolicySettings {
+  return {
+    commandAllow: [...settings.commandAllow],
+    commandDeny: [...settings.commandDeny],
+    disabledTools: [...settings.disabledTools],
+  };
 }

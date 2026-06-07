@@ -51,6 +51,7 @@ use protocol::{
 pub struct ChatRequest {
     pub model: String,
     pub reasoning: Option<ReasoningConfig>,
+    pub fast_mode: bool,
     pub prompt: PromptBundle,
     pub runtime_context: RuntimeContext,
     pub messages: Vec<ChatMessage>,
@@ -386,6 +387,7 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
                     id,
                     model,
                     reasoning,
+                    fast_mode,
                     prompt,
                     runtime_context,
                     messages,
@@ -404,6 +406,7 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
                         ChatRequest {
                             model,
                             reasoning,
+                            fast_mode,
                             prompt,
                             runtime_context,
                             messages,
@@ -435,6 +438,7 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
                         id,
                         model,
                         reasoning,
+                        fast_mode,
                         prompt,
                         runtime_context,
                         messages,
@@ -453,6 +457,7 @@ pub async fn run<A: ProviderAdapter>(mut adapter: A) -> Result<()> {
                             ChatRequest {
                                 model,
                                 reasoning,
+                                fast_mode,
                                 prompt,
                                 runtime_context,
                                 messages,
@@ -728,6 +733,7 @@ mod tests {
             ChatRequest {
                 model: "test-model".to_string(),
                 reasoning: None,
+                fast_mode: false,
                 prompt: PromptBundle::default(),
                 runtime_context: RuntimeContext::default(),
                 messages: Vec::new(),
@@ -838,6 +844,7 @@ mod tests {
             ChatRequest {
                 model: "test-model".to_string(),
                 reasoning: None,
+                fast_mode: false,
                 prompt: PromptBundle::default(),
                 runtime_context: RuntimeContext::default(),
                 messages: Vec::new(),

@@ -10,6 +10,8 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
+import { appearance, PALETTE_OPTIONS } from "../appearance";
+
 // Resolve the Tauri window lazily and only inside the Tauri runtime. Calling
 // getCurrentWindow() at module load reads window.__TAURI_INTERNALS__.metadata,
 // which is undefined in a plain browser and throws — that would block the whole
@@ -489,7 +491,10 @@ function StatusBar() {
   return (
     <footer class="app-statusbar">
       <div class="app-statusbar__group">
-        <span class="status-pill">Aurora</span>
+        <span class="status-pill">
+          {PALETTE_OPTIONS.find((option) => option.id === appearance().palette)
+            ?.label ?? "Aurora"}
+        </span>
         <span>main</span>
         <span>No issues</span>
       </div>

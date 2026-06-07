@@ -8,6 +8,7 @@ use crate::Result;
 
 use super::cancellation::ToolCancellationToken;
 use super::types::{ToolCommand, ToolExecutionRequest};
+use super::ToolKind;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -59,6 +60,130 @@ impl ToolApprovalModeStore {
     }
 }
 
+/// User-authored allow/deny rules layered over the built-in command
+/// classification and the typed-tool catalog. Persisted in `app_settings` and
+/// loaded into a [`ToolPolicyStore`] at sidecar startup; the UI edits them on
+/// the Permissions screen. They are advisory overrides — workspace containment,
+/// cancellation, and the runtime guards still run regardless.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolPolicySettings {
+    /// Command program basenames (case-insensitive, extension-insensitive) that
+    /// are always auto-approved, skipping the per-command approval prompt.
+    pub command_allow: Vec<String>,
+    /// Command program basenames that are always blocked outright.
+    pub command_deny: Vec<String>,
+    /// Wire tool names (`run_command`, `read_file`, …) the agent may not use.
+    pub disabled_tools: Vec<String>,
+}
+
+impl ToolPolicySettings {
+    /// Trim, drop empties, and de-duplicate every list, keeping only tool names
+    /// the runtime actually knows. Stored and compared in this canonical form so
+    /// lookups are order-, whitespace-, and extension-insensitive.
+    pub fn sanitized(self) -> Self {
+        Self {
+            command_allow: sanitize_program_list(self.command_allow),
+            command_deny: sanitize_program_list(self.command_deny),
+            disabled_tools: sanitize_tool_list(self.disabled_tools),
+        }
+    }
+}
+
+fn sanitize_program_list(items: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        let key = program_key(&item);
+        if key.is_empty() || !seen.insert(key.clone()) {
+            continue;
+        }
+        out.push(key);
+    }
+    out
+}
+
+fn sanitize_tool_list(items: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        let name = item.trim().to_ascii_lowercase();
+        if ToolKind::from_name(&name).is_none() || !seen.insert(name.clone()) {
+            continue;
+        }
+        out.push(name);
+    }
+    out
+}
+
+/// Reduce a program to a stable comparison key: basename, lowercased, with a
+/// trailing executable extension stripped — so `rm`, `RM`, and `rm.exe` all map
+/// to the same allow/deny entry.
+fn program_key(value: &str) -> String {
+    let base = normalized(value);
+    for ext in [".exe", ".com", ".bat", ".cmd", ".ps1"] {
+        if let Some(stripped) = base.strip_suffix(ext) {
+            return stripped.to_string();
+        }
+    }
+    base
+}
+
+/// Runtime view of [`ToolPolicySettings`], shared between the command permission
+/// policy and the typed-tool dispatcher. Updated live when the user saves, so a
+/// running session honors new rules without a restart.
+#[derive(Debug, Default)]
+pub struct ToolPolicyStore {
+    settings: Mutex<ToolPolicySettings>,
+}
+
+impl ToolPolicyStore {
+    pub fn new(settings: ToolPolicySettings) -> Arc<Self> {
+        Arc::new(Self {
+            settings: Mutex::new(settings.sanitized()),
+        })
+    }
+
+    pub fn settings(&self) -> ToolPolicySettings {
+        self.settings.lock().unwrap().clone()
+    }
+
+    /// Replace the rules (sanitizing first) and return the canonical form that
+    /// was stored, so the caller can persist exactly what the store now holds.
+    pub fn set_settings(&self, settings: ToolPolicySettings) -> ToolPolicySettings {
+        let sanitized = settings.sanitized();
+        *self.settings.lock().unwrap() = sanitized.clone();
+        sanitized
+    }
+
+    pub fn is_tool_disabled(&self, kind: ToolKind) -> bool {
+        let name = kind.as_str();
+        self.settings
+            .lock()
+            .unwrap()
+            .disabled_tools
+            .iter()
+            .any(|tool| tool == name)
+    }
+
+    /// A user-rule override for `program`, or `None` to defer to default policy.
+    /// Deny wins over allow when a program appears in both lists.
+    pub fn command_decision(&self, program: &str) -> Option<ToolPermissionAction> {
+        let key = program_key(program);
+        if key.is_empty() {
+            return None;
+        }
+        let settings = self.settings.lock().unwrap();
+        if settings.command_deny.iter().any(|item| item == &key) {
+            return Some(ToolPermissionAction::Deny);
+        }
+        if settings.command_allow.iter().any(|item| item == &key) {
+            return Some(ToolPermissionAction::Allow);
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolPermissionEvaluation {
@@ -93,6 +218,31 @@ impl ModeAwareCommandPermissionPolicy {
 impl ToolPermissionPolicy for ModeAwareCommandPermissionPolicy {
     fn evaluate(&self, request: &ToolExecutionRequest) -> ToolPermissionEvaluation {
         command_permission_for_mode(self.mode.mode(), request)
+    }
+}
+
+/// Mode-aware command policy with the user's allow/deny list layered on top: a
+/// denylisted program is refused, an allowlisted one auto-approved, and anything
+/// else falls through to the built-in [`command_permission_for_mode`] decision.
+#[derive(Debug)]
+pub struct UserAwareCommandPermissionPolicy {
+    policy: Arc<ToolPolicyStore>,
+    mode: Arc<ToolApprovalModeStore>,
+}
+
+impl UserAwareCommandPermissionPolicy {
+    pub fn new(policy: Arc<ToolPolicyStore>, mode: Arc<ToolApprovalModeStore>) -> Self {
+        Self { policy, mode }
+    }
+}
+
+impl ToolPermissionPolicy for UserAwareCommandPermissionPolicy {
+    fn evaluate(&self, request: &ToolExecutionRequest) -> ToolPermissionEvaluation {
+        match self.policy.command_decision(&request.command.program) {
+            Some(ToolPermissionAction::Deny) => deny("command is on your denylist"),
+            Some(ToolPermissionAction::Allow) => allow("command is on your allowlist"),
+            _ => command_permission_for_mode(self.mode.mode(), request),
+        }
     }
 }
 
@@ -617,7 +767,70 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::tools::{ToolCommand, ToolExecutionRequest, ToolOutputPolicy};
+    use crate::tools::{ToolCommand, ToolExecutionRequest, ToolKind, ToolOutputPolicy};
+
+    #[test]
+    fn user_denylist_blocks_command_even_in_yolo() {
+        let policy = UserAwareCommandPermissionPolicy::new(
+            ToolPolicyStore::new(ToolPolicySettings {
+                command_deny: vec!["rm".to_string()],
+                ..Default::default()
+            }),
+            ToolApprovalModeStore::new(ToolApprovalMode::Yolo),
+        );
+        let request = command_request("rm", &["-rf", "src"]);
+        assert_eq!(policy.evaluate(&request).action, ToolPermissionAction::Deny);
+    }
+
+    #[test]
+    fn user_allowlist_auto_approves_command_that_would_otherwise_ask() {
+        let policy = UserAwareCommandPermissionPolicy::new(
+            ToolPolicyStore::new(ToolPolicySettings {
+                command_allow: vec!["npm".to_string()],
+                ..Default::default()
+            }),
+            ToolApprovalModeStore::new(ToolApprovalMode::Manual),
+        );
+        // `npm install` is otherwise "ask" under manual mode.
+        let request = command_request("npm", &["install"]);
+        assert_eq!(
+            policy.evaluate(&request).action,
+            ToolPermissionAction::Allow
+        );
+    }
+
+    #[test]
+    fn tool_policy_sanitizes_and_matches_extension_insensitively() {
+        let store = ToolPolicyStore::new(ToolPolicySettings {
+            command_allow: vec!["  Git.EXE ".to_string(), "git".to_string()],
+            disabled_tools: vec!["read_file".to_string(), "bogus_tool".to_string()],
+            ..Default::default()
+        });
+        let settings = store.settings();
+        // Trimmed, lowercased, extension-stripped, de-duplicated.
+        assert_eq!(settings.command_allow, vec!["git".to_string()]);
+        // Unknown tool names are dropped.
+        assert_eq!(settings.disabled_tools, vec!["read_file".to_string()]);
+        assert!(store.is_tool_disabled(ToolKind::ReadFile));
+        assert!(!store.is_tool_disabled(ToolKind::WriteFile));
+        assert_eq!(
+            store.command_decision("GIT.exe"),
+            Some(ToolPermissionAction::Allow)
+        );
+    }
+
+    #[test]
+    fn user_deny_wins_over_allow() {
+        let store = ToolPolicyStore::new(ToolPolicySettings {
+            command_allow: vec!["git".to_string()],
+            command_deny: vec!["git".to_string()],
+            ..Default::default()
+        });
+        assert_eq!(
+            store.command_decision("git"),
+            Some(ToolPermissionAction::Deny)
+        );
+    }
 
     #[tokio::test]
     async fn pending_gate_resolves_after_decision() {

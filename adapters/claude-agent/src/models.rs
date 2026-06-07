@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use mothership_adapter_sdk::protocol::{
-    Model, ReasoningCapabilities, ReasoningEffort, ReasoningOption,
+    FastModeCapabilities, Model, ReasoningCapabilities, ReasoningEffort, ReasoningOption,
 };
 
 use crate::builtin_models::{ClaudeModelFamily, BUILTIN_CLAUDE_MODELS};
@@ -26,7 +26,7 @@ fn from_catalog_parts(
     custom_models: &str,
     hidden_builtin_models: &str,
 ) -> Vec<Model> {
-    let sdk_templates = SdkReasoningTemplates::new(&sdk_models);
+    let sdk_templates = SdkModelTemplates::new(&sdk_models);
     let hidden_builtin_ids = parse_model_ids(hidden_builtin_models)
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -47,6 +47,7 @@ fn from_catalog_parts(
                 label: spec.label.to_string(),
                 recommended,
                 reasoning: sdk_templates.reasoning_for(spec.family),
+                fast_mode: sdk_templates.fast_mode_for(spec.family),
             },
             available_models,
         );
@@ -63,6 +64,7 @@ fn from_catalog_parts(
                 reasoning: family.and_then(|family| sdk_templates.reasoning_for(family)),
                 id,
                 recommended,
+                fast_mode: family.and_then(|family| sdk_templates.fast_mode_for(family)),
             },
             available_models,
         );
@@ -91,21 +93,30 @@ fn push_model(
 }
 
 #[derive(Default)]
-struct SdkReasoningTemplates {
-    opus: Option<ReasoningCapabilities>,
-    sonnet: Option<ReasoningCapabilities>,
-    haiku: Option<ReasoningCapabilities>,
+struct SdkModelCapabilities {
+    reasoning: Option<ReasoningCapabilities>,
+    fast_mode: Option<FastModeCapabilities>,
 }
 
-impl SdkReasoningTemplates {
+#[derive(Default)]
+struct SdkModelTemplates {
+    opus: SdkModelCapabilities,
+    sonnet: SdkModelCapabilities,
+    haiku: SdkModelCapabilities,
+}
+
+impl SdkModelTemplates {
     fn new(models: &[ClaudeModelInfo]) -> Self {
         let mut templates = Self::default();
         for model in models {
-            let reasoning = reasoning_from_model(model);
+            let capabilities = SdkModelCapabilities {
+                reasoning: reasoning_from_model(model),
+                fast_mode: fast_mode_from_model(model),
+            };
             match model.value.as_str() {
-                "default" => templates.opus = reasoning,
-                "sonnet" => templates.sonnet = reasoning,
-                "haiku" => templates.haiku = reasoning,
+                "default" => templates.opus = capabilities,
+                "sonnet" => templates.sonnet = capabilities,
+                "haiku" => templates.haiku = capabilities,
                 _ => {}
             }
         }
@@ -114,9 +125,17 @@ impl SdkReasoningTemplates {
 
     fn reasoning_for(&self, family: ClaudeModelFamily) -> Option<ReasoningCapabilities> {
         match family {
-            ClaudeModelFamily::Opus => self.opus.clone(),
-            ClaudeModelFamily::Sonnet => self.sonnet.clone(),
-            ClaudeModelFamily::Haiku => self.haiku.clone(),
+            ClaudeModelFamily::Opus => self.opus.reasoning.clone(),
+            ClaudeModelFamily::Sonnet => self.sonnet.reasoning.clone(),
+            ClaudeModelFamily::Haiku => self.haiku.reasoning.clone(),
+        }
+    }
+
+    fn fast_mode_for(&self, family: ClaudeModelFamily) -> Option<FastModeCapabilities> {
+        match family {
+            ClaudeModelFamily::Opus => self.opus.fast_mode.clone(),
+            ClaudeModelFamily::Sonnet => self.sonnet.fast_mode.clone(),
+            ClaudeModelFamily::Haiku => self.haiku.fast_mode.clone(),
         }
     }
 }
@@ -146,6 +165,12 @@ fn reasoning_from_model(model: &ClaudeModelInfo) -> Option<ReasoningCapabilities
         capabilities.options.insert(0, ReasoningOption::auto());
     }
     Some(capabilities)
+}
+
+fn fast_mode_from_model(model: &ClaudeModelInfo) -> Option<FastModeCapabilities> {
+    model.supports_fast_mode.then(|| {
+        FastModeCapabilities::supported("Fast", Some("Faster responses, higher usage.".to_string()))
+    })
 }
 
 fn model_allowed(id: &str, available_models: Option<&[String]>) -> bool {
@@ -212,6 +237,7 @@ mod tests {
             supports_effort: false,
             supported_effort_levels: Vec::new(),
             supports_adaptive_thinking: false,
+            supports_fast_mode: false,
         }
     }
 
@@ -228,6 +254,7 @@ mod tests {
         let mut default = sdk_model("default", "Default");
         default.supports_effort = true;
         default.supports_adaptive_thinking = true;
+        default.supports_fast_mode = true;
         default.supported_effort_levels = vec![
             "low".to_string(),
             "medium".to_string(),
@@ -269,6 +296,11 @@ mod tests {
         );
         assert_eq!(models[0].label, "Opus 4.8 (1M context)");
         assert!(models[0].recommended);
+        assert!(models[0]
+            .fast_mode
+            .as_ref()
+            .is_some_and(|fast| fast.supported));
+        assert!(models[2].fast_mode.is_none());
         assert_eq!(
             models[0].reasoning.as_ref().unwrap().efforts,
             vec![

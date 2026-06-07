@@ -55,6 +55,7 @@ pub use permissions::{
     ConservativeCommandPermissionPolicy, ModeAwareCommandPermissionPolicy, PendingToolApprovalGate,
     StaticToolApprovalGate, ToolApprovalDecision, ToolApprovalGate, ToolApprovalMode,
     ToolApprovalModeStore, ToolPermissionAction, ToolPermissionEvaluation, ToolPermissionPolicy,
+    ToolPolicySettings, ToolPolicyStore, UserAwareCommandPermissionPolicy,
 };
 pub use pipeline::{ToolCallContext, ToolExecutor, ToolKind};
 pub use process::{SpawnedToolProcess, ToolProcessExit, ToolProcessSandbox, ToolProcessSpec};

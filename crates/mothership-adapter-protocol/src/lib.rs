@@ -21,7 +21,7 @@ use serde_json::Value;
 /// `initialize` and refuses an adapter that reports a different version, rather
 /// than mis-parsing a contract it doesn't understand. Bump on any incompatible
 /// change to `Request`/`Outbound`.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Host -> adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +65,8 @@ pub enum Request {
         model: String,
         #[serde(default)]
         reasoning: Option<ReasoningConfig>,
+        #[serde(default)]
+        fast_mode: bool,
         #[serde(default)]
         prompt: PromptBundle,
         #[serde(default)]
@@ -274,6 +276,27 @@ pub struct Model {
     pub recommended: bool,
     #[serde(default)]
     pub reasoning: Option<ReasoningCapabilities>,
+    #[serde(default)]
+    pub fast_mode: Option<FastModeCapabilities>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FastModeCapabilities {
+    pub supported: bool,
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl FastModeCapabilities {
+    pub fn supported(label: impl Into<String>, description: Option<String>) -> Self {
+        Self {
+            supported: true,
+            label: label.into(),
+            description,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]

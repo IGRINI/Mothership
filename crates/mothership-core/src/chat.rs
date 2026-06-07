@@ -24,6 +24,22 @@ pub struct ChatThreadSummary {
     pub provider_id: Option<String>,
     #[serde(default)]
     pub model_id: Option<String>,
+    /// Per-chat tool approval mode (`manual`/`auto_safe`/`yolo`). `None` => the
+    /// runtime default (manual). Seeded into the runtime store when a run starts.
+    #[serde(default)]
+    pub approval_mode: Option<String>,
+    /// Per-chat reasoning option id for future runs. `None` => the model's
+    /// recommended default.
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    /// Per-chat fast-mode preference for future runs. `None`/`false` => standard
+    /// provider speed/cost behavior.
+    #[serde(default)]
+    pub fast_mode: Option<bool>,
+    /// The chat's unsent composer text, so it survives reopening. `None`/empty =>
+    /// nothing typed yet.
+    #[serde(default)]
+    pub draft: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -125,6 +141,7 @@ pub struct SendChatMessageResult {
 pub struct ChatRunContextSpec {
     pub include_failed_assistant_message_id: Option<String>,
     pub reasoning: Option<ReasoningConfig>,
+    pub fast_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

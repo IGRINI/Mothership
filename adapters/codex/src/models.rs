@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use mothership_adapter_sdk::http;
-use mothership_adapter_sdk::protocol::{Model, ReasoningCapabilities, ReasoningEffort};
+use mothership_adapter_sdk::protocol::{
+    FastModeCapabilities, Model, ReasoningCapabilities, ReasoningEffort,
+};
 use mothership_adapter_sdk::reasoning::{
     collect_effort_values, collect_nested_efforts, collect_parameter_names, dedupe_efforts,
     value_signals_reasoning, value_signals_reasoning_summary,
@@ -15,6 +17,7 @@ use crate::auth;
 const MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
 const CLIENT_VERSION: &str = "0.133.0";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const CODEX_FAST_SERVICE_TIER: &str = "priority";
 
 #[derive(Debug, Deserialize)]
 struct RemoteModel {
@@ -25,6 +28,10 @@ struct RemoteModel {
     visibility: Option<String>,
     #[serde(default)]
     priority: Option<i64>,
+    #[serde(default)]
+    service_tiers: Value,
+    #[serde(default)]
+    additional_speed_tiers: Value,
     #[serde(default)]
     supported_parameters: Value,
     #[serde(default)]
@@ -79,14 +86,27 @@ pub(crate) async fn fetch_models(
         .enumerate()
         .map(|(index, model)| {
             let reasoning = codex_reasoning_capabilities(&model);
+            let fast_mode = codex_fast_mode_capabilities(&model);
             Model {
                 label: model.display_name.unwrap_or_else(|| model.slug.clone()),
                 reasoning,
                 id: model.slug,
                 recommended: index == 0,
+                fast_mode,
             }
         })
         .collect())
+}
+
+pub(crate) fn codex_fast_service_tier_for_model(
+    model_id: &str,
+    fast_mode: bool,
+) -> Option<&'static str> {
+    (fast_mode && codex_model_supports_fast_mode(model_id)).then_some(CODEX_FAST_SERVICE_TIER)
+}
+
+fn codex_model_supports_fast_mode(model_id: &str) -> bool {
+    matches!(model_id.trim(), "gpt-5.5" | "gpt-5.4")
 }
 
 fn should_show_codex_model(model: &RemoteModel) -> bool {
@@ -151,6 +171,75 @@ fn codex_reasoning_capabilities(model: &RemoteModel) -> Option<ReasoningCapabili
     ))
 }
 
+fn codex_fast_mode_capabilities(model: &RemoteModel) -> Option<FastModeCapabilities> {
+    let service_tier = priority_service_tier(&model.service_tiers);
+    let speed_tier_alias = value_contains_string(&model.additional_speed_tiers, "fast");
+    if service_tier.is_none() && !speed_tier_alias && !codex_model_supports_fast_mode(&model.slug) {
+        return None;
+    }
+
+    let (label, description) = service_tier.unwrap_or_else(|| {
+        (
+            "Fast".to_string(),
+            Some("1.5x speed, increased usage".to_string()),
+        )
+    });
+    Some(FastModeCapabilities::supported(label, description))
+}
+
+fn priority_service_tier(value: &Value) -> Option<(String, Option<String>)> {
+    match value {
+        Value::Array(items) => items.iter().find_map(priority_service_tier),
+        Value::Object(object) => {
+            let id = object.get("id").and_then(Value::as_str).unwrap_or_default();
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if id == CODEX_FAST_SERVICE_TIER || name.eq_ignore_ascii_case("fast") {
+                let label = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or("Fast")
+                    .to_string();
+                let description = object
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .filter(|description| !description.trim().is_empty())
+                    .map(ToOwned::to_owned);
+                return Some((label, description));
+            }
+            object
+                .get(CODEX_FAST_SERVICE_TIER)
+                .and_then(priority_service_tier)
+                .or_else(|| object.values().find_map(priority_service_tier))
+        }
+        Value::String(text)
+            if text == CODEX_FAST_SERVICE_TIER || text.eq_ignore_ascii_case("fast") =>
+        {
+            Some(("Fast".to_string(), None))
+        }
+        _ => None,
+    }
+}
+
+fn value_contains_string(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(text) => text.eq_ignore_ascii_case(expected),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| value_contains_string(item, expected)),
+        Value::Object(object) => {
+            object.keys().any(|key| key.eq_ignore_ascii_case(expected))
+                || object
+                    .values()
+                    .any(|item| value_contains_string(item, expected))
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +251,8 @@ mod tests {
             display_name: Some("GPT Test".to_string()),
             visibility: Some("list".to_string()),
             priority: Some(1),
+            service_tiers: Value::Null,
+            additional_speed_tiers: Value::Null,
             supported_parameters: json!(["reasoning"]),
             reasoning_efforts: json!(["low", "high"]),
             supported_reasoning_efforts: Value::Null,
@@ -200,6 +291,8 @@ mod tests {
             display_name: None,
             visibility: Some("list".to_string()),
             priority: None,
+            service_tiers: Value::Null,
+            additional_speed_tiers: Value::Null,
             supported_parameters: Value::Null,
             reasoning_efforts: Value::Null,
             supported_reasoning_efforts: Value::Null,
@@ -222,6 +315,8 @@ mod tests {
             display_name: None,
             visibility: Some("list".to_string()),
             priority: None,
+            service_tiers: Value::Null,
+            additional_speed_tiers: Value::Null,
             supported_parameters: json!(["reasoning"]),
             reasoning_efforts: Value::Null,
             supported_reasoning_efforts: Value::Null,
@@ -246,6 +341,8 @@ mod tests {
             display_name: Some("GPT-5.5".to_string()),
             visibility: Some("list".to_string()),
             priority: None,
+            service_tiers: Value::Null,
+            additional_speed_tiers: Value::Null,
             supported_parameters: Value::Null,
             reasoning_efforts: Value::Null,
             supported_reasoning_efforts: Value::Null,
@@ -268,6 +365,8 @@ mod tests {
             display_name: None,
             visibility: Some("list".to_string()),
             priority: None,
+            service_tiers: Value::Null,
+            additional_speed_tiers: Value::Null,
             supported_parameters: Value::Null,
             reasoning_efforts: Value::Null,
             supported_reasoning_efforts: Value::Null,
@@ -331,6 +430,47 @@ mod tests {
     }
 
     #[test]
+    fn codex_model_parser_extracts_fast_mode_from_service_tiers() {
+        let model: RemoteModel = serde_json::from_value(json!({
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "visibility": "list",
+            "service_tiers": [
+                { "id": "default", "name": "Standard" },
+                {
+                    "id": "priority",
+                    "name": "Fast",
+                    "description": "1.5x speed, increased usage"
+                }
+            ],
+            "additional_speed_tiers": ["fast"]
+        }))
+        .expect("codex model metadata");
+
+        let fast = codex_fast_mode_capabilities(&model).expect("fast mode");
+
+        assert!(fast.supported);
+        assert_eq!(fast.label, "Fast");
+        assert_eq!(
+            fast.description.as_deref(),
+            Some("1.5x speed, increased usage")
+        );
+    }
+
+    #[test]
+    fn codex_fast_service_tier_only_applies_to_fast_capable_models() {
+        assert_eq!(
+            codex_fast_service_tier_for_model("gpt-5.5", true),
+            Some(CODEX_FAST_SERVICE_TIER)
+        );
+        assert_eq!(
+            codex_fast_service_tier_for_model("gpt-5.4-mini", true),
+            None
+        );
+        assert_eq!(codex_fast_service_tier_for_model("gpt-5.5", false), None);
+    }
+
+    #[test]
     fn codex_model_picker_keeps_backend_only_models() {
         let model: RemoteModel = serde_json::from_value(json!({
             "slug": "gpt-5.3-codex-spark",
@@ -351,6 +491,8 @@ mod tests {
             display_name: Some("Codex Auto Review".to_string()),
             visibility: Some("hide".to_string()),
             priority: Some(43),
+            service_tiers: Value::Null,
+            additional_speed_tiers: Value::Null,
             supported_parameters: Value::Null,
             reasoning_efforts: Value::Null,
             supported_reasoning_efforts: Value::Null,

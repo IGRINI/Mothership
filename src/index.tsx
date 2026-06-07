@@ -2,6 +2,16 @@
 import { ErrorBoundary } from "solid-js";
 import { render } from "solid-js/web";
 import App from "./App";
+import { appearance, applyAppearance } from "./shared/appearance";
+import { applyChatSettings, chatSettings } from "./shared/chatSettings";
+
+// Apply the saved theme/accent/font/scale before first paint so the UI never
+// flashes the defaults on launch. (Importing appearance also registers the live
+// OS-theme listener used by "System" mode.)
+applyAppearance(appearance());
+// Chat-rendering prefs (font/size/visibility) are root-level CSS too — apply the
+// persisted values up front for the same reason.
+applyChatSettings(chatSettings());
 
 const root = document.getElementById("root");
 

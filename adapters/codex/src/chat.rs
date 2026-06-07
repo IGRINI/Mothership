@@ -6,6 +6,7 @@ use mothership_openai_responses as responses;
 use serde_json::json;
 
 use crate::auth;
+use crate::models::codex_fast_service_tier_for_model;
 
 pub(crate) const RESPONSES_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 /// Codex Responses-over-WebSocket beta opt-in (matches the real Codex CLI).
@@ -52,6 +53,7 @@ pub(crate) async fn run_chat_round(
         })
         .collect::<Vec<_>>();
     let ws_arg = if had_ws { ws.as_mut() } else { None };
+    let service_tier = codex_fast_service_tier_for_model(&request.model, request.fast_mode);
     let (transport, round) = tokio::select! {
         result = responses::chat_round_with_state(
             client,
@@ -67,6 +69,7 @@ pub(crate) async fn run_chat_round(
             ws_arg,
             &mut on_delta,
             &tools,
+            service_tier,
         ) => result?,
         _ = cancellation.cancelled() => {
             if let Some(session) = ws.as_mut() {

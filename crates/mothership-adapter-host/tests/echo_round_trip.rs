@@ -49,6 +49,7 @@ fn echo_adapter_round_trip() {
         .chat_round_cancellable(
             "echo-1",
             None,
+            false,
             PromptBundle::default(),
             RuntimeContext::default(),
             vec![ChatMessage {

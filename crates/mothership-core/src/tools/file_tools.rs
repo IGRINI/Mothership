@@ -1140,10 +1140,9 @@ pub fn apply_patch(
         // patch card can show the actual changes, not just a file list.
         let before = snapshot_before(&snapshot, workspace, &file.path);
         let after = file.new_content.as_deref().unwrap_or("");
-        let file_diff =
-            crate::changes::diff::unified_diff_with_context(&before, after, 3)
-                .lines
-                .join("\n");
+        let file_diff = crate::changes::diff::unified_diff_with_context(&before, after, 3)
+            .lines
+            .join("\n");
         if !combined_diff.is_empty() {
             combined_diff.push('\n');
         }

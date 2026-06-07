@@ -336,7 +336,10 @@ mod tests {
         assert!(full.lines.iter().any(|line| line == "-5"));
         // One hunk covering the whole file.
         assert_eq!(
-            full.lines.iter().filter(|line| line.starts_with("@@")).count(),
+            full.lines
+                .iter()
+                .filter(|line| line.starts_with("@@"))
+                .count(),
             1
         );
     }

@@ -225,13 +225,19 @@ fn message_summaries_and_lazy_file_diff() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, summary.id);
 
-    let diff = h.service.file_diff(&summary.files[0].id, 0, 1000, false).unwrap();
+    let diff = h
+        .service
+        .file_diff(&summary.files[0].id, 0, 1000, false)
+        .unwrap();
     assert!(!diff.unavailable);
     assert!(diff.lines.iter().any(|line| line == "+B"));
     assert!(diff.lines.iter().any(|line| line == "-b"));
 
     // Whole-file context keeps every unchanged line as context, not just the hunk.
-    let full = h.service.file_diff(&summary.files[0].id, 0, 0, true).unwrap();
+    let full = h
+        .service
+        .file_diff(&summary.files[0].id, 0, 0, true)
+        .unwrap();
     assert!(full.lines.iter().any(|line| line == "+B"));
     assert!(full.lines.iter().any(|line| line == " a"));
     assert!(full.lines.iter().any(|line| line == " c"));
@@ -253,7 +259,10 @@ fn binary_file_is_tracked_without_a_text_diff() {
     assert!(summary.files[0].is_binary);
     assert_eq!(summary.files[0].additions, 0);
 
-    let diff = h.service.file_diff(&summary.files[0].id, 0, 100, false).unwrap();
+    let diff = h
+        .service
+        .file_diff(&summary.files[0].id, 0, 100, false)
+        .unwrap();
     assert!(diff.unavailable);
 }
 

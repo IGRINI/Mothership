@@ -12,9 +12,10 @@ use mothership_core::ipc::{CoreRequest, CoreResponse};
 use mothership_core::{
     AdapterSettingPatchValue, ChangeFileDiff, ChangeFileSummary, ChangeSetSummary,
     ChatConversation, ChatRunCancellationResult, ChatThreadSummary, ConnectorSettingsSnapshot,
-    DashboardSnapshot, ProjectSnapshot, ReasoningConfig, RevertOutcome, SendChatMessageResult,
-    SidecarStatus, ToolApprovalAnswer, ToolApprovalMode, ToolArtifactRange, ToolExecutionAccepted,
-    ToolExecutionCancellationResult, ToolExecutionRequest,
+    DashboardSnapshot, PersonalizationSettings, ProjectSnapshot, ReasoningConfig, RevertOutcome,
+    SendChatMessageResult, SidecarStatus, ToolApprovalAnswer, ToolApprovalMode, ToolArtifactRange,
+    ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionRequest,
+    ToolPolicySettings,
 };
 use tauri::{AppHandle, State, Window};
 use tauri_plugin_dialog::DialogExt;
@@ -76,11 +77,15 @@ pub async fn list_chats(
 pub async fn create_chat(
     state: State<'_, AppState>,
     project_id: String,
+    copy_from_chat_id: Option<String>,
 ) -> Result<ChatConversation, String> {
     let response = state
         .sidecar()
         .clone()
-        .request(CoreRequest::CreateChat { project_id })
+        .request(CoreRequest::CreateChat {
+            project_id,
+            copy_from_chat_id,
+        })
         .await?;
     expect_variant!(response, CoreResponse::Chat)
 }
@@ -106,6 +111,7 @@ pub async fn send_chat_message(
     project_id: Option<String>,
     content: String,
     reasoning: Option<ReasoningConfig>,
+    fast_mode: Option<bool>,
 ) -> Result<SendChatMessageResult, String> {
     let response = state
         .sidecar()
@@ -115,6 +121,7 @@ pub async fn send_chat_message(
             project_id,
             content,
             reasoning,
+            fast_mode: fast_mode.unwrap_or(false),
         })
         .await?;
     expect_variant!(response, CoreResponse::ChatMessageStarted)
@@ -337,6 +344,60 @@ pub async fn set_tool_approval_mode(
 }
 
 #[tauri::command]
+pub async fn get_personalization(
+    state: State<'_, AppState>,
+) -> Result<PersonalizationSettings, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::GetPersonalization)
+        .await?;
+    expect_variant!(response, CoreResponse::Personalization)
+}
+
+#[tauri::command]
+pub async fn set_personalization(
+    state: State<'_, AppState>,
+    provider_id: Option<String>,
+    model_id: Option<String>,
+    content: String,
+) -> Result<PersonalizationSettings, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::SetPersonalization {
+            provider_id,
+            model_id,
+            content,
+        })
+        .await?;
+    expect_variant!(response, CoreResponse::Personalization)
+}
+
+#[tauri::command]
+pub async fn get_tool_policy(state: State<'_, AppState>) -> Result<ToolPolicySettings, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::GetToolPolicy)
+        .await?;
+    expect_variant!(response, CoreResponse::ToolPolicy)
+}
+
+#[tauri::command]
+pub async fn set_tool_policy(
+    state: State<'_, AppState>,
+    settings: ToolPolicySettings,
+) -> Result<ToolPolicySettings, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::SetToolPolicy { settings })
+        .await?;
+    expect_variant!(response, CoreResponse::ToolPolicy)
+}
+
+#[tauri::command]
 pub async fn get_tool_artifact_range(
     state: State<'_, AppState>,
     tool_call_id: String,
@@ -434,6 +495,23 @@ pub async fn set_selected_model(
 }
 
 #[tauri::command]
+pub async fn set_provider_enabled(
+    state: State<'_, AppState>,
+    provider_id: String,
+    enabled: bool,
+) -> Result<ConnectorSettingsSnapshot, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::SetProviderEnabled {
+            provider_id,
+            enabled,
+        })
+        .await?;
+    expect_variant!(response, CoreResponse::ConnectorSettings)
+}
+
+#[tauri::command]
 pub async fn set_chat_model(
     state: State<'_, AppState>,
     chat_id: String,
@@ -447,6 +525,29 @@ pub async fn set_chat_model(
             chat_id,
             provider_id,
             model_id,
+        })
+        .await?;
+    expect_variant!(response, CoreResponse::ChatSummary)
+}
+
+#[tauri::command]
+pub async fn set_chat_state(
+    state: State<'_, AppState>,
+    chat_id: String,
+    approval_mode: Option<String>,
+    reasoning: Option<String>,
+    fast_mode: Option<bool>,
+    draft: Option<String>,
+) -> Result<ChatThreadSummary, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::SetChatState {
+            chat_id,
+            approval_mode,
+            reasoning,
+            fast_mode,
+            draft,
         })
         .await?;
     expect_variant!(response, CoreResponse::ChatSummary)

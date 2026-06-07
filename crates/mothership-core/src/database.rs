@@ -13,9 +13,10 @@ use crate::{
     id::generate_id, ActivityEvent, ChatConversation, ChatMessage, ChatMessagePart,
     ChatMessagePartKind, ChatMessageRole, ChatMessageStatus, ChatRunContextSpec, ChatRunEvent,
     ChatRunEventKind, ChatThreadSummary, DashboardMetric, DashboardSnapshot, LlmChatMessage,
-    LlmChatRole, MothershipError, ProjectSnapshot, ProjectSummary, Result, SelectedLlmModel,
-    SendChatMessageResult, SidecarStatus, ToolArtifact, ToolCommand, ToolExecutionEvent,
-    ToolExecutionEventKind, ToolExecutionRecord, ToolExecutionResult, ToolKind, ToolOutputStream,
+    LlmChatRole, ModelInstruction, MothershipError, PersonalizationSettings, ProjectSnapshot,
+    ProjectSummary, ProviderInstruction, Result, SelectedLlmModel, SendChatMessageResult,
+    SidecarStatus, ToolArtifact, ToolCommand, ToolExecutionEvent, ToolExecutionEventKind,
+    ToolExecutionRecord, ToolExecutionResult, ToolKind, ToolOutputStream, ToolPolicySettings,
     WorkspaceItem,
 };
 
@@ -27,6 +28,13 @@ const CHAT_MESSAGE_MAX_BYTES: usize = 20_000;
 const TOOL_OUTPUT_DISPLAY_MAX_BYTES: usize = 12_000;
 const DEFAULT_MODEL_SCOPE: &str = "default";
 const ACTIVE_PROJECT_SETTING_KEY: &str = "active_project_id";
+const PERSONALIZATION_GLOBAL_KEY: &str = "personalization.global";
+const PERSONALIZATION_PROVIDER_PREFIX: &str = "personalization.provider.";
+const PERSONALIZATION_MODEL_PREFIX: &str = "personalization.model.";
+const PROVIDER_DISABLED_PREFIX: &str = "provider.disabled.";
+const PERMISSIONS_COMMAND_ALLOW_KEY: &str = "permissions.command.allow";
+const PERMISSIONS_COMMAND_DENY_KEY: &str = "permissions.command.deny";
+const PERMISSIONS_DISABLED_TOOLS_KEY: &str = "permissions.tools.disabled";
 const CONTINUE_CHAT_MESSAGE_CONTENT: &str = "Continue from where you stopped.";
 
 #[derive(Debug, Clone)]
@@ -284,11 +292,23 @@ impl Database {
         )
     }
 
-    pub fn create_chat(&self, project_id: &str) -> Result<ChatConversation> {
+    /// Creates a new chat in `project_id`. When `copy_from_chat_id` is given, the
+    /// new chat inherits that chat's settings — execution model, approval mode,
+    /// and reasoning — so "New chat" carries over the current configuration. The
+    /// draft is intentionally NOT copied (a fresh chat starts with empty input).
+    pub fn create_chat(
+        &self,
+        project_id: &str,
+        copy_from_chat_id: Option<&str>,
+    ) -> Result<ChatConversation> {
         validate_identifier("project_id", project_id)?;
 
         let connection = self.connect()?;
         select_project_summary(&connection, project_id)?;
+        let source = match copy_from_chat_id {
+            Some(id) => select_chat_summary(&connection, id).ok(),
+            None => None,
+        };
         let now = current_timestamp();
         let chat = ChatThreadSummary {
             id: generate_id("chat")?,
@@ -296,27 +316,17 @@ impl Database {
             title: "New chat".to_string(),
             preview: String::new(),
             message_count: 0,
-            provider_id: None,
-            model_id: None,
+            provider_id: source.as_ref().and_then(|chat| chat.provider_id.clone()),
+            model_id: source.as_ref().and_then(|chat| chat.model_id.clone()),
+            approval_mode: source.as_ref().and_then(|chat| chat.approval_mode.clone()),
+            reasoning: source.as_ref().and_then(|chat| chat.reasoning.clone()),
+            fast_mode: source.as_ref().and_then(|chat| chat.fast_mode),
+            draft: None,
             created_at: now.clone(),
             updated_at: now,
         };
 
-        connection.execute(
-            "
-            INSERT INTO chats (id, project_id, title, preview, message_count, archived, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
-            ",
-            params![
-                chat.id,
-                chat.project_id.as_deref(),
-                chat.title,
-                chat.preview,
-                chat.message_count,
-                chat.created_at,
-                chat.updated_at
-            ],
-        )?;
+        insert_chat_summary(&connection, &chat)?;
 
         Ok(ChatConversation {
             chat,
@@ -561,7 +571,7 @@ impl Database {
         project_id: Option<&str>,
         content: &str,
     ) -> Result<SendChatMessageResult> {
-        self.begin_chat_run(chat_id, project_id, content, None)
+        self.begin_chat_run(chat_id, project_id, content, None, false)
     }
 
     pub fn recover_interrupted_chat_runs(&self) -> Result<usize> {
@@ -594,6 +604,7 @@ impl Database {
         project_id: Option<&str>,
         content: &str,
         reasoning: Option<ReasoningConfig>,
+        fast_mode: bool,
     ) -> Result<SendChatMessageResult> {
         let content = validate_chat_message_content(content)?;
         let mut connection = self.connect()?;
@@ -631,6 +642,10 @@ impl Database {
                     message_count: 0,
                     provider_id: None,
                     model_id: None,
+                    approval_mode: None,
+                    reasoning: None,
+                    fast_mode: None,
+                    draft: None,
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 };
@@ -712,6 +727,12 @@ impl Database {
             message_count: chat.message_count + 2,
             provider_id: Some(selected_model.provider_id.clone()),
             model_id: Some(selected_model.model_id.clone()),
+            approval_mode: chat.approval_mode,
+            reasoning: chat.reasoning,
+            fast_mode: fast_mode.then_some(true),
+            // The composer draft is consumed by this send — cleared here and in
+            // the UPDATE below, so it doesn't reappear when the chat is reopened.
+            draft: None,
             created_at: chat.created_at,
             updated_at: now,
         };
@@ -722,7 +743,9 @@ impl Database {
             SET title = ?2,
                 preview = ?3,
                 message_count = ?4,
-                updated_at = ?5
+                fast_mode = ?5,
+                draft = NULL,
+                updated_at = ?6
             WHERE id = ?1
             ",
             params![
@@ -730,6 +753,7 @@ impl Database {
                 updated_chat.title,
                 updated_chat.preview,
                 updated_chat.message_count,
+                updated_chat.fast_mode,
                 updated_chat.updated_at
             ],
         )?;
@@ -744,6 +768,7 @@ impl Database {
             removed_message_ids: Vec::new(),
             context: ChatRunContextSpec {
                 reasoning,
+                fast_mode,
                 ..ChatRunContextSpec::default()
             },
         })
@@ -864,11 +889,16 @@ impl Database {
             message_count,
             provider_id: Some(selected_model.provider_id.clone()),
             model_id: Some(selected_model.model_id.clone()),
+            approval_mode: chat.approval_mode,
+            reasoning: chat.reasoning,
+            fast_mode: chat.fast_mode,
+            draft: chat.draft,
             created_at: chat.created_at,
             updated_at: now,
         };
         update_chat_summary(&tx, &updated_chat)?;
         tx.commit()?;
+        let run_fast_mode = updated_chat.fast_mode.unwrap_or(false);
 
         Ok(SendChatMessageResult {
             run_id: generate_id("chat_run")?,
@@ -876,7 +906,10 @@ impl Database {
             user_message,
             assistant_message,
             removed_message_ids,
-            context: ChatRunContextSpec::default(),
+            context: ChatRunContextSpec {
+                fast_mode: run_fast_mode,
+                ..ChatRunContextSpec::default()
+            },
         })
     }
 
@@ -926,10 +959,15 @@ impl Database {
             title: branch_chat_title(&source_chat.title),
             preview: derive_chat_preview(&branch_point.content),
             message_count: source_messages.len() as i64,
-            // Branch chats inherit the source chat's execution model as the
-            // setting for their future runs (message attribution stays historical).
+            // Branch chats inherit the source chat's execution model + tool/
+            // reasoning settings for their future runs (message attribution stays
+            // historical). The draft is not carried — a branch starts empty.
             provider_id: source_chat.provider_id.clone(),
             model_id: source_chat.model_id.clone(),
+            approval_mode: source_chat.approval_mode.clone(),
+            reasoning: source_chat.reasoning.clone(),
+            fast_mode: source_chat.fast_mode,
+            draft: None,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -1043,11 +1081,16 @@ impl Database {
             message_count,
             provider_id: Some(selected_model.provider_id.clone()),
             model_id: Some(selected_model.model_id.clone()),
+            approval_mode: chat.approval_mode,
+            reasoning: chat.reasoning,
+            fast_mode: chat.fast_mode,
+            draft: chat.draft,
             created_at: chat.created_at,
             updated_at: now,
         };
         update_chat_summary(&tx, &updated_chat)?;
         tx.commit()?;
+        let run_fast_mode = updated_chat.fast_mode.unwrap_or(false);
 
         Ok(SendChatMessageResult {
             run_id: generate_id("chat_run")?,
@@ -1055,7 +1098,10 @@ impl Database {
             user_message,
             assistant_message,
             removed_message_ids,
-            context: ChatRunContextSpec::default(),
+            context: ChatRunContextSpec {
+                fast_mode: run_fast_mode,
+                ..ChatRunContextSpec::default()
+            },
         })
     }
 
@@ -1132,11 +1178,16 @@ impl Database {
             message_count: chat.message_count + 2,
             provider_id: Some(selected_model.provider_id.clone()),
             model_id: Some(selected_model.model_id.clone()),
+            approval_mode: chat.approval_mode,
+            reasoning: chat.reasoning,
+            fast_mode: chat.fast_mode,
+            draft: chat.draft,
             created_at: chat.created_at,
             updated_at: now,
         };
         update_chat_summary(&tx, &updated_chat)?;
         tx.commit()?;
+        let run_fast_mode = updated_chat.fast_mode.unwrap_or(false);
 
         Ok(SendChatMessageResult {
             run_id: generate_id("chat_run")?,
@@ -1147,6 +1198,7 @@ impl Database {
             context: ChatRunContextSpec {
                 include_failed_assistant_message_id: Some(failed_assistant_message.id),
                 reasoning: None,
+                fast_mode: run_fast_mode,
             },
         })
     }
@@ -1188,6 +1240,52 @@ impl Database {
 
         if provider_changed {
             clear_chat_provider_state(&connection, chat_id)?;
+        }
+
+        select_chat_summary(&connection, chat_id)
+    }
+
+    /// Persists a chat's per-chat session state: approval mode, reasoning option,
+    /// fast mode, and the unsent composer draft. Each is a full overwrite (the
+    /// UI sends the chat's current values); an empty/blank string clears text
+    /// fields to NULL.
+    /// `updated_at` is deliberately NOT bumped, so saving a draft doesn't reorder
+    /// the chat list. Returns the refreshed summary.
+    pub fn set_chat_state(
+        &self,
+        chat_id: &str,
+        approval_mode: Option<&str>,
+        reasoning: Option<&str>,
+        fast_mode: Option<bool>,
+        draft: Option<&str>,
+    ) -> Result<ChatThreadSummary> {
+        validate_identifier("chat_id", chat_id)?;
+        fn blank_to_none(value: Option<&str>) -> Option<&str> {
+            value.filter(|text| !text.trim().is_empty())
+        }
+
+        let connection = self.connect()?;
+        let changed = connection.execute(
+            "
+            UPDATE chats
+            SET approval_mode = ?2,
+                reasoning_option = ?3,
+                fast_mode = ?4,
+                draft = ?5
+            WHERE id = ?1 AND archived = 0
+            ",
+            params![
+                chat_id,
+                blank_to_none(approval_mode),
+                blank_to_none(reasoning),
+                fast_mode,
+                blank_to_none(draft),
+            ],
+        )?;
+        if changed == 0 {
+            return Err(MothershipError::InvalidRequest(format!(
+                "chat not found: {chat_id}"
+            )));
         }
 
         select_chat_summary(&connection, chat_id)
@@ -1513,6 +1611,137 @@ impl Database {
         selected_llm_model(&connection)
     }
 
+    /// Provider ids the user has switched off. A provider is enabled by default;
+    /// only the explicitly disabled ones are persisted (as `provider.disabled.<id>`
+    /// rows), so a never-touched or freshly installed adapter is always on.
+    pub fn disabled_provider_ids(&self) -> Result<std::collections::BTreeSet<String>> {
+        let connection = self.connect()?;
+        Ok(settings_with_prefix(&connection, PROVIDER_DISABLED_PREFIX)?
+            .into_iter()
+            .filter(|(_, value)| value == "1")
+            .filter_map(|(key, _)| {
+                key.strip_prefix(PROVIDER_DISABLED_PREFIX)
+                    .map(str::to_string)
+            })
+            .collect())
+    }
+
+    /// Switch a provider on or off. Enabling clears the persisted flag (back to
+    /// the default-on state); disabling records it. Provider-agnostic — the app
+    /// layer validates the id exists among installed adapters.
+    pub fn set_provider_enabled(&self, provider_id: &str, enabled: bool) -> Result<()> {
+        validate_identifier("provider_id", provider_id)?;
+        let connection = self.connect()?;
+        let key = format!("{PROVIDER_DISABLED_PREFIX}{provider_id}");
+        if enabled {
+            delete_setting(&connection, &key)
+        } else {
+            set_setting(&connection, &key, "1", &current_timestamp())
+        }
+    }
+
+    // --- Personalization (user-authored prompt additions) ------------------
+
+    /// The full personalization view (global + every provider/model override).
+    pub fn personalization_settings(&self) -> Result<PersonalizationSettings> {
+        let connection = self.connect()?;
+        personalization_settings(&connection)
+    }
+
+    /// Store (or, when `content` is blank, clear) the instruction for one scope:
+    /// global (`None`/`None`), a provider (`Some`/`None`), or a provider+model
+    /// (`Some`/`Some`). Returns the refreshed full view.
+    pub fn set_personalization(
+        &self,
+        provider_id: Option<&str>,
+        model_id: Option<&str>,
+        content: &str,
+    ) -> Result<PersonalizationSettings> {
+        let key = personalization_key(provider_id, model_id)?;
+        let connection = self.connect()?;
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            delete_setting(&connection, &key)?;
+        } else {
+            set_setting(&connection, &key, trimmed, &current_timestamp())?;
+        }
+        personalization_settings(&connection)
+    }
+
+    /// The non-empty instruction scopes that apply to a run, ordered broad →
+    /// specific (global, provider, provider+model). Each entry is a stable scope
+    /// id and its content, ready to append as prompt sections.
+    pub fn personalization_for(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let connection = self.connect()?;
+        let mut out = Vec::new();
+        if let Some(value) = get_setting(&connection, PERSONALIZATION_GLOBAL_KEY)? {
+            if !value.trim().is_empty() {
+                out.push(("global".to_string(), value));
+            }
+        }
+        if !provider_id.trim().is_empty() {
+            let provider_key = format!("{PERSONALIZATION_PROVIDER_PREFIX}{provider_id}");
+            if let Some(value) = get_setting(&connection, &provider_key)? {
+                if !value.trim().is_empty() {
+                    out.push((format!("provider.{provider_id}"), value));
+                }
+            }
+            if !model_id.trim().is_empty() {
+                let model_key = format!("{PERSONALIZATION_MODEL_PREFIX}{provider_id}::{model_id}");
+                if let Some(value) = get_setting(&connection, &model_key)? {
+                    if !value.trim().is_empty() {
+                        out.push((format!("model.{provider_id}/{model_id}"), value));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    // --- Tool permission policy (command allow/deny + tool toggles) ---------
+
+    /// The persisted user allow/deny rules (sanitized into canonical form).
+    pub fn tool_policy_settings(&self) -> Result<ToolPolicySettings> {
+        let connection = self.connect()?;
+        Ok(ToolPolicySettings {
+            command_allow: read_setting_list(&connection, PERMISSIONS_COMMAND_ALLOW_KEY)?,
+            command_deny: read_setting_list(&connection, PERMISSIONS_COMMAND_DENY_KEY)?,
+            disabled_tools: read_setting_list(&connection, PERMISSIONS_DISABLED_TOOLS_KEY)?,
+        }
+        .sanitized())
+    }
+
+    /// Persist the user allow/deny rules. The caller is expected to pass an
+    /// already-sanitized [`ToolPolicySettings`] (the runtime store sanitizes on
+    /// the way in); this just writes the three newline-joined lists.
+    pub fn set_tool_policy_settings(&self, settings: &ToolPolicySettings) -> Result<()> {
+        let connection = self.connect()?;
+        let now = current_timestamp();
+        write_setting_list(
+            &connection,
+            PERMISSIONS_COMMAND_ALLOW_KEY,
+            &settings.command_allow,
+            &now,
+        )?;
+        write_setting_list(
+            &connection,
+            PERMISSIONS_COMMAND_DENY_KEY,
+            &settings.command_deny,
+            &now,
+        )?;
+        write_setting_list(
+            &connection,
+            PERMISSIONS_DISABLED_TOOLS_KEY,
+            &settings.disabled_tools,
+            &now,
+        )?;
+        Ok(())
+    }
+
     pub fn sidecar_status(&self) -> Result<SidecarStatus> {
         let connection = self.connect()?;
         let page_count: i64 =
@@ -1603,6 +1832,10 @@ fn migrate(connection: &Connection) -> Result<()> {
             provider_state_json TEXT,
             chat_model_provider_id TEXT,
             chat_model_id TEXT,
+            approval_mode TEXT,
+            reasoning_option TEXT,
+            fast_mode INTEGER,
+            draft TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL
@@ -1848,6 +2081,10 @@ fn migrate(connection: &Connection) -> Result<()> {
     add_column_if_missing(connection, "chats", "provider_state_json", "TEXT")?;
     add_column_if_missing(connection, "chats", "chat_model_provider_id", "TEXT")?;
     add_column_if_missing(connection, "chats", "chat_model_id", "TEXT")?;
+    add_column_if_missing(connection, "chats", "approval_mode", "TEXT")?;
+    add_column_if_missing(connection, "chats", "reasoning_option", "TEXT")?;
+    add_column_if_missing(connection, "chats", "fast_mode", "INTEGER")?;
+    add_column_if_missing(connection, "chats", "draft", "TEXT")?;
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_chats_project_updated_at ON chats (project_id, updated_at DESC)",
         [],
@@ -2104,6 +2341,130 @@ fn set_setting(connection: &Connection, key: &str, value: &str, updated_at: &str
     Ok(())
 }
 
+fn delete_setting(connection: &Connection, key: &str) -> Result<()> {
+    connection.execute("DELETE FROM app_settings WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
+/// Read a newline-joined setting back into its trimmed, non-empty lines.
+fn read_setting_list(connection: &Connection, key: &str) -> Result<Vec<String>> {
+    Ok(get_setting(connection, key)?
+        .map(|value| {
+            value
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Store a list as a newline-joined setting, deleting the key when empty.
+fn write_setting_list(
+    connection: &Connection,
+    key: &str,
+    items: &[String],
+    updated_at: &str,
+) -> Result<()> {
+    if items.is_empty() {
+        delete_setting(connection, key)
+    } else {
+        set_setting(connection, key, &items.join("\n"), updated_at)
+    }
+}
+
+/// Every `app_settings` row whose key starts with `prefix`, as (key, value).
+fn settings_with_prefix(connection: &Connection, prefix: &str) -> Result<Vec<(String, String)>> {
+    // Escape LIKE metacharacters in the literal prefix so a key fragment that
+    // happens to contain `%`/`_` can't widen the match.
+    let pattern = format!(
+        "{}%",
+        prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    let mut statement = connection.prepare(
+        "SELECT key, value FROM app_settings WHERE key LIKE ?1 ESCAPE '\\' ORDER BY key",
+    )?;
+    let rows = statement.query_map(params![pattern], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// The `app_settings` key for a personalization scope. `(None, None)` is the
+/// global instruction; `(Some, None)` a provider; `(Some, Some)` a model. A
+/// model id without a provider is rejected.
+fn personalization_key(provider_id: Option<&str>, model_id: Option<&str>) -> Result<String> {
+    match (provider_id, model_id) {
+        (None, None) => Ok(PERSONALIZATION_GLOBAL_KEY.to_string()),
+        (Some(provider_id), None) => {
+            let provider_id = provider_id.trim();
+            if provider_id.is_empty() {
+                return Err(MothershipError::InvalidRequest(
+                    "provider id cannot be empty".to_string(),
+                ));
+            }
+            Ok(format!("{PERSONALIZATION_PROVIDER_PREFIX}{provider_id}"))
+        }
+        (Some(provider_id), Some(model_id)) => {
+            let provider_id = provider_id.trim();
+            let model_id = model_id.trim();
+            if provider_id.is_empty() || model_id.is_empty() {
+                return Err(MothershipError::InvalidRequest(
+                    "provider id and model id cannot be empty".to_string(),
+                ));
+            }
+            Ok(format!(
+                "{PERSONALIZATION_MODEL_PREFIX}{provider_id}::{model_id}"
+            ))
+        }
+        (None, Some(_)) => Err(MothershipError::InvalidRequest(
+            "model-scoped personalization requires a provider id".to_string(),
+        )),
+    }
+}
+
+fn personalization_settings(connection: &Connection) -> Result<PersonalizationSettings> {
+    let global = get_setting(connection, PERSONALIZATION_GLOBAL_KEY)?.unwrap_or_default();
+
+    let mut providers = Vec::new();
+    for (key, content) in settings_with_prefix(connection, PERSONALIZATION_PROVIDER_PREFIX)? {
+        let provider_id = key[PERSONALIZATION_PROVIDER_PREFIX.len()..].to_string();
+        if !provider_id.is_empty() {
+            providers.push(ProviderInstruction {
+                provider_id,
+                content,
+            });
+        }
+    }
+
+    let mut models = Vec::new();
+    for (key, content) in settings_with_prefix(connection, PERSONALIZATION_MODEL_PREFIX)? {
+        let rest = &key[PERSONALIZATION_MODEL_PREFIX.len()..];
+        if let Some((provider_id, model_id)) = rest.split_once("::") {
+            if !provider_id.is_empty() && !model_id.is_empty() {
+                models.push(ModelInstruction {
+                    provider_id: provider_id.to_string(),
+                    model_id: model_id.to_string(),
+                    content,
+                });
+            }
+        }
+    }
+
+    Ok(PersonalizationSettings {
+        global,
+        providers,
+        models,
+    })
+}
+
 fn clear_chat_provider_state(connection: &Connection, chat_id: &str) -> Result<()> {
     connection.execute(
         "
@@ -2127,7 +2488,8 @@ fn select_chat_summaries(
         let mut statement = connection.prepare(
             "
             SELECT id, project_id, title, preview, message_count, created_at, updated_at,
-                   chat_model_provider_id, chat_model_id
+                   chat_model_provider_id, chat_model_id,
+                   approval_mode, reasoning_option, fast_mode, draft
             FROM chats
             WHERE archived = 0 AND project_id = ?1
             ORDER BY updated_at DESC, rowid DESC
@@ -2145,7 +2507,8 @@ fn select_chat_summaries(
     let mut statement = connection.prepare(
         "
         SELECT id, project_id, title, preview, message_count, created_at, updated_at,
-               chat_model_provider_id, chat_model_id
+               chat_model_provider_id, chat_model_id,
+               approval_mode, reasoning_option, fast_mode, draft
         FROM chats
         WHERE archived = 0
         ORDER BY updated_at DESC, rowid DESC
@@ -2223,7 +2586,8 @@ fn select_chat_summary(connection: &Connection, chat_id: &str) -> Result<ChatThr
         .query_row(
             "
             SELECT id, project_id, title, preview, message_count, created_at, updated_at,
-                   chat_model_provider_id, chat_model_id
+                   chat_model_provider_id, chat_model_id,
+                   approval_mode, reasoning_option, fast_mode, draft
             FROM chats
             WHERE id = ?1 AND archived = 0
             ",
@@ -2237,8 +2601,8 @@ fn select_chat_summary(connection: &Connection, chat_id: &str) -> Result<ChatThr
 fn insert_chat_summary(connection: &Connection, chat: &ChatThreadSummary) -> Result<()> {
     connection.execute(
         "
-        INSERT INTO chats (id, project_id, title, preview, message_count, archived, chat_model_provider_id, chat_model_id, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9)
+        INSERT INTO chats (id, project_id, title, preview, message_count, archived, chat_model_provider_id, chat_model_id, approval_mode, reasoning_option, fast_mode, draft, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         ",
         params![
             chat.id,
@@ -2248,6 +2612,10 @@ fn insert_chat_summary(connection: &Connection, chat: &ChatThreadSummary) -> Res
             chat.message_count,
             chat.provider_id.as_deref(),
             chat.model_id.as_deref(),
+            chat.approval_mode.as_deref(),
+            chat.reasoning.as_deref(),
+            chat.fast_mode,
+            chat.draft.as_deref(),
             chat.created_at,
             chat.updated_at
         ],
@@ -3185,6 +3553,10 @@ fn chat_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatThread
         message_count: row.get(4)?,
         provider_id: row.get(7)?,
         model_id: row.get(8)?,
+        approval_mode: row.get(9)?,
+        reasoning: row.get(10)?,
+        fast_mode: row.get(11)?,
+        draft: row.get(12)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
     })
@@ -3695,6 +4067,201 @@ mod tests {
     use crate::ToolExecutionStatus;
 
     #[test]
+    fn provider_enabled_defaults_on_and_round_trips() {
+        let database_path = temp_database_path("provider_enabled");
+        let database = Database::open(database_path).expect("open database");
+
+        // Untouched providers are enabled by default (nothing persisted).
+        assert!(database.disabled_provider_ids().expect("read").is_empty());
+
+        database
+            .set_provider_enabled("codex", false)
+            .expect("disable codex");
+        let disabled = database.disabled_provider_ids().expect("read");
+        assert!(disabled.contains("codex"));
+        assert_eq!(disabled.len(), 1);
+
+        // Re-enabling clears the flag back to the default-on state.
+        database
+            .set_provider_enabled("codex", true)
+            .expect("enable codex");
+        assert!(database.disabled_provider_ids().expect("read").is_empty());
+    }
+
+    #[test]
+    fn personalization_round_trips_and_layers_scopes() {
+        let database_path = temp_database_path("personalization_round_trips");
+        let database = Database::open(database_path.clone()).expect("open database");
+
+        database
+            .set_personalization(None, None, "global text")
+            .expect("set global");
+        database
+            .set_personalization(Some("codex"), None, "provider text")
+            .expect("set provider");
+        database
+            .set_personalization(Some("codex"), Some("gpt-5.5"), "model text")
+            .expect("set model");
+
+        let settings = database.personalization_settings().expect("settings");
+        assert_eq!(settings.global, "global text");
+        assert_eq!(settings.providers.len(), 1);
+        assert_eq!(settings.providers[0].provider_id, "codex");
+        assert_eq!(settings.providers[0].content, "provider text");
+        assert_eq!(settings.models.len(), 1);
+        assert_eq!(settings.models[0].provider_id, "codex");
+        assert_eq!(settings.models[0].model_id, "gpt-5.5");
+
+        // A run for codex/gpt-5.5 layers all three scopes, broad → specific.
+        let layered = database
+            .personalization_for("codex", "gpt-5.5")
+            .expect("layered");
+        assert_eq!(
+            layered.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>(),
+            vec!["global text", "provider text", "model text"]
+        );
+
+        // A different provider only sees the global scope.
+        let other = database
+            .personalization_for("openrouter", "whatever")
+            .expect("other");
+        assert_eq!(
+            other.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>(),
+            vec!["global text"]
+        );
+
+        // Saving blank content clears the scope.
+        database
+            .set_personalization(Some("codex"), None, "   ")
+            .expect("clear provider");
+        assert!(database
+            .personalization_settings()
+            .expect("settings")
+            .providers
+            .is_empty());
+
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn tool_policy_settings_persist() {
+        let database_path = temp_database_path("tool_policy_settings_persist");
+        let database = Database::open(database_path.clone()).expect("open database");
+
+        let settings = crate::ToolPolicySettings {
+            command_allow: vec!["npm".to_string()],
+            command_deny: vec!["rm".to_string()],
+            disabled_tools: vec!["read_file".to_string()],
+        };
+        database
+            .set_tool_policy_settings(&settings)
+            .expect("save tool policy");
+
+        let loaded = database.tool_policy_settings().expect("load tool policy");
+        assert_eq!(loaded.command_allow, vec!["npm".to_string()]);
+        assert_eq!(loaded.command_deny, vec!["rm".to_string()]);
+        assert_eq!(loaded.disabled_tools, vec!["read_file".to_string()]);
+
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn chat_state_round_trips_and_new_chat_copies_settings() {
+        let database_path = temp_database_path("chat_state_round_trips");
+        let database = Database::open(database_path.clone()).expect("open database");
+        let project = create_project(&database, &database_path, "chat_state");
+
+        let chat = database
+            .create_chat(&project.id, None)
+            .expect("create chat")
+            .chat;
+        assert_eq!(chat.approval_mode, None);
+        assert_eq!(chat.draft, None);
+
+        // Per-chat session state round-trips.
+        let updated = database
+            .set_chat_state(
+                &chat.id,
+                Some("yolo"),
+                Some("high"),
+                Some(true),
+                Some("draft text"),
+            )
+            .expect("set state");
+        assert_eq!(updated.approval_mode.as_deref(), Some("yolo"));
+        assert_eq!(updated.reasoning.as_deref(), Some("high"));
+        assert_eq!(updated.fast_mode, Some(true));
+        assert_eq!(updated.draft.as_deref(), Some("draft text"));
+
+        database
+            .set_chat_model(&chat.id, "openai", "test-model")
+            .expect("set model");
+
+        // A new chat copies model + approval + reasoning, but NOT the draft.
+        let copy = database
+            .create_chat(&project.id, Some(&chat.id))
+            .expect("copy chat")
+            .chat;
+        assert_eq!(copy.approval_mode.as_deref(), Some("yolo"));
+        assert_eq!(copy.reasoning.as_deref(), Some("high"));
+        assert_eq!(copy.fast_mode, Some(true));
+        assert_eq!(copy.provider_id.as_deref(), Some("openai"));
+        assert_eq!(copy.model_id.as_deref(), Some("test-model"));
+        assert_eq!(copy.draft, None);
+
+        // Blank/whitespace clears a field to NULL.
+        let cleared = database
+            .set_chat_state(&chat.id, Some(""), None, None, Some("   "))
+            .expect("clear state");
+        assert_eq!(cleared.approval_mode, None);
+        assert_eq!(cleared.reasoning, None);
+        assert_eq!(cleared.fast_mode, None);
+        assert_eq!(cleared.draft, None);
+
+        // The state survives a reopen (persisted, not just returned).
+        drop(database);
+        let reopened = Database::open(database_path.clone()).expect("reopen database");
+        let restored = reopened
+            .create_chat(&project.id, Some(&copy.id))
+            .expect("copy from reopened")
+            .chat;
+        assert_eq!(restored.approval_mode.as_deref(), Some("yolo"));
+        assert_eq!(restored.reasoning.as_deref(), Some("high"));
+        assert_eq!(restored.fast_mode, Some(true));
+
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn sending_a_message_clears_the_chat_draft() {
+        let database_path = temp_database_path("send_clears_draft");
+        let database = Database::open(database_path.clone()).expect("open database");
+        database
+            .set_selected_llm_model("openai", "test-model")
+            .expect("select model");
+        let project = create_project(&database, &database_path, "send_clears_draft");
+
+        let chat = database
+            .create_chat(&project.id, None)
+            .expect("create chat")
+            .chat;
+        database
+            .set_chat_state(&chat.id, None, None, None, Some("half-typed draft"))
+            .expect("set draft");
+
+        // Sending consumes the composer draft — it must not survive the send.
+        let result = database
+            .send_chat_message(Some(&chat.id), Some(&project.id), "actual message")
+            .expect("send");
+        assert_eq!(result.chat.draft, None, "returned summary clears the draft");
+
+        let reread = database.get_chat(&chat.id, 10).expect("get chat").chat;
+        assert_eq!(reread.draft, None, "draft is cleared in the DB on reopen");
+
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[test]
     fn chat_message_creates_persistent_conversation() {
         let database_path = temp_database_path("chat_message_creates_persistent_conversation");
         let database = Database::open(database_path.clone()).expect("open database");
@@ -3746,7 +4313,7 @@ mod tests {
         let project = create_project(&database, &database_path, "retry");
 
         let run = database
-            .begin_chat_run(None, Some(&project.id), "Retry me", None)
+            .begin_chat_run(None, Some(&project.id), "Retry me", None, false)
             .expect("begin run");
         database
             .record_chat_tool_execution_event(
@@ -3852,7 +4419,7 @@ mod tests {
         let project = create_project(&database, &database_path, "continue");
 
         let run = database
-            .begin_chat_run(None, Some(&project.id), "Continue me", None)
+            .begin_chat_run(None, Some(&project.id), "Continue me", None, false)
             .expect("begin run");
         database
             .append_chat_run_delta(
@@ -3911,7 +4478,13 @@ mod tests {
             .expect("select model");
         let project = create_project(&database, &database_path, "tool_history");
         let run = database
-            .begin_chat_run(None, Some(&project.id), "Show the current folder", None)
+            .begin_chat_run(
+                None,
+                Some(&project.id),
+                "Show the current folder",
+                None,
+                false,
+            )
             .expect("begin run");
         let command = ToolCommand::new("powershell", ["-Command", "Get-Location"]);
 
@@ -4016,7 +4589,13 @@ mod tests {
         let project = create_project(&database, &database_path, "message_parts");
 
         let run = database
-            .begin_chat_run(None, Some(&project.id), "Inspect the workspace", None)
+            .begin_chat_run(
+                None,
+                Some(&project.id),
+                "Inspect the workspace",
+                None,
+                false,
+            )
             .expect("begin run");
         database
             .append_chat_run_delta(
@@ -4110,7 +4689,7 @@ mod tests {
         let project = create_project(&database, &database_path, "editing");
 
         let first = database
-            .begin_chat_run(None, Some(&project.id), "Original prompt", None)
+            .begin_chat_run(None, Some(&project.id), "Original prompt", None, false)
             .expect("begin first run");
         database
             .append_chat_run_delta(
@@ -4130,6 +4709,7 @@ mod tests {
                 Some(&project.id),
                 "Follow-up prompt",
                 None,
+                false,
             )
             .expect("begin second run");
         database
@@ -4195,7 +4775,7 @@ mod tests {
         let project = create_project(&database, &database_path, "branch");
 
         let first = database
-            .begin_chat_run(None, Some(&project.id), "First prompt", None)
+            .begin_chat_run(None, Some(&project.id), "First prompt", None, false)
             .expect("begin first run");
         database
             .append_chat_run_delta(
@@ -4215,6 +4795,7 @@ mod tests {
                 Some(&project.id),
                 "Second prompt",
                 None,
+                false,
             )
             .expect("begin second run");
         database
@@ -4282,7 +4863,9 @@ mod tests {
             .set_selected_llm_model("openai", "test-model")
             .expect("select model");
         let project = create_project(&database, &database_path, "empty_chat");
-        let conversation = database.create_chat(&project.id).expect("create chat");
+        let conversation = database
+            .create_chat(&project.id, None)
+            .expect("create chat");
 
         let result = database
             .send_chat_message(
@@ -4308,7 +4891,7 @@ mod tests {
             .expect("select model");
         let project = create_project(&database, &database_path, "startup_recovery");
         let result = database
-            .begin_chat_run(None, Some(&project.id), "Hello", None)
+            .begin_chat_run(None, Some(&project.id), "Hello", None, false)
             .expect("begin chat run");
 
         let changed = database
@@ -4347,7 +4930,13 @@ mod tests {
         let second_project = create_project(&database, &database_path, "second");
 
         database
-            .begin_chat_run(None, Some(&first_project.id), "First project prompt", None)
+            .begin_chat_run(
+                None,
+                Some(&first_project.id),
+                "First project prompt",
+                None,
+                false,
+            )
             .expect("begin first project run");
         database
             .begin_chat_run(
@@ -4355,6 +4944,7 @@ mod tests {
                 Some(&second_project.id),
                 "Second project prompt",
                 None,
+                false,
             )
             .expect("begin second project run");
 
@@ -4451,7 +5041,7 @@ mod tests {
             .expect("select model");
         let project = create_project(&database, &database_path, "typed_roundtrip");
         let run = database
-            .begin_chat_run(None, Some(&project.id), "edit a file", None)
+            .begin_chat_run(None, Some(&project.id), "edit a file", None, false)
             .expect("begin run");
 
         // Mirror the production sink: legacy feed + typed storage for one event.
@@ -4518,7 +5108,7 @@ mod tests {
             .expect("select model");
         let project = create_project(&database, &database_path, "typed_cmd");
         let run = database
-            .begin_chat_run(None, Some(&project.id), "check status", None)
+            .begin_chat_run(None, Some(&project.id), "check status", None, false)
             .expect("begin run");
         let command = ToolCommand::new("git", ["status"]);
 
@@ -4580,7 +5170,7 @@ mod tests {
             .expect("select model");
         let project = create_project(&database, &database_path, "branch_typed");
         let run = database
-            .begin_chat_run(None, Some(&project.id), "edit a file", None)
+            .begin_chat_run(None, Some(&project.id), "edit a file", None, false)
             .expect("begin run");
 
         let completed = ToolExecutionEvent {

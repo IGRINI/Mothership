@@ -31,13 +31,13 @@ use mothership_core::{
     ChangeRecorder, ChangeSetEvent, ChangeSetEventKind, ChangesService, ChatRunCancellationResult,
     ChatRunEvent, ChatRunEventSink, ChatRunRegistry, ChatRunService, ChatUpdatedEvent,
     ConnectorManager, ConnectorSettingsEvent, ConnectorSettingsEventKind, Database, FileBlobStore,
-    FileToolOutputStore, LlmToolCallHandler, ModeAwareCommandPermissionPolicy,
-    PendingToolApprovalGate, ProviderRuntimeManager, RedactingOutputStore, RevertOutcome,
-    SendChatMessageResult, SnapshotBlobStore, StdFileSystem, ToolApprovalAnswer,
-    ToolApprovalDecision, ToolApprovalMode, ToolApprovalModeStore, ToolCancellationToken,
-    ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
-    ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest, ToolRepeatGuard,
-    ToolResourceLimits, ToolSupervisor, Workspace,
+    FileToolOutputStore, LlmToolCallHandler, PendingToolApprovalGate, ProviderRuntimeManager,
+    RedactingOutputStore, RevertOutcome, SendChatMessageResult, SnapshotBlobStore, StdFileSystem,
+    ToolApprovalAnswer, ToolApprovalDecision, ToolApprovalMode, ToolApprovalModeStore,
+    ToolCancellationToken, ToolExecutionAccepted, ToolExecutionCancellationResult,
+    ToolExecutionEvent, ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest,
+    ToolPolicyStore, ToolRepeatGuard, ToolResourceLimits, ToolSupervisor,
+    UserAwareCommandPermissionPolicy, Workspace,
 };
 use sha2::{Digest, Sha256};
 
@@ -161,6 +161,11 @@ fn serve() -> anyhow::Result<()> {
     );
     let tool_approvals = PendingToolApprovalGate::new();
     let tool_approval_mode = ToolApprovalModeStore::new(ToolApprovalMode::Manual);
+    // User-authored command allow/deny + tool toggles, loaded from the database
+    // so they survive restarts. Shared between the command permission policy and
+    // the typed-tool dispatcher; updated live when the user saves on the
+    // Permissions screen.
+    let tool_policy = ToolPolicyStore::new(database.tool_policy_settings().unwrap_or_default());
     let tool_repeat_guard = Arc::new(ToolRepeatGuard::default());
     // Shared output store: the supervisor uses it to spill command output, and
     // the file-tool runner reuses it to spill oversized read_file content.
@@ -194,9 +199,10 @@ fn serve() -> anyhow::Result<()> {
             tool_output_store.clone(),
             ToolResourceLimits::default(),
         )
-        .with_policy(Arc::new(ModeAwareCommandPermissionPolicy::new(Arc::clone(
-            &tool_approval_mode,
-        ))))
+        .with_policy(Arc::new(UserAwareCommandPermissionPolicy::new(
+            Arc::clone(&tool_policy),
+            Arc::clone(&tool_approval_mode),
+        )))
         .with_repeat_guard(tool_repeat_guard),
     );
     let tool_registry = Arc::new(ToolExecutionRegistry::new());
@@ -238,6 +244,7 @@ fn serve() -> anyhow::Result<()> {
                 let chat_registry = Arc::clone(&chat_registry);
                 let change_blob_store = Arc::clone(&change_blob_store);
                 let tool_approval_mode = Arc::clone(&tool_approval_mode);
+                let tool_policy = Arc::clone(&tool_policy);
                 thread::spawn(move || {
                     handle_request(
                         id,
@@ -255,6 +262,7 @@ fn serve() -> anyhow::Result<()> {
                         chat_registry,
                         change_blob_store,
                         tool_approval_mode,
+                        tool_policy,
                     )
                 });
             }
@@ -439,6 +447,7 @@ fn handle_request(
     chat_registry: Arc<ChatRunRegistry>,
     change_blob_store: Arc<dyn SnapshotBlobStore>,
     tool_approval_mode: Arc<ToolApprovalModeStore>,
+    tool_policy: Arc<ToolPolicyStore>,
 ) {
     // Streaming requests answer immediately with the persisted placeholder, then
     // stream the run; handle them before the uniform request/response path.
@@ -447,6 +456,7 @@ fn handle_request(
         project_id,
         content,
         reasoning,
+        fast_mode,
     } = &request
     {
         let started = database.begin_chat_run(
@@ -454,6 +464,7 @@ fn handle_request(
             project_id.as_deref(),
             content,
             reasoning.clone(),
+            *fast_mode,
         );
         run_chat_message(
             id,
@@ -469,6 +480,7 @@ fn handle_request(
             chat_registry,
             change_blob_store,
             Arc::clone(&tool_approval_mode),
+            Arc::clone(&tool_policy),
         );
         return;
     }
@@ -493,6 +505,7 @@ fn handle_request(
             chat_registry,
             change_blob_store,
             Arc::clone(&tool_approval_mode),
+            Arc::clone(&tool_policy),
         );
         return;
     }
@@ -512,6 +525,7 @@ fn handle_request(
             chat_registry,
             change_blob_store,
             Arc::clone(&tool_approval_mode),
+            Arc::clone(&tool_policy),
         );
         return;
     }
@@ -531,6 +545,7 @@ fn handle_request(
             chat_registry,
             change_blob_store,
             Arc::clone(&tool_approval_mode),
+            Arc::clone(&tool_policy),
         );
         return;
     }
@@ -597,6 +612,7 @@ fn handle_request(
         &tool_registry,
         &chat_registry,
         &tool_approval_mode,
+        &tool_policy,
     );
     let _ = match result {
         Ok(outcome) => {
@@ -629,6 +645,7 @@ fn compute(
     tool_registry: &Arc<ToolExecutionRegistry>,
     chat_registry: &Arc<ChatRunRegistry>,
     tool_approval_mode: &Arc<ToolApprovalModeStore>,
+    tool_policy: &Arc<ToolPolicyStore>,
 ) -> Result<RequestOutcome, CoreError> {
     Ok(match request {
         CoreRequest::DashboardSnapshot => response(CoreResponse::Dashboard(database.snapshot()?)),
@@ -639,9 +656,12 @@ fn compute(
         CoreRequest::ListChats { project_id, limit } => response(CoreResponse::ChatList(
             database.list_chats(project_id.as_deref(), limit.unwrap_or(100))?,
         )),
-        CoreRequest::CreateChat { project_id } => {
-            response(CoreResponse::Chat(database.create_chat(&project_id)?))
-        }
+        CoreRequest::CreateChat {
+            project_id,
+            copy_from_chat_id,
+        } => response(CoreResponse::Chat(
+            database.create_chat(&project_id, copy_from_chat_id.as_deref())?,
+        )),
         CoreRequest::GetChat { chat_id, limit } => response(CoreResponse::Chat(
             database.get_chat(&chat_id, limit.unwrap_or(200))?,
         )),
@@ -704,6 +724,24 @@ fn compute(
             }
             response(CoreResponse::ToolApprovalMode(mode))
         }
+        CoreRequest::GetPersonalization => response(CoreResponse::Personalization(
+            database.personalization_settings()?,
+        )),
+        CoreRequest::SetPersonalization {
+            provider_id,
+            model_id,
+            content,
+        } => response(CoreResponse::Personalization(
+            database.set_personalization(provider_id.as_deref(), model_id.as_deref(), &content)?,
+        )),
+        CoreRequest::GetToolPolicy => response(CoreResponse::ToolPolicy(tool_policy.settings())),
+        CoreRequest::SetToolPolicy { settings } => {
+            // Update the live store first (sanitizing), then persist exactly the
+            // canonical form it now holds, so DB and runtime never diverge.
+            let stored = tool_policy.set_settings(settings);
+            database.set_tool_policy_settings(&stored)?;
+            response(CoreResponse::ToolPolicy(stored))
+        }
         CoreRequest::ConnectorSettings => response_with_connector_refresh(
             CoreResponse::ConnectorSettings(connector_manager.snapshot()?),
             Some(ConnectorRefreshScope::All),
@@ -714,6 +752,14 @@ fn compute(
         } => connector_settings_changed(
             ConnectorSettingsEventKind::SelectedModelChanged,
             connector_manager.set_selected_model(&provider_id, &model_id)?,
+            None,
+        ),
+        CoreRequest::SetProviderEnabled {
+            provider_id,
+            enabled,
+        } => connector_settings_changed(
+            ConnectorSettingsEventKind::ProviderEnabledChanged,
+            connector_manager.set_provider_enabled(&provider_id, enabled)?,
             None,
         ),
         CoreRequest::SetChatModel {
@@ -731,6 +777,19 @@ fn compute(
                 connector_refresh: None,
             }
         }
+        CoreRequest::SetChatState {
+            chat_id,
+            approval_mode,
+            reasoning,
+            fast_mode,
+            draft,
+        } => response(CoreResponse::ChatSummary(database.set_chat_state(
+            &chat_id,
+            approval_mode.as_deref(),
+            reasoning.as_deref(),
+            fast_mode,
+            draft.as_deref(),
+        )?)),
         CoreRequest::SaveAdapterSettings {
             provider_id,
             values,
@@ -922,6 +981,16 @@ fn start_connector_refresh(
     });
 }
 
+/// Parse a chat's stored approval-mode string into the runtime enum, defaulting
+/// to the safest mode (manual) for unset/unknown values.
+fn parse_chat_approval_mode(value: Option<&str>) -> ToolApprovalMode {
+    match value {
+        Some("auto_safe") => ToolApprovalMode::AutoSafe,
+        Some("yolo") => ToolApprovalMode::Yolo,
+        _ => ToolApprovalMode::Manual,
+    }
+}
+
 /// The streaming path: given the begun run (a fresh send or a retry), answer the
 /// request with the persisted placeholder, then drive the completion, forwarding
 /// every run event. A failure to even begin the run is a terminal error reply.
@@ -939,10 +1008,17 @@ fn run_chat_message(
     chat_registry: Arc<ChatRunRegistry>,
     change_blob_store: Arc<dyn SnapshotBlobStore>,
     tool_approval_mode: Arc<ToolApprovalModeStore>,
+    tool_policy: Arc<ToolPolicyStore>,
 ) {
     match started {
         Ok(started) => {
             let project = database.chat_project(&started.chat.id).ok().flatten();
+            // Per-chat approval mode: seed the runtime store from this chat's
+            // saved setting so the run honors the chat's mode (the UI shows and
+            // edits approval mode per chat now, not as one global toggle).
+            tool_approval_mode.set_mode(parse_chat_approval_mode(
+                started.chat.approval_mode.as_deref(),
+            ));
             let _ = outbox.send(ServerFrame::Response {
                 id,
                 result: CoreResponse::ChatMessageStarted(started.clone()),
@@ -980,6 +1056,7 @@ fn run_chat_message(
                     tool_output_store,
                     change_recorder,
                     tool_approval_mode,
+                    tool_policy,
                 ));
             let mut sink = ProtocolChatRunSink { outbox };
             ChatRunService::new(&database, provider_manager)

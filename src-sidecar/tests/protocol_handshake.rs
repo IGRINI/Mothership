@@ -126,6 +126,7 @@ fn sidecar_handshake_and_dashboard_roundtrip() {
             id: 4,
             request: CoreRequest::CreateChat {
                 project_id: project_id.clone(),
+                copy_from_chat_id: None,
             },
         },
     );

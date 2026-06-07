@@ -315,6 +315,9 @@ pub(crate) async fn stream_chat(
     if let Some(effort) = request.reasoning.as_ref().and_then(reasoning_effort) {
         command.arg("--effort").arg(effort);
     }
+    if request.fast_mode {
+        command.arg("--settings").arg(fast_mode_settings_json());
+    }
     let instructions = adapter_instructions(request.prompt.rendered_text(), tool_bridge.is_some());
     if !instructions.trim().is_empty() {
         command.arg("--append-system-prompt").arg(instructions);
@@ -492,6 +495,14 @@ fn apply_runtime_context(command: &mut Command, request: &ChatRequest) -> anyhow
     }
     command.current_dir(project_root);
     Ok(())
+}
+
+fn fast_mode_settings_json() -> String {
+    json!({
+        "fastMode": true,
+        "fastModePerSessionOptIn": true,
+    })
+    .to_string()
 }
 
 fn handle_chat_line(
@@ -765,6 +776,7 @@ mod tests {
         ChatRequest {
             model: "claude".to_string(),
             reasoning: None,
+            fast_mode: false,
             prompt: Default::default(),
             runtime_context: Default::default(),
             messages: Vec::new(),
@@ -773,6 +785,14 @@ mod tests {
             tool_results: Vec::new(),
             extra_messages: Vec::new(),
         }
+    }
+
+    #[test]
+    fn fast_mode_settings_enable_session_fast_mode() {
+        let value: Value =
+            serde_json::from_str(&fast_mode_settings_json()).expect("valid settings json");
+        assert_eq!(value["fastMode"], true);
+        assert_eq!(value["fastModePerSessionOptIn"], true);
     }
 
     #[test]

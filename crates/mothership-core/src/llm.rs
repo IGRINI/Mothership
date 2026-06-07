@@ -14,7 +14,8 @@ use serde_json::Value;
 
 use crate::{ChatCancellationToken, Result};
 use mothership_adapter_host::protocol::{
-    PromptBundle, ReasoningCapabilities, ReasoningConfig, RuntimeContext, ToolDescriptor,
+    FastModeCapabilities, PromptBundle, ReasoningCapabilities, ReasoningConfig, RuntimeContext,
+    ToolDescriptor,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
@@ -49,6 +50,8 @@ pub struct LlmModel {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub reasoning: Option<ReasoningCapabilities>,
+    #[serde(default)]
+    pub fast_mode: Option<FastModeCapabilities>,
     pub recommended: bool,
 }
 
@@ -92,6 +95,8 @@ pub struct LlmChatCompletionRequest {
     pub model_id: String,
     #[serde(default)]
     pub reasoning: Option<ReasoningConfig>,
+    #[serde(default)]
+    pub fast_mode: bool,
     pub prompt: PromptBundle,
     #[serde(default)]
     pub runtime_context: RuntimeContext,
@@ -107,6 +112,8 @@ pub struct LlmChatRoundRequest {
     pub model_id: String,
     #[serde(default)]
     pub reasoning: Option<ReasoningConfig>,
+    #[serde(default)]
+    pub fast_mode: bool,
     pub prompt: PromptBundle,
     #[serde(default)]
     pub runtime_context: RuntimeContext,
@@ -127,6 +134,7 @@ impl LlmChatRoundRequest {
             provider_id: request.provider_id,
             model_id: request.model_id,
             reasoning: request.reasoning,
+            fast_mode: request.fast_mode,
             prompt: request.prompt,
             runtime_context: request.runtime_context,
             tools: request.tools,
@@ -145,6 +153,8 @@ pub struct ProviderRequestDraft {
     pub model_id: String,
     #[serde(default)]
     pub reasoning: Option<ReasoningConfig>,
+    #[serde(default)]
+    pub fast_mode: bool,
     pub prompt: PromptBundle,
     #[serde(default)]
     pub runtime_context: RuntimeContext,
@@ -159,6 +169,7 @@ impl From<LlmChatCompletionRequest> for ProviderRequestDraft {
             provider_id: request.provider_id,
             model_id: request.model_id,
             reasoning: request.reasoning,
+            fast_mode: request.fast_mode,
             prompt: request.prompt,
             runtime_context: request.runtime_context,
             tools: request.tools,
@@ -173,6 +184,7 @@ impl From<ProviderRequestDraft> for LlmChatCompletionRequest {
             provider_id: draft.provider_id,
             model_id: draft.model_id,
             reasoning: draft.reasoning,
+            fast_mode: draft.fast_mode,
             prompt: draft.prompt,
             runtime_context: draft.runtime_context,
             tools: draft.tools,
@@ -369,6 +381,7 @@ mod tests {
             provider_id: "provider".to_string(),
             model_id: "model".to_string(),
             reasoning: None,
+            fast_mode: false,
             prompt: PromptBundle::default(),
             runtime_context: RuntimeContext::default(),
             tools: Vec::new(),

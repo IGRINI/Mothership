@@ -26,10 +26,10 @@ use crate::connectors::{
 use crate::{
     ChangeFileDiff, ChangeFileSummary, ChangeSetEvent, ChangeSetSummary, ChatConversation,
     ChatRunCancellationResult, ChatRunEvent, ChatThreadSummary, ChatUpdatedEvent,
-    DashboardSnapshot, MothershipError, ProjectSnapshot, ReasoningConfig, RevertOutcome,
-    SendChatMessageResult, SidecarStatus, ToolApprovalAnswer, ToolApprovalMode, ToolArtifactRange,
-    ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
-    ToolExecutionRequest,
+    DashboardSnapshot, MothershipError, PersonalizationSettings, ProjectSnapshot, ReasoningConfig,
+    RevertOutcome, SendChatMessageResult, SidecarStatus, ToolApprovalAnswer, ToolApprovalMode,
+    ToolArtifactRange, ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
+    ToolExecutionRequest, ToolPolicySettings,
 };
 
 /// Bump the major when a change isn't backward compatible. The host refuses a
@@ -91,6 +91,10 @@ pub enum CoreRequest {
     },
     CreateChat {
         project_id: String,
+        /// When set, the new chat inherits this chat's settings (model, approval
+        /// mode, reasoning) — "New chat" carries over the current configuration.
+        #[serde(default)]
+        copy_from_chat_id: Option<String>,
     },
     GetChat {
         chat_id: String,
@@ -102,6 +106,8 @@ pub enum CoreRequest {
         content: String,
         #[serde(default)]
         reasoning: Option<ReasoningConfig>,
+        #[serde(default)]
+        fast_mode: bool,
     },
     /// Edit an existing user message, remove everything after it in that chat,
     /// and start a fresh assistant run from the edited prompt.
@@ -145,6 +151,24 @@ pub enum CoreRequest {
     SetToolApprovalMode {
         mode: ToolApprovalMode,
     },
+    /// The full personalization view (global + per-provider + per-model prompt
+    /// additions) for the settings screen.
+    GetPersonalization,
+    /// Store (or clear, when `content` is blank) the personalization instruction
+    /// for one scope: global (both ids `None`), a provider (`provider_id` only),
+    /// or a provider+model (both ids). Returns the refreshed full view.
+    SetPersonalization {
+        provider_id: Option<String>,
+        model_id: Option<String>,
+        content: String,
+    },
+    /// The persisted command allow/deny lists and disabled-tool set.
+    GetToolPolicy,
+    /// Replace the command allow/deny lists and disabled-tool set (sanitized and
+    /// applied live, then persisted). Returns the canonical stored form.
+    SetToolPolicy {
+        settings: ToolPolicySettings,
+    },
     /// Lazily read a newline-aligned slice of a tool call's persisted output
     /// artifact (the snapshot taken at tool-call time), for on-demand UI paging.
     GetToolArtifactRange {
@@ -165,10 +189,27 @@ pub enum CoreRequest {
         provider_id: String,
         model_id: String,
     },
+    SetProviderEnabled {
+        provider_id: String,
+        enabled: bool,
+    },
     SetChatModel {
         chat_id: String,
         provider_id: String,
         model_id: String,
+    },
+    /// Persists a chat's per-chat session state — approval mode, reasoning
+    /// option, fast mode, and the unsent composer draft. Blank values clear the field.
+    SetChatState {
+        chat_id: String,
+        #[serde(default)]
+        approval_mode: Option<String>,
+        #[serde(default)]
+        reasoning: Option<String>,
+        #[serde(default)]
+        fast_mode: Option<bool>,
+        #[serde(default)]
+        draft: Option<String>,
     },
     SaveAdapterSettings {
         provider_id: String,
@@ -249,6 +290,8 @@ pub enum CoreResponse {
     ToolExecutionAccepted(ToolExecutionAccepted),
     ToolApproval(ToolApprovalAnswer),
     ToolApprovalMode(ToolApprovalMode),
+    Personalization(PersonalizationSettings),
+    ToolPolicy(ToolPolicySettings),
     ToolExecutionCancellation(ToolExecutionCancellationResult),
     /// A lazily-read slice of a tool's persisted output artifact.
     ToolArtifactRange(ToolArtifactRange),

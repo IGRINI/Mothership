@@ -158,6 +158,7 @@ pub async fn chat(
         ws,
         on_delta,
         &[],
+        None,
     )
     .await
     .map(|(transport, _)| transport)
@@ -178,6 +179,7 @@ pub async fn chat_round_with_state(
     ws: Option<&mut WsSession>,
     on_delta: &mut (dyn FnMut(&str) + Send),
     tools: &[Value],
+    service_tier: Option<&str>,
 ) -> Result<(Transport, ChatRound)> {
     let mut input = input_from_state_or_messages(state, messages)?;
     for output in tool_outputs {
@@ -202,6 +204,7 @@ pub async fn chat_round_with_state(
         on_delta,
         tools,
         reasoning,
+        service_tier,
     )
     .await?;
 
@@ -239,6 +242,7 @@ async fn transport_round(
     on_delta: &mut (dyn FnMut(&str) + Send),
     tools: &[Value],
     reasoning: Option<&ReasoningConfig>,
+    service_tier: Option<&str>,
 ) -> Result<(Transport, RoundOutput)> {
     let mut committed = false;
 
@@ -251,6 +255,7 @@ async fn transport_round(
             input,
             tools,
             reasoning,
+            service_tier,
             &mut committed,
             on_delta,
         )
@@ -277,6 +282,7 @@ async fn transport_round(
         input,
         tools,
         reasoning,
+        service_tier,
         &mut committed,
         on_delta,
     )
@@ -301,6 +307,7 @@ async fn transport_round(
         input,
         tools,
         reasoning,
+        service_tier,
         on_delta,
     )
     .await?;
@@ -314,10 +321,19 @@ async fn chat_ws(
     input: &[Value],
     tools: &[Value],
     reasoning: Option<&ReasoningConfig>,
+    service_tier: Option<&str>,
     committed: &mut bool,
     on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> Result<RoundOutput> {
-    let body = build_request_from_input(model, instructions, input, true, tools, reasoning);
+    let body = build_request_from_input(
+        model,
+        instructions,
+        input,
+        true,
+        tools,
+        reasoning,
+        service_tier,
+    );
     session.send_text(body.to_string()).await?;
     let mut accumulator = ToolCallAccumulator::default();
     let mut round = RoundOutput::default();
@@ -361,10 +377,19 @@ async fn chat_sse(
     input: &[Value],
     tools: &[Value],
     reasoning: Option<&ReasoningConfig>,
+    service_tier: Option<&str>,
     committed: &mut bool,
     on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> Result<RoundOutput> {
-    let body = build_request_from_input(model, instructions, input, true, tools, reasoning);
+    let body = build_request_from_input(
+        model,
+        instructions,
+        input,
+        true,
+        tools,
+        reasoning,
+        service_tier,
+    );
     let response = http::post_stream(client, &endpoint.https_url, auth_headers, &body).await?;
     let mut accumulator = ToolCallAccumulator::default();
     let mut round = RoundOutput::default();
@@ -401,9 +426,18 @@ async fn chat_json(
     input: &[Value],
     tools: &[Value],
     reasoning: Option<&ReasoningConfig>,
+    service_tier: Option<&str>,
     on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> Result<RoundOutput> {
-    let body = build_request_from_input(model, instructions, input, false, tools, reasoning);
+    let body = build_request_from_input(
+        model,
+        instructions,
+        input,
+        false,
+        tools,
+        reasoning,
+        service_tier,
+    );
     let value = http::post_json(
         client,
         &endpoint.https_url,
@@ -438,6 +472,7 @@ pub fn build_request(
         &build_input(messages),
         stream,
         &[],
+        None,
         None,
     )
 }
@@ -492,6 +527,7 @@ fn build_request_from_input(
     stream: bool,
     tools: &[Value],
     reasoning: Option<&ReasoningConfig>,
+    service_tier: Option<&str>,
 ) -> Value {
     let mut body = json!({
         "model": model,
@@ -510,6 +546,14 @@ fn build_request_from_input(
     if let Some(reasoning) = reasoning.and_then(responses_reasoning_value) {
         if let Some(object) = body.as_object_mut() {
             object.insert("reasoning".to_string(), reasoning);
+        }
+    }
+    if let Some(service_tier) = service_tier.filter(|tier| !tier.trim().is_empty()) {
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "service_tier".to_string(),
+                Value::String(service_tier.to_string()),
+            );
         }
     }
     body
@@ -903,11 +947,27 @@ mod tests {
                 budget_tokens: Some(4_000),
                 summary: Some(ReasoningSummary::Auto),
             }),
+            None,
         );
 
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "auto");
         assert!(body["reasoning"].get("budgetTokens").is_none());
+    }
+
+    #[test]
+    fn build_request_includes_service_tier() {
+        let body = build_request_from_input(
+            "gpt-test",
+            "instructions",
+            &[],
+            true,
+            &[],
+            None,
+            Some("priority"),
+        );
+
+        assert_eq!(body["service_tier"], "priority");
     }
 
     #[test]

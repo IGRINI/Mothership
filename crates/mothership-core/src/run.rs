@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use mothership_adapter_host::protocol::RuntimeContext;
+use mothership_adapter_host::protocol::{PromptBundle, PromptSection, RuntimeContext};
 
 use crate::agentic::AgenticLoopPolicy;
 use crate::auth::FileCredentialVault;
@@ -271,11 +271,22 @@ impl<'a> ChatRunService<'a> {
                 eprintln!("mothership-core: {drift}");
             }
         }
+        // Compose the prompt: Core's locked base/project sections, then the
+        // user's personalization (global → provider → model) appended after them.
+        // Look up by provider/model BEFORE they're moved into the request.
+        let mut prompt = runtime_prompt_bundle_for(project.as_ref(), runtime_kind);
+        append_personalization_sections(
+            &mut prompt,
+            database
+                .personalization_for(&provider_id, &model_id)
+                .unwrap_or_default(),
+        );
         let request = self.provider_pipeline.apply(LlmChatCompletionRequest {
             provider_id,
             model_id,
             reasoning: run.context.reasoning.clone(),
-            prompt: runtime_prompt_bundle_for(project.as_ref(), runtime_kind),
+            fast_mode: run.context.fast_mode,
+            prompt,
             runtime_context: runtime_context_for(project.as_ref()),
             tools,
             messages,
@@ -455,6 +466,22 @@ impl<'a> ChatRunService<'a> {
     }
 }
 
+/// Append the user's personalization instructions as prompt sections after
+/// Core's locked base sections (priority 100+), so the provider renders them
+/// last — appended to, never overriding, the product prompt. Verbatim: each
+/// scope (global/provider/model) becomes its own section in broad→specific order.
+fn append_personalization_sections(prompt: &mut PromptBundle, instructions: Vec<(String, String)>) {
+    for (index, (scope, content)) in instructions.into_iter().enumerate() {
+        prompt.sections.push(PromptSection {
+            id: format!("user.{scope}"),
+            source: "user".to_string(),
+            priority: 100 + index as i32,
+            locked: false,
+            content,
+        });
+    }
+}
+
 fn runtime_context_for(project: Option<&crate::ProjectSummary>) -> RuntimeContext {
     RuntimeContext {
         project_id: project.map(|project| project.id.clone()),
@@ -474,6 +501,7 @@ fn next_round_request(
         provider_id: base.provider_id.clone(),
         model_id: base.model_id.clone(),
         reasoning: base.reasoning.clone(),
+        fast_mode: base.fast_mode,
         prompt: base.prompt.clone(),
         runtime_context: base.runtime_context.clone(),
         tools: include_tools
@@ -691,7 +719,9 @@ mod tests {
             .open_project(project_path.to_str().expect("project path"))
             .expect("open project");
         let project_id = snapshot.active_project_id.expect("active project id");
-        let conversation = database.create_chat(&project_id).expect("create chat");
+        let conversation = database
+            .create_chat(&project_id, None)
+            .expect("create chat");
         let chat = conversation.chat;
         let assistant_message = ChatMessage {
             id: "chat_message_assistant_test".to_string(),

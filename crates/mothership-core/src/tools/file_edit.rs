@@ -1134,7 +1134,11 @@ mod tests {
         let content = format!("{}\n", lines.join("\n"));
         let res = applied(&content, "line30", "LINE30", false);
         assert!(res.diff.contains("@@ -27,7 +27,7 @@"), "diff: {}", res.diff);
-        assert!(!res.diff.contains("@@ -1,"), "diff anchored at line 1: {}", res.diff);
+        assert!(
+            !res.diff.contains("@@ -1,"),
+            "diff anchored at line 1: {}",
+            res.diff
+        );
     }
 
     #[test]

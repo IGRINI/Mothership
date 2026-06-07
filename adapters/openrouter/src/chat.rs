@@ -11,6 +11,7 @@ use mothership_adapter_sdk::{ChatRequest, ChatRoundOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::models::openrouter_fast_service_tier_for_model;
 use crate::settings::{auth_headers, OpenRouterSettings};
 
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -79,6 +80,7 @@ pub(crate) async fn stream_chat(
         sink,
         &request.tools,
         request.reasoning.as_ref(),
+        openrouter_fast_service_tier_for_model(&request.model, request.fast_mode),
     )
     .await?;
 
@@ -119,7 +121,37 @@ async fn stream_chat_once(
     sink: &mut mothership_adapter_sdk::ChatSink,
     tools: &[ToolDescriptor],
     reasoning: Option<&ReasoningConfig>,
+    service_tier: Option<&str>,
 ) -> anyhow::Result<ChatRound> {
+    let body = openrouter_chat_body(model, messages, tools, reasoning, service_tier);
+
+    let api_key = settings.api_key();
+    let headers = auth_headers(api_key);
+    let redacted_values = [api_key];
+    let request = http::post_stream_redacted(
+        client,
+        url,
+        &headers,
+        &body,
+        http::DEFAULT_ERROR_BODY_TIMEOUT,
+        http::DEFAULT_MAX_ERROR_BODY_CHARS,
+        &redacted_values,
+    );
+    let response = tokio::select! {
+        result = request => result.context("send OpenRouter chat request")?,
+        _ = sink.cancelled() => return Ok(ChatRound::default()),
+    };
+
+    read_sse_stream(response, sink).await
+}
+
+fn openrouter_chat_body(
+    model: &str,
+    messages: &[Value],
+    tools: &[ToolDescriptor],
+    reasoning: Option<&ReasoningConfig>,
+    service_tier: Option<&str>,
+) -> Value {
     let mut body = json!({
         "model": model,
         "messages": messages,
@@ -140,25 +172,15 @@ async fn stream_chat_once(
             object.insert("reasoning".to_string(), reasoning);
         }
     }
-
-    let api_key = settings.api_key();
-    let headers = auth_headers(api_key);
-    let redacted_values = [api_key];
-    let request = http::post_stream_redacted(
-        client,
-        url,
-        &headers,
-        &body,
-        http::DEFAULT_ERROR_BODY_TIMEOUT,
-        http::DEFAULT_MAX_ERROR_BODY_CHARS,
-        &redacted_values,
-    );
-    let response = tokio::select! {
-        result = request => result.context("send OpenRouter chat request")?,
-        _ = sink.cancelled() => return Ok(ChatRound::default()),
-    };
-
-    read_sse_stream(response, sink).await
+    if let Some(service_tier) = service_tier.filter(|tier| !tier.trim().is_empty()) {
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "service_tier".to_string(),
+                Value::String(service_tier.to_string()),
+            );
+        }
+    }
+    body
 }
 
 fn openrouter_reasoning_value(reasoning: &ReasoningConfig) -> Option<Value> {
@@ -407,5 +429,13 @@ mod tests {
 
         assert_eq!(body["effort"], "low");
         assert_eq!(body["max_tokens"], 2048);
+    }
+
+    #[test]
+    fn openrouter_chat_body_includes_fast_service_tier_without_provider_sort() {
+        let body = openrouter_chat_body("openai/gpt-5.5", &[], &[], None, Some("priority"));
+
+        assert_eq!(body["service_tier"], "priority");
+        assert!(body.get("provider").is_none());
     }
 }

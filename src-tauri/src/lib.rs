@@ -45,8 +45,10 @@ pub fn run() {
             commands::get_connector_settings,
             commands::get_dashboard_snapshot,
             commands::get_message_change_summary,
+            commands::get_personalization,
             commands::get_tool_approval_mode,
             commands::get_tool_artifact_range,
+            commands::get_tool_policy,
             commands::list_change_set_files,
             commands::list_chats,
             commands::list_projects,
@@ -63,8 +65,12 @@ pub fn run() {
             commands::send_chat_message,
             commands::set_active_project,
             commands::set_chat_model,
+            commands::set_chat_state,
+            commands::set_personalization,
             commands::set_tool_approval_mode,
+            commands::set_tool_policy,
             commands::set_selected_model,
+            commands::set_provider_enabled,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

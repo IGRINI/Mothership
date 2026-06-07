@@ -91,6 +91,7 @@ pub enum ConnectorSettingsEventKind {
     AuthenticationFinished,
     AuthenticationCancelled,
     LoggedOut,
+    ProviderEnabledChanged,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +99,10 @@ pub enum ConnectorSettingsEventKind {
 pub struct ConnectorProviderSummary {
     pub id: String,
     pub label: String,
+    /// User-controlled on/off switch. Disabled providers are persisted (default
+    /// on) and hidden from model selection in chat, while still showing in the
+    /// Connectors screen so they can be re-enabled or configured.
+    pub enabled: bool,
     pub runtime_kind: ProviderRuntimeKind,
     /// The adapter's own icon as a data URI, if it ships one (declared in its
     /// manifest). Core just renders whatever the plugin provides.
@@ -234,6 +239,7 @@ impl ConnectorManager {
 
     pub fn snapshot(&self) -> Result<ConnectorSettingsSnapshot> {
         let selected_model = self.database.selected_llm_model()?;
+        let disabled = self.database.disabled_provider_ids()?;
         let provider_labels = self.provider_labels();
         let provider_icons = self.provider_icons();
         let provider_runtime_kinds = self.provider_runtime_kinds();
@@ -244,6 +250,7 @@ impl ConnectorManager {
             providers: connector_providers(
                 &state.catalogs,
                 &selected_model,
+                &disabled,
                 &state.adapter_info,
                 &provider_labels,
                 &provider_icons,
@@ -255,6 +262,25 @@ impl ConnectorManager {
             ),
             selected_model,
         })
+    }
+
+    /// Toggle a provider on or off. Validates the id exists among installed
+    /// adapters (so the UI can't disable a phantom provider), persists the flag,
+    /// and returns the refreshed snapshot. No catalog refresh is needed — the
+    /// adapter's models and auth are unchanged, only its availability.
+    pub fn set_provider_enabled(
+        &self,
+        provider_id: &str,
+        enabled: bool,
+    ) -> Result<ConnectorSettingsSnapshot> {
+        find_trusted_adapter_entry(&self.plugins_dir(), provider_id)?;
+        self.database.set_provider_enabled(provider_id, enabled)?;
+        // Switching a provider off frees its resident process; the next run after
+        // a re-enable just pays a one-time warm-up.
+        if !enabled {
+            self.pool.force_evict(provider_id);
+        }
+        self.snapshot()
     }
 
     /// Validates that a provider/model exists among the installed adapters,
@@ -844,6 +870,7 @@ fn adapter_model_catalog(
             description: String::new(),
             capabilities: vec!["text".to_string()],
             reasoning: model.reasoning,
+            fast_mode: model.fast_mode,
             recommended: model.recommended,
         })
         .collect();
@@ -911,6 +938,7 @@ fn is_authenticated(status: &AuthStatus) -> bool {
 fn connector_providers(
     catalogs: &BTreeMap<String, AdapterModelCatalog>,
     selected_model: &SelectedLlmModel,
+    disabled: &BTreeSet<String>,
     adapter_info: &BTreeMap<String, AdapterInfo>,
     provider_labels: &BTreeMap<String, String>,
     provider_icons: &BTreeMap<String, String>,
@@ -997,9 +1025,12 @@ fn connector_providers(
                 .map(|runtime| runtime.status(&provider_id))
                 .unwrap_or_else(ProviderRuntimeStatus::idle);
 
+            let enabled = !disabled.contains(&provider_id);
+
             ConnectorProviderSummary {
                 id: provider_id,
                 label,
+                enabled,
                 runtime_kind,
                 icon,
                 settings_schema: connector_settings_schema(

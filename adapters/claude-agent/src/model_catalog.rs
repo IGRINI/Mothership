@@ -10,6 +10,8 @@ pub(crate) struct ClaudeModelInfo {
     pub(crate) supported_effort_levels: Vec<String>,
     #[serde(default)]
     pub(crate) supports_adaptive_thinking: bool,
+    #[serde(default)]
+    pub(crate) supports_fast_mode: bool,
 }
 
 #[derive(Debug, Clone)]

@@ -10,6 +10,7 @@ mod id;
 pub mod ipc;
 pub mod llm;
 pub mod model;
+pub mod personalization;
 pub mod project;
 pub mod prompt;
 pub mod provider_runtime;
@@ -52,6 +53,7 @@ pub use model::{ActivityEvent, DashboardMetric, DashboardSnapshot, SidecarStatus
 pub use mothership_adapter_host::protocol::{
     ReasoningCapabilities, ReasoningConfig, ReasoningEffort, ReasoningOption, ReasoningSummary,
 };
+pub use personalization::{ModelInstruction, PersonalizationSettings, ProviderInstruction};
 pub use project::{ProjectSnapshot, ProjectSummary};
 pub use provider_runtime::{ProviderRuntimeHealth, ProviderRuntimeManager, ProviderRuntimeStatus};
 pub use run::{schedule_cancel_fallback, ChatRunRegistry, ChatRunService};
@@ -79,9 +81,10 @@ pub use tools::{
     ToolExecutionEventSink, ToolExecutionRecord, ToolExecutionRegistry, ToolExecutionRequest,
     ToolExecutionResult, ToolExecutionStatus, ToolExecutor, ToolKind, ToolOrchestrator,
     ToolOutputPolicy, ToolOutputStore, ToolOutputStream, ToolPermissionAction,
-    ToolPermissionEvaluation, ToolPermissionPolicy, ToolProcessExit, ToolProcessSandbox,
-    ToolProcessSpec, ToolRepeatBlock, ToolRepeatGuard, ToolRepeatGuardConfig, ToolResourceLimits,
-    ToolSupervisor, Workspace, APPLY_PATCH_TOOL_NAME, DEFAULT_MAX_WRITE_FILE_BYTES,
-    EDIT_FILE_TOOL_NAME, LIST_FILES_TOOL_NAME, MAX_TOOL_EVENT_BYTES, READ_FILE_TOOL_NAME,
-    RUN_COMMAND_TOOL_NAME, SEARCH_TEXT_TOOL_NAME, WRITE_FILE_TOOL_NAME,
+    ToolPermissionEvaluation, ToolPermissionPolicy, ToolPolicySettings, ToolPolicyStore,
+    ToolProcessExit, ToolProcessSandbox, ToolProcessSpec, ToolRepeatBlock, ToolRepeatGuard,
+    ToolRepeatGuardConfig, ToolResourceLimits, ToolSupervisor, UserAwareCommandPermissionPolicy,
+    Workspace, APPLY_PATCH_TOOL_NAME, DEFAULT_MAX_WRITE_FILE_BYTES, EDIT_FILE_TOOL_NAME,
+    LIST_FILES_TOOL_NAME, MAX_TOOL_EVENT_BYTES, READ_FILE_TOOL_NAME, RUN_COMMAND_TOOL_NAME,
+    SEARCH_TEXT_TOOL_NAME, WRITE_FILE_TOOL_NAME,
 };

@@ -22,8 +22,9 @@ use mothership_core::{
     ToolBatchPlan, ToolCallContext, ToolCancellationToken, ToolCapability, ToolCommand,
     ToolDecision, ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest,
     ToolExecutionResult, ToolExecutionStatus, ToolExecutor, ToolKind, ToolOrchestrator,
-    ToolOutputPolicy, ToolOutputStore, ToolPermissionAction, ToolProcessExit, ToolProcessSandbox,
-    ToolProcessSpec, ToolSupervisor, Workspace, DEFAULT_MAX_WRITE_FILE_BYTES, MAX_TOOL_EVENT_BYTES,
+    ToolOutputPolicy, ToolOutputStore, ToolPermissionAction, ToolPolicyStore, ToolProcessExit,
+    ToolProcessSandbox, ToolProcessSpec, ToolSupervisor, Workspace, DEFAULT_MAX_WRITE_FILE_BYTES,
+    MAX_TOOL_EVENT_BYTES,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -207,6 +208,10 @@ pub struct SidecarLlmToolHandler {
     command_executor: Arc<CommandToolExecutor>,
     file_executor: Arc<FileToolExecutor>,
     registry: Arc<ToolExecutionRegistry>,
+    /// User-configured tool toggles: a kind in the disabled set is refused
+    /// before dispatch (command allow/deny is enforced separately, inside the
+    /// supervisor's permission policy).
+    tool_policy: Arc<ToolPolicyStore>,
 }
 
 impl SidecarLlmToolHandler {
@@ -220,6 +225,7 @@ impl SidecarLlmToolHandler {
         output_store: Option<Arc<dyn ToolOutputStore>>,
         change_recorder: Option<Arc<ChangeRecorder>>,
         approval_mode: Arc<ToolApprovalModeStore>,
+        tool_policy: Arc<ToolPolicyStore>,
     ) -> Self {
         let project = project.map(|(id, root)| ToolProjectContext { id, root });
         let command_executor = Arc::new(CommandToolExecutor {
@@ -245,6 +251,7 @@ impl SidecarLlmToolHandler {
             command_executor,
             file_executor,
             registry,
+            tool_policy,
         }
     }
 
@@ -258,6 +265,17 @@ impl SidecarLlmToolHandler {
         request: &LlmToolCallRequest,
         chat_cancellation: &ChatCancellationToken,
     ) -> LlmToolCallResult {
+        // Tool-access toggle: a kind the user disabled on the Permissions screen
+        // is refused up front, before any approval/execution machinery runs.
+        if self.tool_policy.is_tool_disabled(kind) {
+            return LlmToolCallResult {
+                ok: false,
+                content: format!(
+                    "the `{}` tool is disabled in Mothership settings (Permissions)",
+                    kind.as_str()
+                ),
+            };
+        }
         let cancellation = ToolCancellationToken::default();
         if chat_cancellation.is_cancelled() {
             cancellation.cancel();

@@ -1,7 +1,7 @@
 import { Show, type JSX } from "solid-js";
 import { Send, Square } from "lucide-solid";
 
-import type { LlmModel } from "../../../shared/api/mothership";
+import type { LlmModel, ToolApprovalMode } from "../../../shared/api/mothership";
 
 export type ReasoningOptionId = string;
 
@@ -12,9 +12,13 @@ export function Composer(props: {
   isSending: boolean;
   model?: LlmModel;
   reasoningOptionId?: ReasoningOptionId;
+  fastModeEnabled: boolean;
+  toolApprovalMode: ToolApprovalMode;
   onCancelRun: () => void;
   onDraftChange: (value: string) => void;
   onReasoningOptionChange: (optionId: ReasoningOptionId) => void;
+  onFastModeChange: (enabled: boolean) => void;
+  onToolApprovalModeChange: (mode: ToolApprovalMode) => void;
   onSend: () => void;
   ReasoningSelector: (props: {
     disabled: boolean;
@@ -22,8 +26,21 @@ export function Composer(props: {
     value?: ReasoningOptionId;
     onChange: (optionId: ReasoningOptionId) => void;
   }) => JSX.Element;
+  FastModeToggle: (props: {
+    disabled: boolean;
+    enabled: boolean;
+    model?: LlmModel;
+    onChange: (enabled: boolean) => void;
+  }) => JSX.Element;
+  ApprovalModeMenu: (props: {
+    disabled?: boolean;
+    mode: ToolApprovalMode;
+    onChange: (mode: ToolApprovalMode) => void;
+  }) => JSX.Element;
 }) {
   const ReasoningSelector = props.ReasoningSelector;
+  const FastModeToggle = props.FastModeToggle;
+  const ApprovalModeMenu = props.ApprovalModeMenu;
   const canSend = () =>
     props.hasProject && props.draft.trim().length > 0 && !props.isSending;
 
@@ -49,11 +66,21 @@ export function Composer(props: {
         }}
       />
       <div class="composer__actions">
+        <ApprovalModeMenu
+          mode={props.toolApprovalMode}
+          onChange={props.onToolApprovalModeChange}
+        />
         <ReasoningSelector
           disabled={props.isSending || Boolean(props.activeRunId)}
           model={props.model}
           value={props.reasoningOptionId}
           onChange={props.onReasoningOptionChange}
+        />
+        <FastModeToggle
+          disabled={props.isSending || Boolean(props.activeRunId)}
+          enabled={props.fastModeEnabled}
+          model={props.model}
+          onChange={props.onFastModeChange}
         />
         <Show
           when={props.activeRunId}

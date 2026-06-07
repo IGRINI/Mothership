@@ -55,6 +55,7 @@ fn main() -> anyhow::Result<()> {
                         label: "Echo 1".to_string(),
                         recommended: true,
                         reasoning: None,
+                        fast_mode: None,
                     }],
                 },
             )?,

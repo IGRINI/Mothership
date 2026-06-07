@@ -18,6 +18,8 @@ const REFRESH_MARGIN_MS: u64 = 60_000;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const OAUTH_ACCEPT_TIMEOUT: Duration = Duration::from_secs(300);
 const OAUTH_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_USER_AGENT: &str = concat!("codex_cli_rs/", env!("CARGO_PKG_VERSION"), " (Mothership)");
 
 pub(crate) const CREDENTIAL_SETTINGS_KEY: &str = "credential";
 
@@ -127,7 +129,9 @@ pub(crate) fn auth_headers(access_token: &str, account_id: Option<&str>) -> Vec<
         "Authorization".to_string(),
         format!("Bearer {access_token}"),
     )];
-    if let Some(account_id) = account_id {
+    headers.push(("originator".to_string(), CODEX_ORIGINATOR.to_string()));
+    headers.push(("User-Agent".to_string(), CODEX_USER_AGENT.to_string()));
+    if let Some(account_id) = account_id.map(str::trim).filter(|value| !value.is_empty()) {
         headers.push(("ChatGPT-Account-Id".to_string(), account_id.to_string()));
     }
     headers
@@ -324,4 +328,52 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_headers_include_codex_client_identity() {
+        let headers = auth_headers("access-token", Some(" account-123 "));
+
+        assert_eq!(
+            header_value(&headers, "Authorization"),
+            Some("Bearer access-token")
+        );
+        assert_eq!(header_value(&headers, "originator"), Some(CODEX_ORIGINATOR));
+        assert!(header_value(&headers, "User-Agent")
+            .expect("user agent header")
+            .starts_with("codex_cli_rs/"));
+        assert_eq!(
+            header_value(&headers, "ChatGPT-Account-Id"),
+            Some("account-123")
+        );
+    }
+
+    #[test]
+    fn auth_headers_omit_empty_account_id() {
+        let headers = auth_headers("access-token", Some("   "));
+
+        assert_eq!(header_value(&headers, "ChatGPT-Account-Id"), None);
+    }
+
+    #[test]
+    fn ws_headers_keep_codex_client_identity_and_add_beta() {
+        let headers = ws_headers("access-token", Some("account-123"));
+
+        assert_eq!(header_value(&headers, "originator"), Some(CODEX_ORIGINATOR));
+        assert_eq!(
+            header_value(&headers, "OpenAI-Beta"),
+            Some(super::super::chat::WS_BETA_HEADER)
+        );
+    }
+
+    fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
 }
