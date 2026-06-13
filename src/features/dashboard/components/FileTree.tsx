@@ -108,7 +108,7 @@ function TreeRow(props: { node: TreeNode; projectId?: string; depth: number }) {
   );
 }
 
-/** Expandable file tree for a `list_files` result (one path per line). */
+/** Expandable file tree for command output that is already normalized to paths. */
 export function FileTree(props: { paths: string[]; projectId?: string }) {
   const roots = () => [...buildTree(props.paths).children.values()].sort(sortNodes);
   return (

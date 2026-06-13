@@ -223,7 +223,7 @@ fn sanitize_tool_list(items: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     for item in items {
         let name = item.trim().to_ascii_lowercase();
-        if ToolKind::from_name(&name).is_none() || !seen.insert(name.clone()) {
+        if ToolKind::from_routable_name(&name).is_none() || !seen.insert(name.clone()) {
             continue;
         }
         out.push(name);
@@ -1051,13 +1051,17 @@ mod tests {
     fn tool_policy_sanitizes_and_matches_extension_insensitively() {
         let store = ToolPolicyStore::new(ToolPolicySettings {
             command_allow: vec!["  Git.EXE ".to_string(), "git".to_string()],
-            disabled_tools: vec!["read_file".to_string(), "bogus_tool".to_string()],
+            disabled_tools: vec![
+                "read_file".to_string(),
+                "defunct_tool".to_string(),
+                "bogus_tool".to_string(),
+            ],
             ..Default::default()
         });
         let settings = store.settings();
         // Trimmed, lowercased, extension-stripped, de-duplicated.
         assert_eq!(settings.command_allow, vec!["git".to_string()]);
-        // Unknown tool names are dropped.
+        // Unknown and non-routable tool names are dropped.
         assert_eq!(settings.disabled_tools, vec!["read_file".to_string()]);
         assert!(store.is_tool_disabled(ToolKind::ReadFile));
         assert!(!store.is_tool_disabled(ToolKind::WriteFile));

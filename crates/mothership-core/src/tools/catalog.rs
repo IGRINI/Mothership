@@ -21,15 +21,11 @@ pub const EDIT_FILE_TOOL_NAME: &str = "edit_file";
 pub const APPLY_PATCH_TOOL_ID: &str = "core.apply_patch";
 pub const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 
-pub const LIST_FILES_TOOL_ID: &str = "core.list_files";
-pub const LIST_FILES_TOOL_NAME: &str = "list_files";
 pub const SEARCH_TEXT_TOOL_ID: &str = "core.search_text";
 pub const SEARCH_TEXT_TOOL_NAME: &str = "search_text";
 
 pub const IMAGE_GENERATE_TOOL_ID: &str = "core.image_generate";
 pub const IMAGE_GENERATE_TOOL_NAME: &str = "image_generate";
-pub const AUDIO_TRANSCRIBE_TOOL_ID: &str = "core.audio_transcribe";
-pub const AUDIO_TRANSCRIBE_TOOL_NAME: &str = "audio_transcribe";
 
 pub fn default_tool_catalog() -> Vec<ToolDescriptor> {
     vec![
@@ -38,7 +34,6 @@ pub fn default_tool_catalog() -> Vec<ToolDescriptor> {
         write_file_tool_descriptor(),
         edit_file_tool_descriptor(),
         apply_patch_tool_descriptor(),
-        list_files_tool_descriptor(),
         search_text_tool_descriptor(),
     ]
 }
@@ -62,32 +57,6 @@ pub fn image_generate_tool_descriptor() -> ToolDescriptor {
                 }
             },
             "required": ["prompt"],
-            "additionalProperties": false
-        }),
-        strict: false,
-        annotations: BTreeMap::new(),
-    }
-}
-
-pub fn audio_transcribe_tool_descriptor() -> ToolDescriptor {
-    ToolDescriptor {
-        id: AUDIO_TRANSCRIBE_TOOL_ID.to_string(),
-        name: AUDIO_TRANSCRIBE_TOOL_NAME.to_string(),
-        description: "Transcribe an audio file through the STT provider selected in Mothership settings. The input path must be inside the project, current artifact root, or current tmp root.".to_string(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "inputPath": {
-                    "type": "string",
-                    "description": "Project-relative path, or absolute path inside the current project/artifact/tmp scope."
-                },
-                "options": {
-                    "type": "object",
-                    "description": "Optional provider-supported transcription options for this request.",
-                    "additionalProperties": true
-                }
-            },
-            "required": ["inputPath"],
             "additionalProperties": false
         }),
         strict: false,
@@ -377,40 +346,6 @@ fn apply_patch_tool_descriptor() -> ToolDescriptor {
     }
 }
 
-fn list_files_tool_descriptor() -> ToolDescriptor {
-    ToolDescriptor {
-        id: LIST_FILES_TOOL_ID.to_string(),
-        name: LIST_FILES_TOOL_NAME.to_string(),
-        description: "List files in the active project. Honors .gitignore/.ignore and hidden-file rules by default; pass includeIgnored to surface ignored/hidden files. Filter with an optional glob matched against project-relative paths. Sensitive files (credentials, keys) are never listed.".to_string(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "glob": {
-                    "type": "string",
-                    "description": "Optional glob matched against project-relative paths, e.g. `**/*.rs` or `src/**`. Must be a relative pattern inside the project."
-                },
-                "dir": {
-                    "type": "string",
-                    "description": "Optional project-relative subdirectory to start from. Defaults to the project root. Must stay inside the project."
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Optional maximum number of files to return (default 1000)."
-                },
-                "includeIgnored": {
-                    "type": "boolean",
-                    "description": "Include files normally hidden by .gitignore/.ignore and dotfiles (default false). Sensitive files are still excluded."
-                }
-            },
-            "required": [],
-            "additionalProperties": false
-        }),
-        strict: false,
-        annotations: BTreeMap::new(),
-    }
-}
-
 fn search_text_tool_descriptor() -> ToolDescriptor {
     ToolDescriptor {
         id: SEARCH_TEXT_TOOL_ID.to_string(),
@@ -516,9 +451,9 @@ mod tests {
     }
 
     #[test]
-    fn default_catalog_exposes_seven_tools() {
+    fn default_catalog_exposes_six_model_visible_tools() {
         let tools = default_tool_catalog();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 6);
 
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
         assert_eq!(
@@ -529,11 +464,9 @@ mod tests {
                 WRITE_FILE_TOOL_NAME,
                 EDIT_FILE_TOOL_NAME,
                 APPLY_PATCH_TOOL_NAME,
-                LIST_FILES_TOOL_NAME,
                 SEARCH_TEXT_TOOL_NAME,
             ]
         );
-
         // Every file/search tool declares its required fields and forbids extras.
         for tool in tools.iter().skip(1) {
             assert_eq!(tool.parameters["additionalProperties"], false);
@@ -542,16 +475,8 @@ mod tests {
     }
 
     #[test]
-    fn search_tool_ids_and_required_fields() {
+    fn search_tool_id_and_required_fields() {
         let tools = default_tool_catalog();
-        let list = tools
-            .iter()
-            .find(|tool| tool.name == LIST_FILES_TOOL_NAME)
-            .expect("list_files present");
-        assert_eq!(list.id, LIST_FILES_TOOL_ID);
-        // list_files has no required fields.
-        assert_eq!(list.parameters["required"].as_array().unwrap().len(), 0);
-
         let search = tools
             .iter()
             .find(|tool| tool.name == SEARCH_TEXT_TOOL_NAME)

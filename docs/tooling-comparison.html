@@ -1,0 +1,1213 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mothership — сравнение тулов</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #070a0f;
+      --panel: #0d131b;
+      --panel-2: #111925;
+      --panel-3: #162231;
+      --line: #233143;
+      --line-soft: #192334;
+      --text: #e6edf6;
+      --muted: #9aa8b8;
+      --faint: #667486;
+      --green: #69d6a4;
+      --blue: #78a9ff;
+      --cyan: #54c6d7;
+      --yellow: #edc863;
+      --red: #ff8b8b;
+      --purple: #b99bff;
+      --orange: #ffb16c;
+      --shadow: 0 22px 70px rgba(0, 0, 0, .34);
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
+      --mono: "Cascadia Code", "JetBrains Mono", Consolas, ui-monospace, monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      min-width: 360px;
+      background:
+        radial-gradient(900px 520px at 10% -10%, rgba(84, 198, 215, .13), transparent 65%),
+        radial-gradient(820px 480px at 88% 2%, rgba(185, 155, 255, .12), transparent 60%),
+        linear-gradient(180deg, #080c12 0%, #070a0f 48%, #090c12 100%);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 15px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a { color: #9bc1ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      font-family: var(--mono);
+      font-size: .92em;
+      color: #d8e4f3;
+      background: #111a26;
+      border: 1px solid #223046;
+      border-radius: 6px;
+      padding: 1px 5px;
+    }
+
+    .page {
+      width: min(1880px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 28px 0 72px;
+    }
+
+    .hero {
+      border: 1px solid rgba(120, 169, 255, .22);
+      background:
+        linear-gradient(135deg, rgba(17, 25, 37, .94), rgba(9, 14, 21, .96)),
+        linear-gradient(90deg, rgba(84, 198, 215, .1), rgba(185, 155, 255, .1));
+      box-shadow: var(--shadow);
+      border-radius: 14px;
+      padding: 28px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: #9fd8df;
+      font-weight: 700;
+      font-size: 12px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      margin-bottom: 12px;
+    }
+
+    h1, h2, h3 { margin: 0; letter-spacing: 0; }
+    h1 {
+      font-size: clamp(34px, 3.1vw, 62px);
+      line-height: 1.02;
+      max-width: 1180px;
+    }
+    .hero p {
+      color: var(--muted);
+      max-width: 980px;
+      margin: 16px 0 0;
+      font-size: 17px;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(160px, 1fr));
+      gap: 12px;
+      margin-top: 24px;
+    }
+
+    .fact {
+      background: rgba(13, 19, 27, .82);
+      border: 1px solid var(--line-soft);
+      border-radius: 10px;
+      padding: 14px;
+      min-height: 124px;
+    }
+    .fact strong {
+      display: block;
+      font-size: 26px;
+      line-height: 1;
+      margin-bottom: 10px;
+    }
+    .fact span { color: var(--muted); }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 250px minmax(760px, 1fr) 330px;
+      align-items: start;
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    .rail,
+    .side {
+      position: sticky;
+      top: 14px;
+    }
+
+    .rail,
+    .side-card,
+    .section {
+      background: rgba(13, 19, 27, .88);
+      border: 1px solid var(--line-soft);
+      border-radius: 12px;
+      box-shadow: 0 12px 38px rgba(0, 0, 0, .18);
+    }
+
+    .rail {
+      padding: 14px;
+    }
+    .rail h2,
+    .side h2 {
+      font-size: 13px;
+      color: #c9d7e8;
+      margin-bottom: 10px;
+    }
+    .nav {
+      display: grid;
+      gap: 6px;
+    }
+    .nav a,
+    .filter-btn {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      min-height: 36px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid transparent;
+      color: var(--muted);
+      background: transparent;
+      font: inherit;
+      cursor: pointer;
+      text-align: left;
+    }
+    .nav a:hover,
+    .filter-btn:hover,
+    .filter-btn.active {
+      background: #111b28;
+      color: var(--text);
+      border-color: #223046;
+      text-decoration: none;
+    }
+    .nav small,
+    .filter-btn small {
+      color: var(--faint);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .main {
+      display: grid;
+      gap: 18px;
+      min-width: 0;
+    }
+
+    .section {
+      padding: 20px;
+      overflow: hidden;
+    }
+    .section-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .section h2 {
+      font-size: 22px;
+      line-height: 1.18;
+    }
+    .section .lead {
+      margin: 6px 0 0;
+      color: var(--muted);
+      max-width: 900px;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 14px;
+    }
+    .search {
+      width: 100%;
+      min-height: 42px;
+      border: 1px solid #27374b;
+      border-radius: 9px;
+      background: #09101a;
+      color: var(--text);
+      padding: 0 13px;
+      font: inherit;
+      outline: none;
+    }
+    .search:focus {
+      border-color: #5b7fb3;
+      box-shadow: 0 0 0 3px rgba(120, 169, 255, .12);
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      border: 1px solid #28394f;
+      border-radius: 999px;
+      background: #101824;
+      color: #c9d5e4;
+      font-size: 12px;
+      font-weight: 700;
+      min-height: 30px;
+      padding: 5px 10px;
+      white-space: nowrap;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--blue);
+      flex: 0 0 auto;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(180px, 1fr));
+      gap: 12px;
+    }
+    .take {
+      border: 1px solid var(--line-soft);
+      border-radius: 10px;
+      background: #0b121c;
+      padding: 16px;
+      min-height: 154px;
+    }
+    .take b {
+      display: block;
+      font-size: 15px;
+      margin-bottom: 8px;
+    }
+    .take p { margin: 0; color: var(--muted); }
+
+    .chart-grid {
+      display: grid;
+      grid-template-columns: minmax(420px, 1.2fr) minmax(320px, .8fr);
+      gap: 16px;
+      align-items: stretch;
+    }
+    .chart-card {
+      border: 1px solid var(--line-soft);
+      border-radius: 10px;
+      background: #0b121c;
+      padding: 14px;
+      min-height: 340px;
+    }
+    .chart-card h3 {
+      font-size: 15px;
+      margin-bottom: 10px;
+      color: #d5e1ef;
+    }
+    .chart-wrap {
+      position: relative;
+      height: 290px;
+    }
+
+    .matrix-wrap {
+      overflow: auto;
+      border: 1px solid var(--line-soft);
+      border-radius: 10px;
+      background: #0a1018;
+      max-height: 76vh;
+    }
+    table {
+      border-collapse: separate;
+      border-spacing: 0;
+      width: 100%;
+      min-width: 1240px;
+      font-size: 14px;
+    }
+    th,
+    td {
+      border-right: 1px solid #182437;
+      border-bottom: 1px solid #182437;
+      padding: 11px 12px;
+      vertical-align: top;
+      background: #0a1018;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 3;
+      color: #d6e2f0;
+      background: #101927;
+      text-align: left;
+      font-size: 12px;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    th:first-child,
+    td:first-child {
+      position: sticky;
+      left: 0;
+      z-index: 2;
+      min-width: 230px;
+      max-width: 230px;
+      background: #0e1622;
+      box-shadow: 8px 0 18px rgba(0, 0, 0, .18);
+    }
+    th:first-child { z-index: 4; background: #121d2b; }
+    .project-cell b {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 15px;
+    }
+    .project-cell span,
+    td small {
+      color: var(--muted);
+    }
+    .score {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: #cfd9e7;
+      white-space: nowrap;
+      margin-bottom: 4px;
+    }
+    .score i {
+      display: block;
+      width: 9px;
+      height: 9px;
+      border-radius: 2px;
+      background: #243146;
+    }
+    .score i.on { background: var(--green); }
+    .plain { color: var(--muted); }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(260px, 1fr));
+      gap: 12px;
+    }
+    .tool-card {
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      gap: 12px;
+      border: 1px solid var(--line-soft);
+      border-radius: 10px;
+      background: #0b121c;
+      padding: 16px;
+      min-height: 356px;
+    }
+    .tool-card.hidden { display: none; }
+    .card-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: start;
+      gap: 12px;
+    }
+    .card-title h3 {
+      font-size: 18px;
+      line-height: 1.2;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 25px;
+      border-radius: 999px;
+      border: 1px solid #2c3e55;
+      background: #111a26;
+      color: #b9c8d8;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: .03em;
+      text-transform: uppercase;
+      padding: 4px 8px;
+      white-space: nowrap;
+    }
+    .badge.ours { color: #10231a; background: var(--green); border-color: transparent; }
+    .card-text { color: var(--muted); margin: 0; }
+    .list {
+      display: grid;
+      gap: 8px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+    .list li {
+      display: grid;
+      grid-template-columns: 17px 1fr;
+      gap: 8px;
+      color: #c9d6e6;
+    }
+    .list li::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      margin-top: 8px;
+      border-radius: 50%;
+      background: var(--cyan);
+    }
+    .list.pro li::before { background: var(--green); }
+    .list.con li::before { background: var(--red); }
+    .mini-title {
+      color: var(--faint);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      margin-bottom: 7px;
+    }
+    .tool-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .tool-pill {
+      border: 1px solid #26384e;
+      border-radius: 7px;
+      background: #101925;
+      color: #cbd8e8;
+      font-size: 12px;
+      padding: 3px 7px;
+    }
+
+    .decision-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(220px, 1fr));
+      gap: 12px;
+    }
+    .decision {
+      border: 1px solid var(--line-soft);
+      border-radius: 10px;
+      background: #0b121c;
+      padding: 16px;
+    }
+    .decision h3 { font-size: 17px; }
+    .decision p { color: var(--muted); margin: 8px 0 0; }
+    .verdict {
+      display: inline-flex;
+      margin-top: 12px;
+      border-radius: 8px;
+      padding: 7px 9px;
+      font-size: 13px;
+      font-weight: 800;
+      color: #0d1b14;
+      background: var(--green);
+    }
+    .verdict.warn { color: #1f1605; background: var(--yellow); }
+
+    .compare-strip {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(160px, 1fr));
+      gap: 10px;
+    }
+    .idea {
+      border: 1px solid var(--line-soft);
+      border-radius: 10px;
+      background: #0b121c;
+      padding: 14px;
+      min-height: 150px;
+    }
+    .idea b { display: block; margin-bottom: 7px; }
+    .idea p { margin: 0; color: var(--muted); }
+
+    .side {
+      display: grid;
+      gap: 12px;
+    }
+    .side-card {
+      padding: 16px;
+    }
+    .side-card p { color: var(--muted); margin: 8px 0 0; }
+    .legend {
+      display: grid;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .legend-row {
+      display: grid;
+      grid-template-columns: 82px 1fr;
+      gap: 8px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .bar {
+      height: 8px;
+      border-radius: 99px;
+      background: #222d3d;
+      overflow: hidden;
+    }
+    .bar span {
+      display: block;
+      height: 100%;
+      width: var(--w);
+      background: linear-gradient(90deg, var(--cyan), var(--green));
+    }
+
+    .source-list {
+      display: grid;
+      gap: 8px;
+      margin: 0;
+      padding-left: 20px;
+      color: var(--muted);
+    }
+    .source-list li { padding-left: 4px; }
+
+    .empty {
+      display: none;
+      color: var(--muted);
+      border: 1px dashed #32435a;
+      border-radius: 10px;
+      padding: 18px;
+      background: #0b121c;
+    }
+
+    @media (max-width: 1380px) {
+      .layout { grid-template-columns: 220px minmax(0, 1fr); }
+      .side { position: static; grid-column: 1 / -1; grid-template-columns: repeat(3, 1fr); }
+      .hero-grid { grid-template-columns: repeat(3, 1fr); }
+      .cards { grid-template-columns: repeat(2, minmax(260px, 1fr)); }
+      .compare-strip { grid-template-columns: repeat(3, 1fr); }
+    }
+
+    @media (max-width: 920px) {
+      .page { width: min(100% - 20px, 760px); padding-top: 10px; }
+      .hero { padding: 20px; }
+      .layout { display: block; }
+      .rail { position: static; margin-bottom: 12px; }
+      .nav { grid-template-columns: repeat(2, 1fr); }
+      .side { display: grid; grid-template-columns: 1fr; margin-top: 12px; }
+      .hero-grid,
+      .summary-grid,
+      .chart-grid,
+      .cards,
+      .decision-grid,
+      .compare-strip {
+        grid-template-columns: 1fr;
+      }
+      .controls { grid-template-columns: 1fr; }
+      .section { padding: 16px; }
+      .section-head { display: block; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="hero" id="top">
+      <div class="eyebrow"><span class="dot"></span> Обзор тулов из research-проектов и Mothership</div>
+      <h1>Что умеют разные агентские инструменты и что уже есть у нас</h1>
+      <p>
+        Это не техническая спецификация. Это карта для сравнения: какие действия агент может делать,
+        где инструменты сильнее, где опаснее, что стоит перенять, а что лучше оставить за пределами списка тулов.
+      </p>
+      <div class="hero-grid">
+        <div class="fact"><strong>10</strong><span>инструментариев в сравнении, включая Mothership</span></div>
+        <div class="fact"><strong>6</strong><span>базовых тулов сейчас видит модель в Mothership</span></div>
+        <div class="fact"><strong>0</strong><span><code>audio_transcribe</code> не должен быть агентской тулой</span></div>
+        <div class="fact"><strong>1</strong><span><code>auto_safe</code> — режим безопасности, не отдельный инструмент</span></div>
+        <div class="fact"><strong>wide</strong><span>макет рассчитан на ultra wide: слева навигация, центр таблица, справа выводы</span></div>
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="rail">
+        <h2>Разделы</h2>
+        <nav class="nav">
+          <a href="#summary">Коротко <small>вывод</small></a>
+          <a href="#map">Карта <small>оценки</small></a>
+          <a href="#matrix">Матрица <small>сравнение</small></a>
+          <a href="#cards">Проекты <small>карточки</small></a>
+          <a href="#ours">У нас <small>Mothership</small></a>
+          <a href="#decisions">Спорное <small>решения</small></a>
+          <a href="#ideas">Забрать <small>идеи</small></a>
+          <a href="#sources">Источники <small>UX и код</small></a>
+        </nav>
+        <h2 style="margin-top:18px">Фильтр</h2>
+        <div class="nav" id="groupFilters"></div>
+      </aside>
+
+      <main class="main">
+        <section class="section" id="summary">
+          <div class="section-head">
+            <div>
+              <h2>Короткий вывод</h2>
+              <p class="lead">У сильных coding-агентов почти всегда один и тот же фундамент: команды, файлы, поиск, правки и защита.</p>
+            </div>
+          </div>
+          <div class="summary-grid">
+            <article class="take">
+              <b>База у всех похожая</b>
+              <p>Почти везде есть “запусти команду”, “прочитай файл”, “измени файл”, “найди по проекту”. Отличаются не названия, а удобство, безопасность и качество правок.</p>
+            </article>
+            <article class="take">
+              <b>Большой каталог не всегда лучше</b>
+              <p>У CodeWhale и Hermes очень много действий. Это мощно, но обычному пользователю сложнее понять, что происходит и почему агент выбрал именно это.</p>
+            </article>
+            <article class="take">
+              <b>Mothership сейчас намеренно компактный</b>
+              <p>У нас меньше тулов, зато проще объяснить поведение, легче проверять безопасность и проще строить правильный UI для истории действий.</p>
+            </article>
+            <article class="take">
+              <b>Голос — это ввод, не действие агента</b>
+              <p>Диктовка промпта должна превращаться в текст до отправки агенту. Модель не должна видеть <code>audio_transcribe</code> как действие.</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="section" id="map">
+          <div class="section-head">
+            <div>
+              <h2>Карта возможностей</h2>
+              <p class="lead">Шкалы не про качество кода внутри. Это простая оценка того, насколько широко закрыта потребность пользователя.</p>
+            </div>
+          </div>
+          <div class="chart-grid">
+            <div class="chart-card">
+              <h3>Общая ширина инструментария</h3>
+              <div class="chart-wrap"><canvas id="coverageChart"></canvas></div>
+            </div>
+            <div class="chart-card">
+              <h3>Средний профиль по группам</h3>
+              <div class="chart-wrap"><canvas id="profileChart"></canvas></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="section" id="matrix">
+          <div class="section-head">
+            <div>
+              <h2>Большая матрица</h2>
+              <p class="lead">Левая колонка закреплена, чтобы на ultra wide можно было спокойно прокручивать детали вправо.</p>
+            </div>
+          </div>
+          <div class="controls">
+            <input class="search" id="search" type="search" placeholder="Поиск: например голос, файлы, субагенты, безопасность, web..." />
+            <div class="chips">
+              <span class="chip"><span class="dot" style="background:var(--green)"></span> 5 = сильно</span>
+              <span class="chip"><span class="dot" style="background:var(--yellow)"></span> 3 = есть, но не главное</span>
+              <span class="chip"><span class="dot" style="background:var(--red)"></span> 0-1 = почти нет</span>
+            </div>
+          </div>
+          <div class="matrix-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Инструментарий</th>
+                  <th>Команды</th>
+                  <th>Файлы</th>
+                  <th>Поиск</th>
+                  <th>Правки</th>
+                  <th>Субагенты</th>
+                  <th>Интернет</th>
+                  <th>Медиа и голос</th>
+                  <th>Защита</th>
+                  <th>Главное отличие</th>
+                </tr>
+              </thead>
+              <tbody id="matrixBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="section" id="cards">
+          <div class="section-head">
+            <div>
+              <h2>Проекты простым языком</h2>
+              <p class="lead">Карточки показывают не все внутренности, а то, что важно при выборе продукта и при проектировании Mothership.</p>
+            </div>
+          </div>
+          <div class="empty" id="emptyState">Ничего не найдено по фильтру.</div>
+          <div class="cards" id="cardsGrid"></div>
+        </section>
+
+        <section class="section" id="ours">
+          <div class="section-head">
+            <div>
+              <h2>Что есть у нас в Mothership</h2>
+              <p class="lead">Сейчас модель видит компактный набор. Это хорошо для контроля, но расширять его нужно аккуратно, через понятные пользовательские сценарии.</p>
+            </div>
+          </div>
+          <div class="decision-grid">
+            <article class="decision">
+              <h3><code>run_command</code></h3>
+              <p>Запускает локальные команды под присмотром Mothership: тесты, сборку, git, диагностику проекта.</p>
+              <span class="verdict">оставить ядром</span>
+            </article>
+            <article class="decision">
+              <h3><code>read_file</code>, <code>write_file</code>, <code>edit_file</code></h3>
+              <p>Отдельные понятные действия для файлов: прочитать, создать или точечно поменять.</p>
+              <span class="verdict">понятно для UI</span>
+            </article>
+            <article class="decision">
+              <h3><code>apply_patch</code></h3>
+              <p>Нужен для сложных изменений сразу в нескольких файлах. Пользователю лучше показывать это как “пакет правок”.</p>
+              <span class="verdict">важно для серьезных задач</span>
+            </article>
+            <article class="decision">
+              <h3><code>search_text</code></h3>
+              <p>Ищет текст по проекту. Для обычного пользователя это “найти места в коде”, а не отдельный технический режим.</p>
+              <span class="verdict">оставить</span>
+            </article>
+            <article class="decision">
+              <h3><code>image_generate</code></h3>
+              <p>Появляется только если есть провайдер генерации изображений. Это не обязательная coding-база.</p>
+              <span class="verdict warn">дополнительная возможность</span>
+            </article>
+            <article class="decision">
+              <h3>Чего нет в базовом списке</h3>
+              <p><code>list_files</code> не выдается модели как новый инструмент, <code>audio_transcribe</code> тоже не выдается. Это совпадает с нужной логикой.</p>
+              <span class="verdict">логика верная</span>
+            </article>
+          </div>
+        </section>
+
+        <section class="section" id="decisions">
+          <div class="section-head">
+            <div>
+              <h2>Спорные вещи и решение</h2>
+              <p class="lead">Здесь проверка логики по тем местам, которые легко перепутать в продукте.</p>
+            </div>
+          </div>
+          <div class="decision-grid">
+            <article class="decision">
+              <h3><code>audio_transcribe</code></h3>
+              <p>Это не то, что агент “делает”. Это способ для человека надиктовать сообщение. Правильное место — поле ввода, микрофон, обработка до отправки промпта.</p>
+              <span class="verdict">не делать тулой</span>
+            </article>
+            <article class="decision">
+              <h3><code>auto_safe</code></h3>
+              <p>Это режим защиты: обычное можно пропускать, очень опасное тормозить или спрашивать. В интерфейсе это настройка поведения, а не кнопка и не тул.</p>
+              <span class="verdict">режим, не инструмент</span>
+            </article>
+            <article class="decision">
+              <h3><code>list_files</code></h3>
+              <p>В других проектах чаще встречается не ровно <code>list_files</code>, а <code>Glob</code>, <code>glob</code>, <code>list_dir</code>, чтение папки или команда оболочки. Отдельная тула не обязательна.</p>
+              <span class="verdict warn">можно не показывать модели</span>
+            </article>
+          </div>
+        </section>
+
+        <section class="section" id="ideas">
+          <div class="section-head">
+            <div>
+              <h2>Что стоит забрать в Mothership</h2>
+              <p class="lead">Не копировать каталоги целиком, а брать понятные продуктовые идеи.</p>
+            </div>
+          </div>
+          <div class="compare-strip">
+            <article class="idea"><b>Из OpenCode</b><p>Более умные точечные правки и хорошая подсветка ошибок после изменения.</p></article>
+            <article class="idea"><b>Из Codex</b><p>Единый путь: запрос разрешения, безопасный запуск, понятный результат.</p></article>
+            <article class="idea"><b>Из Hermes</b><p>Жесткая граница для секретов: агент не должен видеть токены и ключи напрямую.</p></article>
+            <article class="idea"><b>Из CodeWhale</b><p>Умная работа с огромным выводом: не засорять чат, а давать краткое превью и ссылку.</p></article>
+            <article class="idea"><b>Из NanoClaw</b><p>“Системное действие”: агент просит, а привилегированный хост выполняет только после проверки.</p></article>
+            <article class="idea"><b>Из Pi-agents</b><p>Граф работ: несколько агентов, fork/join, бюджет, понятный результат команды.</p></article>
+          </div>
+        </section>
+
+        <section class="section" id="sources">
+          <div class="section-head">
+            <div>
+              <h2>Источники и как сделана страница</h2>
+              <p class="lead">Для удобства применены базовые правила хороших comparison-доков: фиксированная первая колонка, фильтры, короткие карточки, подсветка отличий и разделение “сводка / детали”.</p>
+            </div>
+          </div>
+          <ul class="source-list">
+            <li><a href="https://www.nngroup.com/articles/comparison-tables/">NN/g: Comparison Tables for Products, Services, and Features</a> — почему таблицы сравнения помогают принимать решение.</li>
+            <li><a href="https://baymard.com/ecommerce-design-examples/39-comparison-tool">Baymard: Comparison Tool examples</a> — как показывать сравнение товаров и функций без перегруза.</li>
+            <li><a href="https://www.pencilandpaper.io/articles/ux-pattern-analysis-enterprise-data-tables">Pencil & Paper: Enterprise Data Tables</a> — sticky columns, широкие таблицы, сканирование больших наборов.</li>
+            <li><a href="https://blog.logrocket.com/ux-design/ui-design-comparison-features/">LogRocket: Feature comparison tables</a> — как выбирать признаки сравнения под аудиторию.</li>
+            <li>Локальные research-отчеты: <code>projects-to-research/tool-analysis/*.md</code>, README Kimi Code и текущий каталог Mothership <code>crates/mothership-core/src/tools/catalog.rs</code>.</li>
+          </ul>
+        </section>
+      </main>
+
+      <aside class="side">
+        <div class="side-card">
+          <h2>Как читать</h2>
+          <p>5 точек — сильная сторона. 3 — есть, но не главная фишка. 0-1 — почти нет или не обнаружено.</p>
+          <div class="legend">
+            <div class="legend-row"><span>Сильно</span><div class="bar"><span style="--w:100%"></span></div></div>
+            <div class="legend-row"><span>Средне</span><div class="bar"><span style="--w:60%"></span></div></div>
+            <div class="legend-row"><span>Слабо</span><div class="bar"><span style="--w:20%"></span></div></div>
+          </div>
+        </div>
+        <div class="side-card">
+          <h2>Главное для нас</h2>
+          <p>Не надо выигрывать количеством тулов. Нужно, чтобы человек понимал: что агент хочет сделать, зачем, насколько это опасно и как отменить.</p>
+        </div>
+        <div class="side-card">
+          <h2>Логическая проверка</h2>
+          <p><code>audio_transcribe</code> — ввод. <code>auto_safe</code> — режим. <code>list_files</code> — не обязательная отдельная тула. В текущем каталоге Mothership это в целом соблюдено.</p>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script>
+    const groups = [
+      ["all", "Все", "10"],
+      ["ours", "Mothership", "1"],
+      ["coding", "Coding-агенты", "5"],
+      ["assistant", "Ассистенты", "3"],
+      ["orchestrator", "Оркестраторы", "1"]
+    ];
+
+    const categories = [
+      ["commands", "Команды"],
+      ["files", "Файлы"],
+      ["search", "Поиск"],
+      ["edits", "Правки"],
+      ["agents", "Субагенты"],
+      ["web", "Интернет"],
+      ["media", "Медиа"],
+      ["safety", "Защита"]
+    ];
+
+    const projects = [
+      {
+        name: "Mothership",
+        group: "ours",
+        kind: "наш продукт",
+        confidence: "проверено",
+        accent: "#69d6a4",
+        scores: { commands: 4, files: 4, search: 3, edits: 4, agents: 1, web: 0, media: 2, safety: 4 },
+        tools: ["run_command", "read_file", "write_file", "edit_file", "apply_patch", "search_text", "image_generate"],
+        simple: "Компактный набор для локального coding-агента: команды, файлы, поиск и правки под контролем приложения.",
+        pros: ["Понятно объяснять пользователю", "Проще держать безопасность", "Хорошая база для UI истории действий"],
+        cons: ["Пока меньше ассистентских интеграций", "Нет богатой системы субагентов в базовом каталоге"],
+        difference: "Меньше шума, больше контроля."
+      },
+      {
+        name: "Claude Code",
+        group: "coding",
+        kind: "coding-агент",
+        confidence: "проверено",
+        accent: "#78a9ff",
+        scores: { commands: 5, files: 5, search: 5, edits: 4, agents: 5, web: 4, media: 3, safety: 4 },
+        tools: ["Bash", "PowerShell", "Read", "Write", "Edit", "Glob", "Grep", "Task", "Todo", "MCP", "Skills"],
+        simple: "Очень широкий рабочий набор: может читать и менять проект, искать, запускать команды и отдавать часть работы субагентам.",
+        pros: ["Сильный универсальный набор", "Хорошие субагенты", "Много расширений через skills и MCP"],
+        cons: ["Каталог большой и сложный", "Часть логики сильно привязана к собственному интерфейсу"],
+        difference: "Максимально широкий набор для ежедневного coding-workflow."
+      },
+      {
+        name: "Codex",
+        group: "coding",
+        kind: "coding-агент",
+        confidence: "проверено",
+        accent: "#54c6d7",
+        scores: { commands: 5, files: 3, search: 4, edits: 5, agents: 4, web: 5, media: 3, safety: 5 },
+        tools: ["exec_command", "write_stdin", "apply_patch", "update_plan", "subagents", "tool_search", "web", "image_gen"],
+        simple: "Сильный оркестратор действий: умеет запускать команды, вести долгие процессы, править патчами и подключать дополнительные инструменты.",
+        pros: ["Очень сильная модель разрешений и запусков", "Хорош для ревью и длинных задач", "Умеет расширяться без постоянного показа всех тулов"],
+        cons: ["Файловые операции часто идут через команды или патчи", "Часть возможностей зависит от окружения"],
+        difference: "Лучший ориентир для безопасного выполнения команд и патчей."
+      },
+      {
+        name: "OpenCode",
+        group: "coding",
+        kind: "coding-агент",
+        confidence: "проверено",
+        accent: "#b99bff",
+        scores: { commands: 4, files: 5, search: 5, edits: 5, agents: 4, web: 4, media: 1, safety: 4 },
+        tools: ["read", "write", "edit", "apply_patch", "glob", "grep", "lsp", "task", "webfetch", "websearch", "skill"],
+        simple: "Сильный инструмент именно для кода: хорошо ищет, правит, понимает ошибки редактора и умеет запускать дочерние задачи.",
+        pros: ["Очень сильные точечные правки", "Хорошая связь с диагностикой кода", "Понятная модель субзадач"],
+        cons: ["Сильно заточен под coding", "Меньше ассистентских и медиа-сценариев"],
+        difference: "Лучший референс для качественного edit-file поведения."
+      },
+      {
+        name: "CodeWhale / DeepSeek-TUI",
+        group: "coding",
+        kind: "coding-агент",
+        confidence: "частично проверено",
+        accent: "#edc863",
+        scores: { commands: 5, files: 5, search: 4, edits: 5, agents: 4, web: 4, media: 3, safety: 4 },
+        tools: ["exec_shell", "read_file", "write_file", "edit_file", "list_dir", "apply_patch", "grep_files", "git", "web", "todo", "automation", "subagents"],
+        simple: "Большой комбайн: не только код, но и git, web, задачи, автоматизации, большие выводы и свои рабочие режимы.",
+        pros: ["Очень широкий каталог", "Есть list_dir вместо list_files", "Много идей для больших задач и фона"],
+        cons: ["Сложнее объяснять обычному пользователю", "Часть старого отчета была сделана по неполному checkout"],
+        difference: "Много возможностей для power-user, но высок риск перегруза."
+      },
+      {
+        name: "Kimi Code",
+        group: "coding",
+        kind: "coding-агент",
+        confidence: "частично проверено",
+        accent: "#ffb16c",
+        scores: { commands: 4, files: 4, search: 4, edits: 4, agents: 4, web: 3, media: 4, safety: 3 },
+        tools: ["read/edit code", "shell commands", "search files", "fetch web pages", "video input", "MCP", "plugins", "subagents", "hooks"],
+        simple: "Терминальный coding-агент с акцентом на быстрый TUI, плагины, MCP, видео-ввод и встроенных субагентов.",
+        pros: ["Хорошо упакован для обычного запуска", "Есть видео-ввод", "Есть плагины и субагенты"],
+        cons: ["В локальных отчетах нет полного списка внутренних тулов", "Нужно отдельно разбирать реализацию, если брать идеи в код"],
+        difference: "Интересен как продуктовая упаковка: видео, marketplace, hooks, ACP."
+      },
+      {
+        name: "Hermes",
+        group: "assistant",
+        kind: "универсальный ассистент",
+        confidence: "проверено",
+        accent: "#69d6a4",
+        scores: { commands: 4, files: 5, search: 4, edits: 5, agents: 5, web: 5, media: 5, safety: 5 },
+        tools: ["file tools", "terminal", "browser", "computer use", "delegate_task", "memory", "todo", "kanban", "cron", "image", "video", "voice", "MCP"],
+        simple: "Ассистент на все случаи: код, браузер, компьютер, память, расписание, медиа, голос и делегирование.",
+        pros: ["Очень сильная защита секретов", "Много медиа и ассистентских возможностей", "Хорошая идея управляемых внешних сервисов"],
+        cons: ["Каталог огромный", "Для Mothership нельзя брать все сразу без жесткого разделения ролей"],
+        difference: "Лучший референс для защиты секретов и медиа-слоя."
+      },
+      {
+        name: "OpenClaw",
+        group: "assistant",
+        kind: "персональный ассистент",
+        confidence: "проверено",
+        accent: "#78a9ff",
+        scores: { commands: 3, files: 3, search: 2, edits: 2, agents: 4, web: 5, media: 5, safety: 4 },
+        tools: ["message", "sessions", "spawn", "cron", "gateway", "media", "web_search", "web_fetch", "nodes", "dir_list"],
+        simple: "Больше похож на живого ассистента в каналах: сообщения, сессии, медиа, фоновые задания и связь с устройствами.",
+        pros: ["Сильные сценарии общения и медиа", "Есть web и защита от опасных fetch", "Хорошая идея gateway-администрирования"],
+        cons: ["Не лучший референс для чистого coding-core", "Файловая часть вторична"],
+        difference: "Сильнее в каналах, сессиях и медиа, чем в кодовых правках."
+      },
+      {
+        name: "NanoClaw",
+        group: "assistant",
+        kind: "оркестратор ассистентов",
+        confidence: "проверено",
+        accent: "#54c6d7",
+        scores: { commands: 3, files: 3, search: 3, edits: 3, agents: 5, web: 3, media: 2, safety: 5 },
+        tools: ["send_message", "ask_user_question", "schedule_task", "install_packages", "add_mcp_server", "create_agent"],
+        simple: "Система, где агент может попросить хост изменить свою среду, поставить пакет, добавить MCP или создать другого агента.",
+        pros: ["Отличное разделение просьбы агента и действия хоста", "Сильная модель approval для self-mod", "Хорошо для долгоживущих агентов"],
+        cons: ["Завязано на контейнерную модель", "Не надо переносить Docker-подход напрямую"],
+        difference: "Лучший паттерн “агент просит, хост решает и выполняет”."
+      },
+      {
+        name: "Pi-agents",
+        group: "orchestrator",
+        kind: "оркестратор",
+        confidence: "проверено",
+        accent: "#b99bff",
+        scores: { commands: 1, files: 1, search: 1, edits: 1, agents: 5, web: 0, media: 0, safety: 2 },
+        tools: ["agent", "workflow"],
+        simple: "Почти не про файлы и команды. Это слой, который запускает агентов и собирает их в workflow.",
+        pros: ["Очень чистая идея workflow-графа", "Хорошо для fork/join и распределенной работы", "Мало лишнего"],
+        cons: ["Сам по себе не закрывает coding-tools", "Без хостового агента почти ничего не делает"],
+        difference: "Не набор инструментов, а диспетчер команды агентов."
+      }
+    ];
+
+    const groupLabel = {
+      all: "Все",
+      ours: "Mothership",
+      coding: "Coding-агенты",
+      assistant: "Ассистенты",
+      orchestrator: "Оркестраторы"
+    };
+
+    let activeGroup = "all";
+    let query = "";
+
+    const byId = (id) => document.getElementById(id);
+    const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#039;"
+    })[char]);
+
+    function scoreDots(value) {
+      const dots = Array.from({ length: 5 }, (_, index) => `<i class="${index < value ? "on" : ""}"></i>`).join("");
+      return `<span class="score">${dots}</span>`;
+    }
+
+    function projectMatches(project) {
+      const groupOk = activeGroup === "all" || project.group === activeGroup;
+      const haystack = [
+        project.name,
+        project.kind,
+        project.simple,
+        project.difference,
+        project.tools.join(" "),
+        project.pros.join(" "),
+        project.cons.join(" ")
+      ].join(" ").toLowerCase();
+      return groupOk && haystack.includes(query);
+    }
+
+    function visibleProjects() {
+      return projects.filter(projectMatches);
+    }
+
+    function renderFilters() {
+      byId("groupFilters").innerHTML = groups.map(([id, label, count]) => `
+        <button class="filter-btn ${activeGroup === id ? "active" : ""}" data-group="${id}">
+          <span>${label}</span><small>${count}</small>
+        </button>
+      `).join("");
+    }
+
+    function renderMatrix() {
+      const rows = visibleProjects().map((project) => `
+        <tr>
+          <td class="project-cell">
+            <b>${escapeHtml(project.name)}</b>
+            <span>${escapeHtml(project.kind)} · ${escapeHtml(project.confidence)}</span>
+          </td>
+          <td>${scoreDots(project.scores.commands)}<br><small>${explainScore(project.scores.commands, "команд")}</small></td>
+          <td>${scoreDots(project.scores.files)}<br><small>${explainScore(project.scores.files, "файлов")}</small></td>
+          <td>${scoreDots(project.scores.search)}<br><small>${explainScore(project.scores.search, "поиска")}</small></td>
+          <td>${scoreDots(project.scores.edits)}<br><small>${explainScore(project.scores.edits, "правок")}</small></td>
+          <td>${scoreDots(project.scores.agents)}<br><small>${explainScore(project.scores.agents, "субагентов")}</small></td>
+          <td>${scoreDots(project.scores.web)}<br><small>${explainScore(project.scores.web, "web")}</small></td>
+          <td>${scoreDots(project.scores.media)}<br><small>${explainScore(project.scores.media, "медиа")}</small></td>
+          <td>${scoreDots(project.scores.safety)}<br><small>${explainScore(project.scores.safety, "защиты")}</small></td>
+          <td class="plain">${escapeHtml(project.difference)}</td>
+        </tr>
+      `).join("");
+      byId("matrixBody").innerHTML = rows;
+    }
+
+    function explainScore(value, noun) {
+      if (value >= 5) return `сильная зона ${noun}`;
+      if (value >= 4) return `хорошо закрыто`;
+      if (value >= 3) return `есть в рабочем виде`;
+      if (value >= 2) return `есть частично`;
+      if (value >= 1) return `почти не фокус`;
+      return `не видно`;
+    }
+
+    function renderCards() {
+      const visible = visibleProjects();
+      byId("emptyState").style.display = visible.length ? "none" : "block";
+      byId("cardsGrid").innerHTML = visible.map((project) => `
+        <article class="tool-card" style="--accent:${project.accent}">
+          <div class="card-title">
+            <h3>${escapeHtml(project.name)}</h3>
+            <span class="badge ${project.group === "ours" ? "ours" : ""}">${escapeHtml(groupLabel[project.group])}</span>
+          </div>
+          <p class="card-text">${escapeHtml(project.simple)}</p>
+          <div>
+            <div class="mini-title">Основные действия</div>
+            <div class="tool-row">${project.tools.map((tool) => `<span class="tool-pill">${escapeHtml(tool)}</span>`).join("")}</div>
+          </div>
+          <div>
+            <div class="mini-title">Плюсы</div>
+            <ul class="list pro">${project.pros.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+          </div>
+          <div>
+            <div class="mini-title">Минусы</div>
+            <ul class="list con">${project.cons.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+          </div>
+        </article>
+      `).join("");
+    }
+
+    let coverageChart;
+    let profileChart;
+
+    function average(project) {
+      const values = Object.values(project.scores);
+      return Math.round(values.reduce((sum, value) => sum + value, 0) / values.length * 10) / 10;
+    }
+
+    function renderCharts() {
+      if (!window.Chart) {
+        return;
+      }
+
+      const visible = visibleProjects();
+      const labels = visible.map((project) => project.name);
+      const data = visible.map(average);
+      const colors = visible.map((project) => project.accent);
+
+      if (coverageChart) coverageChart.destroy();
+      coverageChart = new Chart(byId("coverageChart"), {
+        type: "bar",
+        data: {
+          labels,
+          datasets: [{
+            label: "ширина набора",
+            data,
+            backgroundColor: colors.map((color) => color + "cc"),
+            borderColor: colors,
+            borderWidth: 1,
+            borderRadius: 6
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: false },
+            tooltip: { callbacks: { label: (ctx) => ` ${ctx.raw} из 5` } }
+          },
+          scales: {
+            x: {
+              ticks: { color: "#9aa8b8", maxRotation: 30, minRotation: 0 },
+              grid: { display: false }
+            },
+            y: {
+              suggestedMin: 0,
+              suggestedMax: 5,
+              ticks: { color: "#9aa8b8", stepSize: 1 },
+              grid: { color: "#1d2a3b" }
+            }
+          }
+        }
+      });
+
+      const profile = categories.map(([key]) => {
+        if (!visible.length) return 0;
+        return Math.round(visible.reduce((sum, project) => sum + project.scores[key], 0) / visible.length * 10) / 10;
+      });
+
+      if (profileChart) profileChart.destroy();
+      profileChart = new Chart(byId("profileChart"), {
+        type: "radar",
+        data: {
+          labels: categories.map(([, label]) => label),
+          datasets: [{
+            label: "профиль",
+            data: profile,
+            backgroundColor: "rgba(84, 198, 215, .18)",
+            borderColor: "#54c6d7",
+            pointBackgroundColor: "#69d6a4",
+            pointBorderColor: "#69d6a4"
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            r: {
+              min: 0,
+              max: 5,
+              ticks: { display: false, stepSize: 1 },
+              grid: { color: "#253348" },
+              angleLines: { color: "#253348" },
+              pointLabels: { color: "#aebbd0", font: { size: 12 } }
+            }
+          }
+        }
+      });
+    }
+
+    function renderAll() {
+      renderFilters();
+      renderMatrix();
+      renderCards();
+      renderCharts();
+    }
+
+    document.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-group]");
+      if (!button) return;
+      activeGroup = button.dataset.group;
+      renderAll();
+    });
+
+    byId("search").addEventListener("input", (event) => {
+      query = event.target.value.trim().toLowerCase();
+      renderAll();
+    });
+
+    renderAll();
+  </script>
+</body>
+</html>

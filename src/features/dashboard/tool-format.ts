@@ -1,20 +1,14 @@
 import type { ToolExecutionEventKind } from "../../shared/api/mothership";
+import { commandPresentation } from "../../shared/toolCommandPresentation";
 import type { ToolExecutionView } from "./types";
 
 export function formatToolCommand(tool: ToolExecutionView): string {
-  if (tool.command) {
-    return [tool.command.program, ...(tool.command.args ?? [])].join(" ");
-  }
-  const program = toolProgram(tool);
-  if (!program) {
-    return "";
-  }
-  return [program, ...toolPayloadArgs(tool)].join(" ").trim();
+  return commandPresentation(tool).commandLine;
 }
 
 export function formatToolHeadline(tool: ToolExecutionView) {
   if (tool.toolKind === "run_command" || tool.command) {
-    return formatToolCommand(tool) || "Ran command";
+    return commandPresentation(tool).headline;
   }
 
   const path = toolPath(tool);
@@ -27,14 +21,10 @@ export function formatToolHeadline(tool: ToolExecutionView) {
       return path ? `Edited ${path}` : "Edited file";
     case "apply_patch":
       return "Applied patch";
-    case "list_files":
-      return "Listed files";
     case "search_text":
       return "Searched";
     case "image_generate":
       return "Generated image";
-    case "audio_transcribe":
-      return "Transcribed audio";
     default:
       return "Used tool";
   }
@@ -124,21 +114,6 @@ export function toolTone(kind: ToolExecutionEventKind) {
     return "pending";
   }
   return "running";
-}
-
-function toolProgram(tool: ToolExecutionView): string | undefined {
-  if (tool.command?.program) {
-    return tool.command.program;
-  }
-  const program = tool.payload?.["program"];
-  return typeof program === "string" && program ? program : undefined;
-}
-
-function toolPayloadArgs(tool: ToolExecutionView): string[] {
-  const args = tool.payload?.["args"];
-  return Array.isArray(args)
-    ? args.filter((arg): arg is string => typeof arg === "string")
-    : [];
 }
 
 function toolPath(tool: ToolExecutionView): string | undefined {

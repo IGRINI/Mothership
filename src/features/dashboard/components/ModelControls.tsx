@@ -41,8 +41,7 @@ const TOOL_APPROVAL_MODE_OPTIONS: Array<{
   {
     mode: "auto_safe",
     label: "Auto",
-    title:
-      "Auto-run ordinary future approval checks; keep prompts for dangerous commands.",
+    title: "Auto-run ordinary actions; ask before destructive commands or escalation.",
   },
   {
     mode: "yolo",

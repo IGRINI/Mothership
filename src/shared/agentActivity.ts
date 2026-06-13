@@ -28,6 +28,7 @@ import type {
 } from "./api/mothership";
 import type { JsonValue } from "./api/generated/serde_json/JsonValue";
 import { rememberChat } from "./session";
+import { commandPresentation } from "./toolCommandPresentation";
 
 export interface ActiveAgent {
   runId: string;
@@ -77,16 +78,13 @@ const WRITING = "Writing";
 const WORKING = "Working";
 const NEEDS_APPROVAL = "Needs approval";
 
-const TOOL_LABELS: Record<ToolKind, string> = {
-  run_command: "Running command",
+const TOOL_LABELS: Partial<Record<ToolKind, string>> = {
   read_file: "Reading file",
   write_file: "Writing file",
   edit_file: "Editing file",
   apply_patch: "Applying patch",
-  list_files: "Listing files",
   search_text: "Searching code",
   image_generate: "Generating image",
-  audio_transcribe: "Transcribing audio",
 };
 
 interface ToolState {
@@ -444,11 +442,23 @@ function toolPresentation(
   previous?: ToolState,
 ): { label: string; detail?: string } {
   const kind = event.toolKind ?? undefined;
+  if (kind === "run_command" || event.command) {
+    const command = commandPresentation({
+      command: event.command,
+      payload: payloadRecord(event.payload),
+      result: event.result,
+      output: event.chunk,
+    });
+    const detail = command.target ?? command.commandLine;
+    return {
+      label: command.activityLabel,
+      detail: detail ? truncate(detail, 72) : previous?.detail,
+    };
+  }
+
   const label = kind
     ? TOOL_LABELS[kind] ?? "Running tool"
-    : event.command
-      ? TOOL_LABELS.run_command
-      : previous?.label ?? "Running tool";
+    : previous?.label ?? "Running tool";
 
   let detail: string | undefined;
   if (event.command) {
@@ -479,6 +489,14 @@ function payloadString(
     }
   }
   return undefined;
+}
+
+function payloadRecord(
+  payload: JsonValue | null | undefined,
+): Record<string, unknown> | null {
+  return payload && typeof payload === "object" && !Array.isArray(payload)
+    ? (payload as Record<string, unknown>)
+    : null;
 }
 
 // --- Agent lifecycle ----------------------------------------------------------

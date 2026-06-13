@@ -1,29 +1,26 @@
-//! Typed handlers for the two first-class, read-only search tools: `list_files`
-//! and `search_text`.
+//! Typed handler for the first-class, read-only `search_text` tool.
 //!
-//! Both walk the project tree with the ripgrep [`ignore`] walker so they honor
-//! `.gitignore`/`.ignore`/hidden filters by default (and can surface ignored
+//! The handler walks the project tree with the ripgrep [`ignore`] walker so it honors
+//! `.gitignore`/`.ignore`/hidden filters by default (and can search ignored
 //! entries on request via `includeIgnored`). A broad walk always skips
 //! [`Workspace::is_sensitive`] entries — even with `includeIgnored:true` — so a
-//! credential file is never listed or grepped incidentally; only a walk whose
+//! credential file is never searched incidentally; only a walk whose
 //! ROOT is itself a sensitive path (an explicitly targeted, policy-gated read:
 //! `Ask` in manual mode, allowed in auto_safe/yolo) surfaces the entries
 //! beneath it. Symlinks are never followed (`follow_links(false)`), so the walk
 //! cannot escape the workspace.
 //!
-//! Like the file tools, these handlers never call `std::fs` for byte IO of file
+//! Like the file tools, the handler never calls `std::fs` for byte IO of file
 //! contents: `search_text` reads each candidate through the injected
 //! [`FileSystem`] port. (The directory *walk* itself uses the [`ignore`] walker,
 //! which reads directory entries directly off the real filesystem — the same way
 //! `run_command` shells out to the real fs — but it is fully contained to the
 //! resolved, workspace-checked walk root and never follows a symlink out.)
 //!
-//! Both tools are pure reads inside the workspace: [`classify_list_files`] /
-//! [`classify_search_text`] report [`ToolPermissionAction::Allow`] within the
-//! workspace, `Ask` for a sensitive `dir` (the per-chat approval mode decides),
-//! and `Deny` for a `dir` that escapes the workspace.
-
-#![allow(dead_code)]
+//! The tool is a pure read inside the workspace: [`classify_search_text`]
+//! reports [`ToolPermissionAction::Allow`] within the workspace, `Ask` for a
+//! sensitive `dir` (the per-chat approval mode decides), and `Deny` for a `dir`
+//! that escapes the workspace.
 
 use std::path::{Path, PathBuf};
 
@@ -37,17 +34,12 @@ use super::file_tools::{FileToolCapability, FileToolError, FileToolOutcome, File
 use super::filesystem::{FileSystem, PathError, Workspace};
 use super::permissions::ToolPermissionAction;
 
-/// Default cap on how many entries `list_files` returns before reporting
-/// `truncated`. Keeps a huge tree from flooding the model context.
-const DEFAULT_LIST_LIMIT: usize = 1000;
-
 /// Default cap on how many matches `search_text` returns before reporting
 /// `truncated`.
 const DEFAULT_MAX_MATCHES: usize = 200;
 
 /// Hard ceiling on per-call results regardless of the caller's requested limit,
 /// so a request for a very large limit cannot allocate unbounded results.
-const MAX_LIST_LIMIT: usize = 50_000;
 const MAX_SEARCH_MATCHES: usize = 10_000;
 
 /// Per-file byte ceiling for `search_text` reads (mirrors `read_file`'s raw read
@@ -77,19 +69,6 @@ const BINARY_SNIFF_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ListFilesInput {
-    #[serde(default)]
-    pub glob: Option<String>,
-    #[serde(default)]
-    pub dir: Option<String>,
-    #[serde(default)]
-    pub limit: Option<usize>,
-    #[serde(default)]
-    pub include_ignored: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchTextInput {
     pub pattern: String,
     #[serde(default)]
@@ -110,34 +89,7 @@ pub struct SearchTextInput {
 // Capability classification (intent → allow/deny)
 // ===========================================================================
 
-/// Classify `list_files` into a read [`FileToolCapability`]. The walk root
-/// (`dir`, default the workspace root) must resolve inside the workspace —
-/// otherwise the call is denied. A sensitive root is a mode-gated `Ask` (manual
-/// prompts; auto_safe/yolo allow). Sensitive *entries* inside a non-sensitive
-/// root are skipped during the walk, not decided here.
-pub fn classify_list_files(
-    arguments: &Value,
-    workspace: &Workspace,
-) -> Result<FileToolCapability, FileToolError> {
-    let input: ListFilesInput = parse_args(arguments)?;
-    let touched = vec![input.dir.clone().unwrap_or_else(|| ".".to_string())];
-    match resolve_dir(workspace, input.dir.as_deref()) {
-        Ok(root) if workspace.is_sensitive(&root) => Ok(FileToolCapability {
-            action: ToolPermissionAction::Ask,
-            summary: format!("list files in {} — reads a sensitive path", touched[0]),
-            touched_paths: touched,
-        }),
-        Ok(_) => Ok(FileToolCapability {
-            action: ToolPermissionAction::Allow,
-            summary: format!("list files in {}", touched[0]),
-            touched_paths: touched,
-        }),
-        Err(reason) => Ok(deny(reason, touched)),
-    }
-}
-
-/// Classify `search_text` into a read [`FileToolCapability`]. Same `dir`
-/// containment/sensitivity gate as [`classify_list_files`].
+/// Classify `search_text` into a read [`FileToolCapability`].
 pub fn classify_search_text(
     arguments: &Value,
     workspace: &Workspace,
@@ -170,147 +122,6 @@ fn deny(reason: String, touched: Vec<String>) -> FileToolCapability {
     }
 }
 
-// ===========================================================================
-// list_files
-// ===========================================================================
-
-/// Run `list_files`. Walks the (contained) `dir` with the [`ignore`] walker,
-/// optionally filters entries by a workspace-relative `glob`, always skips
-/// sensitive paths, and returns the relative file paths (capped by `limit`).
-pub fn list_files(
-    arguments: &Value,
-    workspace: &Workspace,
-    tool_call_id: &str,
-    spill: Option<&dyn FileToolSpill>,
-) -> Result<FileToolOutcome, FileToolError> {
-    let input: ListFilesInput = parse_args(arguments)?;
-
-    let root = match resolve_dir(workspace, input.dir.as_deref()) {
-        Ok(root) => root,
-        Err(reason) => return Ok(path_failure(&input, reason)),
-    };
-    // A sensitive walk ROOT was explicitly targeted and policy-gated upstream
-    // (Ask in manual, auto-allowed in auto_safe/yolo), so its entries must
-    // surface — every path under it inherits a sensitive component and the
-    // per-entry skip below would otherwise return a silently empty result. A
-    // non-sensitive root keeps the per-entry skip, so a broad walk never
-    // vacuums up secrets incidentally in any mode.
-    let root_is_sensitive = workspace.is_sensitive(&root);
-
-    let matcher = match build_glob_matcher(input.glob.as_deref()) {
-        Ok(matcher) => matcher,
-        Err(reason) => {
-            return Ok(FileToolOutcome::failure(
-                reason.clone(),
-                json!({ "status": "invalid_glob", "reason": reason }),
-            ));
-        }
-    };
-
-    let include_ignored = input.include_ignored.unwrap_or(false);
-    let limit = input
-        .limit
-        .unwrap_or(DEFAULT_LIST_LIMIT)
-        .min(MAX_LIST_LIMIT);
-
-    let mut paths: Vec<String> = Vec::new();
-    let mut scan_truncated = false;
-    let walker = build_walker(&root, include_ignored);
-    for entry in walker {
-        let Ok(entry) = entry else { continue };
-        // Files only (skip directories and other non-file entries).
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
-        let Some(relative) = workspace_relative(workspace, entry.path()) else {
-            continue;
-        };
-        // Sensitive entries are skipped — even with includeIgnored — unless the
-        // walk root itself is the (already gated) sensitive target.
-        if !root_is_sensitive && super::filesystem::is_sensitive_relative(Path::new(&relative)) {
-            continue;
-        }
-        if let Some(matcher) = &matcher {
-            if !matcher.is_match(&relative) {
-                continue;
-            }
-        }
-        // Collect up to the hard scan ceiling (bounds memory in a huge tree); we
-        // sort and apply `limit` AFTER the walk so `limit` yields a STABLE first-N
-        // of the sorted set, not whatever order the walker produced.
-        if paths.len() >= MAX_LIST_LIMIT {
-            scan_truncated = true;
-            break;
-        }
-        paths.push(relative);
-    }
-
-    paths.sort();
-    let truncated = scan_truncated || paths.len() > limit;
-    paths.truncate(limit);
-    let count = paths.len();
-
-    let mut data = json!({
-        "dir": input.dir.clone().unwrap_or_else(|| ".".to_string()),
-        "count": count,
-        "truncated": truncated,
-        "includeIgnored": include_ignored,
-    });
-    if let Some(glob) = &input.glob {
-        data["glob"] = json!(glob);
-    }
-
-    // Render the full list; spill if it exceeds the inline budget.
-    let full_text = paths.join("\n");
-    if full_text.len() > MAX_RESULT_INLINE_BYTES {
-        let preview = take_prefix_on_char_boundary(&full_text, MAX_RESULT_INLINE_BYTES);
-        let log_ref = match spill {
-            Some(spill) => Some(
-                spill
-                    .spill(tool_call_id, &full_text)
-                    .map_err(|error| FileToolError::Io(error.to_string()))?,
-            ),
-            None => None,
-        };
-        data["truncated"] = json!(true);
-        if let Some(log_ref) = &log_ref {
-            data["logRef"] = json!(log_ref);
-        }
-        let mut model_text = format!("{count} file(s):\n{preview}");
-        model_text.push_str("\n... list truncated ...\n");
-        if let Some(log_ref) = &log_ref {
-            model_text.push_str(&format!("full list: {log_ref}\n"));
-        }
-        return Ok(FileToolOutcome {
-            ok: true,
-            model_text,
-            data,
-            sha256: None,
-            diff: None,
-        });
-    }
-
-    let model_text = if count == 0 {
-        "no files matched".to_string()
-    } else if truncated {
-        format!("{count} file(s) (truncated at limit {limit}):\n{full_text}")
-    } else {
-        format!("{count} file(s):\n{full_text}")
-    };
-
-    Ok(FileToolOutcome {
-        ok: true,
-        model_text,
-        data,
-        sha256: None,
-        diff: None,
-    })
-}
-
-// ===========================================================================
-// search_text
-// ===========================================================================
-
 /// One matched line in a file, returned by `search_text`.
 struct TextMatch {
     path: String,
@@ -319,7 +130,7 @@ struct TextMatch {
 }
 
 /// Run `search_text`. Compiles `pattern` (literal by default, regex when
-/// `regex:true`), walks the (contained) `dir` like `list_files`, reads each
+/// `regex:true`), walks the contained `dir`, reads each
 /// non-binary candidate bounded through the [`FileSystem`] port, and collects
 /// matching lines up to `maxMatches`.
 pub fn search_text(
@@ -335,8 +146,8 @@ pub fn search_text(
         Ok(root) => root,
         Err(reason) => return Ok(search_path_failure(&input, reason)),
     };
-    // Same surfacing rule as `list_files`: an explicitly targeted, policy-gated
-    // sensitive root is searchable; a broad walk still skips sensitive entries.
+    // An explicitly targeted, policy-gated sensitive root is searchable; a broad
+    // walk still skips sensitive entries.
     let root_is_sensitive = workspace.is_sensitive(&root);
 
     let matcher = match build_glob_matcher(input.glob.as_deref()) {
@@ -541,8 +352,8 @@ fn parse_args<T: for<'de> Deserialize<'de>>(arguments: &Value) -> Result<T, File
 /// Resolve the walk root `dir` (default the workspace root) for containment.
 /// Returns the resolved absolute root, or a human-readable denial reason when
 /// the dir escapes the workspace. Sensitivity of the root is NOT a refusal
-/// here: [`classify_list_files`] / [`classify_search_text`] report it as a
-/// mode-gated `Ask`, so a call reaching a handler was approved or auto-allowed.
+/// here: [`classify_search_text`] reports it as a mode-gated `Ask`, so a call
+/// reaching a handler was approved or auto-allowed.
 fn resolve_dir(workspace: &Workspace, dir: Option<&str>) -> Result<PathBuf, String> {
     match dir {
         Some(dir) => workspace
@@ -622,17 +433,6 @@ fn workspace_relative(workspace: &Workspace, path: &Path) -> Option<String> {
         return None;
     }
     Some(relative.to_string_lossy().replace('\\', "/"))
-}
-
-fn path_failure(input: &ListFilesInput, reason: String) -> FileToolOutcome {
-    FileToolOutcome::failure(
-        reason.clone(),
-        json!({
-            "dir": input.dir.clone().unwrap_or_else(|| ".".to_string()),
-            "status": "denied",
-            "reason": reason,
-        }),
-    )
 }
 
 fn search_path_failure(input: &SearchTextInput, reason: String) -> FileToolOutcome {
@@ -717,155 +517,6 @@ mod tests {
         fs::create_dir_all(&dir).expect("create workspace");
         let ws = Workspace::new(&dir).expect("workspace");
         (ws, dir)
-    }
-
-    // ---- list_files -------------------------------------------------------
-
-    #[test]
-    fn list_files_matches_glob() {
-        let (ws, dir) = temp_workspace("list_glob");
-        fs::create_dir_all(dir.join("src")).unwrap();
-        fs::write(dir.join("src/main.rs"), b"fn main() {}\n").unwrap();
-        fs::write(dir.join("src/lib.rs"), b"// lib\n").unwrap();
-        fs::write(dir.join("README.md"), b"# readme\n").unwrap();
-
-        let out = list_files(&json!({ "glob": "**/*.rs" }), &ws, "tc", None).unwrap();
-        assert!(out.ok);
-        assert!(out.model_text.contains("src/main.rs"));
-        assert!(out.model_text.contains("src/lib.rs"));
-        assert!(!out.model_text.contains("README.md"));
-        assert_eq!(out.data["count"], 2);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn list_files_skips_gitignored_by_default() {
-        let (ws, dir) = temp_workspace("list_gitignore");
-        // The `ignore` walker only honors .gitignore inside a git repo, so mark
-        // the temp dir as one (real Mothership projects are git repos).
-        fs::create_dir_all(dir.join(".git")).unwrap();
-        fs::write(dir.join(".gitignore"), b"ignored.txt\nbuild/\n").unwrap();
-        fs::write(dir.join("kept.txt"), b"keep\n").unwrap();
-        fs::write(dir.join("ignored.txt"), b"nope\n").unwrap();
-        fs::create_dir_all(dir.join("build")).unwrap();
-        fs::write(dir.join("build/artifact.txt"), b"art\n").unwrap();
-
-        let out = list_files(&json!({}), &ws, "tc", None).unwrap();
-        assert!(out.ok);
-        assert!(out.model_text.contains("kept.txt"));
-        assert!(!out.model_text.contains("ignored.txt"));
-        assert!(!out.model_text.contains("build/artifact.txt"));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn list_files_include_ignored_surfaces_ignored_but_still_skips_sensitive() {
-        let (ws, dir) = temp_workspace("list_include_ignored");
-        fs::create_dir_all(dir.join(".git")).unwrap();
-        fs::write(dir.join(".gitignore"), b"ignored.txt\n.env\n").unwrap();
-        fs::write(dir.join("kept.txt"), b"keep\n").unwrap();
-        fs::write(dir.join("ignored.txt"), b"surfaced\n").unwrap();
-        // A sensitive file that is ALSO gitignored: must stay hidden even with
-        // includeIgnored.
-        fs::write(dir.join(".env"), b"SECRET=1\n").unwrap();
-
-        // First confirm the default DOES hide the ignored file (so the
-        // includeIgnored assertion below is meaningful).
-        let default = list_files(&json!({}), &ws, "tc", None).unwrap();
-        assert!(
-            !default.model_text.contains("ignored.txt"),
-            "default walk must hide gitignored files: {}",
-            default.model_text
-        );
-
-        let out = list_files(&json!({ "includeIgnored": true }), &ws, "tc", None).unwrap();
-        assert!(out.ok);
-        // Ignored file is now surfaced.
-        assert!(
-            out.model_text.contains("ignored.txt"),
-            "includeIgnored should surface gitignored files: {}",
-            out.model_text
-        );
-        // Sensitive file is STILL skipped.
-        assert!(
-            !out.model_text.contains(".env"),
-            "sensitive .env must never be listed: {}",
-            out.model_text
-        );
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn list_files_never_surfaces_git_internals_even_with_include_ignored() {
-        let (ws, dir) = temp_workspace("list_git_pruned");
-        fs::create_dir_all(dir.join(".git/objects")).unwrap();
-        fs::write(dir.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
-        fs::write(dir.join(".git/objects/blob"), b"obj\n").unwrap();
-        fs::write(dir.join("src.rs"), b"fn x() {}\n").unwrap();
-
-        let out = list_files(&json!({ "includeIgnored": true }), &ws, "tc", None).unwrap();
-        assert!(out.ok);
-        assert!(out.model_text.contains("src.rs"));
-        assert!(
-            !out.model_text.contains(".git/"),
-            ".git internals must be pruned even with includeIgnored: {}",
-            out.model_text
-        );
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn list_files_rejects_dir_outside_workspace() {
-        let (ws, dir) = temp_workspace("list_dir_escape");
-        let out = list_files(&json!({ "dir": "../.." }), &ws, "tc", None).unwrap();
-        assert!(!out.ok);
-        assert_eq!(out.data["status"], "denied");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn list_files_rejects_escaping_glob() {
-        let (ws, dir) = temp_workspace("list_glob_escape");
-        fs::write(dir.join("a.txt"), b"x\n").unwrap();
-
-        // An escaping glob is rejected outright.
-        let out = list_files(&json!({ "glob": "../**/*" }), &ws, "tc", None).unwrap();
-        assert!(!out.ok);
-        assert_eq!(out.data["status"], "invalid_glob");
-
-        // An absolute glob is rejected too.
-        let out = list_files(&json!({ "glob": "/etc/*" }), &ws, "tc", None).unwrap();
-        assert!(!out.ok);
-        assert_eq!(out.data["status"], "invalid_glob");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn list_files_limit_truncates() {
-        let (ws, dir) = temp_workspace("list_limit");
-        for i in 0..10 {
-            fs::write(dir.join(format!("f{i}.txt")), b"x\n").unwrap();
-        }
-
-        let out = list_files(&json!({ "limit": 3 }), &ws, "tc", None).unwrap();
-        assert!(out.ok);
-        assert_eq!(out.data["count"], 3);
-        assert_eq!(out.data["truncated"], true);
-        // `limit` returns the STABLE first-N of the SORTED set (f0,f1,f2), not the
-        // walker's arbitrary first-N. (Regression: sort used to run AFTER the limit.)
-        assert!(out.model_text.contains("f0.txt"));
-        assert!(out.model_text.contains("f1.txt"));
-        assert!(out.model_text.contains("f2.txt"));
-        assert!(!out.model_text.contains("f3.txt"));
-        assert!(!out.model_text.contains("f9.txt"));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     // ---- search_text ------------------------------------------------------
@@ -1136,46 +787,32 @@ mod tests {
         let (ws, dir) = temp_workspace("classify_sensitive_dir");
         fs::create_dir_all(dir.join(".ssh")).unwrap();
 
-        let list = classify_list_files(&json!({ "dir": ".ssh" }), &ws).unwrap();
-        assert_eq!(list.action, ToolPermissionAction::Ask);
-        assert!(
-            list.summary.contains("sensitive"),
-            "the approval card must say WHY: {}",
-            list.summary
-        );
         let search =
             classify_search_text(&json!({ "pattern": "key", "dir": ".ssh" }), &ws).unwrap();
         assert_eq!(search.action, ToolPermissionAction::Ask);
         assert!(search.summary.contains("sensitive"), "{}", search.summary);
 
         // Containment violations are still hard denials.
-        let escape = classify_list_files(&json!({ "dir": "../.." }), &ws).unwrap();
+        let escape =
+            classify_search_text(&json!({ "pattern": "key", "dir": "../.." }), &ws).unwrap();
         assert_eq!(escape.action, ToolPermissionAction::Deny);
         // A normal dir stays a plain read Allow.
-        let normal = classify_list_files(&json!({}), &ws).unwrap();
+        let normal = classify_search_text(&json!({ "pattern": "key" }), &ws).unwrap();
         assert_eq!(normal.action, ToolPermissionAction::Allow);
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn sensitive_walk_root_surfaces_its_entries_after_policy_gate() {
+    fn sensitive_search_root_surfaces_entries_after_policy_gate() {
         // A call whose `dir` IS the sensitive path was explicitly targeted and
         // policy-gated (approved in manual / auto-allowed in auto+yolo); the
-        // handler must surface its entries rather than skip them all and return
+        // handler must search its entries rather than skip them all and return
         // a silently empty result.
         let (ws, dir) = temp_workspace("sensitive_root_walk");
         fs::create_dir_all(dir.join(".ssh")).unwrap();
         fs::write(dir.join(".ssh/id_rsa"), b"PRIVATE KEY BODY\n").unwrap();
         fs::write(dir.join(".ssh/known_hosts"), b"host fingerprint\n").unwrap();
-
-        let listed = list_files(&json!({ "dir": ".ssh" }), &ws, "tc", None).unwrap();
-        assert!(listed.ok, "{}", listed.model_text);
-        assert!(
-            listed.model_text.contains("id_rsa"),
-            "gated sensitive root must list its entries: {}",
-            listed.model_text
-        );
 
         let searched = search_text(
             &json!({ "pattern": "PRIVATE", "dir": ".ssh" }),

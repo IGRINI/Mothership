@@ -31,16 +31,13 @@ use ts_rs::TS;
 
 use super::cancellation::ToolCancellationToken;
 use super::catalog::{
-    APPLY_PATCH_TOOL_NAME, AUDIO_TRANSCRIBE_TOOL_NAME, EDIT_FILE_TOOL_NAME,
-    IMAGE_GENERATE_TOOL_NAME, LIST_FILES_TOOL_NAME, READ_FILE_TOOL_NAME, RUN_COMMAND_TOOL_NAME,
-    SEARCH_TEXT_TOOL_NAME, WRITE_FILE_TOOL_NAME,
+    APPLY_PATCH_TOOL_NAME, EDIT_FILE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME, READ_FILE_TOOL_NAME,
+    RUN_COMMAND_TOOL_NAME, SEARCH_TEXT_TOOL_NAME, WRITE_FILE_TOOL_NAME,
 };
 use super::file_tools::FileTool;
 use crate::{ChatCancellationToken, LlmToolCallResult};
 
-/// The typed identity of a tool the runtime knows how to execute. This is the
-/// single source of truth for routing, classification, scheduling, storage, and
-/// UI rendering — every layer keys off `ToolKind` rather than re-parsing names.
+/// The typed identity of an executable tool the runtime stores and renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -55,19 +52,14 @@ pub enum ToolKind {
     EditFile,
     /// `apply_patch` — multi-file V4A patch (all-or-none).
     ApplyPatch,
-    /// `list_files` — read-only glob/walk of the workspace.
-    ListFiles,
     /// `search_text` — read-only content search of the workspace.
     SearchText,
     /// `image_generate` — provider-routed media generation.
     ImageGenerate,
-    /// `audio_transcribe` — provider-routed speech-to-text.
-    AudioTranscribe,
 }
 
 impl ToolKind {
-    /// Resolve a wire tool name to its kind, or `None` if the runtime does not
-    /// own a typed executor for it.
+    /// Resolve a known wire tool name to its kind.
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             RUN_COMMAND_TOOL_NAME => Self::RunCommand,
@@ -75,12 +67,20 @@ impl ToolKind {
             WRITE_FILE_TOOL_NAME => Self::WriteFile,
             EDIT_FILE_TOOL_NAME => Self::EditFile,
             APPLY_PATCH_TOOL_NAME => Self::ApplyPatch,
-            LIST_FILES_TOOL_NAME => Self::ListFiles,
             SEARCH_TEXT_TOOL_NAME => Self::SearchText,
             IMAGE_GENERATE_TOOL_NAME => Self::ImageGenerate,
-            AUDIO_TRANSCRIBE_TOOL_NAME => Self::AudioTranscribe,
             _ => return None,
         })
+    }
+
+    /// Resolve a model-submitted tool name to an executable kind.
+    pub fn from_routable_name(name: &str) -> Option<Self> {
+        Self::from_name(name)
+    }
+
+    /// True when Core should accept new calls for this tool kind.
+    pub fn is_routable(&self) -> bool {
+        true
     }
 
     /// The canonical wire tool name.
@@ -91,10 +91,8 @@ impl ToolKind {
             Self::WriteFile => WRITE_FILE_TOOL_NAME,
             Self::EditFile => EDIT_FILE_TOOL_NAME,
             Self::ApplyPatch => APPLY_PATCH_TOOL_NAME,
-            Self::ListFiles => LIST_FILES_TOOL_NAME,
             Self::SearchText => SEARCH_TEXT_TOOL_NAME,
             Self::ImageGenerate => IMAGE_GENERATE_TOOL_NAME,
-            Self::AudioTranscribe => AUDIO_TRANSCRIBE_TOOL_NAME,
         }
     }
 
@@ -109,29 +107,24 @@ impl ToolKind {
         matches!(self, Self::WriteFile | Self::EditFile | Self::ApplyPatch)
     }
 
-    /// True for the read-only typed tools (read / list / search). `run_command`
+    /// True for currently routable read-only typed tools (read / search). `run_command`
     /// is intentionally excluded — its read-only-ness is argument-dependent and
     /// decided by the scheduler, not the kind.
     pub fn is_read_only(&self) -> bool {
-        matches!(self, Self::ReadFile | Self::ListFiles | Self::SearchText)
+        matches!(self, Self::ReadFile | Self::SearchText)
     }
 
     /// True if executing the tool requires an active project (workspace root) to
-    /// resolve and contain paths. All typed file/search tools do; `run_command`
-    /// can run without one (cwd falls back to the process default).
+    /// resolve and contain paths.
     pub fn requires_project(&self) -> bool {
         matches!(
             self,
-            Self::ReadFile
-                | Self::WriteFile
-                | Self::EditFile
-                | Self::ApplyPatch
-                | Self::ListFiles
-                | Self::SearchText
+            Self::ReadFile | Self::WriteFile | Self::EditFile | Self::ApplyPatch | Self::SearchText
         )
     }
 
-    /// The corresponding typed file-tool handler, or `None` for `run_command`.
+    /// The corresponding typed file-tool handler, or `None` for process and
+    /// provider-service tools.
     pub fn file_tool(&self) -> Option<FileTool> {
         Some(match self {
             Self::RunCommand => return None,
@@ -139,10 +132,8 @@ impl ToolKind {
             Self::WriteFile => FileTool::Write,
             Self::EditFile => FileTool::Edit,
             Self::ApplyPatch => FileTool::ApplyPatch,
-            Self::ListFiles => FileTool::ListFiles,
             Self::SearchText => FileTool::SearchText,
             Self::ImageGenerate => return None,
-            Self::AudioTranscribe => return None,
         })
     }
 }
@@ -154,7 +145,6 @@ impl From<FileTool> for ToolKind {
             FileTool::Write => Self::WriteFile,
             FileTool::Edit => Self::EditFile,
             FileTool::ApplyPatch => Self::ApplyPatch,
-            FileTool::ListFiles => Self::ListFiles,
             FileTool::SearchText => Self::SearchText,
         }
     }
@@ -210,12 +200,11 @@ mod tests {
             ToolKind::WriteFile,
             ToolKind::EditFile,
             ToolKind::ApplyPatch,
-            ToolKind::ListFiles,
             ToolKind::SearchText,
             ToolKind::ImageGenerate,
-            ToolKind::AudioTranscribe,
         ] {
             assert_eq!(ToolKind::from_name(kind.as_str()), Some(kind));
+            assert_eq!(ToolKind::from_routable_name(kind.as_str()), Some(kind));
         }
     }
 
@@ -247,25 +236,20 @@ mod tests {
         assert!(!ToolKind::ReadFile.is_mutating());
         assert!(!ToolKind::RunCommand.is_mutating());
         assert!(!ToolKind::ImageGenerate.is_mutating());
-        assert!(!ToolKind::AudioTranscribe.is_mutating());
 
         assert!(ToolKind::ReadFile.is_read_only());
-        assert!(ToolKind::ListFiles.is_read_only());
         assert!(ToolKind::SearchText.is_read_only());
         assert!(!ToolKind::RunCommand.is_read_only());
         assert!(!ToolKind::ImageGenerate.is_read_only());
-        assert!(!ToolKind::AudioTranscribe.is_read_only());
 
         // Every file/search tool requires a project; run_command does not.
         assert!(!ToolKind::RunCommand.requires_project());
         assert!(!ToolKind::ImageGenerate.requires_project());
-        assert!(!ToolKind::AudioTranscribe.requires_project());
         for kind in [
             ToolKind::ReadFile,
             ToolKind::WriteFile,
             ToolKind::EditFile,
             ToolKind::ApplyPatch,
-            ToolKind::ListFiles,
             ToolKind::SearchText,
         ] {
             assert!(kind.requires_project());
@@ -279,7 +263,6 @@ mod tests {
             FileTool::Write,
             FileTool::Edit,
             FileTool::ApplyPatch,
-            FileTool::ListFiles,
             FileTool::SearchText,
         ] {
             let kind = ToolKind::from(tool);
@@ -287,6 +270,5 @@ mod tests {
         }
         assert_eq!(ToolKind::RunCommand.file_tool(), None);
         assert_eq!(ToolKind::ImageGenerate.file_tool(), None);
-        assert_eq!(ToolKind::AudioTranscribe.file_tool(), None);
     }
 }

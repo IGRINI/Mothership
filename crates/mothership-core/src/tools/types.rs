@@ -319,6 +319,7 @@ pub fn run_command_typed_payload(
     let payload = serde_json::json!({
         "program": command.program,
         "args": command.args,
+        "commandIntent": command_intent(command),
         "exitCode": result.exit_code,
         "stdoutPreview": result.stdout_preview,
         "stderrPreview": result.stderr_preview,
@@ -341,4 +342,198 @@ pub fn run_command_typed_payload(
         });
     }
     (payload, artifacts)
+}
+
+fn command_intent(command: &ToolCommand) -> &'static str {
+    let program = program_name(&command.program);
+    match program.as_str() {
+        "git" => git_intent(&command.args),
+        "ls" | "dir" => "list",
+        "cat" | "type" => "read",
+        "grep" | "findstr" => "search",
+        "pwd" => "location",
+        "npm" | "pnpm" | "yarn" | "bun" => package_manager_intent(&command.args),
+        "cargo" => cargo_intent(&command.args),
+        "powershell" | "pwsh" => {
+            shell_command_intent(&powershell_command_text(&command.args))
+        }
+        "cmd" => cmd_command_intent(&command.args),
+        "bash" | "sh" => shell_script_arg_intent(&command.args),
+        _ => "generic",
+    }
+}
+
+fn git_intent(args: &[String]) -> &'static str {
+    match args.first().map(|arg| arg.to_ascii_lowercase()) {
+        Some(cmd) if cmd == "status" => "git_status",
+        Some(cmd) if cmd == "diff" => "git_diff",
+        Some(cmd) if cmd == "show" => "git_show",
+        Some(cmd) if cmd == "log" => "git_log",
+        Some(cmd) if cmd == "ls-files" => "list",
+        _ => "generic",
+    }
+}
+
+fn package_manager_intent(args: &[String]) -> &'static str {
+    let words: Vec<String> = args.iter().map(|arg| arg.to_ascii_lowercase()).collect();
+    if words.iter().any(|arg| arg == "test" || arg == "tests") {
+        "test"
+    } else if words.iter().any(|arg| arg == "build") {
+        "build"
+    } else if words.iter().any(|arg| arg == "install" || arg == "add") {
+        "install"
+    } else {
+        "generic"
+    }
+}
+
+fn cargo_intent(args: &[String]) -> &'static str {
+    match args.first().map(|arg| arg.to_ascii_lowercase()) {
+        Some(cmd) if cmd == "test" => "test",
+        Some(cmd) if cmd == "build" => "build",
+        Some(cmd) if cmd == "check" => "check",
+        _ => "generic",
+    }
+}
+
+fn shell_command_intent(command: &str) -> &'static str {
+    let tokens = shell_words(command);
+    let Some(first) = tokens.first().map(|token| token.to_ascii_lowercase()) else {
+        return "generic";
+    };
+    match first.as_str() {
+        "get-childitem" | "gci" | "ls" | "dir" => "list",
+        "get-content" | "gc" | "cat" | "type" => "read",
+        "select-string" | "sls" | "grep" | "findstr" => "search",
+        "get-location" | "pwd" => "location",
+        "git" => git_intent(&tokens[1..]),
+        "npm" | "pnpm" | "yarn" | "bun" => package_manager_intent(&tokens[1..]),
+        "cargo" => cargo_intent(&tokens[1..]),
+        _ => "generic",
+    }
+}
+
+fn powershell_command_text(args: &[String]) -> String {
+    for (index, arg) in args.iter().enumerate() {
+        if arg.eq_ignore_ascii_case("-command") || arg.eq_ignore_ascii_case("-c") {
+            return args[index + 1..].join(" ");
+        }
+    }
+    args.first().cloned().unwrap_or_default()
+}
+
+fn cmd_command_intent(args: &[String]) -> &'static str {
+    if let Some(index) = args
+        .iter()
+        .position(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("-c"))
+    {
+        shell_command_intent(&args[index + 1..].join(" "))
+    } else {
+        shell_command_intent(&args.join(" "))
+    }
+}
+
+fn shell_script_arg_intent(args: &[String]) -> &'static str {
+    if let Some(index) = args
+        .iter()
+        .position(|arg| arg == "-c" || arg == "-lc" || arg == "--command")
+    {
+        shell_command_intent(&args[index + 1..].join(" "))
+    } else {
+        shell_command_intent(&args.join(" "))
+    }
+}
+
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for ch in command.chars() {
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            ch if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn program_name(program: &str) -> String {
+    let mut name = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .trim()
+        .to_ascii_lowercase();
+    for suffix in [".exe", ".cmd", ".bat", ".ps1"] {
+        if name.ends_with(suffix) {
+            name.truncate(name.len() - suffix.len());
+            break;
+        }
+    }
+    name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn completed_result() -> ToolExecutionResult {
+        ToolExecutionResult {
+            tool_call_id: "tc".to_string(),
+            status: ToolExecutionStatus::Completed,
+            exit_code: Some(0),
+            stdout_preview: String::new(),
+            stderr_preview: String::new(),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            truncated_for_display: false,
+            truncated_for_agent: false,
+            log_ref: None,
+            message: None,
+        }
+    }
+
+    fn payload_intent(program: &str, args: &[&str]) -> String {
+        let command = ToolCommand::new(program, args.iter().copied());
+        let (payload, _) = run_command_typed_payload(&command, &completed_result());
+        payload["commandIntent"]
+            .as_str()
+            .expect("intent")
+            .to_string()
+    }
+
+    #[test]
+    fn run_command_payload_classifies_common_command_intents() {
+        assert_eq!(payload_intent("git", &["diff"]), "git_diff");
+        assert_eq!(payload_intent("git.exe", &["status", "--short"]), "git_status");
+        assert_eq!(payload_intent("npm", &["run", "build"]), "build");
+        assert_eq!(payload_intent("cargo", &["check", "--workspace"]), "check");
+        assert_eq!(
+            payload_intent("powershell.exe", &["-Command", "Get-ChildItem src"]),
+            "list"
+        );
+        assert_eq!(
+            payload_intent("pwsh", &["-c", "Get-Content src/main.ts"]),
+            "read"
+        );
+        assert_eq!(payload_intent("cmd.exe", &["/c", "dir src"]), "list");
+    }
 }

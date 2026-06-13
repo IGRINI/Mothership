@@ -17,7 +17,6 @@ import {
   GitCompare,
   Image,
   ListTree,
-  Mic,
   Terminal,
 } from "lucide-solid";
 
@@ -26,9 +25,15 @@ import {
   readImageDataUrlWithTimeout,
   type ChangeFileDiff,
   type ToolArtifact,
+  type ToolCommand,
   type ToolExecutionResult,
   type ToolKind,
 } from "../../shared/api/mothership";
+import {
+  commandPresentation,
+  looksLikeUnifiedDiff,
+  type CommandOutputView,
+} from "../../shared/toolCommandPresentation";
 import { FileActions, onFileContextMenu } from "../../shared/ui/FileActions";
 import { CodeBlock } from "./components/CodeBlock";
 import { CollapsibleDiff } from "./components/CollapsibleDiff";
@@ -270,6 +275,7 @@ export interface ToolCardData {
   toolCallId?: string;
   toolKind?: ToolKind;
   projectId?: string | null;
+  command?: ToolCommand | null;
   result?: ToolExecutionResult | null;
   payload?: Record<string, unknown> | null;
   touchedPaths?: string[];
@@ -306,20 +312,6 @@ function readBoolean(
 ): boolean | undefined {
   const value = payload?.[key];
   return typeof value === "boolean" ? value : undefined;
-}
-
-function readStringArray(
-  payload: Record<string, unknown> | null | undefined,
-  key: string,
-): string[] | undefined {
-  const value = payload?.[key];
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-  const strings = value.filter(
-    (item): item is string => typeof item === "string",
-  );
-  return strings.length > 0 ? strings : undefined;
 }
 
 function shortSha(value: string | undefined): string | undefined {
@@ -527,45 +519,130 @@ function CommandLine(props: { text: string }) {
   );
 }
 
-function RunCommandCard(props: {
-  payload: Record<string, unknown> | null | undefined;
+function commandCodeLines(output: string): CodeLineModel[] {
+  const numbered = parseNumberedOutput(output);
+  if (numbered.length > 0) {
+    return numbered.map((line) => ({ ...line, read: true }));
+  }
+  return output.replace(/\r\n/g, "\n").split("\n").map((line, index) => ({
+    no: index + 1,
+    text: line,
+    read: true,
+  }));
+}
+
+function RunCommandIntentIcon(props: { view: CommandOutputView }) {
+  return (
+    <Switch fallback={<Terminal size={13} />}>
+      <Match when={props.view === "file_tree"}>
+        <ListTree size={13} />
+      </Match>
+      <Match when={props.view === "text"}>
+        <FileText size={13} />
+      </Match>
+      <Match when={props.view === "search"}>
+        <FileSearch size={13} />
+      </Match>
+      <Match when={props.view === "diff" || props.view === "status"}>
+        <GitCompare size={13} />
+      </Match>
+    </Switch>
+  );
+}
+
+function RunCommandOutput(props: {
+  view: CommandOutputView;
+  stdout: string;
+  paths: string[];
+  target?: string;
+  projectId?: string;
 }) {
-  const program = () => readString(props.payload, "program");
-  const args = () => readStringArray(props.payload, "args") ?? [];
-  const exitCode = () => readNumber(props.payload, "exitCode");
-  const stdout = () => readString(props.payload, "stdoutPreview")?.trim();
-  const stderr = () => readString(props.payload, "stderrPreview")?.trim();
-  const truncated = () => readBoolean(props.payload, "truncated");
-  const logRef = () => readString(props.payload, "logRef");
-  const commandLine = () =>
-    [program() ?? "", ...args()].join(" ").trim() || "command";
+  return (
+    <Switch
+      fallback={
+        <Show when={props.stdout}>
+          {(text) => <OutputBlock text={text()} />}
+        </Show>
+      }
+    >
+      <Match when={props.view === "file_tree" && props.paths.length > 0}>
+        <FileTree paths={props.paths} projectId={props.projectId} />
+      </Match>
+      <Match when={props.view === "text" && props.stdout.trim().length > 0}>
+        <CodeBlock
+          lines={commandCodeLines(props.stdout)}
+          title={props.target}
+          path={props.target}
+        />
+      </Match>
+      <Match
+        when={
+          props.view === "diff" &&
+          props.stdout.trim().length > 0 &&
+          looksLikeUnifiedDiff(props.stdout)
+        }
+      >
+        <DiffBlock diff={props.stdout} maxRows={10} />
+      </Match>
+      <Match when={props.view === "search" && props.stdout.trim().length > 0}>
+        <OutputBlock text={props.stdout} />
+      </Match>
+      <Match when={props.view === "status" && props.stdout.trim().length > 0}>
+        <OutputBlock text={props.stdout} />
+      </Match>
+    </Switch>
+  );
+}
+
+function RunCommandCard(props: { tool: ToolCardData }) {
+  const presentation = () =>
+    commandPresentation({
+      command: props.tool.command,
+      payload: props.tool.payload,
+      result: props.tool.result,
+      output: props.tool.output,
+    });
 
   return (
     <div class="tool-body">
       <div class="tool-body__head">
-        <CommandLine text={commandLine()} />
-        <Show when={exitCode() !== undefined}>
+        <RunCommandIntentIcon view={presentation().outputView} />
+        <CommandLine text={presentation().commandLine || "command"} />
+        <Show when={presentation().exitCode !== undefined}>
           <span
             class={`tool-card__pill tool-card__pill--${
-              exitCode() === 0 ? "ok" : "error"
+              presentation().exitCode === 0 ? "ok" : "error"
             }`}
           >
-            exit {exitCode()}
+            exit {presentation().exitCode}
           </span>
         </Show>
       </div>
-      <Show when={stdout()}>
-        {(text) => <OutputBlock text={text()} />}
-      </Show>
-      <Show when={stderr()}>
+      <RunCommandOutput
+        view={presentation().outputView}
+        stdout={presentation().stdout}
+        paths={presentation().paths}
+        target={presentation().target}
+        projectId={props.tool.projectId ?? undefined}
+      />
+      <Show when={presentation().stderr}>
         {(text) => <OutputBlock text={text()} tone="err" />}
       </Show>
-      <Show when={truncated() || logRef()}>
+      <Show
+        when={
+          presentation().target ||
+          presentation().truncated ||
+          presentation().logRef
+        }
+      >
         <div class="tool-card__chips">
-          <Show when={truncated()}>
+          <Show when={presentation().target}>
+            {(value) => <Chip label="target" value={<code>{value()}</code>} />}
+          </Show>
+          <Show when={presentation().truncated}>
             <Chip label="output" value="truncated" />
           </Show>
-          <Show when={logRef()}>
+          <Show when={presentation().logRef}>
             {(ref) => <Chip label="log" value={<code>{ref()}</code>} />}
           </Show>
         </div>
@@ -1096,58 +1173,6 @@ function normalizePatchFiles(value: unknown): string[] {
   return out;
 }
 
-function ListFilesCard(props: {
-  payload: Record<string, unknown> | null | undefined;
-  output?: string;
-  projectId?: string;
-}) {
-  const count = () => readNumber(props.payload, "count");
-  const truncated = () => readBoolean(props.payload, "truncated");
-  const dir = () => readString(props.payload, "dir");
-  const glob = () => readString(props.payload, "glob");
-  const listing = () => (props.output ?? "").trim();
-  const paths = () =>
-    listing()
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean);
-
-  return (
-    <div class="tool-body">
-      <div class="tool-body__head">
-        <ListTree size={13} />
-        <span class="tool-card__title">Список</span>
-        <Show when={dir()}>{(value) => <PathLabel path={value()} />}</Show>
-      </div>
-      <div class="tool-card__chips">
-        <Show when={count() !== undefined}>
-          <Chip label="файлов" value={String(count())} />
-        </Show>
-        <Show when={glob()}>
-          {(value) => <Chip label="glob" value={<code>{value()}</code>} />}
-        </Show>
-        <Show when={truncated()}>
-          <Chip label="список" value="обрезан" />
-        </Show>
-      </div>
-      <Show
-        when={paths().length > 0}
-        fallback={
-          <Show when={listing()}>{(text) => <OutputBlock text={text()} />}</Show>
-        }
-      >
-        <FileTree paths={paths()} projectId={props.projectId} />
-      </Show>
-      <Show when={truncated()}>
-        <p class="tool-body__note">
-          Показаны первые {count() ?? paths().length} — список обрезан по лимиту,
-          в каталоге есть ещё файлы.
-        </p>
-      </Show>
-    </div>
-  );
-}
-
 function SearchTextCard(props: {
   payload: Record<string, unknown> | null | undefined;
   output?: string;
@@ -1217,8 +1242,6 @@ function ProviderServiceCard(props: {
   onPreviewImage?: PreviewImageFn;
 }) {
   const [promptExpanded, setPromptExpanded] = createSignal(false);
-  const isImage = () => props.tool.toolKind === "image_generate";
-  const label = () => (isImage() ? "Image generation" : "Audio transcription");
   const providerId = () => readString(props.payload, "providerId");
   const modelId = () => readString(props.payload, "modelId");
   const prompt = () => readString(props.payload, "prompt") ?? promptPreview();
@@ -1226,7 +1249,7 @@ function ProviderServiceCard(props: {
   const imageCount = () => readNumber(props.payload, "imageCount");
   const status = () => props.tool.result?.status;
   const message = () => props.tool.result?.message ?? props.tool.message ?? "";
-  const images = () => (isImage() ? imagePreviewItems(props.tool.artifacts) : []);
+  const images = () => imagePreviewItems(props.tool.artifacts);
   const firstImage = () => images()[0];
 
   return (
@@ -1245,10 +1268,8 @@ function ProviderServiceCard(props: {
       }}
     >
       <div class="tool-body__head">
-        <Show when={isImage()} fallback={<Mic size={13} />}>
-          <Image size={13} />
-        </Show>
-        <span class="tool-card__title">{label()}</span>
+        <Image size={13} />
+        <span class="tool-card__title">Image generation</span>
         <StatusPill status={status()} />
       </div>
       <div class="tool-card__chips">
@@ -1325,7 +1346,7 @@ export function ToolCard(props: {
   const body = () => {
     switch (props.tool.toolKind) {
       case "run_command":
-        return <RunCommandCard payload={payload()} />;
+        return <RunCommandCard tool={props.tool} />;
       case "read_file":
         return (
           <ReadFileCard
@@ -1368,18 +1389,9 @@ export function ToolCard(props: {
             findChangeFileId={props.findChangeFileId}
           />
         );
-      case "list_files":
-        return (
-          <ListFilesCard
-            payload={payload()}
-            output={props.tool.output}
-            projectId={props.tool.projectId ?? undefined}
-          />
-        );
       case "search_text":
         return <SearchTextCard payload={payload()} output={props.tool.output} />;
       case "image_generate":
-      case "audio_transcribe":
         return (
           <ProviderServiceCard
             tool={props.tool}

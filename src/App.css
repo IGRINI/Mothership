@@ -7977,7 +7977,7 @@ kbd,
   cursor: pointer;
 }
 
-/* Expandable file tree (list_files result). */
+/* Expandable file tree for command listing output. */
 .file-tree {
   max-height: 360px;
   overflow: auto;

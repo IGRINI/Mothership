@@ -62,14 +62,12 @@ pub use provider_runtime::{ProviderRuntimeHealth, ProviderRuntimeManager, Provid
 pub use run::{chat_prompt_preview, schedule_cancel_fallback, ChatRunRegistry, ChatRunService};
 pub use subprocess_gateway::SubprocessChatGateway;
 pub use tools::{
-    apply_patch as run_apply_patch_tool, audio_transcribe_tool_descriptor, canonical_catalog_bytes,
-    canonical_json, catalog_fingerprint,
-    check_write_content_precondition as check_write_file_content_precondition,
+    apply_patch as run_apply_patch_tool, canonical_catalog_bytes, canonical_json,
+    catalog_fingerprint, check_write_content_precondition as check_write_file_content_precondition,
     classify as classify_file_tool, default_credential_guard, edit_file as run_edit_file_tool,
     file_permission_action_for_mode, image_generate_tool_descriptor,
-    list_files as run_list_files_tool, preview_diff as file_tool_preview_diff,
-    read_file as run_read_file_tool, redact_event, run_command_typed_payload,
-    search_text as run_search_text_tool, tool_batch_plan,
+    preview_diff as file_tool_preview_diff, read_file as run_read_file_tool, redact_event,
+    run_command_typed_payload, search_text as run_search_text_tool, tool_batch_plan,
     validate_args_shallow as validate_file_tool_args_shallow, write_file as run_write_file_tool,
     write_file_with_limit as run_write_file_tool_with_limit,
     write_file_with_limit_and_observation as run_write_file_tool_with_limit_and_observation,
@@ -89,7 +87,7 @@ pub use tools::{
     ToolPermissionEvaluation, ToolPermissionPolicy, ToolPolicySettings, ToolPolicyStore,
     ToolProcessExit, ToolProcessSandbox, ToolProcessSpec, ToolRepeatBlock, ToolRepeatGuard,
     ToolRepeatGuardConfig, ToolResourceLimits, ToolSupervisor, UserAwareCommandPermissionPolicy,
-    Workspace, APPLY_PATCH_TOOL_NAME, AUDIO_TRANSCRIBE_TOOL_NAME, DEFAULT_MAX_WRITE_FILE_BYTES,
-    EDIT_FILE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME, LIST_FILES_TOOL_NAME, MAX_TOOL_EVENT_BYTES,
-    READ_FILE_TOOL_NAME, RUN_COMMAND_TOOL_NAME, SEARCH_TEXT_TOOL_NAME, WRITE_FILE_TOOL_NAME,
+    Workspace, APPLY_PATCH_TOOL_NAME, DEFAULT_MAX_WRITE_FILE_BYTES, EDIT_FILE_TOOL_NAME,
+    IMAGE_GENERATE_TOOL_NAME, MAX_TOOL_EVENT_BYTES, READ_FILE_TOOL_NAME, RUN_COMMAND_TOOL_NAME,
+    SEARCH_TEXT_TOOL_NAME, WRITE_FILE_TOOL_NAME,
 };

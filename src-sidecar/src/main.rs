@@ -27,20 +27,19 @@ use mothership_core::ipc::{
     ClientFrame, CoreError, CoreEvent, CoreRequest, CoreResponse, ServerFrame, PROTOCOL_VERSION,
 };
 use mothership_core::{
-    audio_transcribe_tool_descriptor, chat_prompt_preview, default_credential_guard,
-    image_generate_tool_descriptor, redact_event, schedule_cancel_fallback,
-    trusted_built_in_adapter_sha256, AdapterPool, AuthProcessRegistry, ChangeEventSink,
-    ChangeRecorder, ChangeSetEvent, ChangeSetEventKind, ChangesService, ChatRunCancellationResult,
-    ChatRunEvent, ChatRunEventSink, ChatRunRegistry, ChatRunService, ChatUpdatedEvent,
-    ConnectorManager, ConnectorSettingsEvent, ConnectorSettingsEventKind, Database, FileBlobStore,
-    FileToolOutputStore, LlmToolCallHandler, PendingToolApprovalGate, ProviderRuntimeManager,
-    RedactingOutputStore, RevertOutcome, SendChatMessageResult, SnapshotBlobStore, StdFileSystem,
-    ToolApprovalAnswer, ToolApprovalDecision, ToolApprovalMode, ToolApprovalModeStore,
-    ToolCancellationToken, ToolDescriptor, ToolExecutionAccepted, ToolExecutionCancellationResult,
-    ToolExecutionEvent, ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRegistry,
-    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolKind, ToolPolicyStore,
-    ToolRepeatGuard, ToolResourceLimits, ToolSupervisor, UserAwareCommandPermissionPolicy,
-    Workspace,
+    chat_prompt_preview, default_credential_guard, image_generate_tool_descriptor, redact_event,
+    schedule_cancel_fallback, trusted_built_in_adapter_sha256, AdapterPool, AuthProcessRegistry,
+    ChangeEventSink, ChangeRecorder, ChangeSetEvent, ChangeSetEventKind, ChangesService,
+    ChatRunCancellationResult, ChatRunEvent, ChatRunEventSink, ChatRunRegistry, ChatRunService,
+    ChatUpdatedEvent, ConnectorManager, ConnectorSettingsEvent, ConnectorSettingsEventKind,
+    Database, FileBlobStore, FileToolOutputStore, LlmToolCallHandler, PendingToolApprovalGate,
+    ProviderRuntimeManager, RedactingOutputStore, RevertOutcome, SendChatMessageResult,
+    SnapshotBlobStore, StdFileSystem, ToolApprovalAnswer, ToolApprovalDecision, ToolApprovalMode,
+    ToolApprovalModeStore, ToolCancellationToken, ToolDescriptor, ToolExecutionAccepted,
+    ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionEventKind,
+    ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest, ToolExecutionResult,
+    ToolExecutionStatus, ToolKind, ToolPolicyStore, ToolRepeatGuard, ToolResourceLimits,
+    ToolSupervisor, UserAwareCommandPermissionPolicy, Workspace,
 };
 use sha2::{Digest, Sha256};
 
@@ -102,7 +101,6 @@ const BUILT_IN_ADAPTERS: &[BuiltInAdapter] = &[
 ];
 
 const FEATURE_IMAGE_GENERATE: &str = "media.image.generate";
-const FEATURE_AUDIO_TRANSCRIBE: &str = "audio.transcribe";
 
 /// Frames queued for the writer thread, which alone owns stdout.
 type Outbox = mpsc::Sender<ServerFrame>;
@@ -1220,15 +1218,11 @@ fn routed_service_tools(
         .iter()
         .filter(|route| route.feature == FEATURE_IMAGE_GENERATE)
         .collect::<Vec<_>>();
-    let audio_routes = routes
-        .iter()
-        .filter(|route| route.feature == FEATURE_AUDIO_TRANSCRIBE)
-        .collect::<Vec<_>>();
-    if image_routes.is_empty() && audio_routes.is_empty() {
+    if image_routes.is_empty() {
         return Vec::new();
     }
 
-    for route in image_routes.iter().chain(audio_routes.iter()) {
+    for route in &image_routes {
         connector_manager.refresh_provider(&route.provider_id, |_| {});
     }
     let Ok(snapshot) = connector_manager.snapshot() else {
@@ -1256,15 +1250,6 @@ fn routed_service_tools(
         .any(|route| service_available(FEATURE_IMAGE_GENERATE, &route.provider_id, &route.model_id))
     {
         tools.push(image_generate_tool_descriptor());
-    }
-    if audio_routes.iter().any(|route| {
-        service_available(
-            FEATURE_AUDIO_TRANSCRIBE,
-            &route.provider_id,
-            &route.model_id,
-        )
-    }) {
-        tools.push(audio_transcribe_tool_descriptor());
     }
     tools
 }

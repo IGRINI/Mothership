@@ -13,7 +13,7 @@ const TOOL_CATALOG: { name: string; label: string; description: string }[] = [
   {
     name: "run_command",
     label: "Run commands",
-    description: "Execute sandboxed shell / OS commands.",
+    description: "Execute local shell / OS commands.",
   },
   {
     name: "read_file",
@@ -34,11 +34,6 @@ const TOOL_CATALOG: { name: string; label: string; description: string }[] = [
     name: "apply_patch",
     label: "Apply patches",
     description: "Multi-file patch applied all-or-nothing.",
-  },
-  {
-    name: "list_files",
-    label: "List files",
-    description: "Glob / walk the workspace (read-only).",
   },
   {
     name: "search_text",

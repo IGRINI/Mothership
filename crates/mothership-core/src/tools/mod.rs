@@ -28,13 +28,12 @@ mod types;
 
 pub use cancellation::ToolCancellationToken;
 pub use catalog::{
-    audio_transcribe_tool_descriptor, canonical_catalog_bytes, canonical_json, catalog_fingerprint,
-    default_tool_catalog, image_generate_tool_descriptor, CatalogDrift, CatalogPin,
-    APPLY_PATCH_TOOL_ID, APPLY_PATCH_TOOL_NAME, AUDIO_TRANSCRIBE_TOOL_ID,
-    AUDIO_TRANSCRIBE_TOOL_NAME, EDIT_FILE_TOOL_ID, EDIT_FILE_TOOL_NAME, IMAGE_GENERATE_TOOL_ID,
-    IMAGE_GENERATE_TOOL_NAME, LIST_FILES_TOOL_ID, LIST_FILES_TOOL_NAME, READ_FILE_TOOL_ID,
-    READ_FILE_TOOL_NAME, RUN_COMMAND_TOOL_ID, RUN_COMMAND_TOOL_NAME, SEARCH_TEXT_TOOL_ID,
-    SEARCH_TEXT_TOOL_NAME, WRITE_FILE_TOOL_ID, WRITE_FILE_TOOL_NAME,
+    canonical_catalog_bytes, canonical_json, catalog_fingerprint, default_tool_catalog,
+    image_generate_tool_descriptor, CatalogDrift, CatalogPin, APPLY_PATCH_TOOL_ID,
+    APPLY_PATCH_TOOL_NAME, EDIT_FILE_TOOL_ID, EDIT_FILE_TOOL_NAME, IMAGE_GENERATE_TOOL_ID,
+    IMAGE_GENERATE_TOOL_NAME, READ_FILE_TOOL_ID, READ_FILE_TOOL_NAME, RUN_COMMAND_TOOL_ID,
+    RUN_COMMAND_TOOL_NAME, SEARCH_TEXT_TOOL_ID, SEARCH_TEXT_TOOL_NAME, WRITE_FILE_TOOL_ID,
+    WRITE_FILE_TOOL_NAME,
 };
 pub use credential_guard::{
     default_credential_guard, redact_event, CredentialGuard, NoopCredentialGuard,
@@ -65,7 +64,7 @@ pub use registry::ToolExecutionRegistry;
 pub use repeat_guard::{ToolRepeatBlock, ToolRepeatGuard, ToolRepeatGuardConfig};
 pub use resources::ToolResourceLimits;
 pub use scheduler::{tool_batch_plan, tool_concurrency, ToolBatchPlan, ToolConcurrency};
-pub use search::{classify_list_files, classify_search_text, list_files, search_text};
+pub use search::{classify_search_text, search_text};
 pub use supervisor::ToolSupervisor;
 pub use types::{
     run_command_typed_payload, NoopToolExecutionEventSink, ToolApprovalAnswer, ToolArtifact,

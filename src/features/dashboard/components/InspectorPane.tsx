@@ -5,6 +5,7 @@ import type {
   ChatThreadSummary,
   PromptPreview,
 } from "../../../shared/api/mothership";
+import { commandPresentation } from "../../../shared/toolCommandPresentation";
 import { startWindowDrag } from "../../../shared/window-drag";
 import {
   formatToolCommand,
@@ -163,13 +164,17 @@ function ToolCallRow(props: {
 }) {
   const command = () => formatToolCommand(props.tool);
   const headline = () => formatToolHeadline(props.tool);
+  const commandIntent = () => commandPresentation(props.tool).intent;
   const canApprove = () => props.tool.kind === "permission_requested";
   const canCancel = () =>
     !canApprove() && !isTerminalToolKind(props.tool.kind);
 
   return (
     <div class="tool-call-row">
-      <ToolKindIcon kind={props.tool.toolKind} />
+      <ToolKindIcon
+        kind={props.tool.toolKind}
+        commandIntent={commandIntent()}
+      />
       <div class="tool-call-row__body">
         <strong title={command() || headline()}>{headline()}</strong>
         <span class={`tool-status tool-status--${toolTone(props.tool.kind)}`}>

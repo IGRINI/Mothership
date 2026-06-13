@@ -13,8 +13,8 @@ use base64::Engine as _;
 use mothership_core::{
     check_write_file_content_precondition, classify_file_tool, file_permission_action_for_mode,
     file_tool_preview_diff, run_apply_patch_tool, run_command_typed_payload, run_edit_file_tool,
-    run_list_files_tool, run_read_file_tool, run_search_text_tool,
-    run_write_file_tool_with_limit_and_observation, tool_batch_plan,
+    run_read_file_tool, run_search_text_tool, run_write_file_tool_with_limit_and_observation,
+    tool_batch_plan,
     validate_file_tool_args_shallow, ApprovalPreview, BackendOutcome, ChangeRecorder,
     ChatCancellationToken, ConnectorManager, FileSystem, FileTool, FileToolOutcome, FileToolSpill,
     LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResult, MothershipError,
@@ -205,7 +205,6 @@ struct ProviderServiceToolExecutor {
     sink: Arc<dyn ToolExecutionEventSink>,
     project: Option<ToolProjectContext>,
     artifact_root: Option<PathBuf>,
-    tmp_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -285,7 +284,6 @@ impl SidecarLlmToolHandler {
             sink,
             project: project.clone(),
             artifact_root,
-            tmp_root,
         });
         Self {
             command_executor,
@@ -358,9 +356,7 @@ impl SidecarLlmToolHandler {
         };
         let result = match kind {
             ToolKind::RunCommand => self.command_executor.execute(ctx),
-            ToolKind::ImageGenerate | ToolKind::AudioTranscribe => {
-                self.service_executor.execute(ctx)
-            }
+            ToolKind::ImageGenerate => self.service_executor.execute(ctx),
             _ => {
                 // FileToolExecutor now implements both ToolExecutor (this dispatcher
                 // seam) and ToolBackend (the orchestrator seam); name the trait.
@@ -381,7 +377,7 @@ impl LlmToolCallHandler for SidecarLlmToolHandler {
         request: LlmToolCallRequest,
         chat_cancellation: &ChatCancellationToken,
     ) -> LlmToolCallResult {
-        match ToolKind::from_name(&request.name) {
+        match ToolKind::from_routable_name(&request.name) {
             Some(kind) => self.dispatch(kind, &request, chat_cancellation),
             None => LlmToolCallResult {
                 ok: false,
@@ -467,7 +463,6 @@ impl ToolExecutor for ProviderServiceToolExecutor {
     fn execute(&self, ctx: ToolCallContext<'_>) -> LlmToolCallResult {
         match ctx.kind {
             ToolKind::ImageGenerate => self.execute_image(ctx),
-            ToolKind::AudioTranscribe => self.execute_audio_transcribe(ctx),
             _ => LlmToolCallResult {
                 ok: false,
                 content: format!("unsupported provider service tool `{}`", ctx.kind.as_str()),
@@ -549,108 +544,6 @@ impl ProviderServiceToolExecutor {
                         "promptPreview": preview_chars(&args.prompt, 240),
                         "imageCount": artifacts.len(),
                         "metadata": metadata,
-                    })),
-                );
-                LlmToolCallResult {
-                    ok: true,
-                    content: message,
-                }
-            }
-            Err(error) => {
-                let message = error.to_string();
-                self.emit_terminal(
-                    &ctx,
-                    ToolExecutionStatus::Failed,
-                    message.clone(),
-                    Vec::new(),
-                    None,
-                );
-                LlmToolCallResult {
-                    ok: false,
-                    content: message,
-                }
-            }
-        }
-    }
-
-    fn execute_audio_transcribe(&self, ctx: ToolCallContext<'_>) -> LlmToolCallResult {
-        let args = match serde_json::from_value::<AudioTranscribeArguments>(ctx.arguments.clone()) {
-            Ok(args) if !args.input_path.trim().is_empty() => args,
-            Ok(_) => {
-                return LlmToolCallResult {
-                    ok: false,
-                    content: "audio_transcribe.inputPath cannot be empty".to_string(),
-                };
-            }
-            Err(error) => {
-                return LlmToolCallResult {
-                    ok: false,
-                    content: format!("invalid audio_transcribe arguments: {error}"),
-                };
-            }
-        };
-        if ctx.cancellation.is_cancelled() {
-            let message = "audio transcription was cancelled before it started".to_string();
-            self.emit_terminal(
-                &ctx,
-                ToolExecutionStatus::Cancelled,
-                message.clone(),
-                Vec::new(),
-                None,
-            );
-            return LlmToolCallResult {
-                ok: false,
-                content: message,
-            };
-        }
-        let input_path = match self.resolve_service_input_path(&args.input_path) {
-            Ok(path) => path,
-            Err(error) => {
-                return LlmToolCallResult {
-                    ok: false,
-                    content: error,
-                };
-            }
-        };
-
-        self.emit_lifecycle(&ctx, ToolExecutionEventKind::Queued, None, None);
-        self.emit_lifecycle(
-            &ctx,
-            ToolExecutionEventKind::Started,
-            Some("transcribing audio".to_string()),
-            Some(serde_json::json!({
-                "inputPath": input_path.display().to_string(),
-            })),
-        );
-
-        let outcome = self
-            .connector_manager
-            .transcribe_audio(&input_path.display().to_string(), args.options.clone())
-            .and_then(|(route, result)| {
-                let artifacts = self.store_transcription_artifacts(&ctx, &result)?;
-                Ok((route, result, artifacts))
-            });
-
-        match outcome {
-            Ok((route, result, artifacts)) => {
-                let message = transcription_summary(
-                    &route.provider_id,
-                    &route.model_id,
-                    &result.text,
-                    &artifacts,
-                );
-                self.emit_terminal(
-                    &ctx,
-                    ToolExecutionStatus::Completed,
-                    message.clone(),
-                    artifacts,
-                    Some(serde_json::json!({
-                        "feature": route.feature,
-                        "providerId": route.provider_id,
-                        "modelId": route.model_id,
-                        "language": result.language,
-                        "transcriptChars": result.text.chars().count(),
-                        "metadata": result.metadata,
                     })),
                 );
                 LlmToolCallResult {
@@ -806,138 +699,6 @@ impl ProviderServiceToolExecutor {
             });
         }
         Ok(artifacts)
-    }
-
-    fn store_transcription_artifacts(
-        &self,
-        ctx: &ToolCallContext<'_>,
-        result: &mothership_core::AudioTranscriptionResult,
-    ) -> Result<Vec<ToolArtifact>> {
-        let root = self
-            .artifact_root
-            .as_ref()
-            .or_else(|| {
-                self.project
-                    .as_ref()
-                    .and_then(|project| project.artifact_root.as_ref())
-            })
-            .ok_or_else(|| {
-                MothershipError::Runtime("no artifact root is configured".to_string())
-            })?;
-        let tool_dir = root.join(path_component(ctx.tool_call_id));
-        fs::create_dir_all(&tool_dir)?;
-
-        let transcript_path = tool_dir.join("transcript.txt");
-        fs::write(&transcript_path, result.text.as_bytes())?;
-        let mut artifacts = vec![ToolArtifact {
-            artifact_id: "transcript".to_string(),
-            kind: "transcript".to_string(),
-            content_type: "text/plain; charset=utf-8".to_string(),
-            preview: preview_chars(&result.text, 2000),
-            log_ref: Some(transcript_path.display().to_string()),
-            size_bytes: result.text.len() as u64,
-            sha256: Some(hex_sha256(result.text.as_bytes())),
-            truncated: result.text.chars().count() > 2000,
-        }];
-
-        for (index, artifact) in result.artifacts.iter().enumerate() {
-            let artifact_id = format!("provider_artifact_{}", index + 1);
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(artifact.bytes_base64.as_bytes())
-                .map_err(|error| {
-                    MothershipError::Runtime(format!(
-                        "provider returned invalid base64 for {artifact_id}: {error}"
-                    ))
-                })?;
-            let content_type = if artifact.content_type.trim().is_empty() {
-                "application/octet-stream".to_string()
-            } else {
-                artifact.content_type.trim().to_string()
-            };
-            let fallback_name = format!(
-                "{artifact_id}.{}",
-                extension_for_content_type(&content_type)
-            );
-            let file_name = artifact
-                .filename
-                .as_deref()
-                .map(|name| safe_file_name(name, &fallback_name))
-                .unwrap_or(fallback_name);
-            let path = tool_dir.join(format!("{artifact_id}-{file_name}"));
-            fs::write(&path, &bytes)?;
-            artifacts.push(ToolArtifact {
-                artifact_id,
-                kind: "provider_media".to_string(),
-                content_type,
-                preview: format!("provider artifact saved to {}", path.display()),
-                log_ref: Some(path.display().to_string()),
-                size_bytes: bytes.len() as u64,
-                sha256: Some(hex_sha256(&bytes)),
-                truncated: false,
-            });
-        }
-        Ok(artifacts)
-    }
-
-    fn resolve_service_input_path(&self, raw: &str) -> std::result::Result<PathBuf, String> {
-        let input = PathBuf::from(raw);
-        let resolved = if let Some(project) = &self.project {
-            let workspace = workspace_for_project(project)
-                .map_err(|error| format!("workspace unavailable: {error}"))?;
-            workspace
-                .resolve(&input)
-                .map_err(|error| format!("inputPath is outside allowed roots: {error}"))?
-        } else {
-            if !input.is_absolute() {
-                return Err(
-                    "audio_transcribe.inputPath must be absolute when no project is active"
-                        .to_string(),
-                );
-            }
-            input
-        };
-        let canonical = fs::canonicalize(&resolved)
-            .map_err(|error| format!("audio_transcribe.inputPath is not readable: {error}"))?;
-        if !canonical.is_file() {
-            return Err("audio_transcribe.inputPath must point to a file".to_string());
-        }
-        if self.input_path_allowed(&canonical) {
-            Ok(canonical)
-        } else {
-            Err("audio_transcribe.inputPath must stay inside the current project, artifact root, or tmp root".to_string())
-        }
-    }
-
-    fn input_path_allowed(&self, path: &Path) -> bool {
-        if let Some(project) = &self.project {
-            if fs::canonicalize(&project.root)
-                .ok()
-                .is_some_and(|root| path_within(path, &root))
-            {
-                return true;
-            }
-        }
-        for root in [
-            self.artifact_root.as_ref(),
-            self.tmp_root.as_ref(),
-            self.project
-                .as_ref()
-                .and_then(|project| project.artifact_root.as_ref()),
-            self.project
-                .as_ref()
-                .and_then(|project| project.tmp_root.as_ref()),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if fs::canonicalize(root)
-                .ok()
-                .is_some_and(|root| path_within(path, &root))
-            {
-                return true;
-            }
-        }
-        false
     }
 }
 
@@ -1341,9 +1102,6 @@ impl ToolBackend for FileToolExecutor {
             ),
             FileTool::Edit => run_edit_file_tool(ctx.arguments, &workspace, fs_for_tool),
             FileTool::ApplyPatch => run_apply_patch_tool(ctx.arguments, &workspace, fs_for_tool),
-            FileTool::ListFiles => {
-                run_list_files_tool(ctx.arguments, &workspace, tool_call_id, spill_ref)
-            }
             FileTool::SearchText => run_search_text_tool(
                 ctx.arguments,
                 &workspace,
@@ -1893,14 +1651,6 @@ struct ImageGenerateArguments {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AudioTranscribeArguments {
-    input_path: String,
-    #[serde(default)]
-    options: Value,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct RunCommandArguments {
     program: String,
     #[serde(default)]
@@ -1942,30 +1692,6 @@ fn image_generation_summary(
         "Use these AppData-scoped artifact paths directly, or copy files into the project only when the task requires it."
             .to_string(),
     );
-    lines.join("\n")
-}
-
-fn transcription_summary(
-    provider_id: &str,
-    model_id: &str,
-    transcript: &str,
-    artifacts: &[ToolArtifact],
-) -> String {
-    let mut lines = vec![format!("Transcribed audio via {provider_id}/{model_id}.")];
-    lines.push("Transcript preview:".to_string());
-    lines.push(preview_chars(transcript, 4000));
-    for artifact in artifacts {
-        if let Some(path) = artifact.log_ref.as_deref() {
-            lines.push(format!(
-                "- {}: {} ({} bytes, {}, sha256 {})",
-                artifact.artifact_id,
-                path,
-                artifact.size_bytes,
-                artifact.content_type,
-                artifact.sha256.as_deref().unwrap_or("unknown")
-            ));
-        }
-    }
     lines.join("\n")
 }
 
@@ -2011,10 +1737,6 @@ fn safe_file_name(raw: &str, fallback: &str) -> String {
     } else {
         name.chars().take(96).collect()
     }
-}
-
-fn path_component(raw: &str) -> String {
-    safe_file_name(raw, "tool")
 }
 
 fn unique_artifact_path(dir: &Path, file_name: &str) -> PathBuf {

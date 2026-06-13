@@ -11,6 +11,7 @@ import {
   getToolArtifactRange,
   openToolPath,
 } from "../../../shared/api/mothership";
+import { commandPresentation } from "../../../shared/toolCommandPresentation";
 import { FileActions, onFileContextMenu } from "../../../shared/ui/FileActions";
 import {
   ApprovalPreview,
@@ -47,6 +48,7 @@ export function InlineToolCall(props: {
   onToggle: () => void;
 }) {
   const command = () => formatToolCommand(props.tool);
+  const commandIntent = () => commandPresentation(props.tool).intent;
   // The change file (in the journal) recording THIS tool call's edit to a path,
   // so the card shows the live, foldable per-edit diff (its own before/after
   // snapshot) instead of a frozen compact one. Undefined → fall back to the
@@ -164,7 +166,10 @@ export function InlineToolCall(props: {
           onClick={props.onToggle}
         >
           <span class="inline-tool-call__icon">
-            <ToolKindIcon kind={props.tool.toolKind} />
+            <ToolKindIcon
+              kind={props.tool.toolKind}
+              commandIntent={commandIntent()}
+            />
           </span>
           <span
             class="inline-tool-call__title"
