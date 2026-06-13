@@ -8,6 +8,7 @@ mod adapter;
 mod auth;
 mod chat;
 mod models;
+mod services;
 
 use adapter::CodexAdapter;
 

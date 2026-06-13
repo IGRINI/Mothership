@@ -5,6 +5,8 @@
 //! here.
 
 use mothership_adapter_host::protocol::{PromptBundle, PromptSection};
+use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 use crate::llm::ProviderRuntimeKind;
 use crate::ProjectSummary;
@@ -24,6 +26,10 @@ Runtime context:
 - Tool calls run through Mothership's supervised runtime, not directly inside the model provider.
 - When using run_command, pass the executable as program and command arguments as args. Do not rely on POSIX shell syntax unless you explicitly invoke a shell.
 - Prefer Windows-compatible commands. Simple read-only aliases such as pwd, ls, dir, cat, type, and grep are accepted and normalized by the runtime.
+- Large tool outputs and provider-generated media are stored as AppData-scoped artifacts. Use returned artifact paths or logRef range reads instead of asking for base64, raw provider payloads, or long stdout/stderr inline.
+- If an artifact must become part of the project, copy it with a normal supervised command only when the task requires it. Do not move generated artifacts into the project by default.
+- When referencing local project files in user-facing answers, prefer Markdown links with workspace-relative paths, e.g. [src/App.css (line 4841)](src/App.css:4841). Mothership can open these file links and show their file context menu.
+- When referencing a generated image artifact in a user-facing answer, use Markdown image syntax with the exact artifact path, e.g. ![generated image](<C:\\path\\to\\image.png>). For non-image artifacts or files, use Markdown links instead of bare text paths or inline code.
 - If the project folder is not known, say so and ask the user to open or select a project before running project-specific commands.";
 
 const SELF_MANAGED_AGENT_PROMPT: &str = "You are running inside Mothership as an upstream self-managed coding agent.
@@ -66,6 +72,81 @@ pub fn runtime_prompt_bundle_for(
     }
 
     PromptBundle { sections }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PromptPreviewSection {
+    pub id: String,
+    pub source: String,
+    pub priority: i32,
+    pub locked: bool,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PromptPreview {
+    pub chat_id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub runtime_kind: ProviderRuntimeKind,
+    pub project_id: Option<String>,
+    pub project_path: Option<String>,
+    pub sections: Vec<PromptPreviewSection>,
+    pub rendered_text: String,
+}
+
+/// Append the user's personalization instructions as prompt sections after
+/// Core's locked base sections (priority 100+), so the provider renders them
+/// last. Each scope (global/provider/model) becomes its own section in
+/// broad-to-specific order.
+pub fn append_personalization_sections(
+    prompt: &mut PromptBundle,
+    instructions: Vec<(String, String)>,
+) {
+    for (index, (scope, content)) in instructions.into_iter().enumerate() {
+        prompt.sections.push(PromptSection {
+            id: format!("user.{scope}"),
+            source: "user".to_string(),
+            priority: 100 + index as i32,
+            locked: false,
+            content,
+        });
+    }
+}
+
+pub fn prompt_preview_for_bundle(
+    chat_id: String,
+    provider_id: String,
+    model_id: String,
+    runtime_kind: ProviderRuntimeKind,
+    project: Option<&ProjectSummary>,
+    prompt: PromptBundle,
+) -> PromptPreview {
+    let sections = prompt
+        .sections
+        .iter()
+        .map(|section| PromptPreviewSection {
+            id: section.id.clone(),
+            source: section.source.clone(),
+            priority: section.priority,
+            locked: section.locked,
+            content: section.content.clone(),
+        })
+        .collect();
+    PromptPreview {
+        chat_id,
+        provider_id,
+        model_id,
+        runtime_kind,
+        project_id: project.map(|project| project.id.clone()),
+        project_path: project.map(|project| project.path.clone()),
+        sections,
+        rendered_text: prompt.rendered_text(),
+    }
 }
 
 fn project_context_prompt(project: &ProjectSummary, runtime_kind: ProviderRuntimeKind) -> String {
@@ -113,6 +194,8 @@ mod tests {
             name: "Mothership".to_string(),
             path: "E:\\Mothership".to_string(),
             chat_count: 1,
+            icon: None,
+            icon_color: None,
             created_at: "now".to_string(),
             updated_at: "now".to_string(),
             last_opened_at: "now".to_string(),
@@ -122,5 +205,27 @@ mod tests {
 
         assert!(prompt.contains("structured runtime context"));
         assert!(!prompt.contains("run_command"));
+    }
+
+    #[test]
+    fn prompt_preview_renders_sections_and_personalization() {
+        let mut prompt = runtime_prompt_bundle_for(None, ProviderRuntimeKind::CoreManaged);
+        append_personalization_sections(
+            &mut prompt,
+            vec![("global".to_string(), "Use terse answers.".to_string())],
+        );
+
+        let preview = prompt_preview_for_bundle(
+            "chat_1".to_string(),
+            "codex".to_string(),
+            "gpt-5.5".to_string(),
+            ProviderRuntimeKind::CoreManaged,
+            None,
+            prompt,
+        );
+
+        assert_eq!(preview.sections.len(), 2);
+        assert!(preview.rendered_text.contains("Use terse answers."));
+        assert_eq!(preview.sections[1].id, "user.global");
     }
 }

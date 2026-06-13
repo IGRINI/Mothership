@@ -8,8 +8,9 @@
 //!   outside). This is the path-containment logic the sidecar previously owned
 //!   for `run_command`, lifted into Core so the file tools share it. The
 //!   resolver also flags *sensitive* paths (`.env`, `.ssh`, private keys, cloud
-//!   credentials, `.git/config`, vaults, secrets) so the policy layer can refuse
-//!   to read or mutate them.
+//!   credentials, `.git/config`, vaults, secrets) so the policy layer can gate
+//!   reads of them behind the per-chat approval mode (manual prompts;
+//!   auto_safe/yolo allow) and refuse mutations of them outright.
 //! * [`FileSystem`] — the injected byte-IO port (mirroring how `ProcessSandbox`
 //!   injects process spawning). Core never calls `std::fs` directly for tool IO;
 //!   the sidecar composition root supplies [`StdFileSystem`]. Tests can supply an
@@ -35,6 +36,14 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
+    absolute_roots: Vec<WorkspaceAbsoluteRoot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceAbsoluteRoot {
+    root: PathBuf,
+    writable: bool,
+    label: String,
 }
 
 /// Why a tool-supplied path was rejected by [`Workspace::resolve`].
@@ -73,13 +82,34 @@ impl Workspace {
                 "workspace root must be a directory",
             ));
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            absolute_roots: Vec::new(),
+        })
     }
 
     /// Construct a workspace from an already-canonical root without touching the
     /// filesystem. Intended for tests with a known-good path.
     pub fn from_canonical_root(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            absolute_roots: Vec::new(),
+        }
+    }
+
+    pub fn with_absolute_root(
+        mut self,
+        root: impl AsRef<Path>,
+        writable: bool,
+        label: impl Into<String>,
+    ) -> io::Result<Self> {
+        let root = canonicalize_or_create_dir(root.as_ref())?;
+        self.absolute_roots.push(WorkspaceAbsoluteRoot {
+            root,
+            writable,
+            label: label.into(),
+        });
+        Ok(self)
     }
 
     /// The canonical project root.
@@ -107,40 +137,14 @@ impl Workspace {
             });
         }
 
-        // Join relative paths onto the root; keep absolute paths as-is for the
-        // containment check below.
-        let joined = if raw.is_absolute() {
-            raw.to_path_buf()
-        } else {
-            self.root.join(raw)
-        };
-
-        // Lexically normalize so `..` segments are resolved without touching the
-        // filesystem (this catches `../../etc/passwd` before any IO).
-        //
-        // Containment is checked with a platform-aware comparison rather than a
-        // raw `starts_with`: on Windows a canonicalized verbatim root
-        // (`\\?\E:\proj`) must still contain a normal `E:\proj\src\x.rs` input,
-        // and the match must be case-insensitive. `path_contains` strips the
-        // verbatim prefixes, folds case (on Windows), and normalizes separators
-        // on both sides.
-        let normalized = lexically_normalize(&joined);
-        if !path_contains(&self.root, &normalized) {
+        if raw.is_absolute() {
+            if let Some(resolved) = self.resolve_inside_known_root(raw, &display)? {
+                return Ok(resolved);
+            }
             return Err(PathError::OutsideWorkspace { path: display });
         }
 
-        // If the target or an ancestor exists, canonicalize the deepest existing
-        // prefix to defeat symlink escapes, then re-check containment. A target
-        // that does not exist yet (new file) is allowed as long as its lexical
-        // form and its nearest existing ancestor stay inside the root.
-        let canonical_prefix = canonicalize_existing_prefix(&normalized);
-        if let Some(prefix) = canonical_prefix {
-            if !path_contains(&self.root, &prefix) {
-                return Err(PathError::OutsideWorkspace { path: display });
-            }
-        }
-
-        Ok(normalized)
+        resolve_inside_root(&self.root, &self.root.join(raw), &display)
     }
 
     /// Whether a resolved path is *sensitive* (credentials, private keys, VCS
@@ -149,9 +153,104 @@ impl Workspace {
     /// trigger — the check looks at individual path components and a few
     /// well-known filenames.
     pub fn is_sensitive(&self, resolved: &Path) -> bool {
-        let relative = resolved.strip_prefix(&self.root).unwrap_or(resolved);
+        let root = self
+            .matching_root(resolved)
+            .map(|entry| entry.root.as_path())
+            .unwrap_or(&self.root);
+        let relative = resolved.strip_prefix(root).unwrap_or(resolved);
         is_sensitive_relative(relative)
     }
+
+    pub fn can_write(&self, resolved: &Path) -> bool {
+        if path_contains(&self.root, resolved) {
+            return true;
+        }
+        self.absolute_roots
+            .iter()
+            .find(|entry| path_contains(&entry.root, resolved))
+            .is_some_and(|entry| entry.writable)
+    }
+
+    pub fn write_denial_reason(&self, resolved: &Path) -> Option<String> {
+        if self.can_write(resolved) {
+            return None;
+        }
+        let label = self
+            .absolute_roots
+            .iter()
+            .find(|entry| path_contains(&entry.root, resolved))
+            .map(|entry| entry.label.as_str())
+            .unwrap_or("read-only workspace root");
+        Some(format!(
+            "`{}` is inside {label}, which is read-only for file tools",
+            resolved.display()
+        ))
+    }
+
+    fn resolve_inside_known_root(
+        &self,
+        raw: &Path,
+        display: &str,
+    ) -> Result<Option<PathBuf>, PathError> {
+        if path_contains(&self.root, raw) {
+            return resolve_inside_root(&self.root, raw, display).map(Some);
+        }
+        for root in &self.absolute_roots {
+            if path_contains(&root.root, raw) {
+                return resolve_inside_root(&root.root, raw, display).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    fn matching_root(&self, resolved: &Path) -> Option<&WorkspaceAbsoluteRoot> {
+        self.absolute_roots
+            .iter()
+            .find(|entry| path_contains(&entry.root, resolved))
+    }
+}
+
+fn resolve_inside_root(root: &Path, raw: &Path, display: &str) -> Result<PathBuf, PathError> {
+    // Lexically normalize so `..` segments are resolved without touching the
+    // filesystem (this catches `../../etc/passwd` before any IO).
+    //
+    // Containment is checked with a platform-aware comparison rather than a raw
+    // `starts_with`: on Windows a canonicalized verbatim root (`\\?\E:\proj`)
+    // must still contain a normal `E:\proj\src\x.rs` input, and the match must
+    // be case-insensitive.
+    let normalized = lexically_normalize(raw);
+    if !path_contains(root, &normalized) {
+        return Err(PathError::OutsideWorkspace {
+            path: display.to_string(),
+        });
+    }
+
+    // If the target or an ancestor exists, canonicalize the deepest existing
+    // prefix to defeat symlink escapes, then re-check containment. A target that
+    // does not exist yet (new file) is allowed as long as its lexical form and
+    // nearest existing ancestor stay inside the root.
+    let canonical_prefix = canonicalize_existing_prefix(&normalized);
+    if let Some(prefix) = canonical_prefix {
+        if !path_contains(root, &prefix) {
+            return Err(PathError::OutsideWorkspace {
+                path: display.to_string(),
+            });
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn canonicalize_or_create_dir(root: &Path) -> io::Result<PathBuf> {
+    fs::create_dir_all(root)?;
+    let root = fs::canonicalize(root)?;
+    if !root.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "workspace absolute root must be a directory",
+        ));
+    }
+    Ok(root)
 }
 
 /// Component- and filename-based sensitive-path detection over a path that has
@@ -233,7 +332,9 @@ fn is_sensitive_component(name: &str) -> bool {
 /// containment (`normalize_for_compare`/`path_within`) but additionally strips
 /// the `\\?\` / `\\?\UNC\` verbatim prefixes that `fs::canonicalize` produces on
 /// Windows, since the root is canonicalized but tool-supplied inputs are not.
-fn path_contains(root: &Path, candidate: &Path) -> bool {
+/// Crate-visible so the read-only command-argument screen shares the exact same
+/// containment semantics as the file tools.
+pub(crate) fn path_contains(root: &Path, candidate: &Path) -> bool {
     let root = normalize_for_compare(root);
     let candidate = normalize_for_compare(candidate);
     if candidate == root {
@@ -274,8 +375,9 @@ fn normalize_for_compare(path: &Path) -> String {
 
 /// Lexically normalize a path: collapse `.` and resolve `..` against earlier
 /// `Normal` components, without consulting the filesystem. The root/prefix
-/// components are preserved so an absolute path stays absolute.
-fn lexically_normalize(path: &Path) -> PathBuf {
+/// components are preserved so an absolute path stays absolute. Crate-visible
+/// for the read-only command-argument screen.
+pub(crate) fn lexically_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
@@ -561,6 +663,45 @@ mod tests {
         assert!(matches!(err, PathError::OutsideWorkspace { .. }), "{err:?}");
 
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn absolute_roots_are_scoped_and_write_aware() {
+        let project = unique_temp_dir("abs_roots_project");
+        let artifacts = unique_temp_dir("abs_roots_artifacts");
+        let tmp = unique_temp_dir("abs_roots_tmp");
+        let outside = unique_temp_dir("abs_roots_outside");
+        let artifact_file = artifacts.join("runs/run-1/call-1/image.png");
+        fs::create_dir_all(artifact_file.parent().unwrap()).unwrap();
+        fs::write(&artifact_file, b"png").unwrap();
+
+        let ws = Workspace::new(&project)
+            .unwrap()
+            .with_absolute_root(&artifacts, false, "current artifact root")
+            .unwrap()
+            .with_absolute_root(&tmp, true, "current tmp root")
+            .unwrap();
+
+        let resolved_artifact = ws.resolve(&artifact_file).expect("artifact read path");
+        assert_eq!(resolved_artifact, artifact_file);
+        assert!(!ws.can_write(&resolved_artifact));
+        assert!(ws
+            .write_denial_reason(&resolved_artifact)
+            .unwrap()
+            .contains("current artifact root"));
+
+        let tmp_output = ws
+            .resolve(tmp.join("runs/run-1/out.txt"))
+            .expect("tmp path");
+        assert!(ws.can_write(&tmp_output));
+
+        let err = ws.resolve(outside.join("secret.txt")).unwrap_err();
+        assert!(matches!(err, PathError::OutsideWorkspace { .. }), "{err:?}");
+
+        let _ = fs::remove_dir_all(&project);
+        let _ = fs::remove_dir_all(&artifacts);
+        let _ = fs::remove_dir_all(&tmp);
         let _ = fs::remove_dir_all(&outside);
     }
 

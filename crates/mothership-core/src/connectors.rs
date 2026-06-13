@@ -18,19 +18,22 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use ts_rs::TS;
 
 use mothership_adapter_host::protocol::{
-    AuthKind, AuthStatus, AuthStatusKind, ModelManagement, SettingsField, SettingsFieldKind,
+    AudioTranscriptionRequest, AudioTranscriptionResult, AuthKind, AuthStatus, AuthStatusKind,
+    ImageGenerationRequest, ImageGenerationResult, ModelManagement, ProviderService, SettingsField,
+    SettingsFieldKind, FEATURE_AUDIO_TRANSCRIBE, FEATURE_IMAGE_GENERATE,
 };
 use mothership_adapter_host::{AdapterEntry, AdapterRegistry};
 
 use crate::adapter_pool::{
-    spawn_ready_adapter, spawn_ready_adapter_without_secret_sink, AdapterPool,
+    kill_process_tree, spawn_ready_adapter, spawn_ready_adapter_without_secret_sink, AdapterPool,
 };
 use crate::auth::FileCredentialVault;
 use crate::llm::{
     ConnectorModelManagementKind, ConnectorModelManagementSchema, ConnectorSettingsSchema,
-    LlmModel, ProviderRuntimeKind, SelectedLlmModel,
+    FeatureRoute, LlmModel, ProviderRuntimeKind, SelectedLlmModel,
 };
 use crate::provider_runtime::{ProviderRuntimeManager, ProviderRuntimeStatus};
 use crate::{Database, MothershipError, Result};
@@ -44,6 +47,10 @@ const CLAUDE_AGENT_ADAPTER_SHA256: Option<&str> =
 pub(crate) const CAPABILITY_LLM_MODELS: &str = "llm.models";
 pub(crate) const CAPABILITY_LLM_CHAT: &str = "llm.chat";
 pub(crate) const CAPABILITY_AGENT_RUNTIME: &str = "agent.runtime";
+pub(crate) const CAPABILITY_IMAGE_GENERATE: &str = "media.image.generate";
+pub(crate) const CAPABILITY_IMAGE_EDIT: &str = "media.image.edit";
+pub(crate) const CAPABILITY_AUDIO_TRANSCRIBE: &str = "audio.transcribe";
+pub(crate) const CAPABILITY_AUDIO_SPEECH: &str = "audio.speech";
 const CAPABILITY_SETTINGS_READ: &str = "settings.read";
 const CAPABILITY_SETTINGS_WRITE: &str = "settings.write";
 const CAPABILITY_AUTH_INTERACTIVE: &str = "auth.interactive";
@@ -67,22 +74,26 @@ pub fn trusted_built_in_adapter_sha256(provider_id: &str) -> Option<&'static str
 
 /// The full Connectors view plus the active model selection. Serialized straight
 /// to the UI, so the field casing is the UI contract.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ConnectorSettingsSnapshot {
     pub providers: Vec<ConnectorProviderSummary>,
     pub selected_model: SelectedLlmModel,
+    pub feature_routes: Vec<FeatureRoute>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ConnectorSettingsEvent {
     pub kind: ConnectorSettingsEventKind,
     pub snapshot: ConnectorSettingsSnapshot,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ConnectorSettingsEventKind {
     RefreshStarted,
     ProviderUpdated,
@@ -94,8 +105,12 @@ pub enum ConnectorSettingsEventKind {
     ProviderEnabledChanged,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// `optional_fields`: `icon` / `model_error` / `selected_model_id` /
+// `adapter_settings` are `Option<_>` the UI treats as optional (and the preview
+// providers omit), matching the original `icon?` / `modelError?` / … shape.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, optional_fields = nullable)]
 pub struct ConnectorProviderSummary {
     pub id: String,
     pub label: String,
@@ -128,10 +143,12 @@ pub struct ConnectorProviderSummary {
     /// Present for subprocess adapters: the settings fields they declare plus
     /// their current values, so the UI can render and save a config form.
     pub adapter_settings: Option<AdapterSettingsView>,
+    pub services: Vec<ProviderService>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ConnectorRefreshStatus {
     Pending,
     Refreshing,
@@ -139,8 +156,9 @@ pub enum ConnectorRefreshStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct AdapterSettingsView {
     pub fields: Vec<AdapterSettingsFieldView>,
     /// Non-secret current values only. Secret values are write-only and exposed
@@ -149,16 +167,18 @@ pub struct AdapterSettingsView {
     pub secrets: BTreeMap<String, SecretSettingState>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct SecretSettingState {
     pub has_value: bool,
     pub fingerprint: Option<String>,
     pub last4: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct AdapterSettingsFieldView {
     pub key: String,
     pub label: String,
@@ -167,8 +187,9 @@ pub struct AdapterSettingsFieldView {
     pub options: Vec<AdapterSettingsFieldOptionView>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct AdapterSettingsFieldOptionView {
     pub value: String,
     pub label: String,
@@ -196,6 +217,7 @@ struct AdapterModelCatalog {
 #[derive(Default)]
 struct ConnectorManagerState {
     catalogs: BTreeMap<String, AdapterModelCatalog>,
+    service_catalogs: BTreeMap<String, Vec<ProviderService>>,
     catalog_fetched_at: BTreeMap<String, Instant>,
     adapter_info: BTreeMap<String, AdapterInfo>,
     refreshing: BTreeSet<String>,
@@ -239,6 +261,7 @@ impl ConnectorManager {
 
     pub fn snapshot(&self) -> Result<ConnectorSettingsSnapshot> {
         let selected_model = self.database.selected_llm_model()?;
+        let feature_routes = self.database.feature_routes()?;
         let disabled = self.database.disabled_provider_ids()?;
         let provider_labels = self.provider_labels();
         let provider_icons = self.provider_icons();
@@ -249,6 +272,7 @@ impl ConnectorManager {
         Ok(ConnectorSettingsSnapshot {
             providers: connector_providers(
                 &state.catalogs,
+                &state.service_catalogs,
                 &selected_model,
                 &disabled,
                 &state.adapter_info,
@@ -261,6 +285,7 @@ impl ConnectorManager {
                 self.runtime.as_deref(),
             ),
             selected_model,
+            feature_routes,
         })
     }
 
@@ -318,6 +343,131 @@ impl ConnectorManager {
         self.database
             .set_selected_llm_model(provider_id, model_id)?;
         self.snapshot()
+    }
+
+    pub fn set_feature_route(
+        &self,
+        feature: &str,
+        provider_id: &str,
+        model_id: &str,
+        options: serde_json::Value,
+    ) -> Result<ConnectorSettingsSnapshot> {
+        self.ensure_feature_route_supported(feature, provider_id, model_id)?;
+        self.database
+            .set_feature_route(feature, provider_id, model_id, &options)?;
+        self.snapshot()
+    }
+
+    pub fn generate_image(
+        &self,
+        prompt: &str,
+        options: serde_json::Value,
+    ) -> Result<(FeatureRoute, ImageGenerationResult)> {
+        let route = self
+            .database
+            .feature_routes()?
+            .into_iter()
+            .find(|route| route.feature == FEATURE_IMAGE_GENERATE)
+            .ok_or_else(|| {
+                MothershipError::InvalidRequest(
+                    "no image generation provider is selected in Mothership settings".to_string(),
+                )
+            })?;
+        let entry = find_trusted_adapter_entry(&self.plugins_dir(), &route.provider_id)?;
+        ensure_adapter_capability(&entry, CAPABILITY_IMAGE_GENERATE, "generate images")
+            .map_err(MothershipError::InvalidRequest)?;
+        let vault = self.vault();
+
+        let auth_status = self
+            .pool
+            .with(&entry, &vault, |adapter| adapter.auth_status())
+            .map_err(|error| MothershipError::InvalidRequest(error.to_string()))?;
+        if !is_authenticated(&auth_status) {
+            return Err(MothershipError::InvalidRequest(format!(
+                "provider `{}` is not authorized for image generation: {}",
+                route.provider_id,
+                auth_status
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| format!("{:?}", auth_status.kind))
+            )));
+        }
+
+        let services = adapter_service_catalog(&self.pool, &entry, &vault)
+            .map_err(MothershipError::InvalidRequest)?;
+        ensure_service_catalog_supports(
+            &services,
+            &route.feature,
+            &route.provider_id,
+            &route.model_id,
+        )?;
+
+        let request = ImageGenerationRequest {
+            model: route.model_id.clone(),
+            prompt: prompt.to_string(),
+            options: merge_route_options(route.options.clone(), options),
+        };
+        let result = self
+            .pool
+            .with(&entry, &vault, |adapter| adapter.generate_image(request))
+            .map_err(|error| MothershipError::InvalidRequest(error.to_string()))?;
+        Ok((route, result))
+    }
+
+    pub fn transcribe_audio(
+        &self,
+        input_path: &str,
+        options: serde_json::Value,
+    ) -> Result<(FeatureRoute, AudioTranscriptionResult)> {
+        let route = self
+            .database
+            .feature_routes()?
+            .into_iter()
+            .find(|route| route.feature == FEATURE_AUDIO_TRANSCRIBE)
+            .ok_or_else(|| {
+                MothershipError::InvalidRequest(
+                    "no STT provider is selected in Mothership settings".to_string(),
+                )
+            })?;
+        let entry = find_trusted_adapter_entry(&self.plugins_dir(), &route.provider_id)?;
+        ensure_adapter_capability(&entry, CAPABILITY_AUDIO_TRANSCRIBE, "transcribe audio")
+            .map_err(MothershipError::InvalidRequest)?;
+        let vault = self.vault();
+
+        let auth_status = self
+            .pool
+            .with(&entry, &vault, |adapter| adapter.auth_status())
+            .map_err(|error| MothershipError::InvalidRequest(error.to_string()))?;
+        if !is_authenticated(&auth_status) {
+            return Err(MothershipError::InvalidRequest(format!(
+                "provider `{}` is not authorized for STT: {}",
+                route.provider_id,
+                auth_status
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| format!("{:?}", auth_status.kind))
+            )));
+        }
+
+        let services = adapter_service_catalog(&self.pool, &entry, &vault)
+            .map_err(MothershipError::InvalidRequest)?;
+        ensure_service_catalog_supports(
+            &services,
+            &route.feature,
+            &route.provider_id,
+            &route.model_id,
+        )?;
+
+        let request = AudioTranscriptionRequest {
+            model: route.model_id.clone(),
+            input_path: input_path.to_string(),
+            options: merge_route_options(route.options.clone(), options),
+        };
+        let result = self
+            .pool
+            .with(&entry, &vault, |adapter| adapter.transcribe_audio(request))
+            .map_err(|error| MothershipError::InvalidRequest(error.to_string()))?;
+        Ok((route, result))
     }
 
     pub fn save_adapter_settings(
@@ -444,6 +594,21 @@ impl ConnectorManager {
         Ok(())
     }
 
+    fn ensure_feature_route_supported(
+        &self,
+        feature: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<()> {
+        let state = self.state.lock().unwrap();
+        let services = state.service_catalogs.get(provider_id).ok_or_else(|| {
+            MothershipError::InvalidRequest(format!(
+                "provider `{provider_id}` has no loaded service catalog"
+            ))
+        })?;
+        ensure_service_catalog_supports(services, feature, provider_id, model_id)
+    }
+
     fn authenticate_only(&self, provider_id: &str, registry: &AuthProcessRegistry) -> Result<()> {
         let entry = find_trusted_adapter_entry(&self.plugins_dir(), provider_id)?;
         ensure_adapter_capability(&entry, CAPABILITY_AUTH_INTERACTIVE, "authenticate")
@@ -483,7 +648,7 @@ impl ConnectorManager {
             .ok()
             .and_then(|mut map| map.remove(provider_id));
         if let Some(pid) = pid {
-            kill_process(pid);
+            kill_process_tree(pid);
         }
         Ok(())
     }
@@ -565,6 +730,7 @@ impl ConnectorManager {
             );
             state.catalog_fetched_at.remove(&entry.provider_id);
             state.adapter_info.remove(&entry.provider_id);
+            state.service_catalogs.remove(&entry.provider_id);
             state.refreshing.remove(&entry.provider_id);
             if let Some(event) = self.event(ConnectorSettingsEventKind::ProviderUpdated) {
                 emit(event);
@@ -590,6 +756,7 @@ impl ConnectorManager {
             .unwrap_or_else(|| {
                 adapter_model_catalog(&self.pool, entry, &vault).map(|catalog| (catalog, true))
             });
+        let service_result = adapter_service_catalog(&self.pool, entry, &vault);
 
         {
             let mut state = self.state.lock().unwrap();
@@ -621,6 +788,20 @@ impl ConnectorManager {
                     state.catalog_fetched_at.remove(&entry.provider_id);
                 }
             }
+            match service_result {
+                Ok(services) => {
+                    state
+                        .service_catalogs
+                        .insert(entry.provider_id.clone(), services);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "failed to read service catalog for {}: {error}",
+                        entry.provider_id
+                    );
+                    state.service_catalogs.remove(&entry.provider_id);
+                }
+            }
 
             state.refreshing.remove(&entry.provider_id);
         }
@@ -645,6 +826,7 @@ impl ConnectorManager {
         state.catalogs.remove(provider_id);
         state.catalog_fetched_at.remove(provider_id);
         state.adapter_info.remove(provider_id);
+        state.service_catalogs.remove(provider_id);
     }
 
     fn cached_model_catalog(&self, provider_id: &str) -> Option<AdapterModelCatalog> {
@@ -700,35 +882,52 @@ impl ConnectorManager {
     }
 }
 
+fn ensure_service_catalog_supports(
+    services: &[ProviderService],
+    feature: &str,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<()> {
+    let service = services
+        .iter()
+        .find(|service| service.feature == feature)
+        .ok_or_else(|| {
+            MothershipError::InvalidRequest(format!(
+                "provider `{provider_id}` does not support feature `{feature}`"
+            ))
+        })?;
+    if !service.models.iter().any(|model| model.id == model_id) {
+        return Err(MothershipError::InvalidRequest(format!(
+            "provider `{provider_id}` does not expose model `{model_id}` for feature `{feature}`"
+        )));
+    }
+    Ok(())
+}
+
+fn merge_route_options(
+    base: serde_json::Value,
+    override_options: serde_json::Value,
+) -> serde_json::Value {
+    match (base, override_options) {
+        (serde_json::Value::Object(mut base), serde_json::Value::Object(override_map)) => {
+            base.extend(override_map);
+            serde_json::Value::Object(base)
+        }
+        (base, serde_json::Value::Null) => base,
+        (_, override_options) => override_options,
+    }
+}
+
 /// Patch value accepted from UI settings forms. Secret fields are write-only:
 /// `unchanged` keeps the existing value, `set` replaces it, and `clear` removes
 /// it. Unknown/internal keys are rejected against the adapter's declared schema.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "action", rename_all = "snake_case")]
+#[ts(export)]
 pub enum AdapterSettingPatchValue {
     Set { value: String },
     Clear,
     Unchanged,
-}
-
-/// Best-effort terminate a child process by id (a spawned adapter). Core can
-/// always kill an adapter — crash isolation is part of the contract.
-/// Fire-and-forget (`spawn`, not `output`) so it never blocks the caller.
-pub fn kill_process(pid: u32) {
-    #[cfg(windows)]
-    let _ = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    #[cfg(unix)]
-    let _ = std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
 }
 
 fn verified_adapter_entry(entry: &AdapterEntry) -> std::result::Result<(), String> {
@@ -881,6 +1080,29 @@ fn adapter_model_catalog(
     })
 }
 
+fn adapter_service_catalog(
+    pool: &AdapterPool,
+    entry: &AdapterEntry,
+    vault: &FileCredentialVault,
+) -> std::result::Result<Vec<ProviderService>, String> {
+    if !has_provider_service_capability(entry) {
+        return Ok(Vec::new());
+    }
+    pool.with(entry, vault, |adapter| adapter.services())
+        .map_err(|error| error.to_string())
+}
+
+fn has_provider_service_capability(entry: &AdapterEntry) -> bool {
+    [
+        CAPABILITY_IMAGE_GENERATE,
+        CAPABILITY_IMAGE_EDIT,
+        CAPABILITY_AUDIO_TRANSCRIBE,
+        CAPABILITY_AUDIO_SPEECH,
+    ]
+    .iter()
+    .any(|capability| entry.has_capability(capability))
+}
+
 fn adapter_settings_fields(
     pool: &AdapterPool,
     entry: &AdapterEntry,
@@ -937,6 +1159,7 @@ fn is_authenticated(status: &AuthStatus) -> bool {
 
 fn connector_providers(
     catalogs: &BTreeMap<String, AdapterModelCatalog>,
+    service_catalogs: &BTreeMap<String, Vec<ProviderService>>,
     selected_model: &SelectedLlmModel,
     disabled: &BTreeSet<String>,
     adapter_info: &BTreeMap<String, AdapterInfo>,
@@ -963,6 +1186,9 @@ fn connector_providers(
         provider_ids.insert(provider_id.clone());
     }
     for provider_id in catalogs.keys() {
+        provider_ids.insert(provider_id.clone());
+    }
+    for provider_id in service_catalogs.keys() {
         provider_ids.insert(provider_id.clone());
     }
     for provider_id in provider_labels.keys() {
@@ -1002,6 +1228,10 @@ fn connector_providers(
                 .map(|info| info.auth_status.clone())
                 .unwrap_or_else(|| AuthStatus::missing("connector has not reported auth status"));
             let adapter_settings = info.map(|info| info.view.clone());
+            let services = service_catalogs
+                .get(&provider_id)
+                .cloned()
+                .unwrap_or_default();
             let icon = provider_icons.get(&provider_id).cloned();
             let runtime_kind = provider_runtime_kinds
                 .get(&provider_id)
@@ -1046,6 +1276,7 @@ fn connector_providers(
                 auth_status,
                 authenticated,
                 adapter_settings,
+                services,
             }
         })
         .collect()

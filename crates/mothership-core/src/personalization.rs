@@ -8,18 +8,21 @@
 //! and edits.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// One provider's stored instruction text.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ProviderInstruction {
     pub provider_id: String,
     pub content: String,
 }
 
 /// One provider+model's stored instruction text.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ModelInstruction {
     pub provider_id: String,
     pub model_id: String,
@@ -28,8 +31,9 @@ pub struct ModelInstruction {
 
 /// The full personalization view the settings UI renders and edits: the global
 /// instruction plus every provider- and model-scoped override the user has saved.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct PersonalizationSettings {
     pub global: String,
     pub providers: Vec<ProviderInstruction>,

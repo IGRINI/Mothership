@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct WorkspaceItem {
     pub id: i64,
     pub kind: String,
@@ -11,8 +13,9 @@ pub struct WorkspaceItem {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ActivityEvent {
     pub id: i64,
     pub source: String,
@@ -21,16 +24,18 @@ pub struct ActivityEvent {
     pub occurred_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct DashboardMetric {
     pub label: String,
     pub value: String,
     pub tone: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct SidecarStatus {
     pub healthy: bool,
     pub database_path: String,
@@ -39,8 +44,9 @@ pub struct SidecarStatus {
     pub database_bytes: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct DashboardSnapshot {
     pub metrics: Vec<DashboardMetric>,
     pub workspace_items: Vec<WorkspaceItem>,

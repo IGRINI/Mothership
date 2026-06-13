@@ -1,12 +1,15 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
+use ts_rs::TS;
 
 use crate::Result;
 
 use super::cancellation::ToolCancellationToken;
+use super::filesystem::{is_sensitive_relative, lexically_normalize, path_contains};
 use super::types::{ToolCommand, ToolExecutionRequest};
 use super::ToolKind;
 
@@ -18,8 +21,9 @@ pub enum ToolPermissionAction {
     Deny,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ToolApprovalMode {
     /// Current conservative behavior: ask for every non-read-only command and
     /// mutating file tool.
@@ -38,25 +42,135 @@ impl Default for ToolApprovalMode {
     }
 }
 
-#[derive(Debug, Default)]
+/// Live approval modes for the chats whose runs are currently in flight.
+///
+/// One store is shared process-wide, but every entry is scoped to a chat id so
+/// concurrent runs in different chats each enforce their OWN chat's mode — a
+/// `yolo` chat must never loosen the gating of a `manual` chat running next to
+/// it. Entries are reference-counted by active run ([`begin_run`]) and removed
+/// when the last run for the chat ends (its guard drops, including on unwind),
+/// so the map stays bounded by the number of in-flight runs. Chats without an
+/// entry — and calls with no chat context at all — get `default_mode`.
+///
+/// [`begin_run`]: Self::begin_run
+#[derive(Debug)]
 pub struct ToolApprovalModeStore {
-    mode: Mutex<ToolApprovalMode>,
+    default_mode: ToolApprovalMode,
+    chats: Mutex<HashMap<String, ChatModeEntry>>,
+}
+
+#[derive(Debug)]
+struct ChatModeEntry {
+    mode: ToolApprovalMode,
+    active_runs: usize,
+}
+
+impl Default for ToolApprovalModeStore {
+    fn default() -> Self {
+        Self {
+            default_mode: ToolApprovalMode::default(),
+            chats: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl ToolApprovalModeStore {
-    pub fn new(mode: ToolApprovalMode) -> Arc<Self> {
+    pub fn new(default_mode: ToolApprovalMode) -> Arc<Self> {
         Arc::new(Self {
-            mode: Mutex::new(mode),
+            default_mode,
+            chats: Mutex::new(HashMap::new()),
         })
     }
 
-    pub fn mode(&self) -> ToolApprovalMode {
-        *self.mode.lock().unwrap()
+    /// The fallback mode used when a call has no chat context (or the chat has
+    /// no run in flight).
+    pub fn default_mode(&self) -> ToolApprovalMode {
+        self.default_mode
     }
 
-    pub fn set_mode(&self, mode: ToolApprovalMode) -> ToolApprovalMode {
-        *self.mode.lock().unwrap() = mode;
-        mode
+    /// The mode governing tool decisions for `chat_id`. Unknown chats — and
+    /// `None` (e.g. the protocol-level `run_command`) — get the default.
+    pub fn mode_for_chat(&self, chat_id: Option<&str>) -> ToolApprovalMode {
+        let Some(chat_id) = chat_id else {
+            return self.default_mode;
+        };
+        self.chats()
+            .get(chat_id)
+            .map(|entry| entry.mode)
+            .unwrap_or(self.default_mode)
+    }
+
+    /// Register a run starting in `chat_id` with the chat's saved mode. The
+    /// returned guard keeps the entry alive; dropping it (run finished, failed,
+    /// cancelled, or panicked) releases it, removing the entry once the chat
+    /// has no other active run.
+    pub fn begin_run(
+        self: &Arc<Self>,
+        chat_id: &str,
+        mode: ToolApprovalMode,
+    ) -> ToolApprovalRunGuard {
+        {
+            let mut chats = self.chats();
+            let entry = chats.entry(chat_id.to_string()).or_insert(ChatModeEntry {
+                mode,
+                active_runs: 0,
+            });
+            entry.mode = mode;
+            entry.active_runs += 1;
+        }
+        ToolApprovalRunGuard {
+            store: Arc::clone(self),
+            chat_id: chat_id.to_string(),
+        }
+    }
+
+    /// Live-update the mode of a chat with a run in flight (the composer's
+    /// mid-run mode switch), scoped to that chat only. Chats without an active
+    /// run are left alone — their next run seeds from the persisted chat state
+    /// — so idle chats never accumulate entries. Returns whether an in-flight
+    /// entry was updated.
+    pub fn update_chat_mode(&self, chat_id: &str, mode: ToolApprovalMode) -> bool {
+        match self.chats().get_mut(chat_id) {
+            Some(entry) => {
+                entry.mode = mode;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn end_run(&self, chat_id: &str) {
+        let mut chats = self.chats();
+        if let Some(entry) = chats.get_mut(chat_id) {
+            entry.active_runs = entry.active_runs.saturating_sub(1);
+            if entry.active_runs == 0 {
+                chats.remove(chat_id);
+            }
+        }
+    }
+
+    /// Recover from a poisoned lock: entries are plain copies (a panic can
+    /// never leave one half-written), and approval decisions must keep working
+    /// after an unrelated panic was contained by the request isolation layer.
+    fn chats(&self) -> std::sync::MutexGuard<'_, HashMap<String, ChatModeEntry>> {
+        self.chats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// RAII registration of one active run in a [`ToolApprovalModeStore`]; dropping
+/// it ends the run's claim on its chat entry (also on unwind, so a panicking
+/// run never leaks a stale mode).
+#[derive(Debug)]
+pub struct ToolApprovalRunGuard {
+    store: Arc<ToolApprovalModeStore>,
+    chat_id: String,
+}
+
+impl Drop for ToolApprovalRunGuard {
+    fn drop(&mut self) {
+        self.store.end_run(&self.chat_id);
     }
 }
 
@@ -65,8 +179,9 @@ impl ToolApprovalModeStore {
 /// loaded into a [`ToolPolicyStore`] at sidecar startup; the UI edits them on
 /// the Permissions screen. They are advisory overrides — workspace containment,
 /// cancellation, and the runtime guards still run regardless.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ToolPolicySettings {
     /// Command program basenames (case-insensitive, extension-insensitive) that
     /// are always auto-approved, skipping the per-command approval prompt.
@@ -200,7 +315,9 @@ pub struct ConservativeCommandPermissionPolicy;
 
 impl ToolPermissionPolicy for ConservativeCommandPermissionPolicy {
     fn evaluate(&self, request: &ToolExecutionRequest) -> ToolPermissionEvaluation {
-        classify_command(&request.command)
+        // The conservative default IS manual-mode semantics (including the
+        // read-only argument screen), just without a per-chat mode store.
+        command_permission_for_mode(ToolApprovalMode::Manual, request)
     }
 }
 
@@ -217,7 +334,7 @@ impl ModeAwareCommandPermissionPolicy {
 
 impl ToolPermissionPolicy for ModeAwareCommandPermissionPolicy {
     fn evaluate(&self, request: &ToolExecutionRequest) -> ToolPermissionEvaluation {
-        command_permission_for_mode(self.mode.mode(), request)
+        command_permission_for_mode(self.mode.mode_for_chat(request.chat_id.as_deref()), request)
     }
 }
 
@@ -241,7 +358,10 @@ impl ToolPermissionPolicy for UserAwareCommandPermissionPolicy {
         match self.policy.command_decision(&request.command.program) {
             Some(ToolPermissionAction::Deny) => deny("command is on your denylist"),
             Some(ToolPermissionAction::Allow) => allow("command is on your allowlist"),
-            _ => command_permission_for_mode(self.mode.mode(), request),
+            _ => command_permission_for_mode(
+                self.mode.mode_for_chat(request.chat_id.as_deref()),
+                request,
+            ),
         }
     }
 }
@@ -256,7 +376,20 @@ pub fn command_permission_for_mode(
     }
 
     match mode {
-        ToolApprovalMode::Manual => classify_command(&request.command),
+        ToolApprovalMode::Manual => {
+            let evaluation = classify_command(&request.command);
+            // A read-only program's auto-allow is screened in MANUAL mode only:
+            // `cat`/`type`/… are safe per se, but an argument can still point
+            // the read at a secret (`cat .env`) or outside the workspace. In
+            // auto_safe/yolo sensitive reads are an explicitly allowed
+            // capability, so the screen does not run there.
+            if evaluation.action == ToolPermissionAction::Allow {
+                if let Some(reason) = read_only_argument_screen(request) {
+                    return ask(reason);
+                }
+            }
+            evaluation
+        }
         ToolApprovalMode::AutoSafe => {
             let base = classify_command(&request.command);
             if base.action == ToolPermissionAction::Deny {
@@ -483,6 +616,121 @@ fn command_requires_manual_approval(command: &ToolCommand) -> bool {
         return shell_script_requires_manual_approval(command);
     }
     false
+}
+
+/// Manual-mode argument screen for auto-allowed read-only programs (`cat`,
+/// `type`, `findstr`, `ls`, …): any argument that references a sensitive path
+/// (the same component rules the file tools use) or resolves outside the
+/// workspace turns the auto-allow into an `Ask`. Bare, non-sensitive words stay
+/// auto-allowed — `cat README.md` must not prompt; the goal is catching secret
+/// reads and workspace escapes, not harassing the user. Returns the ask reason,
+/// or `None` to keep the auto-allow.
+fn read_only_argument_screen(request: &ToolExecutionRequest) -> Option<String> {
+    if !is_read_only_program(&normalized(&request.command.program)) {
+        return None;
+    }
+
+    // Containment context: relative arguments resolve against the command's cwd
+    // (falling back to the workspace root), and a path is in-bounds when it is
+    // under the workspace root OR the (already vetted) cwd — the cwd may sit in
+    // the writable tmp root, whose files a read-only program may read. With no
+    // context at all, containment cannot be judged and only the sensitive-name
+    // screen applies (ambiguity prefers auto-allow).
+    let base = request.cwd.as_deref().or(request.workspace_root.as_deref());
+    let mut roots: Vec<&Path> = Vec::new();
+    roots.extend(request.workspace_root.as_deref());
+    roots.extend(request.cwd.as_deref());
+
+    request
+        .command
+        .args
+        .iter()
+        .find_map(|argument| screen_read_only_argument(argument, base, &roots))
+}
+
+/// Screen one argument of a read-only program. Flag tokens are skipped; a token
+/// whose path components match the sensitive rules asks; a path-like token that
+/// resolves (lexically, against `base`) outside every allowed root asks; bare
+/// non-path words are tested against the sensitive names only (catching
+/// `cat .env`) and otherwise stay auto-allowed.
+fn screen_read_only_argument(
+    argument: &str,
+    base: Option<&Path>,
+    roots: &[&Path],
+) -> Option<String> {
+    let token = argument.trim().trim_matches(|ch| matches!(ch, '"' | '\''));
+    if token.is_empty() {
+        return None;
+    }
+    // Flags: `-…` always; a `/x` Windows switch only when nothing after it looks
+    // like a path separator (so `/etc/passwd` is not mistaken for a switch).
+    if token.starts_with('-') {
+        return None;
+    }
+    if let Some(rest) = token.strip_prefix('/') {
+        if !rest.contains(['/', '\\']) {
+            return None;
+        }
+    }
+
+    // Judge the same shape on every platform: fold `\` to `/` so a backslash
+    // path embedded in one token cannot dodge `..` resolution on non-Windows.
+    // Conservative — it can only over-ask on an exotic filename containing a
+    // literal backslash, never under-ask.
+    let token_normalized = token.replace('\\', "/");
+    let token_path = Path::new(&token_normalized);
+
+    // Sensitive names anywhere in the token's components — catches a bare
+    // `.env`, a relative `config/.ssh/id_rsa`, and an absolute
+    // `C:\Users\me\.ssh\id_rsa` alike, reusing the file tools' single source of
+    // truth for what counts as sensitive.
+    if is_sensitive_relative(token_path) {
+        return Some(format!(
+            "`{token}` references a sensitive path — reading it requires approval in manual mode"
+        ));
+    }
+
+    // Home-anchored references live outside the workspace by definition.
+    if token == "~" || token.starts_with("~/") || token.starts_with("~\\") {
+        return Some(outside_workspace_reason(token));
+    }
+
+    // Containment is tested only for path-like tokens: a bare word resolves
+    // under the cwd anyway, and prompting on every ambiguous word would make
+    // manual mode unusable.
+    if !is_path_like_token(token) {
+        return None;
+    }
+    let base = base?;
+    let resolved = if token_path.is_absolute() {
+        lexically_normalize(token_path)
+    } else {
+        lexically_normalize(&base.join(token_path))
+    };
+    if roots.iter().any(|root| path_contains(root, &resolved)) {
+        return None;
+    }
+    Some(outside_workspace_reason(token))
+}
+
+fn outside_workspace_reason(token: &str) -> String {
+    format!(
+        "`{token}` points outside the project workspace — reading it requires approval in manual mode"
+    )
+}
+
+/// Whether a token plausibly names a filesystem path (vs a bare word, pattern,
+/// or switch): it contains a separator, climbs with `..`, or starts with a
+/// Windows drive prefix (`C:`).
+fn is_path_like_token(token: &str) -> bool {
+    if token.contains(['/', '\\']) {
+        return true;
+    }
+    if token == ".." {
+        return true;
+    }
+    let bytes = token.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn classify_git(command: &ToolCommand) -> ToolPermissionEvaluation {
@@ -832,6 +1080,114 @@ mod tests {
         );
     }
 
+    #[test]
+    fn concurrent_chats_each_enforce_their_own_mode() {
+        // The privilege-escalation regression this store exists to prevent: a
+        // run starting in a yolo chat must not loosen the gating of a manual
+        // chat running concurrently.
+        let mode = ToolApprovalModeStore::new(ToolApprovalMode::Manual);
+        let policy = UserAwareCommandPermissionPolicy::new(
+            ToolPolicyStore::new(ToolPolicySettings::default()),
+            Arc::clone(&mode),
+        );
+        let _yolo_run = mode.begin_run("chat_yolo", ToolApprovalMode::Yolo);
+        let _manual_run = mode.begin_run("chat_manual", ToolApprovalMode::Manual);
+
+        // `npm install` is "ask" under manual mode, auto-approved under yolo.
+        let yolo_request = chat_command_request("npm", &["install"], Some("chat_yolo"));
+        let manual_request = chat_command_request("npm", &["install"], Some("chat_manual"));
+        assert_eq!(
+            policy.evaluate(&yolo_request).action,
+            ToolPermissionAction::Allow
+        );
+        assert_eq!(
+            policy.evaluate(&manual_request).action,
+            ToolPermissionAction::Ask
+        );
+        // No chat context at all (protocol-level run_command) → default mode.
+        let bare_request = chat_command_request("npm", &["install"], None);
+        assert_eq!(
+            policy.evaluate(&bare_request).action,
+            ToolPermissionAction::Ask
+        );
+
+        // The read-only argument screen is per-chat too: the manual chat's
+        // `cat .env` asks while the concurrent yolo chat reads it freely.
+        let manual_env = chat_command_request("cat", &[".env"], Some("chat_manual"));
+        assert_eq!(
+            policy.evaluate(&manual_env).action,
+            ToolPermissionAction::Ask,
+            "manual chat must be asked before a secret read"
+        );
+        let yolo_env = chat_command_request("cat", &[".env"], Some("chat_yolo"));
+        assert_eq!(
+            policy.evaluate(&yolo_env).action,
+            ToolPermissionAction::Allow,
+            "yolo chat reads sensitive paths without a prompt"
+        );
+    }
+
+    #[test]
+    fn mid_run_mode_change_affects_only_its_chat() {
+        let mode = ToolApprovalModeStore::new(ToolApprovalMode::Manual);
+        let _run_a = mode.begin_run("chat_a", ToolApprovalMode::Manual);
+        let _run_b = mode.begin_run("chat_b", ToolApprovalMode::Manual);
+
+        assert!(mode.update_chat_mode("chat_a", ToolApprovalMode::Yolo));
+        assert_eq!(
+            mode.mode_for_chat(Some("chat_a")),
+            ToolApprovalMode::Yolo,
+            "the changed chat follows its new mode mid-run"
+        );
+        assert_eq!(
+            mode.mode_for_chat(Some("chat_b")),
+            ToolApprovalMode::Manual,
+            "a sibling chat's in-flight run must keep its own mode"
+        );
+
+        // A chat with no run in flight is not registered by an update — its
+        // next run seeds from the persisted chat state instead.
+        assert!(!mode.update_chat_mode("chat_idle", ToolApprovalMode::Yolo));
+        assert_eq!(
+            mode.mode_for_chat(Some("chat_idle")),
+            ToolApprovalMode::Manual
+        );
+    }
+
+    #[test]
+    fn run_guard_drop_releases_chat_entry() {
+        let mode = ToolApprovalModeStore::new(ToolApprovalMode::Manual);
+        let guard = mode.begin_run("chat_a", ToolApprovalMode::Yolo);
+        assert_eq!(mode.mode_for_chat(Some("chat_a")), ToolApprovalMode::Yolo);
+
+        drop(guard);
+        assert_eq!(
+            mode.mode_for_chat(Some("chat_a")),
+            ToolApprovalMode::Manual,
+            "a terminal run must release its chat's entry"
+        );
+        assert!(
+            !mode.update_chat_mode("chat_a", ToolApprovalMode::Yolo),
+            "the entry must actually be removed, not just reset"
+        );
+    }
+
+    #[test]
+    fn overlapping_runs_in_one_chat_keep_entry_until_last_ends() {
+        let mode = ToolApprovalModeStore::new(ToolApprovalMode::Manual);
+        let first = mode.begin_run("chat_a", ToolApprovalMode::AutoSafe);
+        let second = mode.begin_run("chat_a", ToolApprovalMode::AutoSafe);
+
+        drop(first);
+        assert_eq!(
+            mode.mode_for_chat(Some("chat_a")),
+            ToolApprovalMode::AutoSafe,
+            "the entry must survive while another run of the chat is active"
+        );
+        drop(second);
+        assert_eq!(mode.mode_for_chat(Some("chat_a")), ToolApprovalMode::Manual);
+    }
+
     #[tokio::test]
     async fn pending_gate_resolves_after_decision() {
         let gate = PendingToolApprovalGate::new();
@@ -921,7 +1277,9 @@ mod tests {
         ToolExecutionRequest {
             tool_call_id: tool_call_id.to_string(),
             run_id: None,
+            chat_id: None,
             project_id: Some("project_1".to_string()),
+            workspace_root: None,
             cwd: None,
             command: ToolCommand {
                 program: "npm".to_string(),
@@ -934,10 +1292,20 @@ mod tests {
     }
 
     fn command_request(program: &str, args: &[&str]) -> ToolExecutionRequest {
+        chat_command_request(program, args, None)
+    }
+
+    fn chat_command_request(
+        program: &str,
+        args: &[&str],
+        chat_id: Option<&str>,
+    ) -> ToolExecutionRequest {
         ToolExecutionRequest {
             tool_call_id: "tool_command".to_string(),
             run_id: None,
+            chat_id: chat_id.map(str::to_string),
             project_id: Some("project_1".to_string()),
+            workspace_root: None,
             cwd: None,
             command: ToolCommand {
                 program: program.to_string(),
@@ -947,6 +1315,21 @@ mod tests {
             timeout_ms: None,
             output_policy: ToolOutputPolicy::default(),
         }
+    }
+
+    /// A command request with a workspace root + cwd, as the chat dispatcher
+    /// builds them, for the read-only argument screen tests. The paths are used
+    /// purely lexically, so they need not exist.
+    fn screen_request(
+        program: &str,
+        args: &[&str],
+        workspace_root: &std::path::Path,
+        cwd: &std::path::Path,
+    ) -> ToolExecutionRequest {
+        let mut request = command_request(program, args);
+        request.workspace_root = Some(workspace_root.to_path_buf());
+        request.cwd = Some(cwd.to_path_buf());
+        request
     }
 
     #[test]
@@ -1040,6 +1423,122 @@ mod tests {
         assert_eq!(
             file_permission_action_for_mode(ToolApprovalMode::Yolo, ToolPermissionAction::Deny),
             ToolPermissionAction::Deny
+        );
+    }
+
+    // ---- read-only argument screen (manual mode) ---------------------------
+
+    #[test]
+    fn manual_screens_read_only_commands_for_sensitive_arguments() {
+        let root = std::env::temp_dir().join("mothership_screen_ws");
+        let action = |program: &str, args: &[&str]| {
+            command_permission_for_mode(
+                ToolApprovalMode::Manual,
+                &screen_request(program, args, &root, &root),
+            )
+            .action
+        };
+
+        // Secret reads must ask, whether named bare, relative, or absolute.
+        assert_eq!(action("cat", &[".env"]), ToolPermissionAction::Ask);
+        assert_eq!(
+            action("type", &["config\\.ssh\\id_rsa"]),
+            ToolPermissionAction::Ask
+        );
+        assert_eq!(
+            action("cat", &["C:\\Users\\me\\.ssh\\id_rsa"]),
+            ToolPermissionAction::Ask
+        );
+        // The reason must say WHY so the approval card is meaningful.
+        let evaluation = command_permission_for_mode(
+            ToolApprovalMode::Manual,
+            &screen_request("cat", &[".env"], &root, &root),
+        );
+        assert!(
+            evaluation.reason.contains("sensitive"),
+            "got: {}",
+            evaluation.reason
+        );
+
+        // Ordinary workspace reads stay auto-allowed — no prompt harassment.
+        assert_eq!(action("cat", &["src/main.rs"]), ToolPermissionAction::Allow);
+        assert_eq!(action("cat", &["README.md"]), ToolPermissionAction::Allow);
+        assert_eq!(action("ls", &["-la"]), ToolPermissionAction::Allow);
+        // Flags and Windows switches are not treated as paths.
+        assert_eq!(
+            action("findstr", &["/i", "needle", "src\\app.rs"]),
+            ToolPermissionAction::Allow
+        );
+    }
+
+    #[test]
+    fn manual_screens_read_only_commands_for_workspace_escapes() {
+        let root = std::env::temp_dir().join("mothership_screen_ws");
+        let action = |program: &str, args: &[&str]| {
+            command_permission_for_mode(
+                ToolApprovalMode::Manual,
+                &screen_request(program, args, &root, &root),
+            )
+            .action
+        };
+
+        // Relative climb-outs and absolute outside paths must ask.
+        assert_eq!(
+            action("type", &["..\\..\\outside.txt"]),
+            ToolPermissionAction::Ask
+        );
+        assert_eq!(
+            action("cat", &["../secrets-elsewhere"]),
+            ToolPermissionAction::Ask
+        );
+        let outside = std::env::temp_dir()
+            .join("mothership_screen_outside")
+            .join("notes.txt");
+        assert_eq!(
+            action("cat", &[outside.to_string_lossy().as_ref()]),
+            ToolPermissionAction::Ask
+        );
+        // Home-anchored references are outside the workspace by definition.
+        assert_eq!(action("cat", &["~/todo.txt"]), ToolPermissionAction::Ask);
+
+        // An absolute path INSIDE the workspace stays auto-allowed.
+        let inside = root.join("docs").join("guide.md");
+        assert_eq!(
+            action("cat", &[inside.to_string_lossy().as_ref()]),
+            ToolPermissionAction::Allow
+        );
+    }
+
+    #[test]
+    fn auto_safe_and_yolo_skip_the_read_only_argument_screen() {
+        // In auto_safe/yolo sensitive reads are an explicitly allowed
+        // capability: no screening, the read-only auto-allow stands.
+        let request = command_request("cat", &[".env"]);
+        assert_eq!(
+            command_permission_for_mode(ToolApprovalMode::AutoSafe, &request).action,
+            ToolPermissionAction::Allow
+        );
+        assert_eq!(
+            command_permission_for_mode(ToolApprovalMode::Yolo, &request).action,
+            ToolPermissionAction::Allow
+        );
+    }
+
+    #[test]
+    fn screen_judges_sensitive_names_even_without_path_context() {
+        // A protocol-level request may carry neither workspace root nor cwd;
+        // containment cannot be judged then, but secret names still ask.
+        let request = command_request("cat", &[".env"]);
+        assert_eq!(
+            command_permission_for_mode(ToolApprovalMode::Manual, &request).action,
+            ToolPermissionAction::Ask
+        );
+        // …while a plain workspace-looking read stays allowed (ambiguity
+        // prefers auto-allow).
+        let request = command_request("cat", &["src/main.rs"]);
+        assert_eq!(
+            command_permission_for_mode(ToolApprovalMode::Manual, &request).action,
+            ToolPermissionAction::Allow
         );
     }
 }

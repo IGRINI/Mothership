@@ -1,5 +1,13 @@
 import { Match, Switch } from "solid-js";
-import { FileText, Folder, GitBranch, Search, Terminal } from "lucide-solid";
+import {
+  FileText,
+  Folder,
+  GitBranch,
+  Image,
+  Mic,
+  Search,
+  Terminal,
+} from "lucide-solid";
 
 import type { ToolKind } from "../../../shared/api/mothership";
 
@@ -14,6 +22,12 @@ export function ToolKindIcon(props: { kind?: ToolKind }) {
       </Match>
       <Match when={props.kind === "apply_patch"}>
         <GitBranch size={14} />
+      </Match>
+      <Match when={props.kind === "image_generate"}>
+        <Image size={14} />
+      </Match>
+      <Match when={props.kind === "audio_transcribe"}>
+        <Mic size={14} />
       </Match>
       <Match
         when={

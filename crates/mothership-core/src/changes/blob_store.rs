@@ -23,6 +23,11 @@ pub trait SnapshotBlobStore: Send + Sync {
     fn get(&self, hash: &str) -> io::Result<Option<Vec<u8>>>;
     /// Whether a blob exists for this content id.
     fn has(&self, hash: &str) -> bool;
+    /// Remove the blob for a content id. Idempotent: removing an absent blob
+    /// succeeds. Callers (retention pruning) must only pass hashes no longer
+    /// referenced by any change-set file row — the store itself does no
+    /// reference counting.
+    fn remove(&self, hash: &str) -> io::Result<()>;
 }
 
 /// Hex-encode the SHA-256 of `bytes` (lower-case), matching
@@ -99,6 +104,21 @@ impl SnapshotBlobStore for FileBlobStore {
     fn has(&self, hash: &str) -> bool {
         self.path_for(hash).exists()
     }
+
+    fn remove(&self, hash: &str) -> io::Result<()> {
+        let path = self.path_for(hash);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        // Best effort: drop the shard directory once it is empty (remove_dir
+        // refuses non-empty directories, so a concurrent writer is safe).
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+        Ok(())
+    }
 }
 
 fn unique_temp_path(parent: &Path, hash: &str) -> PathBuf {
@@ -153,6 +173,24 @@ mod tests {
         let store = FileBlobStore::new(&dir);
         let hash = store.put(b"").unwrap();
         assert_eq!(store.get(&hash).unwrap().as_deref(), Some(&b""[..]));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_deletes_the_blob_and_is_idempotent() {
+        let dir = temp_dir("remove");
+        let store = FileBlobStore::new(&dir);
+
+        let hash = store.put(b"to be removed").unwrap();
+        assert!(store.has(&hash));
+
+        store.remove(&hash).unwrap();
+        assert!(!store.has(&hash));
+        assert!(store.get(&hash).unwrap().is_none());
+
+        // Removing an absent blob is not an error.
+        store.remove(&hash).unwrap();
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

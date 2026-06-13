@@ -31,6 +31,10 @@ export function formatToolHeadline(tool: ToolExecutionView) {
       return "Listed files";
     case "search_text":
       return "Searched";
+    case "image_generate":
+      return "Generated image";
+    case "audio_transcribe":
+      return "Transcribed audio";
     default:
       return "Used tool";
   }

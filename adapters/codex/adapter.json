@@ -2,5 +2,16 @@
   "provider_id": "codex",
   "provider_label": "Codex",
   "program": "codex-adapter.exe",
-  "icon": "icon.svg"
+  "icon": "icon.svg",
+  "capabilities": [
+    "llm.models",
+    "llm.chat",
+    "settings.read",
+    "auth.interactive",
+    "auth.logout",
+    "media.image.generate",
+    "network",
+    "browser.open",
+    "localhost.listen"
+  ]
 }

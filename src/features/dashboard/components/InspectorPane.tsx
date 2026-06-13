@@ -1,7 +1,10 @@
 import { For, Show, type JSX } from "solid-js";
-import { Check, Circle, Square, Terminal, X } from "lucide-solid";
+import { Check, Circle, Copy, FileText, RefreshCw, Square, Terminal, X } from "lucide-solid";
 
-import type { ChatThreadSummary } from "../../../shared/api/mothership";
+import type {
+  ChatThreadSummary,
+  PromptPreview,
+} from "../../../shared/api/mothership";
 import { startWindowDrag } from "../../../shared/window-drag";
 import {
   formatToolCommand,
@@ -16,10 +19,15 @@ import { ToolKindIcon } from "./ToolKindIcon";
 export function InspectorPane(props: {
   activeChat: ChatThreadSummary | null;
   messageCount: number;
+  promptError: string;
+  promptLoading: boolean;
+  promptPreview: PromptPreview | null;
   toolExecutions: ToolExecutionView[];
   onApproveTool: (toolCallId: string) => void;
   onCancelTool: (toolCallId: string) => void;
+  onCopyPrompt: () => void;
   onDenyTool: (toolCallId: string) => void;
+  onLoadPrompt: () => void;
 }) {
   const activeTools = () =>
     props.toolExecutions.filter((tool) => !isTerminalToolKind(tool.kind)).length;
@@ -55,6 +63,53 @@ export function InspectorPane(props: {
               <span>{props.messageCount} messages</span>
             </div>
           </div>
+        </InspectorSection>
+
+        <InspectorSection
+          title="Prompt"
+          action={
+            <div class="prompt-preview__actions">
+              <button
+                type="button"
+                class="inspector-icon-button"
+                title={props.promptPreview ? "Refresh prompt" : "Load prompt"}
+                disabled={!props.activeChat || props.promptLoading}
+                onClick={props.onLoadPrompt}
+              >
+                <RefreshCw size={14} />
+              </button>
+              <button
+                type="button"
+                class="inspector-icon-button"
+                title="Copy prompt"
+                disabled={!props.promptPreview}
+                onClick={props.onCopyPrompt}
+              >
+                <Copy size={14} />
+              </button>
+            </div>
+          }
+        >
+          <Show
+            when={props.promptPreview}
+            fallback={<div class="panel-empty">No prompt loaded.</div>}
+          >
+            {(preview) => (
+              <div class="prompt-preview">
+                <div class="prompt-preview__meta">
+                  <span>
+                    <FileText size={13} />
+                    {preview().providerId}/{preview().modelId}
+                  </span>
+                  <span>{preview().sections.length} sections</span>
+                </div>
+                <pre class="prompt-preview__body">{preview().renderedText}</pre>
+              </div>
+            )}
+          </Show>
+          <Show when={props.promptError}>
+            <div class="prompt-preview__error">{props.promptError}</div>
+          </Show>
         </InspectorSection>
 
         <InspectorSection

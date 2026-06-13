@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use mothership_adapter_host::AdapterEntry;
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 use crate::adapter_pool::AdapterPool;
 use crate::auth::FileCredentialVault;
@@ -18,16 +19,18 @@ const BACKOFF_AFTER_CONSECUTIVE_FAILURES: u32 = 3;
 const BASE_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ProviderRuntimeHealth {
     Healthy,
     Degraded,
     CoolingDown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ProviderRuntimeStatus {
     pub health: ProviderRuntimeHealth,
     pub active: usize,

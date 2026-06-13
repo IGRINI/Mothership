@@ -17,6 +17,7 @@ import {
   Palette,
   Plug,
   RefreshCw,
+  Route,
   ShieldCheck,
   Sparkles,
   type LucideProps,
@@ -33,6 +34,7 @@ import {
   getConnectorSettings,
   logoutAdapter,
   saveAdapterSettings,
+  setFeatureRoute,
   setProviderEnabled,
   setSelectedModel,
 } from "../../shared/api/mothership";
@@ -42,13 +44,15 @@ import { ChatTab } from "./tabs/ChatTab";
 import { ConnectorsTab } from "./tabs/ConnectorsTab";
 import { PermissionsTab } from "./tabs/PermissionsTab";
 import { PersonalizationTab } from "./tabs/PersonalizationTab";
+import { ServicesTab } from "./tabs/ServicesTab";
 
 type TabId =
   | "appearance"
   | "chat"
   | "connectors"
   | "personalization"
-  | "permissions";
+  | "permissions"
+  | "services";
 
 interface TabDef {
   id: TabId;
@@ -68,6 +72,7 @@ const NAV_GROUPS: { label: string; items: TabDef[] }[] = [
     label: "Providers",
     items: [
       { id: "connectors", label: "Connectors", icon: Plug },
+      { id: "services", label: "Services", icon: Route },
       { id: "personalization", label: "Personalization", icon: Sparkles },
     ],
   },
@@ -93,6 +98,7 @@ export function Settings(props: { onBack: () => void }) {
         (item) => item.id === tab(),
       )?.label ?? "",
   );
+  const initialConnectorLoading = () => isLoading() && !settings();
 
   onMount(() => {
     void reloadSettings();
@@ -151,7 +157,10 @@ export function Settings(props: { onBack: () => void }) {
   }
 
   async function reloadSettings() {
-    setIsLoading(true);
+    const initialLoad = !settings();
+    if (initialLoad) {
+      setIsLoading(true);
+    }
     setError("");
 
     try {
@@ -163,37 +172,113 @@ export function Settings(props: { onBack: () => void }) {
     }
   }
 
-  async function selectModel(providerId: string, modelId: string) {
+  // Reflect a preference change in the UI on the NEXT FRAME, then reconcile with
+  // the server: apply the edit to the local snapshot immediately, fire the async
+  // call in the background, and roll back only if it rejects. So switches and
+  // selectors never wait on the IPC round-trip to visually respond.
+  function applyOptimistic(
+    edit: (snapshot: ConnectorSettingsSnapshot) => ConnectorSettingsSnapshot,
+    commit: () => Promise<ConnectorSettingsSnapshot>,
+    done?: () => void,
+  ) {
     setError("");
-    try {
-      setSettings(await setSelectedModel(providerId, modelId));
-      notify("Model selection saved.");
-    } catch (caughtError) {
-      fail(errorMessage(caughtError));
+    const previous = settings();
+    if (previous) {
+      setSettings(edit(previous));
     }
+    void commit()
+      .then((snapshot) => {
+        setSettings(snapshot);
+        done?.();
+      })
+      .catch((caughtError) => {
+        if (previous) {
+          setSettings(previous);
+        }
+        fail(errorMessage(caughtError));
+      });
   }
+
+  function selectModel(providerId: string, modelId: string) {
+    applyOptimistic(
+      (snapshot) => ({
+        ...snapshot,
+        selectedModel: { ...snapshot.selectedModel, providerId, modelId },
+        providers: snapshot.providers.map((provider) => ({
+          ...provider,
+          selectedModelId: provider.id === providerId ? modelId : null,
+        })),
+      }),
+      () => setSelectedModel(providerId, modelId),
+      () => notify("Model selection saved."),
+    );
+  }
+
+  function selectFeatureRoute(
+    feature: string,
+    providerId: string,
+    modelId: string,
+  ) {
+    applyOptimistic(
+      (snapshot) => {
+        const existing = snapshot.featureRoutes.find(
+          (route) => route.feature === feature,
+        );
+        return {
+          ...snapshot,
+          featureRoutes: [
+            ...snapshot.featureRoutes.filter(
+              (route) => route.feature !== feature,
+            ),
+            {
+              feature,
+              providerId,
+              modelId,
+              options: existing?.options ?? {},
+              updatedAt: existing?.updatedAt ?? "",
+            },
+          ],
+        };
+      },
+      () => setFeatureRoute(feature, providerId, modelId),
+      () => notify("Service selection saved."),
+    );
+  }
+
+  // In-flight save marker: the form's values are already local state, so the
+  // next-frame cue here is the Save button disabling until the IPC settles.
+  const [savingAdapterId, setSavingAdapterId] = createSignal<string>();
 
   async function saveAdapter(
     providerId: string,
     patch: Record<string, AdapterSettingPatchValue>,
   ) {
+    if (savingAdapterId()) {
+      return;
+    }
     setError("");
+    setSavingAdapterId(providerId);
     try {
       setSettings(await saveAdapterSettings(providerId, patch));
       notify("Adapter settings saved.");
     } catch (caughtError) {
       fail(errorMessage(caughtError));
+    } finally {
+      setSavingAdapterId(undefined);
     }
   }
 
-  async function setEnabled(providerId: string, enabled: boolean) {
-    setError("");
-    try {
-      setSettings(await setProviderEnabled(providerId, enabled));
-      notify(enabled ? "Connector enabled." : "Connector disabled.");
-    } catch (caughtError) {
-      fail(errorMessage(caughtError));
-    }
+  function setEnabled(providerId: string, enabled: boolean) {
+    applyOptimistic(
+      (snapshot) => ({
+        ...snapshot,
+        providers: snapshot.providers.map((provider) =>
+          provider.id === providerId ? { ...provider, enabled } : provider,
+        ),
+      }),
+      () => setProviderEnabled(providerId, enabled),
+      () => notify(enabled ? "Connector enabled." : "Connector disabled."),
+    );
   }
 
   async function authorize(providerId: string) {
@@ -254,7 +339,7 @@ export function Settings(props: { onBack: () => void }) {
           <span>{tabLabel()}</span>
         </div>
         <Show
-          when={tab() === "connectors"}
+          when={tab() === "connectors" || tab() === "services"}
           fallback={<span aria-hidden="true" />}
         >
           <button
@@ -304,7 +389,7 @@ export function Settings(props: { onBack: () => void }) {
             </Match>
             <Match when={tab() === "connectors"}>
               <ConnectorsTab
-                loading={isLoading()}
+                loading={initialConnectorLoading()}
                 providers={settings()?.providers ?? []}
                 authorizingId={authorizingId()}
                 onAuthorize={(id) => void authorize(id)}
@@ -313,6 +398,17 @@ export function Settings(props: { onBack: () => void }) {
                 onSelectModel={(id, modelId) => void selectModel(id, modelId)}
                 onSetEnabled={(id, enabled) => void setEnabled(id, enabled)}
                 onSaveSettings={(id, patch) => void saveAdapter(id, patch)}
+                savingId={savingAdapterId()}
+              />
+            </Match>
+            <Match when={tab() === "services"}>
+              <ServicesTab
+                loading={initialConnectorLoading()}
+                providers={settings()?.providers ?? []}
+                featureRoutes={settings()?.featureRoutes ?? []}
+                onSelectFeatureRoute={(feature, id, modelId) =>
+                  void selectFeatureRoute(feature, id, modelId)
+                }
               />
             </Match>
             <Match when={tab() === "personalization"}>

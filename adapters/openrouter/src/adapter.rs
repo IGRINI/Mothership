@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use mothership_adapter_sdk::protocol::{
-    AuthKind, AuthStatus, Model, ModelManagement, SettingsField,
+    AuthKind, AuthStatus, ImageGenerationRequest, ImageGenerationResult, Model, ModelManagement,
+    ProviderService, SettingsField,
 };
 use mothership_adapter_sdk::{ChatRequest, ChatRoundOutcome, Context, ProviderAdapter};
 
@@ -55,18 +56,25 @@ impl ProviderAdapter for OpenRouterAdapter {
         if model_ids.is_empty() {
             return Ok((ModelManagement::UserDefined, Vec::new()));
         }
-        let metadata = match crate::models::fetch_model_metadata(&self.client, &self.settings).await
-        {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                eprintln!("openrouter-adapter: model metadata refresh failed: {error:#}");
-                BTreeMap::new()
-            }
-        };
+        let metadata =
+            crate::models::fetch_model_metadata_for_ids(&self.client, &self.settings, &model_ids)
+                .await;
         Ok((
             ModelManagement::UserDefined,
             crate::models::models_from_user_list(model_ids, &metadata),
         ))
+    }
+
+    async fn services(&mut self, _ctx: &Context) -> anyhow::Result<Vec<ProviderService>> {
+        crate::services::service_catalog(&self.client, &self.settings).await
+    }
+
+    async fn generate_image(
+        &mut self,
+        request: ImageGenerationRequest,
+        _ctx: &Context,
+    ) -> anyhow::Result<ImageGenerationResult> {
+        crate::services::generate_image(&self.client, &self.settings, request).await
     }
 
     async fn chat(

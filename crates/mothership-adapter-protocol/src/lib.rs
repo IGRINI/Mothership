@@ -16,12 +16,13 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use ts_rs::TS;
 
 /// Wire-protocol version between host and adapter. The host sends it on
 /// `initialize` and refuses an adapter that reports a different version, rather
 /// than mis-parsing a contract it doesn't understand. Bump on any incompatible
 /// change to `Request`/`Outbound`.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Host -> adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +39,9 @@ pub enum Request {
         id: u64,
     },
     GetModels {
+        id: u64,
+    },
+    GetServices {
         id: u64,
     },
     GetSettingsSchema {
@@ -99,6 +103,14 @@ pub enum Request {
         tool_call_id: String,
         result: ToolCallResult,
     },
+    GenerateImage {
+        id: u64,
+        request: ImageGenerationRequest,
+    },
+    TranscribeAudio {
+        id: u64,
+        request: AudioTranscriptionRequest,
+    },
     /// Ask the adapter to revoke / clean up its current auth (e.g. revoke an
     /// OAuth token server-side) before the host forgets the stored credential.
     /// Best-effort: the adapter acks even if revoke fails. Adapters with nothing
@@ -130,6 +142,10 @@ pub enum Outbound {
         id: u64,
         management: ModelManagement,
         models: Vec<Model>,
+    },
+    Services {
+        id: u64,
+        services: Vec<ProviderService>,
     },
     SettingsSchema {
         id: u64,
@@ -165,6 +181,14 @@ pub enum Outbound {
         state: Option<Value>,
         #[serde(default)]
         tool_calls: Vec<ToolCallInvocation>,
+    },
+    ImageGenerated {
+        id: u64,
+        result: ImageGenerationResult,
+    },
+    AudioTranscribed {
+        id: u64,
+        result: AudioTranscriptionResult,
     },
     Error {
         id: u64,
@@ -262,6 +286,94 @@ pub struct ToolDescriptor {
     pub annotations: BTreeMap<String, Value>,
 }
 
+pub const FEATURE_IMAGE_GENERATE: &str = "media.image.generate";
+pub const FEATURE_IMAGE_EDIT: &str = "media.image.edit";
+pub const FEATURE_AUDIO_TRANSCRIBE: &str = "audio.transcribe";
+pub const FEATURE_AUDIO_SPEECH: &str = "audio.speech";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ProviderServiceMode {
+    Sync,
+    Async,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ProviderService {
+    pub feature: String,
+    pub label: String,
+    #[serde(default)]
+    pub models: Vec<ProviderServiceModel>,
+    #[serde(default)]
+    pub options_schema: Value,
+    pub mode: ProviderServiceMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ProviderServiceModel {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub recommended: bool,
+    #[serde(default)]
+    pub options_schema: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageGenerationRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub options: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageGenerationResult {
+    #[serde(default)]
+    pub images: Vec<ProviderMediaBlob>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTranscriptionRequest {
+    pub model: String,
+    pub input_path: String,
+    #[serde(default)]
+    pub options: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTranscriptionResult {
+    pub text: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub artifacts: Vec<ProviderMediaBlob>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderMediaBlob {
+    pub content_type: String,
+    pub bytes_base64: String,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallResult {
@@ -280,8 +392,9 @@ pub struct Model {
     pub fast_mode: Option<FastModeCapabilities>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, optional_fields = nullable)]
 pub struct FastModeCapabilities {
     pub supported: bool,
     pub label: String,
@@ -299,8 +412,9 @@ impl FastModeCapabilities {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ReasoningCapabilities {
     pub supported: bool,
     #[serde(default)]
@@ -340,8 +454,12 @@ impl ReasoningCapabilities {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+// `optional_fields` makes the `Option` `description` optional in TS. The
+// non-Option `#[serde(default)]` members (`recommended`, `config`) stay required;
+// the reasoning-picker preview supplies them explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, optional_fields = nullable)]
 pub struct ReasoningOption {
     pub id: String,
     pub label: String,
@@ -380,8 +498,11 @@ impl ReasoningOption {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+// `optional_fields`: all members are `#[serde(default)] Option<_>`; an empty
+// `{}` config (auto) and partial `{ effort }` configs are valid, so emit `?:`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, optional_fields = nullable)]
 pub struct ReasoningConfig {
     #[serde(default)]
     pub effort: Option<ReasoningEffort>,
@@ -397,8 +518,9 @@ impl ReasoningConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ReasoningEffort {
     None,
     Minimal,
@@ -460,8 +582,9 @@ impl ReasoningEffort {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ReasoningSummary {
     Auto,
     Concise,
@@ -545,8 +668,9 @@ pub enum AuthKind {
     ExternalProcess,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum AuthStatusKind {
     NotRequired,
     Missing,
@@ -556,8 +680,9 @@ pub enum AuthStatusKind {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, optional_fields = nullable)]
 pub struct AuthStatus {
     pub kind: AuthStatusKind,
     #[serde(default)]
@@ -679,5 +804,38 @@ mod tests {
         assert_eq!(ReasoningSummary::Auto.as_wire_str(), "auto");
         assert_eq!(ReasoningSummary::Concise.as_wire_str(), "concise");
         assert_eq!(ReasoningSummary::Detailed.as_wire_str(), "detailed");
+    }
+
+    #[test]
+    fn service_catalog_round_trips_wire_shape() {
+        let frame = Outbound::Services {
+            id: 7,
+            services: vec![ProviderService {
+                feature: FEATURE_IMAGE_GENERATE.to_string(),
+                label: "Image generation".to_string(),
+                models: vec![ProviderServiceModel {
+                    id: "image-model".to_string(),
+                    label: "Image Model".to_string(),
+                    recommended: true,
+                    options_schema: serde_json::json!({ "size": ["1024x1024"] }),
+                }],
+                options_schema: serde_json::json!({ "quality": ["standard", "high"] }),
+                mode: ProviderServiceMode::Sync,
+            }],
+        };
+
+        let encoded = serde_json::to_string(&frame).expect("encode services");
+        assert!(encoded.contains("\"type\":\"services\""));
+        let decoded: Outbound = serde_json::from_str(&encoded).expect("decode services");
+        let Outbound::Services { id, services } = decoded else {
+            panic!("decoded wrong frame");
+        };
+        assert_eq!(id, 7);
+        assert_eq!(services[0].feature, FEATURE_IMAGE_GENERATE);
+        assert_eq!(services[0].models[0].id, "image-model");
+
+        let request = Request::GetServices { id: 9 };
+        let encoded = serde_json::to_string(&request).expect("encode request");
+        assert_eq!(encoded, r#"{"method":"get_services","id":9}"#);
     }
 }

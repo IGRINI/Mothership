@@ -24,6 +24,13 @@ const HEADER_SLACK_BYTES: u64 = 8 * 1024;
 pub trait ToolOutputStore: Send + Sync {
     async fn open(&self, tool_call_id: &str) -> Result<Box<dyn ToolOutputWriter>>;
 
+    async fn open_with_context(
+        &self,
+        context: ToolOutputContext,
+    ) -> Result<Box<dyn ToolOutputWriter>> {
+        self.open(&context.tool_call_id).await
+    }
+
     /// Read a newline-aligned slice of a previously-spilled artifact, identified
     /// by the `tool_call_id` that produced it. `log_ref` is the durable reference
     /// handed to the UI; the store validates it against its own root (containment)
@@ -42,6 +49,39 @@ pub trait ToolOutputStore: Send + Sync {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOutputContext {
+    pub tool_call_id: String,
+    pub run_id: Option<String>,
+    pub project_id: Option<String>,
+    pub artifact_id: String,
+}
+
+impl ToolOutputContext {
+    pub fn new(tool_call_id: impl Into<String>) -> Self {
+        Self {
+            tool_call_id: tool_call_id.into(),
+            run_id: None,
+            project_id: None,
+            artifact_id: "output".to_string(),
+        }
+    }
+
+    pub fn for_artifact(
+        tool_call_id: impl Into<String>,
+        run_id: Option<String>,
+        project_id: Option<String>,
+        artifact_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            tool_call_id: tool_call_id.into(),
+            run_id,
+            project_id,
+            artifact_id: artifact_id.into(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait ToolOutputWriter: Send {
     async fn append(&mut self, stream: ToolOutputStream, bytes: &[u8]) -> Result<()>;
@@ -52,11 +92,83 @@ pub trait ToolOutputWriter: Send {
 #[derive(Debug, Clone)]
 pub struct FileToolOutputStore {
     root: PathBuf,
+    legacy_roots: Vec<PathBuf>,
 }
 
 impl FileToolOutputStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            legacy_roots: Vec::new(),
+        }
+    }
+
+    pub fn with_legacy_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.legacy_roots.push(root.into());
+        self
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn scoped_path(&self, context: &ToolOutputContext) -> PathBuf {
+        let mut path = self.root.clone();
+        if let Some(project_id) = context.project_id.as_deref() {
+            path.push("projects");
+            path.push(sanitize_file_stem(project_id));
+        }
+        if let Some(run_id) = context.run_id.as_deref() {
+            path.push("runs");
+            path.push(sanitize_file_stem(run_id));
+        } else {
+            path.push("tools");
+        }
+        path.push(sanitize_file_stem(&context.tool_call_id));
+        path.push(format!("{}.log", sanitize_file_stem(&context.artifact_id)));
+        path
+    }
+
+    async fn reference_belongs_to_tool(&self, tool_call_id: &str, supplied: &Path) -> Result<bool> {
+        let sanitized_tool_id = sanitize_file_stem(tool_call_id);
+        if self
+            .is_current_store_reference(&sanitized_tool_id, supplied)
+            .await?
+        {
+            return Ok(true);
+        }
+        for root in &self.legacy_roots {
+            if is_legacy_store_reference(root, &sanitized_tool_id, supplied).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn is_current_store_reference(
+        &self,
+        sanitized_tool_id: &str,
+        supplied: &Path,
+    ) -> Result<bool> {
+        let root = canonicalize_existing_or_create(&self.root).await?;
+        if !supplied.starts_with(&root) {
+            return Ok(false);
+        }
+
+        let legacy_file_name = format!("{sanitized_tool_id}.log");
+        if supplied
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == legacy_file_name)
+        {
+            return Ok(true);
+        }
+
+        Ok(supplied
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some(sanitized_tool_id))
     }
 }
 
@@ -76,6 +188,26 @@ impl ToolOutputStore for FileToolOutputStore {
         Ok(Box::new(FileToolOutputWriter { path, file }))
     }
 
+    async fn open_with_context(
+        &self,
+        context: ToolOutputContext,
+    ) -> Result<Box<dyn ToolOutputWriter>> {
+        let path = self.scoped_path(&context);
+        let parent = path
+            .parent()
+            .ok_or_else(|| MothershipError::Runtime("tool output path has no parent".to_string()))?
+            .to_path_buf();
+        tokio::fs::create_dir_all(&parent).await?;
+        ensure_child_path(&self.root, &path)?;
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .await?;
+        Ok(Box::new(FileToolOutputWriter { path, file }))
+    }
+
     async fn read_range(
         &self,
         tool_call_id: &str,
@@ -83,22 +215,13 @@ impl ToolOutputStore for FileToolOutputStore {
         offset: u64,
         limit: u64,
     ) -> Result<ToolArtifactRange> {
-        // Derive the blob path from the tool_call_id (the same mapping `open`
-        // uses); the UI never gets to pick the path. Containment + an existence
-        // check keep the read inside this store's root.
-        let file_name = format!("{}.log", sanitize_file_stem(tool_call_id));
-        let path = self.root.join(&file_name);
-        ensure_child_path(&self.root, &path)?;
-        let canonical = tokio::fs::canonicalize(&path)
-            .await
-            .map_err(|error| MothershipError::Runtime(error.to_string()))?;
-
-        // Bind the durable reference to this tool call: the supplied `log_ref`
-        // must resolve to exactly this id's blob.
         let supplied = tokio::fs::canonicalize(Path::new(log_ref))
             .await
             .map_err(|_| MothershipError::Runtime("unknown artifact reference".to_string()))?;
-        if supplied != canonical {
+        if !self
+            .reference_belongs_to_tool(tool_call_id, &supplied)
+            .await?
+        {
             return Err(MothershipError::Runtime(
                 "artifact reference does not match tool call".to_string(),
             ));
@@ -108,13 +231,13 @@ impl ToolOutputStore for FileToolOutputStore {
         // we read at most `cap + slack` bytes from there — never the whole
         // (possibly multi-MB) blob. The window ends on a line boundary; the
         // writer's stream headers are stripped from just that window.
-        let file_size = tokio::fs::metadata(&canonical).await?.len();
+        let file_size = tokio::fs::metadata(&supplied).await?.len();
         let cap = limit.min(MAX_ARTIFACT_RANGE_BYTES);
         let start = offset.min(file_size);
         let remaining = file_size - start;
         let window_len = cap.saturating_add(HEADER_SLACK_BYTES).min(remaining);
 
-        let mut file = tokio::fs::File::open(&canonical).await?;
+        let mut file = tokio::fs::File::open(&supplied).await?;
         file.seek(std::io::SeekFrom::Start(start)).await?;
         let mut window = vec![0_u8; window_len as usize];
         file.read_exact(&mut window).await?;
@@ -597,6 +720,37 @@ fn ensure_child_path(root: &Path, child: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn canonicalize_existing_or_create(root: &Path) -> Result<PathBuf> {
+    match tokio::fs::canonicalize(root).await {
+        Ok(path) => Ok(path),
+        Err(_) => {
+            tokio::fs::create_dir_all(root).await?;
+            tokio::fs::canonicalize(root)
+                .await
+                .map_err(|error| MothershipError::Runtime(error.to_string()))
+        }
+    }
+}
+
+async fn is_legacy_store_reference(
+    root: &Path,
+    sanitized_tool_id: &str,
+    supplied: &Path,
+) -> Result<bool> {
+    let root = match tokio::fs::canonicalize(root).await {
+        Ok(root) => root,
+        Err(_) => return Ok(false),
+    };
+    if !supplied.starts_with(&root) {
+        return Ok(false);
+    }
+    let legacy_file_name = format!("{sanitized_tool_id}.log");
+    Ok(supplied
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == legacy_file_name))
+}
+
 /// Strip the `\n--- stdout/stderr N bytes ---\n` separators the writer
 /// interleaves between appends, rejoining the surrounding content. The separator
 /// is removed *as a whole* (including the leading newline the writer adds), so a
@@ -672,7 +826,10 @@ fn pick_line_end(window: &[u8], cap: usize, to_eof: bool) -> usize {
 
 #[cfg(test)]
 mod range_tests {
-    use super::{pick_line_end, strip_stream_headers, FileToolOutputStore, ToolOutputStore};
+    use super::{
+        pick_line_end, strip_stream_headers, FileToolOutputStore, ToolOutputContext,
+        ToolOutputStore,
+    };
     use crate::tools::types::ToolOutputStream;
 
     #[test]
@@ -757,5 +914,55 @@ mod range_tests {
         assert_eq!(assembled, body);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn scoped_artifact_round_trips_and_legacy_root_remains_readable() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mship_artifacts_scoped_{nanos}"));
+        let legacy_root = std::env::temp_dir().join(format!("mship_tool_logs_legacy_{nanos}"));
+        let store = FileToolOutputStore::new(&root).with_legacy_root(&legacy_root);
+
+        let scoped_ref = {
+            let mut writer = store
+                .open_with_context(ToolOutputContext::for_artifact(
+                    "call/1",
+                    Some("run:1".to_string()),
+                    Some("project:1".to_string()),
+                    "stdout",
+                ))
+                .await
+                .unwrap();
+            writer
+                .append(ToolOutputStream::Stdout, b"scoped output\n")
+                .await
+                .unwrap();
+            writer.finish().await.unwrap()
+        };
+        assert!(scoped_ref.contains("projects"));
+        assert!(scoped_ref.contains("runs"));
+
+        let scoped = store
+            .read_range("call/1", &scoped_ref, 0, 1024)
+            .await
+            .unwrap();
+        assert_eq!(scoped.content, "scoped output\n");
+
+        tokio::fs::create_dir_all(&legacy_root).await.unwrap();
+        let legacy_ref = legacy_root.join("call_1.log");
+        tokio::fs::write(&legacy_ref, b"\n--- stdout 14 bytes ---\nlegacy output\n")
+            .await
+            .unwrap();
+        let legacy = store
+            .read_range("call/1", &legacy_ref.display().to_string(), 0, 1024)
+            .await
+            .unwrap();
+        assert_eq!(legacy.content, "legacy output\n");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&legacy_root).ok();
     }
 }

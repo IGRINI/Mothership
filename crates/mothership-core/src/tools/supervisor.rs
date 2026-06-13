@@ -8,7 +8,7 @@ use crate::{MothershipError, Result};
 
 use super::cancellation::ToolCancellationToken;
 use super::orchestrator::ResourceLease;
-use super::output::{drain_stream, SharedToolOutputWriter, ToolOutputStore};
+use super::output::{drain_stream, SharedToolOutputWriter, ToolOutputContext, ToolOutputStore};
 use super::permissions::{
     ConservativeCommandPermissionPolicy, ToolPermissionEvaluation, ToolPermissionPolicy,
 };
@@ -101,10 +101,16 @@ impl ToolSupervisor {
 
         let writer = if request.output_policy.spill_to_file {
             match &self.output_store {
-                Some(store) => Some(
-                    Arc::new(Mutex::new(store.open(&request.tool_call_id).await?))
-                        as SharedToolOutputWriter,
-                ),
+                Some(store) => Some(Arc::new(Mutex::new(
+                    store
+                        .open_with_context(ToolOutputContext::for_artifact(
+                            request.tool_call_id.clone(),
+                            request.run_id.clone(),
+                            request.project_id.clone(),
+                            "output",
+                        ))
+                        .await?,
+                )) as SharedToolOutputWriter),
                 None => None,
             }
         } else {

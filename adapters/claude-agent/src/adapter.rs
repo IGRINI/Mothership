@@ -6,12 +6,16 @@ use mothership_adapter_sdk::protocol::{
 };
 use mothership_adapter_sdk::{ChatRequest, ChatRoundOutcome, ChatSink, Context, ProviderAdapter};
 
+use crate::auth::ClaudeAuthState;
 use crate::settings::{self, ClaudeAgentSettings};
-use crate::{cli, models};
+use crate::{auth, cli, models};
 
 #[derive(Default)]
 pub(crate) struct ClaudeAgentAdapter {
     settings: ClaudeAgentSettings,
+    /// Shared across rounds so the persistent credentials file is only
+    /// rewritten when the configured secret actually changes.
+    auth_state: ClaudeAuthState,
 }
 
 #[async_trait::async_trait]
@@ -44,6 +48,13 @@ impl ProviderAdapter for ClaudeAgentAdapter {
 
     async fn set_settings(&mut self, values: BTreeMap<String, String>) -> anyhow::Result<()> {
         self.settings = ClaudeAgentSettings::from_values(values);
+        // The host clears a secret by force-evicting the adapter and pushing the
+        // remaining settings to the next spawn; there is no dedicated "secret
+        // cleared" frame. So whenever the configured payload no longer carries a
+        // credentials JSON, drop the stale persisted copy.
+        if auth::persisted_credentials_are_stale(self.settings.credential_payload()) {
+            auth::remove_persisted_credentials();
+        }
         Ok(())
     }
 
@@ -52,7 +63,7 @@ impl ProviderAdapter for ClaudeAgentAdapter {
             return Ok((ModelManagement::Fixed, Vec::new()));
         }
 
-        let sdk_catalog = cli::supported_models(&self.settings, ctx)
+        let sdk_catalog = cli::supported_models(&self.settings, &self.auth_state, ctx)
             .await
             .context("read Claude Agent SDK model metadata")?;
         Ok((
@@ -72,6 +83,13 @@ impl ProviderAdapter for ClaudeAgentAdapter {
                 "missing Claude credentials (paste a `claude setup-token` token or configure a Claude config directory)"
             );
         }
-        cli::stream_chat(&self.settings, request, ctx, sink).await
+        cli::stream_chat(&self.settings, &self.auth_state, request, ctx, sink).await
+    }
+
+    async fn logout(&mut self, _ctx: &Context) -> anyhow::Result<()> {
+        // Core seeds this call with the old settings right before it forgets the
+        // stored credential; remove the plaintext copy this adapter persisted.
+        auth::remove_persisted_credentials();
+        Ok(())
     }
 }

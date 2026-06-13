@@ -1,3 +1,11 @@
 [env]
 CC_x86_64_pc_windows_gnu = { value = "clang", force = false }
 "CC_x86_64-pc-windows-gnu" = { value = "clang", force = false }
+
+# ts-rs codegen (`cargo test` writes the generated TS wire types here). The path
+# is relative to this config file's directory (the workspace root), so every
+# crate's `#[ts(export)]` types land in the same frontend folder. `TS_RS_LARGE_INT`
+# = number keeps u64/i64/usize fields as TS `number` (the existing call-site
+# contract), not the ts-rs default `bigint`.
+TS_RS_EXPORT_DIR = { value = "src/shared/api/generated", relative = true }
+TS_RS_LARGE_INT = "number"

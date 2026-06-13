@@ -2,7 +2,12 @@ import { createSignal, For, onMount, Show } from "solid-js";
 import { Plus, X } from "lucide-solid";
 
 import type { ToolPolicySettings } from "../../../shared/api/mothership";
-import { getToolPolicy, setToolPolicy } from "../../../shared/api/mothership";
+import {
+  getChangeJournalRetention,
+  getToolPolicy,
+  setChangeJournalRetention,
+  setToolPolicy,
+} from "../../../shared/api/mothership";
 
 const TOOL_CATALOG: { name: string; label: string; description: string }[] = [
   {
@@ -60,16 +65,42 @@ export function PermissionsTab(props: {
 }) {
   const [policy, setPolicy] = createSignal<ToolPolicySettings>(EMPTY_POLICY);
   const [loading, setLoading] = createSignal(true);
+  const [retention, setRetention] = createSignal(10);
 
   onMount(async () => {
     try {
       setPolicy(await getToolPolicy());
+      setRetention(await getChangeJournalRetention());
     } catch (error) {
       props.onError(errorMessage(error));
     } finally {
       setLoading(false);
     }
   });
+
+  // Optimistic: the field reflects the new value immediately; reconcile with
+  // the stored canonical value, roll back if Core rejects it.
+  function commitRetention(raw: number) {
+    const value = Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 0;
+    const previous = retention();
+    if (value === previous) {
+      return;
+    }
+    setRetention(value);
+    setChangeJournalRetention(value)
+      .then((stored) => {
+        setRetention(stored);
+        props.onStatus(
+          stored === 0
+            ? "Change journal: keeping everything."
+            : `Change journal: keeping changes from the last ${stored} messages per project.`,
+        );
+      })
+      .catch((error: unknown) => {
+        setRetention(previous);
+        props.onError(errorMessage(error));
+      });
+  }
 
   async function commit(next: ToolPolicySettings) {
     const previous = policy();
@@ -156,6 +187,38 @@ export function PermissionsTab(props: {
           onAdd={(value) => addCommand("commandDeny", value)}
           onRemove={(value) => removeCommand("commandDeny", value)}
         />
+      </section>
+
+      <section class="settings-card">
+        <div class="settings-card__head">
+          <h3>Change journal</h3>
+          <p>
+            Every file change an agent makes is snapshotted so it can be
+            reviewed and reverted. History is kept for the last N agent{" "}
+            <em>messages</em> per project — one message may carry hundreds of
+            edits and they're kept (or pruned) together. <code>0</code> keeps
+            everything.
+          </p>
+        </div>
+        <div class="rule-editor">
+          <div class="rule-input-row">
+            <input
+              type="number"
+              min="0"
+              step="1"
+              value={retention()}
+              disabled={loading()}
+              onChange={(event) =>
+                commitRetention(event.currentTarget.valueAsNumber)
+              }
+            />
+            <span class="rule-empty">
+              {retention() === 0
+                ? "Unlimited history"
+                : `Changes from the last ${retention()} messages per project`}
+            </span>
+          </div>
+        </div>
       </section>
 
       <section class="settings-card">

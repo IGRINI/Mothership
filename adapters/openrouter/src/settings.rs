@@ -13,6 +13,7 @@ pub(crate) struct OpenRouterSettings {
     api_key: String,
     base_url: String,
     models: String,
+    image_models: String,
 }
 
 impl OpenRouterSettings {
@@ -20,6 +21,7 @@ impl OpenRouterSettings {
         self.api_key = values.get("api_key").cloned().unwrap_or_default();
         self.base_url = values.get("base_url").cloned().unwrap_or_default();
         self.models = values.get("models").cloned().unwrap_or_default();
+        self.image_models = values.get("image_models").cloned().unwrap_or_default();
     }
 
     pub(crate) fn api_key(&self) -> &str {
@@ -36,6 +38,10 @@ impl OpenRouterSettings {
 
     pub(crate) fn models(&self) -> &str {
         &self.models
+    }
+
+    pub(crate) fn image_models(&self) -> &str {
+        &self.image_models
     }
 }
 
@@ -58,6 +64,13 @@ pub(crate) fn settings_schema() -> Vec<SettingsField> {
         SettingsField {
             key: "models".to_string(),
             label: "Models".to_string(),
+            kind: SettingsFieldKind::StringList,
+            required: false,
+            options: Vec::new(),
+        },
+        SettingsField {
+            key: "image_models".to_string(),
+            label: "Image models".to_string(),
             kind: SettingsFieldKind::StringList,
             required: false,
             options: Vec::new(),

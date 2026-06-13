@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::Result;
-use mothership_adapter_sdk::protocol::{AuthKind, AuthStatus, Model, ModelManagement};
+use mothership_adapter_sdk::protocol::{
+    AuthKind, AuthStatus, ImageGenerationRequest, ImageGenerationResult, Model, ModelManagement,
+    ProviderService,
+};
 use mothership_adapter_sdk::ws::WsSession;
 use mothership_adapter_sdk::{ChatRequest, ChatRoundOutcome, Context, ProviderAdapter};
 use mothership_openai_responses as responses;
@@ -106,6 +109,24 @@ impl ProviderAdapter for CodexAdapter {
         Ok((ModelManagement::Server, models))
     }
 
+    async fn services(&mut self, ctx: &Context) -> Result<Vec<ProviderService>> {
+        // Never trigger OAuth from service listing; only use an existing credential.
+        if self.credential.is_none() {
+            return Ok(Vec::new());
+        }
+        self.refresh_if_needed(ctx).await?;
+        let (access_token, account_id) = {
+            let credential = self.credential.as_ref().expect("credential present");
+            (
+                credential.access_token.clone(),
+                credential.account_id.clone(),
+            )
+        };
+        let models =
+            crate::models::fetch_models(&self.client, &access_token, account_id.as_deref()).await?;
+        Ok(crate::services::service_catalog_from_models(models))
+    }
+
     async fn authenticate(&mut self, ctx: &Context) -> Result<()> {
         let fresh = auth::run_oauth(&self.client).await?;
         auth::persist_credential(ctx, &fresh);
@@ -129,6 +150,22 @@ impl ProviderAdapter for CodexAdapter {
             account_id.as_deref(),
             request,
             sink,
+        )
+        .await
+    }
+
+    async fn generate_image(
+        &mut self,
+        request: ImageGenerationRequest,
+        ctx: &Context,
+    ) -> Result<ImageGenerationResult> {
+        let (access_token, account_id) = self.ensure_token(ctx).await?;
+        crate::services::generate_image(
+            &self.client,
+            &self.endpoint,
+            &access_token,
+            account_id.as_deref(),
+            request,
         )
         .await
     }

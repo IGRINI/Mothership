@@ -9,6 +9,7 @@
     "agent.self_managed_tools",
     "settings.read",
     "settings.write",
+    "auth.logout",
     "network",
     "process.spawn"
   ]

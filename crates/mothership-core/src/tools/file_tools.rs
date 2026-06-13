@@ -12,8 +12,11 @@
 //! and a [`ToolPermissionAction`] (`Allow`/`Ask`/`Deny`). The supervisor/runner
 //! uses the action to decide whether to auto-run, prompt for approval, or
 //! refuse — keeping the tool-declares-intent / policy-decides split from the
-//! design doc. Reads inside the workspace are `Allow`; mutations are `Ask`;
-//! anything outside the workspace or touching a sensitive path is `Deny`.
+//! design doc. Reads inside the workspace are `Allow` — except reads of
+//! *sensitive* paths (`.env`, keys, credentials), which are `Ask` so the
+//! per-chat approval mode decides (manual prompts; auto_safe/yolo run them
+//! freely). Mutations are `Ask`; anything outside the workspace — and any
+//! mutation touching a sensitive path — is `Deny`.
 //!
 //! These handlers never call `std::fs` directly: all byte IO flows through the
 //! injected [`FileSystem`], and all path resolution flows through [`Workspace`],
@@ -223,8 +226,9 @@ impl FileTool {
 
 /// Classify a file-tool call into a [`FileToolCapability`]. Resolves every path
 /// the call touches against the workspace; an unresolvable or out-of-workspace
-/// path, or any sensitive path, yields `Deny`. Reads are otherwise `Allow`;
-/// mutations are `Ask`.
+/// path yields `Deny`. Reads are `Allow`, or `Ask` when the path is sensitive —
+/// the per-chat approval mode maps the `Ask` (manual prompts; auto_safe/yolo
+/// allow). Mutations are `Ask`, or `Deny` when they touch a sensitive path.
 pub fn classify(
     tool: FileTool,
     arguments: &Value,
@@ -234,10 +238,15 @@ pub fn classify(
         FileTool::Read => {
             let input: ReadFileInput = parse_args(arguments)?;
             let touched = vec![input.path.clone()];
-            match guard_paths(workspace, &[&input.path]) {
-                Ok(()) => Ok(FileToolCapability {
+            match classify_read_path(workspace, &input.path) {
+                Ok(ReadPathAccess::Allowed) => Ok(FileToolCapability {
                     action: ToolPermissionAction::Allow,
                     summary: format!("read {}", input.path),
+                    touched_paths: touched,
+                }),
+                Ok(ReadPathAccess::Sensitive) => Ok(FileToolCapability {
+                    action: ToolPermissionAction::Ask,
+                    summary: format!("reads a sensitive path: {}", input.path),
                     touched_paths: touched,
                 }),
                 Err(reason) => Ok(deny(reason, touched)),
@@ -249,7 +258,7 @@ pub fn classify(
             // (`parse_args` clones the whole argument object, content included).
             let path = arg_str(arguments, "path")?;
             let touched = vec![path.to_string()];
-            match guard_paths(workspace, &[path]) {
+            match guard_write_paths(workspace, &[path]) {
                 Ok(()) => Ok(FileToolCapability {
                     action: ToolPermissionAction::Ask,
                     summary: format!("write {path}"),
@@ -261,7 +270,7 @@ pub fn classify(
         FileTool::Edit => {
             let input: EditFileInput = parse_args(arguments)?;
             let touched = vec![input.path.clone()];
-            match guard_paths(workspace, &[&input.path]) {
+            match guard_write_paths(workspace, &[&input.path]) {
                 Ok(()) => Ok(FileToolCapability {
                     action: ToolPermissionAction::Ask,
                     summary: format!("edit {}", input.path),
@@ -286,7 +295,7 @@ pub fn classify(
             };
             let touched = patch_paths(&ops);
             let refs: Vec<&str> = touched.iter().map(String::as_str).collect();
-            match guard_paths(workspace, &refs) {
+            match guard_write_paths(workspace, &refs) {
                 Ok(()) => Ok(FileToolCapability {
                     action: ToolPermissionAction::Ask,
                     summary: format!("apply_patch touching {} file(s)", touched.len()),
@@ -423,10 +432,34 @@ fn deny(reason: String, touched: Vec<String>) -> FileToolCapability {
     }
 }
 
-/// Resolve and screen a set of paths: every path must resolve inside the
-/// workspace and must not be sensitive. Returns a human-readable denial reason
-/// on the first offending path.
-fn guard_paths(workspace: &Workspace, paths: &[&str]) -> Result<(), String> {
+/// How a read path may be accessed once resolved + contained: normally
+/// (auto-allowed), or as a *sensitive* path. Sensitivity is NOT a refusal for
+/// reads — it maps to a mode-gated `Ask` (the user decides via the approval
+/// mode: manual prompts; auto_safe/yolo allow).
+enum ReadPathAccess {
+    Allowed,
+    Sensitive,
+}
+
+/// Resolve + contain a read path and report its sensitivity. Containment
+/// failures (outside the workspace, invalid) are still hard denials.
+fn classify_read_path(workspace: &Workspace, path: &str) -> Result<ReadPathAccess, String> {
+    let resolved = workspace
+        .resolve(path)
+        .map_err(|error: PathError| error.to_string())?;
+    if workspace.is_sensitive(&resolved) {
+        return Ok(ReadPathAccess::Sensitive);
+    }
+    Ok(ReadPathAccess::Allowed)
+}
+
+/// Resolve and screen a set of *mutation* targets: every path must resolve
+/// inside the workspace, must not be sensitive, and must be writable. Returns a
+/// human-readable denial reason on the first offending path. (Reads are
+/// screened by [`classify_read_path`] instead, where sensitivity becomes a
+/// mode-gated `Ask` rather than a refusal — writes to sensitive paths stay
+/// denied in every mode.)
+fn guard_write_paths(workspace: &Workspace, paths: &[&str]) -> Result<(), String> {
     for path in paths {
         let resolved = workspace
             .resolve(path)
@@ -434,8 +467,31 @@ fn guard_paths(workspace: &Workspace, paths: &[&str]) -> Result<(), String> {
         if workspace.is_sensitive(&resolved) {
             return Err(format!("`{path}` is a sensitive path and is blocked"));
         }
+        if let Some(reason) = workspace.write_denial_reason(&resolved) {
+            return Err(reason);
+        }
     }
     Ok(())
+}
+
+fn resolve_write_guarded(workspace: &Workspace, path: &str) -> Result<PathBuf, String> {
+    let resolved = resolve_guarded(workspace, path)?;
+    if let Some(reason) = workspace.write_denial_reason(&resolved) {
+        return Err(reason);
+    }
+    Ok(resolved)
+}
+
+/// Resolve a path for a read at execution time: containment only. Sensitivity
+/// was already decided upstream by [`classify`] + the per-chat approval mode (a
+/// sensitive read reaching a handler was either auto-allowed by mode or
+/// explicitly approved), and read-only absolute roots are readable by
+/// definition — so neither the sensitivity refusal nor the write guard applies
+/// here.
+fn resolve_read(workspace: &Workspace, path: &str) -> Result<PathBuf, String> {
+    workspace
+        .resolve(path)
+        .map_err(|error: PathError| error.to_string())
 }
 
 // ===========================================================================
@@ -454,7 +510,7 @@ pub fn read_file(
     spill: Option<&dyn FileToolSpill>,
 ) -> Result<FileToolOutcome, FileToolError> {
     let input: ReadFileInput = parse_args(arguments)?;
-    let resolved = match resolve_guarded(workspace, &input.path) {
+    let resolved = match resolve_read(workspace, &input.path) {
         Ok(path) => path,
         Err(reason) => return Ok(path_failure(&input.path, reason)),
     };
@@ -673,7 +729,10 @@ pub fn write_file_with_limit_and_observation(
     }
 
     let input: WriteFileInput = parse_args(arguments)?;
-    let resolved = match resolve_guarded(workspace, &input.path) {
+    // Defense in depth: the handler enforces the same write guard the classifier
+    // applied (sensitivity AND writability), so a direct call cannot write into
+    // a read-only absolute root or a sensitive path even if classify is bypassed.
+    let resolved = match resolve_write_guarded(workspace, &input.path) {
         Ok(path) => path,
         Err(reason) => return Ok(path_failure(&input.path, reason)),
     };
@@ -830,7 +889,7 @@ pub fn check_write_content_precondition(
     validate_args_shallow(FileTool::Write, arguments)?;
     let path = arg_str(arguments, "path")?;
     let expected = optional_string_value_any(arguments, &["expectedSha256", "expected_sha256"])?;
-    let resolved = match resolve_guarded(workspace, path) {
+    let resolved = match resolve_write_guarded(workspace, path) {
         Ok(path) => path,
         Err(reason) => return Ok(Some(path_failure(path, reason))),
     };
@@ -897,7 +956,7 @@ pub fn edit_file(
     fs: &dyn FileSystem,
 ) -> Result<FileToolOutcome, FileToolError> {
     let input: EditFileInput = parse_args(arguments)?;
-    let resolved = match resolve_guarded(workspace, &input.path) {
+    let resolved = match resolve_write_guarded(workspace, &input.path) {
         Ok(path) => path,
         Err(reason) => return Ok(path_failure(&input.path, reason)),
     };
@@ -1052,7 +1111,7 @@ pub fn apply_patch(
     // target aborts the whole patch before reading or writing anything.
     let touched = patch_paths(&ops);
     let refs: Vec<&str> = touched.iter().map(String::as_str).collect();
-    if let Err(reason) = guard_paths(workspace, &refs) {
+    if let Err(reason) = guard_write_paths(workspace, &refs) {
         return Ok(FileToolOutcome::failure(
             reason,
             json!({ "status": "denied", "paths": touched }),
@@ -1073,6 +1132,29 @@ pub fn apply_patch(
         };
         if !fs.exists(&resolved) {
             continue;
+        }
+        // Read ceiling: every other mutating tool refuses files past the read
+        // cap before loading them; apply_patch must too, because it reads each
+        // must-exist target up to three times (this UTF-8 check, the planner's
+        // FileMap, and the rollback snapshot) and holds the full content in
+        // memory. Check size BEFORE the first read so a huge target can never
+        // be slurped. (Metadata unavailable → fall through; the read below is
+        // still bounded by the OS, and the planner re-validates.)
+        if let Ok(meta) = fs.metadata(&resolved) {
+            if meta.len > MAX_READ_FILE_BYTES as u64 {
+                return Ok(FileToolOutcome::failure(
+                    format!(
+                        "`{path}` is {} bytes, larger than the {}-byte apply_patch read ceiling; split the change or use run_command for very large files",
+                        meta.len, MAX_READ_FILE_BYTES
+                    ),
+                    json!({
+                        "status": "too_large",
+                        "path": path,
+                        "size": meta.len,
+                        "readCeilingBytes": MAX_READ_FILE_BYTES,
+                    }),
+                ));
+            }
         }
         let bytes = fs
             .read(&resolved)
@@ -1099,6 +1181,32 @@ pub fn apply_patch(
             ));
         }
     };
+
+    // Write ceiling: mirror write_file's bound on the planned content of every
+    // file the patch will create or rewrite, so a patch can't materialize a
+    // file larger than the write cap (the new bytes are held in memory and
+    // written wholesale). Checked after planning (the resolved sizes are known)
+    // and before any disk write, so an oversize plan changes nothing.
+    for file in &plan.files {
+        if let Some(content) = &file.new_content {
+            if content.len() > DEFAULT_MAX_WRITE_FILE_BYTES {
+                return Ok(FileToolOutcome::failure(
+                    format!(
+                        "`{}` would be {} bytes after the patch, larger than the {}-byte write ceiling",
+                        file.path,
+                        content.len(),
+                        DEFAULT_MAX_WRITE_FILE_BYTES
+                    ),
+                    json!({
+                        "status": "too_large",
+                        "path": file.path,
+                        "size": content.len(),
+                        "writeCeilingBytes": DEFAULT_MAX_WRITE_FILE_BYTES,
+                    }),
+                ));
+            }
+        }
+    }
 
     // Snapshot the prior state of every path the plan will write/move/delete
     // (and, for a move, the destination too) so we can make the apply step
@@ -2415,6 +2523,96 @@ mod tests {
     }
 
     #[test]
+    fn apply_patch_refuses_update_target_over_read_cap() {
+        // apply_patch reads each must-exist target up to three times (UTF-8
+        // check, planner, rollback snapshot). A double whose reads panic proves
+        // the read ceiling returns BEFORE any of them touches the oversize file.
+        struct OversizeFs {
+            len: u64,
+        }
+        impl FileSystem for OversizeFs {
+            fn read(&self, _p: &std::path::Path) -> std::io::Result<Vec<u8>> {
+                panic!("apply_patch must refuse an oversize target before reading it");
+            }
+            fn read_capped(
+                &self,
+                _p: &std::path::Path,
+                _m: usize,
+            ) -> std::io::Result<(Vec<u8>, bool)> {
+                panic!("apply_patch must not read an oversize target at all");
+            }
+            fn write_atomic(&self, _p: &std::path::Path, _b: &[u8]) -> std::io::Result<()> {
+                panic!("apply_patch must not write when a target is over the read cap");
+            }
+            fn metadata(&self, _p: &std::path::Path) -> std::io::Result<FileMetadata> {
+                Ok(FileMetadata {
+                    len: self.len,
+                    is_dir: false,
+                })
+            }
+            fn exists(&self, _p: &std::path::Path) -> bool {
+                true
+            }
+            fn rename(&self, _f: &std::path::Path, _t: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_file(&self, _p: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn create_dir_all(&self, _p: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_dir(&self, _p: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (ws, dir) = temp_workspace("patch_oversize_read");
+        // guard_write_paths canonicalizes against the real fs, so the path must
+        // exist on disk; the double supplies the (pretend) oversize length.
+        fs::write(dir.join("big.txt"), b"placeholder").unwrap();
+        let fs = OversizeFs {
+            len: MAX_READ_FILE_BYTES as u64 + 1,
+        };
+
+        let patch = "\
+*** Begin Patch
+*** Update File: big.txt
+@@
+-old
++new
+*** End Patch
+";
+        let out = apply_patch(&json!({ "patch": patch }), &ws, &fs).unwrap();
+        assert!(!out.ok);
+        assert_eq!(out.data["status"], "too_large");
+        assert_eq!(out.data["path"], "big.txt");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_patch_refuses_planned_content_over_write_cap() {
+        // A patch that would materialize a file larger than the write ceiling is
+        // refused after planning and before any disk write.
+        let (ws, dir) = temp_workspace("patch_oversize_write");
+        let fs = StdFileSystem::new();
+
+        let huge = "a".repeat(DEFAULT_MAX_WRITE_FILE_BYTES + 1);
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: big.txt\n+{huge}\n*** End Patch\n"
+        );
+        let out = apply_patch(&json!({ "patch": patch }), &ws, &fs).unwrap();
+        assert!(!out.ok);
+        assert_eq!(out.data["status"], "too_large");
+        assert_eq!(out.data["path"], "big.txt");
+        // Nothing was written.
+        assert!(!dir.join("big.txt").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn apply_patch_all_or_none_leaves_disk_untouched_on_bad_hunk() {
         let (ws, dir) = temp_workspace("patch_aon");
         let fs = StdFileSystem::new();
@@ -3079,11 +3277,155 @@ mod tests {
     }
 
     #[test]
-    fn classify_sensitive_path_is_denied() {
+    fn classify_sensitive_read_asks_in_manual_allows_in_auto() {
+        use crate::tools::permissions::{file_permission_action_for_mode, ToolApprovalMode};
+
         let (ws, dir) = temp_workspace("classify_sensitive");
+        // A sensitive read is a mode-gated Ask, not a refusal: the user decides
+        // via the approval mode (manual prompts; auto_safe/yolo run it freely).
         let read = classify(FileTool::Read, &json!({ "path": ".env" }), &ws).unwrap();
-        assert_eq!(read.action, ToolPermissionAction::Deny);
+        assert_eq!(read.action, ToolPermissionAction::Ask);
+        assert!(
+            read.summary.contains("sensitive"),
+            "the approval card must say WHY: {}",
+            read.summary
+        );
+        assert_eq!(
+            file_permission_action_for_mode(ToolApprovalMode::Manual, read.action),
+            ToolPermissionAction::Ask
+        );
+        assert_eq!(
+            file_permission_action_for_mode(ToolApprovalMode::AutoSafe, read.action),
+            ToolPermissionAction::Allow
+        );
+        assert_eq!(
+            file_permission_action_for_mode(ToolApprovalMode::Yolo, read.action),
+            ToolPermissionAction::Allow
+        );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classify_sensitive_mutations_stay_denied() {
+        // WRITES to sensitive paths keep the hard deny in every mode — only
+        // reads were opened up to the approval gate.
+        let (ws, dir) = temp_workspace("classify_sensitive_write");
+        let write = classify(
+            FileTool::Write,
+            &json!({ "path": ".env", "content": "X=1\n" }),
+            &ws,
+        )
+        .unwrap();
+        assert_eq!(write.action, ToolPermissionAction::Deny);
+        let edit = classify(
+            FileTool::Edit,
+            &json!({ "path": ".env", "oldText": "a", "newText": "b" }),
+            &ws,
+        )
+        .unwrap();
+        assert_eq!(edit.action, ToolPermissionAction::Deny);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_handler_reads_sensitive_path_once_policy_allows() {
+        // Sensitivity is the policy layer's decision now: a call that reaches
+        // the handler was approved (manual) or auto-allowed (auto_safe/yolo),
+        // so the handler must not re-refuse it.
+        let (ws, dir) = temp_workspace("read_sensitive_handler");
+        let fs_port = StdFileSystem::new();
+        fs::write(dir.join(".env"), b"SECRET=1\n").unwrap();
+
+        let out = read_file(&json!({ "path": ".env" }), &ws, &fs_port, "tc_env", None).unwrap();
+        assert!(out.ok, "{}", out.model_text);
+        assert!(out.model_text.contains("SECRET=1"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_to_sensitive_path_stays_refused_by_handler() {
+        let (ws, dir) = temp_workspace("write_sensitive_handler");
+        let fs_port = StdFileSystem::new();
+
+        let out = write_file(
+            &json!({ "path": ".env", "content": "X=1\n" }),
+            &ws,
+            &fs_port,
+        )
+        .unwrap();
+        assert!(!out.ok, "sensitive write must stay refused");
+        assert!(
+            out.model_text.contains("sensitive"),
+            "got: {}",
+            out.model_text
+        );
+        assert!(!dir.join(".env").exists(), "no file may be created");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_succeeds_in_read_only_absolute_root() {
+        // M2 regression: reads used the WRITE-guarded resolve, so a read-only
+        // absolute root (e.g. the artifact root) was unreadable even though the
+        // classifier allowed it. Reads now use a read-oriented resolve.
+        let (_, dir) = temp_workspace("read_abs_root_project");
+        let (_, artifacts) = temp_workspace("read_abs_root_artifacts");
+        let artifact_file = artifacts.join("report.txt");
+        fs::write(&artifact_file, b"artifact body\n").unwrap();
+        let ws = Workspace::new(&dir)
+            .unwrap()
+            .with_absolute_root(&artifacts, false, "current artifact root")
+            .unwrap();
+        let fs_port = StdFileSystem::new();
+
+        let arguments = json!({ "path": artifact_file.to_string_lossy() });
+        let capability = classify(FileTool::Read, &arguments, &ws).unwrap();
+        assert_eq!(capability.action, ToolPermissionAction::Allow);
+        let out = read_file(&arguments, &ws, &fs_port, "tc_abs", None).unwrap();
+        assert!(out.ok, "{}", out.model_text);
+        assert!(out.model_text.contains("artifact body"));
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&artifacts);
+    }
+
+    #[test]
+    fn write_file_handler_refuses_read_only_absolute_root() {
+        // L5 regression: the write handler used the read-only resolve, so a
+        // direct call could bypass the classifier's write guard. The handler now
+        // enforces writability itself (defense in depth).
+        let (_, dir) = temp_workspace("write_abs_root_project");
+        let (_, artifacts) = temp_workspace("write_abs_root_artifacts");
+        let artifact_file = artifacts.join("existing.txt");
+        fs::write(&artifact_file, b"before\n").unwrap();
+        let ws = Workspace::new(&dir)
+            .unwrap()
+            .with_absolute_root(&artifacts, false, "current artifact root")
+            .unwrap();
+        let fs_port = StdFileSystem::new();
+
+        let out = write_file(
+            &json!({
+                "path": artifact_file.to_string_lossy(),
+                "content": "after\n",
+                "expectedSha256": sha_of("before\n"),
+            }),
+            &ws,
+            &fs_port,
+        )
+        .unwrap();
+        assert!(!out.ok, "write into a read-only root must be refused");
+        assert!(
+            out.model_text.contains("read-only"),
+            "got: {}",
+            out.model_text
+        );
+        assert_eq!(fs::read(&artifact_file).unwrap(), b"before\n");
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&artifacts);
     }
 
     // ---- preview_diff -----------------------------------------------------

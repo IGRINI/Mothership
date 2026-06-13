@@ -74,7 +74,35 @@ impl ChangesService {
             return Ok(None);
         }
         let summary = repo::create_change_set(&self.db, ctx, tool_failed, files)?;
+        // Retention runs after every successful record. A pruning hiccup must
+        // not fail the journal entry that was just persisted.
+        if let Err(error) = self.prune_project(ctx.project_id.as_deref()) {
+            eprintln!("change journal: failed to prune old change sets: {error}");
+        }
         Ok(Some(summary))
+    }
+
+    /// Enforce the retention policy for one project scope: keep every change
+    /// set belonging to the newest N MESSAGES (N = the persisted
+    /// `change_journal_retention` setting; 0 = unlimited — counted in messages
+    /// because one agent message can record hundreds of sets), delete the
+    /// rest, then garbage-collect snapshot blobs no longer referenced by any
+    /// remaining change file. Blob removal is best-effort per hash — a leaked
+    /// blob is recoverable noise, a failed prune is not.
+    pub fn prune_project(&self, project_id: Option<&str>) -> Result<()> {
+        let retention = self.db.change_journal_retention()?;
+        if retention == 0 {
+            return Ok(());
+        }
+        let orphaned = repo::prune_change_sets(&self.db, project_id, retention)?;
+        for hash in orphaned {
+            if let Err(error) = self.blobs.remove(&hash) {
+                eprintln!(
+                    "change journal: failed to remove orphaned snapshot blob {hash}: {error}"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Convert one captured path into a persistable change file, or `None` when

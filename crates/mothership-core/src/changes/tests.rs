@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::tools::{FileMetadata, FileSystem, StdFileSystem, Workspace};
 use crate::Database;
 
-use super::blob_store::FileBlobStore;
+use super::blob_store::{sha256_hex, FileBlobStore, SnapshotBlobStore};
 use super::{
     CaptureFileSystem, ChangeContext, ChangeEventSink, ChangeOp, ChangeRecorder, ChangeSetStatus,
     ChangesService, ConflictReason, NoopChangeEventSink,
@@ -17,6 +17,8 @@ use super::{
 
 struct Harness {
     root: PathBuf,
+    db: Database,
+    blobs: Arc<FileBlobStore>,
     service: ChangesService,
     workspace: Workspace,
     fs: StdFileSystem,
@@ -38,10 +40,12 @@ fn harness(label: &str) -> Harness {
     std::fs::create_dir_all(&project).unwrap();
     let database = Database::open(root.join("app.db")).unwrap();
     let blobs = Arc::new(FileBlobStore::new(root.join("blobs")));
-    let service = ChangesService::new(database, blobs);
+    let service = ChangesService::new(database.clone(), blobs.clone());
     let workspace = Workspace::new(&project).unwrap();
     Harness {
         root,
+        db: database,
+        blobs,
         service,
         workspace,
         fs: StdFileSystem::new(),
@@ -49,8 +53,12 @@ fn harness(label: &str) -> Harness {
 }
 
 fn ctx(message_id: &str, tool_call_id: &str) -> ChangeContext {
+    ctx_in(Some("project"), message_id, tool_call_id)
+}
+
+fn ctx_in(project_id: Option<&str>, message_id: &str, tool_call_id: &str) -> ChangeContext {
     ChangeContext {
-        project_id: Some("project".to_string()),
+        project_id: project_id.map(str::to_string),
         run_id: Some("run".to_string()),
         chat_id: "chat".to_string(),
         message_id: message_id.to_string(),
@@ -456,4 +464,145 @@ fn summary_previews_files_and_pages_the_rest() {
         let path = h.workspace.resolve(&format!("f{index:02}.txt")).unwrap();
         assert!(!h.fs.exists(&path));
     }
+}
+
+/// Record one added file with `content` for `message_id`/`tool_call_id` in the
+/// given project scope, returning the stored after-hash.
+fn record_added_file(
+    h: &Harness,
+    project_id: Option<&str>,
+    message_id: &str,
+    rel_path: &str,
+    content: &[u8],
+) -> String {
+    let path = h.workspace.resolve(rel_path).unwrap();
+    let cap = capture(h, |fs| {
+        fs.write_atomic(&path, content).unwrap();
+    });
+    let summary = h
+        .service
+        .record(&ctx_in(project_id, message_id, message_id), &cap, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.files[0].op, ChangeOp::Added);
+    sha256_hex(content)
+}
+
+#[test]
+fn retention_prunes_oldest_sets_per_project() {
+    let h = harness("retention_per_project");
+    h.db.set_change_journal_retention(2).unwrap();
+
+    let hash_a = record_added_file(&h, Some("project"), "m1", "a.txt", b"alpha\n");
+    let hash_b = record_added_file(&h, Some("project"), "m2", "b.txt", b"beta\n");
+    // Another project's only set must not count against (or be touched by)
+    // this project's retention.
+    let hash_other = record_added_file(&h, Some("other"), "m3", "o.txt", b"other\n");
+    let hash_d = record_added_file(&h, Some("project"), "m4", "d.txt", b"delta\n");
+
+    // "project" exceeded N=2: its oldest set (m1) is gone, the newest two stay.
+    assert!(h.service.message_summaries("m1").unwrap().is_empty());
+    assert_eq!(h.service.message_summaries("m2").unwrap().len(), 1);
+    assert_eq!(h.service.message_summaries("m4").unwrap().len(), 1);
+    assert_eq!(h.service.message_summaries("m3").unwrap().len(), 1);
+
+    // The pruned set's blob is gone from disk; everything still referenced stays.
+    assert!(!h.blobs.has(&hash_a));
+    assert!(h.blobs.has(&hash_b));
+    assert!(h.blobs.has(&hash_other));
+    assert!(h.blobs.has(&hash_d));
+}
+
+#[test]
+fn retention_keeps_blobs_shared_with_surviving_sets() {
+    let h = harness("retention_shared_blob");
+    h.db.set_change_journal_retention(1).unwrap();
+
+    // Set 1 stores the shared content and a unique one; set 2 stores the same
+    // shared bytes under another path (content-addressing dedups them into one
+    // blob) plus its own unique file.
+    let shared_path = h.workspace.resolve("shared_one.txt").unwrap();
+    let unique_path = h.workspace.resolve("unique_one.txt").unwrap();
+    let cap = capture(&h, |fs| {
+        fs.write_atomic(&shared_path, b"SHARED\n").unwrap();
+        fs.write_atomic(&unique_path, b"only in set one\n").unwrap();
+    });
+    h.service
+        .record(&ctx("m1", "t1"), &cap, false)
+        .unwrap()
+        .unwrap();
+
+    let hash_shared = sha256_hex(b"SHARED\n");
+    let hash_unique = sha256_hex(b"only in set one\n");
+    assert!(h.blobs.has(&hash_shared));
+    assert!(h.blobs.has(&hash_unique));
+
+    let shared_two = h.workspace.resolve("shared_two.txt").unwrap();
+    let unique_two = h.workspace.resolve("unique_two.txt").unwrap();
+    let cap = capture(&h, |fs| {
+        fs.write_atomic(&shared_two, b"SHARED\n").unwrap();
+        fs.write_atomic(&unique_two, b"only in set two\n").unwrap();
+    });
+    h.service
+        .record(&ctx("m2", "t2"), &cap, false)
+        .unwrap()
+        .unwrap();
+
+    // Set 1 was pruned (N=1). The blob it shared with the surviving set lives
+    // on; the blob only it referenced was garbage-collected.
+    assert!(h.service.message_summaries("m1").unwrap().is_empty());
+    assert_eq!(h.service.message_summaries("m2").unwrap().len(), 1);
+    assert!(h.blobs.has(&hash_shared));
+    assert!(!h.blobs.has(&hash_unique));
+    assert!(h.blobs.has(&sha256_hex(b"only in set two\n")));
+}
+
+#[test]
+fn retention_zero_disables_pruning() {
+    let h = harness("retention_unlimited");
+    h.db.set_change_journal_retention(0).unwrap();
+
+    let hash_a = record_added_file(&h, Some("project"), "m1", "a.txt", b"one\n");
+    record_added_file(&h, Some("project"), "m2", "b.txt", b"two\n");
+    record_added_file(&h, Some("project"), "m3", "c.txt", b"three\n");
+
+    assert_eq!(h.service.message_summaries("m1").unwrap().len(), 1);
+    assert_eq!(h.service.message_summaries("m2").unwrap().len(), 1);
+    assert_eq!(h.service.message_summaries("m3").unwrap().len(), 1);
+    assert!(h.blobs.has(&hash_a));
+}
+
+/// Retention counts MESSAGES, not change sets: one agent message may record
+/// hundreds of sets (one per tool call) and they must survive — or be pruned —
+/// together as a unit.
+#[test]
+fn retention_counts_messages_not_sets() {
+    let h = harness("retention_message_buckets");
+    h.db.set_change_journal_retention(1).unwrap();
+
+    // One message, three sets (three tool calls). With set-counting semantics
+    // N=1 would have pruned two of them; with message-counting all three stay.
+    for (index, name) in ["m1_a.txt", "m1_b.txt", "m1_c.txt"].iter().enumerate() {
+        let path = h.workspace.resolve(name).unwrap();
+        let cap = capture(&h, |fs| {
+            fs.write_atomic(&path, format!("m1 file {index}\n").as_bytes())
+                .unwrap();
+        });
+        h.service
+            .record(
+                &ctx_in(Some("project"), "m1", &format!("t1-{index}")),
+                &cap,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(h.service.message_summaries("m1").unwrap().len(), 3);
+
+    // A newer message displaces the whole m1 bucket at once.
+    record_added_file(&h, Some("project"), "m2", "m2.txt", b"newer\n");
+    assert!(h.service.message_summaries("m1").unwrap().is_empty());
+    assert_eq!(h.service.message_summaries("m2").unwrap().len(), 1);
+    assert!(!h.blobs.has(&sha256_hex(b"m1 file 0\n")));
+    assert!(h.blobs.has(&sha256_hex(b"newer\n")));
 }

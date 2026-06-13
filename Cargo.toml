@@ -39,7 +39,13 @@ tauri-build = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-shell = "2"
+tauri-plugin-single-instance = "2"
 thiserror = "2"
+# Generates the TypeScript wire types from the Rust serde structs (see
+# `src/shared/api/generated/`). `serde-compat` makes the derive read the existing
+# serde attributes (rename_all / tag / content / rename / skip / default) so the
+# emitted .ts mirrors the JSON exactly; `format` prettifies the output.
+ts-rs = { version = "12", features = ["serde-compat", "format", "serde-json-impl"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 tungstenite = { version = "0.28", features = ["native-tls"] }

@@ -1,6 +1,11 @@
 import { ExternalLink, FolderOpen } from "lucide-solid";
 
-import { openToolPath, revealToolPath } from "../api/mothership";
+import {
+  openArtifactPath,
+  openToolPath,
+  revealArtifactPath,
+  revealToolPath,
+} from "../api/mothership";
 import { openContextMenu, type ContextMenuItem } from "./ContextMenu";
 
 /** Open a workspace file in the OS default app. Errors surface via `onError`. */
@@ -41,6 +46,8 @@ function errorText(error: unknown, fallback: string): string {
 interface FileActionTarget {
   projectId?: string;
   path: string;
+  artifact?: boolean;
+  copyPath?: string;
   // When set, "Открыть" calls this instead of opening directly — lets a host
   // surface open errors in its own UI. Reveal always goes through the API.
   onOpen?: (path: string) => void;
@@ -48,23 +55,37 @@ interface FileActionTarget {
 }
 
 function fileMenuItems(target: FileActionTarget): ContextMenuItem[] {
+  const openPath = () =>
+    target.artifact
+      ? openArtifactPath(target.path).catch((error: unknown) =>
+          target.onError?.(errorText(error, "не удалось открыть файл")),
+        )
+      : openWorkspaceFile(target.projectId, target.path, target.onError);
+  const revealPath = () =>
+    target.artifact
+      ? revealArtifactPath(target.path).catch((error: unknown) =>
+          target.onError?.(errorText(error, "не удалось показать файл в папке")),
+        )
+      : revealWorkspaceFile(target.projectId, target.path, target.onError);
+
   return [
     {
       label: "Открыть",
       onSelect: () =>
-        target.onOpen
+        target.onOpen && !target.artifact
           ? target.onOpen(target.path)
-          : openWorkspaceFile(target.projectId, target.path, target.onError),
+          : openPath(),
     },
     {
       label: "Показать в папке",
-      onSelect: () =>
-        revealWorkspaceFile(target.projectId, target.path, target.onError),
+      onSelect: revealPath,
     },
     {
       label: "Копировать путь",
       onSelect: () => {
-        navigator.clipboard?.writeText(target.path).catch(() => {});
+        navigator.clipboard
+          ?.writeText(target.copyPath ?? target.path)
+          .catch(() => {});
       },
     },
   ];

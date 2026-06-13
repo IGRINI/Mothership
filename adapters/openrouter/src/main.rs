@@ -7,6 +7,7 @@
 mod adapter;
 mod chat;
 mod models;
+mod services;
 mod settings;
 
 use adapter::OpenRouterAdapter;

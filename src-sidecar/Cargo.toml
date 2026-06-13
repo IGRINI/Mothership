@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 mothership-core = { path = "../crates/mothership-core" }
 process-sandbox = { path = "../crates/process-sandbox" }
 serde.workspace = true

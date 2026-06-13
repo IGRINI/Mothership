@@ -12,6 +12,8 @@
     "sidecar:build:release": "node scripts/build-sidecar.mjs --release",
     "adapters:install": "node scripts/install-adapters.mjs",
     "adapters:install:release": "node scripts/install-adapters.mjs --release",
+    "types:gen": "node scripts/gen-types.mjs",
+    "types:check": "node scripts/gen-types.mjs --check",
     "tauri": "node scripts/run-tauri.mjs",
     "tauri:dev": "node scripts/run-tauri.mjs dev",
     "tauri:build": "node scripts/run-tauri.mjs build",

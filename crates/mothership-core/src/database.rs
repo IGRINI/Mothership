@@ -12,12 +12,12 @@ use mothership_adapter_host::protocol::ReasoningConfig;
 use crate::{
     id::generate_id, ActivityEvent, ChatConversation, ChatMessage, ChatMessagePart,
     ChatMessagePartKind, ChatMessageRole, ChatMessageStatus, ChatRunContextSpec, ChatRunEvent,
-    ChatRunEventKind, ChatThreadSummary, DashboardMetric, DashboardSnapshot, LlmChatMessage,
-    LlmChatRole, ModelInstruction, MothershipError, PersonalizationSettings, ProjectSnapshot,
-    ProjectSummary, ProviderInstruction, Result, SelectedLlmModel, SendChatMessageResult,
-    SidecarStatus, ToolArtifact, ToolCommand, ToolExecutionEvent, ToolExecutionEventKind,
-    ToolExecutionRecord, ToolExecutionResult, ToolKind, ToolOutputStream, ToolPolicySettings,
-    WorkspaceItem,
+    ChatRunEventKind, ChatThreadSummary, DashboardMetric, DashboardSnapshot, FeatureRoute,
+    LlmChatMessage, LlmChatRole, ModelInstruction, MothershipError, PersonalizationSettings,
+    ProjectSnapshot, ProjectSummary, ProviderInstruction, Result, SelectedLlmModel,
+    SendChatMessageResult, SidecarStatus, ToolArtifact, ToolCommand, ToolExecutionEvent,
+    ToolExecutionEventKind, ToolExecutionRecord, ToolExecutionResult, ToolKind, ToolOutputStream,
+    ToolPolicySettings, WorkspaceItem,
 };
 
 const WORKSPACE_LIMIT: i64 = 2_500;
@@ -35,6 +35,8 @@ const PROVIDER_DISABLED_PREFIX: &str = "provider.disabled.";
 const PERMISSIONS_COMMAND_ALLOW_KEY: &str = "permissions.command.allow";
 const PERMISSIONS_COMMAND_DENY_KEY: &str = "permissions.command.deny";
 const PERMISSIONS_DISABLED_TOOLS_KEY: &str = "permissions.tools.disabled";
+const CHANGE_JOURNAL_RETENTION_KEY: &str = "change_journal_retention";
+const CHANGE_JOURNAL_RETENTION_DEFAULT: u32 = 10;
 const CONTINUE_CHAT_MESSAGE_CONTENT: &str = "Continue from where you stopped.";
 
 #[derive(Debug, Clone)]
@@ -52,8 +54,7 @@ impl Database {
 
         {
             let mut connection = database.connect()?;
-            migrate(&connection)?;
-            seed(&mut connection)?;
+            migrate(&mut connection)?;
         }
 
         Ok(database)
@@ -1291,6 +1292,149 @@ impl Database {
         select_chat_summary(&connection, chat_id)
     }
 
+    /// Renames a chat (user-initiated). The title is trimmed and length-capped;
+    /// `updated_at` is deliberately NOT bumped so renaming doesn't reorder the
+    /// list. Returns the refreshed summary.
+    pub fn rename_chat(&self, chat_id: &str, title: &str) -> Result<ChatThreadSummary> {
+        validate_identifier("chat_id", chat_id)?;
+        let title = sanitize_user_label(title, 200)?;
+
+        let connection = self.connect()?;
+        let changed = connection.execute(
+            "UPDATE chats SET title = ?2 WHERE id = ?1 AND archived = 0",
+            params![chat_id, title],
+        )?;
+        if changed == 0 {
+            return Err(MothershipError::InvalidRequest(format!(
+                "chat not found: {chat_id}"
+            )));
+        }
+
+        select_chat_summary(&connection, chat_id)
+    }
+
+    /// Permanently deletes a chat with its messages, tool calls, message parts,
+    /// and recorded change sets (snapshot blobs are content-addressed and left
+    /// to the pruning pass). Irreversible.
+    pub fn delete_chat(&self, chat_id: &str) -> Result<()> {
+        validate_identifier("chat_id", chat_id)?;
+
+        let mut connection = self.connect()?;
+        let tx = connection.transaction()?;
+        // Change sets reference chats by plain column (no FK cascade) — clear
+        // them explicitly; their files/reverts/conflicts cascade off them.
+        tx.execute(
+            "DELETE FROM change_sets WHERE chat_id = ?1",
+            params![chat_id],
+        )?;
+        let deleted = tx.execute("DELETE FROM chats WHERE id = ?1", params![chat_id])?;
+        if deleted == 0 {
+            return Err(MothershipError::InvalidRequest(format!(
+                "chat not found: {chat_id}"
+            )));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Renames a project's display name (the on-disk folder is untouched).
+    pub fn rename_project(&self, project_id: &str, name: &str) -> Result<ProjectSnapshot> {
+        validate_identifier("project_id", project_id)?;
+        let name = sanitize_user_label(name, 120)?;
+
+        let connection = self.connect()?;
+        let now = current_timestamp();
+        let changed = connection.execute(
+            "UPDATE projects SET name = ?2, updated_at = ?3 WHERE id = ?1",
+            params![project_id, name, now],
+        )?;
+        if changed == 0 {
+            return Err(MothershipError::InvalidRequest(format!(
+                "project not found: {project_id}"
+            )));
+        }
+
+        project_snapshot(&connection)
+    }
+
+    /// Removes a project from Mothership together with ALL its chats and their
+    /// recorded change sets. The workspace folder on disk is untouched.
+    /// Irreversible (for the chat history).
+    pub fn delete_project(&self, project_id: &str) -> Result<ProjectSnapshot> {
+        validate_identifier("project_id", project_id)?;
+
+        let mut connection = self.connect()?;
+        let tx = connection.transaction()?;
+        tx.execute(
+            "DELETE FROM change_sets WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        // Chats cascade their messages/tool calls/parts via FKs.
+        tx.execute(
+            "DELETE FROM chats WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        let deleted = tx.execute("DELETE FROM projects WHERE id = ?1", params![project_id])?;
+        if deleted == 0 {
+            return Err(MothershipError::InvalidRequest(format!(
+                "project not found: {project_id}"
+            )));
+        }
+        // A dangling active-project hint would point at nothing; clear it so
+        // clients fall back to their own session restore.
+        if get_setting(&tx, ACTIVE_PROJECT_SETTING_KEY)?.as_deref() == Some(project_id) {
+            delete_setting(&tx, ACTIVE_PROJECT_SETTING_KEY)?;
+        }
+        tx.commit()?;
+
+        project_snapshot(&connection)
+    }
+
+    /// Persists the user-picked sidebar appearance for a project. `icon` is
+    /// `emoji:<char>` / `lucide:<id>` (None clears back to the folder glyph);
+    /// `icon_color` is `#rrggbb` (None clears to the theme default).
+    pub fn set_project_appearance(
+        &self,
+        project_id: &str,
+        icon: Option<&str>,
+        icon_color: Option<&str>,
+    ) -> Result<ProjectSnapshot> {
+        validate_identifier("project_id", project_id)?;
+        let icon = icon.map(str::trim).filter(|value| !value.is_empty());
+        if let Some(icon) = icon {
+            if icon.chars().count() > 64 {
+                return Err(MothershipError::InvalidRequest(
+                    "project icon value is too long".to_string(),
+                ));
+            }
+        }
+        let icon_color = icon_color.map(str::trim).filter(|value| !value.is_empty());
+        if let Some(color) = icon_color {
+            let valid = color.len() == 7
+                && color.starts_with('#')
+                && color[1..].chars().all(|c| c.is_ascii_hexdigit());
+            if !valid {
+                return Err(MothershipError::InvalidRequest(
+                    "project icon color must be #rrggbb".to_string(),
+                ));
+            }
+        }
+
+        let connection = self.connect()?;
+        let now = current_timestamp();
+        let changed = connection.execute(
+            "UPDATE projects SET icon = ?2, icon_color = ?3, updated_at = ?4 WHERE id = ?1",
+            params![project_id, icon, icon_color, now],
+        )?;
+        if changed == 0 {
+            return Err(MothershipError::InvalidRequest(format!(
+                "project not found: {project_id}"
+            )));
+        }
+
+        project_snapshot(&connection)
+    }
+
     pub fn llm_chat_context(
         &self,
         chat_id: &str,
@@ -1364,34 +1508,23 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Append a streamed delta to the assistant message and its live text
+    /// part. Deliberately returns no event and re-reads nothing: callers emit
+    /// their own coalesced UI delta, and re-SELECTing the accumulated content
+    /// on every flush made DB read traffic quadratic in answer length.
     pub fn append_chat_run_delta(
         &self,
         run_id: &str,
         chat_id: &str,
         assistant_message_id: &str,
         delta: &str,
-    ) -> Result<ChatRunEvent> {
+    ) -> Result<()> {
         validate_identifier("run_id", run_id)?;
         validate_identifier("chat_id", chat_id)?;
         validate_identifier("assistant_message_id", assistant_message_id)?;
 
         if delta.is_empty() {
-            return Ok(ChatRunEvent {
-                run_id: run_id.to_string(),
-                chat_id: chat_id.to_string(),
-                message_id: assistant_message_id.to_string(),
-                kind: ChatRunEventKind::Delta,
-                delta: Some(String::new()),
-                message: Some(select_chat_message_by_id(
-                    &self.connect()?,
-                    assistant_message_id,
-                )?),
-                chat: None,
-                transport: None,
-                tool_call_id: None,
-                removed_message_ids: Vec::new(),
-                error: None,
-            });
+            return Ok(());
         }
 
         let connection = self.connect()?;
@@ -1404,23 +1537,7 @@ impl Database {
             params![assistant_message_id, delta, chat_id],
         )?;
         append_text_message_part(&connection, run_id, chat_id, assistant_message_id, delta)?;
-
-        Ok(ChatRunEvent {
-            run_id: run_id.to_string(),
-            chat_id: chat_id.to_string(),
-            message_id: assistant_message_id.to_string(),
-            kind: ChatRunEventKind::Delta,
-            delta: Some(delta.to_string()),
-            message: Some(select_chat_message_by_id(
-                &connection,
-                assistant_message_id,
-            )?),
-            chat: None,
-            transport: None,
-            tool_call_id: None,
-            removed_message_ids: Vec::new(),
-            error: None,
-        })
+        Ok(())
     }
 
     pub fn mark_chat_run_transport(
@@ -1611,6 +1728,42 @@ impl Database {
         selected_llm_model(&connection)
     }
 
+    pub fn feature_routes(&self) -> Result<Vec<FeatureRoute>> {
+        let connection = self.connect()?;
+        feature_routes(&connection)
+    }
+
+    pub fn set_feature_route(
+        &self,
+        feature: &str,
+        provider_id: &str,
+        model_id: &str,
+        options: &serde_json::Value,
+    ) -> Result<FeatureRoute> {
+        validate_feature_id(feature)?;
+        validate_identifier("provider_id", provider_id)?;
+        validate_identifier("model_id", model_id)?;
+        let connection = self.connect()?;
+        let now = current_timestamp();
+        let options_json = serde_json::to_string(options)
+            .map_err(|error| MothershipError::InvalidRequest(error.to_string()))?;
+        connection.execute(
+            "
+            INSERT INTO feature_routes (
+                feature, scope_kind, scope_id, provider_id, model_id, options_json, updated_at
+            )
+            VALUES (?1, 'global', '', ?2, ?3, ?4, ?5)
+            ON CONFLICT(feature, scope_kind, scope_id) DO UPDATE SET
+                provider_id = excluded.provider_id,
+                model_id = excluded.model_id,
+                options_json = excluded.options_json,
+                updated_at = excluded.updated_at
+            ",
+            params![feature, provider_id, model_id, options_json, now],
+        )?;
+        feature_route(&connection, feature)
+    }
+
     /// Provider ids the user has switched off. A provider is enabled by default;
     /// only the explicitly disabled ones are persisted (as `provider.disabled.<id>`
     /// rows), so a never-touched or freshly installed adapter is always on.
@@ -1742,6 +1895,31 @@ impl Database {
         Ok(())
     }
 
+    // --- Change journal retention ----------------------------------------
+
+    /// How many of the newest MESSAGES keep their change sets per project
+    /// (`0` = unlimited). Counted in messages, not sets — one agent message can
+    /// record hundreds of sets and they survive or go together. Unset or
+    /// unparseable values fall back to the default.
+    pub fn change_journal_retention(&self) -> Result<u32> {
+        let connection = self.connect()?;
+        Ok(get_setting(&connection, CHANGE_JOURNAL_RETENTION_KEY)?
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or(CHANGE_JOURNAL_RETENTION_DEFAULT))
+    }
+
+    /// Persist the change-journal retention, returning the stored value.
+    pub fn set_change_journal_retention(&self, value: u32) -> Result<u32> {
+        let connection = self.connect()?;
+        set_setting(
+            &connection,
+            CHANGE_JOURNAL_RETENTION_KEY,
+            &value.to_string(),
+            &current_timestamp(),
+        )?;
+        Ok(value)
+    }
+
     pub fn sidecar_status(&self) -> Result<SidecarStatus> {
         let connection = self.connect()?;
         let page_count: i64 =
@@ -1772,14 +1950,80 @@ impl Database {
     }
 }
 
-fn migrate(connection: &Connection) -> Result<()> {
+/// The schema version a fully-migrated database sits at (the last entry of
+/// [`MIGRATIONS`]). Bump when appending a migration.
+const LATEST_SCHEMA_VERSION: i64 = 15;
+
+/// One registry entry: a schema version and the step that produces it.
+type Migration = (i64, fn(&Connection) -> Result<()>);
+
+/// The ordered migration registry. Each entry runs in its own transaction and
+/// records its version; [`migrate`] applies only entries newer than the highest
+/// version already recorded.
+///
+/// Versions 1-12 predate this registry: the legacy path re-ran one big
+/// idempotent DDL batch on every open and recorded versions 1..=13 with
+/// `INSERT OR IGNORE`. The baseline entry therefore carries the highest legacy
+/// version (13) and consists of exactly that guarded DDL, so it is safe on a
+/// fresh database *and* on any database the legacy path produced (including one
+/// that only recorded part of the 1..=13 range): guarded DDL never drops or
+/// rewrites existing rows. Future migrations append as `(version, fn)` pairs —
+/// never fold new DDL into the baseline, or databases already at v13 would
+/// silently skip it.
+const MIGRATIONS: &[Migration] = &[
+    (13, migrate_baseline_schema),
+    (14, migrate_change_file_hash_indexes),
+    (15, migrate_project_appearance),
+];
+
+fn migrate(connection: &mut Connection) -> Result<()> {
+    debug_assert_eq!(
+        MIGRATIONS.last().map(|(version, _apply)| *version),
+        Some(LATEST_SCHEMA_VERSION),
+        "LATEST_SCHEMA_VERSION must match the last registry entry",
+    );
+
+    // The bookkeeping table lives outside the registry: it must exist before
+    // any version can be read or recorded.
     connection.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
             applied_at TEXT NOT NULL
         );
+        ",
+    )?;
 
+    for (version, apply) in MIGRATIONS {
+        // Each step runs in its own IMMEDIATE transaction, and the applied
+        // version is re-read inside it: a second process racing the same
+        // database blocks on the write lock, then sees the recorded version
+        // and skips — never double-applying a step.
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let applied: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if *version <= applied {
+            continue; // dropping `tx` rolls back the (read-only) transaction
+        }
+        apply(&tx)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            params![version, current_timestamp()],
+        )?;
+        tx.commit()?;
+    }
+
+    Ok(())
+}
+
+/// Baseline (v13): the full schema as guarded, re-runnable DDL — the exact
+/// batch the legacy migration path executed on every open.
+fn migrate_baseline_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "
         CREATE TABLE IF NOT EXISTS workspace_items (
             id INTEGER PRIMARY KEY,
             kind TEXT NOT NULL,
@@ -1910,6 +2154,20 @@ fn migrate(connection: &Connection) -> Result<()> {
             model_id TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS feature_routes (
+            feature TEXT NOT NULL,
+            scope_kind TEXT NOT NULL DEFAULT 'global',
+            scope_id TEXT NOT NULL DEFAULT '',
+            provider_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            options_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (feature, scope_kind, scope_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_feature_routes_scope
+            ON feature_routes (scope_kind, scope_id);
 
         -- Typed tool storage (source of truth for tool calls). The legacy
         -- chat_tool_events stream is retained as a feed/fallback; these tables
@@ -2050,27 +2308,6 @@ fn migrate(connection: &Connection) -> Result<()> {
         ",
     )?;
 
-    connection.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-        params![1_i64, current_timestamp()],
-    )?;
-    connection.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-        params![2_i64, current_timestamp()],
-    )?;
-    connection.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-        params![3_i64, current_timestamp()],
-    )?;
-    connection.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-        params![4_i64, current_timestamp()],
-    )?;
-    connection.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-        params![5_i64, current_timestamp()],
-    )?;
-
     // Fresh databases already have these columns; ALTER brings existing ones
     // up to date (guarded, so re-running is a no-op).
     add_column_if_missing(connection, "chat_messages", "provider_id", "TEXT")?;
@@ -2089,38 +2326,30 @@ fn migrate(connection: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_chats_project_updated_at ON chats (project_id, updated_at DESC)",
         [],
     )?;
-    connection.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-        params![6_i64, current_timestamp()],
-    )?;
-    connection.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-        params![7_i64, current_timestamp()],
-    )?;
-    connection.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-        params![8_i64, current_timestamp()],
-    )?;
-    connection.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-        params![9_i64, current_timestamp()],
-    )?;
-    connection.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-        params![10_i64, current_timestamp()],
-    )?;
-    // v11: typed tool storage (tool_calls / tool_events / tool_artifacts).
-    connection.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-        params![11_i64, current_timestamp()],
-    )?;
-    // v12: workspace change journal (change_sets / change_files / change_reverts
-    // / change_conflicts).
-    connection.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-        params![12_i64, current_timestamp()],
-    )?;
 
+    Ok(())
+}
+
+/// v14: hash-lookup indexes on `change_files`, so the change-journal retention
+/// pruner's blob GC ("is this snapshot hash still referenced by any change
+/// file?") doesn't scan the whole table per hash.
+fn migrate_change_file_hash_indexes(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_change_files_before_hash
+            ON change_files (before_hash);
+
+        CREATE INDEX IF NOT EXISTS idx_change_files_after_hash
+            ON change_files (after_hash);
+        ",
+    )?;
+    Ok(())
+}
+
+/// v15: user-customizable project appearance (sidebar icon + accent color).
+fn migrate_project_appearance(connection: &Connection) -> Result<()> {
+    add_column_if_missing(connection, "projects", "icon", "TEXT")?;
+    add_column_if_missing(connection, "projects", "icon_color", "TEXT")?;
     Ok(())
 }
 
@@ -2144,47 +2373,6 @@ fn add_column_if_missing(
             [],
         )?;
     }
-    Ok(())
-}
-
-fn seed(connection: &mut Connection) -> Result<()> {
-    if count(connection, "workspace_items")? > 0 {
-        return Ok(());
-    }
-
-    let tx = connection.transaction()?;
-    let kinds = ["agent", "source", "queue", "index", "task"];
-    let statuses = ["active", "idle", "queued", "research", "blocked"];
-    let namespaces = ["core", "tauri", "solid", "sidecar", "research"];
-
-    for index in 0..WORKSPACE_LIMIT {
-        tx.execute(
-            "INSERT INTO workspace_items (kind, namespace, name, status, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                kinds[index as usize % kinds.len()],
-                namespaces[index as usize % namespaces.len()],
-                format!("mothership-unit-{index:04}"),
-                statuses[index as usize % statuses.len()],
-                current_timestamp(),
-            ],
-        )?;
-    }
-
-    for index in 0..EVENT_LIMIT {
-        let source = if index % 3 == 0 { "sidecar" } else { "app" };
-        let level = if index % 17 == 0 { "warn" } else { "info" };
-        tx.execute(
-            "INSERT INTO activity_events (source, level, message, occurred_at) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                source,
-                level,
-                format!("virtualized pipeline event #{index:04}"),
-                current_timestamp(),
-            ],
-        )?;
-    }
-
-    tx.commit()?;
     Ok(())
 }
 
@@ -2256,6 +2444,8 @@ fn select_project_summaries(connection: &Connection) -> Result<Vec<ProjectSummar
             projects.name,
             projects.path,
             COUNT(chats.id) AS chat_count,
+            projects.icon,
+            projects.icon_color,
             projects.created_at,
             projects.updated_at,
             projects.last_opened_at
@@ -2283,6 +2473,8 @@ fn select_project_summary(connection: &Connection, project_id: &str) -> Result<P
                 projects.name,
                 projects.path,
                 COUNT(chats.id) AS chat_count,
+                projects.icon,
+                projects.icon_color,
                 projects.created_at,
                 projects.updated_at,
                 projects.last_opened_at
@@ -3544,6 +3736,61 @@ fn selected_llm_model(connection: &Connection) -> Result<SelectedLlmModel> {
     }))
 }
 
+fn feature_routes(connection: &Connection) -> Result<Vec<FeatureRoute>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT feature, provider_id, model_id, options_json, updated_at
+        FROM feature_routes
+        WHERE scope_kind = 'global' AND scope_id = ''
+        ORDER BY feature
+        ",
+    )?;
+    let rows = statement.query_map([], feature_route_from_row)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn feature_route(connection: &Connection, feature: &str) -> Result<FeatureRoute> {
+    connection
+        .query_row(
+            "
+            SELECT feature, provider_id, model_id, options_json, updated_at
+            FROM feature_routes
+            WHERE feature = ?1 AND scope_kind = 'global' AND scope_id = ''
+            ",
+            params![feature],
+            feature_route_from_row,
+        )
+        .map_err(Into::into)
+}
+
+fn feature_route_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeatureRoute> {
+    let options_json: String = row.get(3)?;
+    let options = serde_json::from_str(&options_json).unwrap_or(serde_json::Value::Null);
+    Ok(FeatureRoute {
+        feature: row.get(0)?,
+        provider_id: row.get(1)?,
+        model_id: row.get(2)?,
+        options,
+        updated_at: row.get(4)?,
+    })
+}
+
+fn validate_feature_id(feature: &str) -> Result<()> {
+    let trimmed = feature.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 128
+        || !trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(MothershipError::InvalidRequest(format!(
+            "invalid feature id: {feature}"
+        )));
+    }
+    Ok(())
+}
+
 fn chat_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatThreadSummary> {
     Ok(ChatThreadSummary {
         id: row.get(0)?,
@@ -3568,9 +3815,11 @@ fn project_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project
         name: row.get(1)?,
         path: row.get(2)?,
         chat_count: row.get(3)?,
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
-        last_opened_at: row.get(6)?,
+        icon: row.get(4)?,
+        icon_color: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        last_opened_at: row.get(8)?,
     })
 }
 
@@ -3922,6 +4171,18 @@ fn validate_identifier(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Trims a user-entered display name (chat title / project name) and caps it
+/// at `max_chars`, rejecting blank input. Char-boundary safe.
+fn sanitize_user_label(value: &str, max_chars: usize) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(MothershipError::InvalidRequest(
+            "name cannot be empty".to_string(),
+        ));
+    }
+    Ok(trimmed.chars().take(max_chars).collect())
+}
+
 fn validate_chat_message_content(content: &str) -> Result<&str> {
     let content = content.trim();
     if content.is_empty() {
@@ -4086,6 +4347,44 @@ mod tests {
             .set_provider_enabled("codex", true)
             .expect("enable codex");
         assert!(database.disabled_provider_ids().expect("read").is_empty());
+    }
+
+    #[test]
+    fn feature_routes_persist_and_validate_identifiers() {
+        let database_path = temp_database_path("feature_routes");
+        let database = Database::open(database_path.clone()).expect("open database");
+
+        let route = database
+            .set_feature_route(
+                "media.image.generate",
+                "codex",
+                "gpt-image-2",
+                &serde_json::json!({ "size": "1024x1024" }),
+            )
+            .expect("set route");
+        assert_eq!(route.feature, "media.image.generate");
+        assert_eq!(route.provider_id, "codex");
+        assert_eq!(route.model_id, "gpt-image-2");
+        assert_eq!(route.options["size"], "1024x1024");
+
+        drop(database);
+        let reopened = Database::open(database_path.clone()).expect("reopen database");
+        let routes = reopened.feature_routes().expect("load routes");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].feature, "media.image.generate");
+        assert_eq!(routes[0].options["size"], "1024x1024");
+
+        let bad_feature = reopened
+            .set_feature_route(
+                "media image",
+                "codex",
+                "gpt-image-2",
+                &serde_json::json!({}),
+            )
+            .unwrap_err();
+        assert!(bad_feature.to_string().contains("feature"));
+
+        let _ = fs::remove_file(database_path);
     }
 
     #[test]
@@ -4919,6 +5218,72 @@ mod tests {
     }
 
     #[test]
+    fn rename_delete_and_appearance_round_trip() {
+        let database_path = temp_database_path("rename_delete_appearance");
+        let database = Database::open(database_path.clone()).expect("open database");
+        database
+            .set_selected_llm_model("openai", "test-model")
+            .expect("select model");
+
+        let project = create_project(&database, &database_path, "alpha");
+        let run = database
+            .begin_chat_run(None, Some(&project.id), "Hello there", None, false)
+            .expect("begin run");
+        let chat_id = run.chat.id.clone();
+
+        // Rename chat: trimmed, persisted, summary returned.
+        let renamed = database
+            .rename_chat(&chat_id, "  Renamed chat  ")
+            .expect("rename chat");
+        assert_eq!(renamed.title, "Renamed chat");
+        assert!(database.rename_chat(&chat_id, "   ").is_err());
+
+        // Project appearance: persisted + validated.
+        let snapshot = database
+            .set_project_appearance(&project.id, Some("emoji:🚀"), Some("#f0b748"))
+            .expect("set appearance");
+        let stored = snapshot
+            .projects
+            .iter()
+            .find(|item| item.id == project.id)
+            .expect("project present");
+        assert_eq!(stored.icon.as_deref(), Some("emoji:🚀"));
+        assert_eq!(stored.icon_color.as_deref(), Some("#f0b748"));
+        assert!(database
+            .set_project_appearance(&project.id, None, Some("not-a-color"))
+            .is_err());
+
+        // Rename project.
+        let snapshot = database
+            .rename_project(&project.id, "Beta")
+            .expect("rename project");
+        assert_eq!(
+            snapshot
+                .projects
+                .iter()
+                .find(|item| item.id == project.id)
+                .map(|item| item.name.as_str()),
+            Some("Beta")
+        );
+
+        // Delete chat: rows + cascaded children gone.
+        database.delete_chat(&chat_id).expect("delete chat");
+        assert!(database.get_chat(&chat_id, 10).is_err());
+        assert!(database.delete_chat(&chat_id).is_err());
+
+        // Delete project: project + its chats gone, active hint cleared.
+        let run = database
+            .begin_chat_run(None, Some(&project.id), "Another", None, false)
+            .expect("begin run");
+        let snapshot = database.delete_project(&project.id).expect("delete project");
+        assert!(snapshot.projects.iter().all(|item| item.id != project.id));
+        assert!(snapshot.active_project_id.is_none());
+        assert!(database.get_chat(&run.chat.id, 10).is_err());
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn project_snapshot_tracks_active_project_and_project_chats() {
         let database_path = temp_database_path("project_snapshot_tracks_chats");
         let database = Database::open(database_path.clone()).expect("open database");
@@ -5029,6 +5394,216 @@ mod tests {
         assert!(version >= 11, "schema should be >= v11, got {version}");
         drop(connection);
         drop(database);
+        let _ = fs::remove_file(database_path);
+    }
+
+    fn applied_versions(database: &Database) -> Vec<i64> {
+        let connection = database.connect().expect("connect");
+        let mut statement = connection
+            .prepare("SELECT version FROM schema_migrations ORDER BY version ASC")
+            .expect("prepare versions");
+        let rows = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .expect("query versions");
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect versions")
+    }
+
+    fn table_exists(database: &Database, table: &str) -> bool {
+        let connection = database.connect().expect("connect");
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("query table");
+        count == 1
+    }
+
+    #[test]
+    fn fresh_database_starts_empty() {
+        let database_path = temp_database_path("fresh_starts_empty");
+        let database = Database::open(database_path.clone()).expect("open database");
+
+        // No demo seed: a fresh dashboard has no rows until something happens.
+        let snapshot = database.snapshot().expect("snapshot");
+        assert!(snapshot.workspace_items.is_empty());
+        assert!(snapshot.activity_events.is_empty());
+
+        database
+            .append_activity_event("first real event")
+            .expect("append event");
+        let snapshot = database.snapshot().expect("snapshot");
+        assert!(snapshot.workspace_items.is_empty());
+        assert_eq!(snapshot.activity_events.len(), 1);
+        assert_eq!(snapshot.activity_events[0].message, "first real event");
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn migration_registry_is_strictly_ordered_and_ends_at_latest() {
+        let mut previous = 0_i64;
+        for (version, _apply) in MIGRATIONS {
+            assert!(
+                *version > previous,
+                "migration versions must be strictly increasing: {version} after {previous}"
+            );
+            previous = *version;
+        }
+        assert_eq!(previous, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn fresh_database_migrates_to_latest_version_with_full_schema() {
+        let database_path = temp_database_path("fresh_migrates_to_latest");
+        let database = Database::open(database_path.clone()).expect("open database");
+
+        // Only registry versions are recorded (no legacy 1..=12 backfill), in
+        // registry order, ending at the latest.
+        assert_eq!(
+            applied_versions(&database),
+            MIGRATIONS
+                .iter()
+                .map(|(version, _)| *version)
+                .collect::<Vec<_>>()
+        );
+
+        for table in ["chats", "change_sets", "feature_routes", "tool_calls"] {
+            assert!(table_exists(&database, table), "missing table `{table}`");
+        }
+        let connection = database.connect().expect("connect");
+        let index_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+                 AND name IN ('idx_change_files_before_hash', 'idx_change_files_after_hash')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query indexes");
+        assert_eq!(index_count, 2, "v14 hash indexes should exist");
+        drop(connection);
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn legacy_database_with_old_migration_rows_upgrades_cleanly() {
+        let database_path = temp_database_path("legacy_full_upgrade");
+        let database = Database::open(database_path.clone()).expect("open database");
+        let project = create_project(&database, &database_path, "legacy_full");
+        let chat = database
+            .create_chat(&project.id, None)
+            .expect("create chat")
+            .chat;
+
+        // Simulate a database written by the legacy migration path: same schema
+        // (the baseline IS the legacy DDL), but schema_migrations holds the full
+        // 1..=13 row set it used to insert.
+        {
+            let connection = database.connect().expect("connect");
+            connection
+                .execute("DELETE FROM schema_migrations", [])
+                .expect("clear versions");
+            for version in 1..=13_i64 {
+                connection
+                    .execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                        params![version, current_timestamp()],
+                    )
+                    .expect("insert legacy version");
+            }
+        }
+        drop(database);
+
+        // Reopen: only versions newer than 13 run; data is untouched.
+        let reopened = Database::open(database_path.clone()).expect("reopen database");
+        let versions = applied_versions(&reopened);
+        assert_eq!(versions, (1..=15_i64).collect::<Vec<_>>());
+        let projects = reopened.list_projects().expect("projects").projects;
+        assert!(projects.iter().any(|entry| entry.id == project.id));
+        let restored = reopened.get_chat(&chat.id, 50).expect("chat survives");
+        assert_eq!(restored.chat.id, chat.id);
+        drop(reopened);
+
+        // A second reopen is a pure no-op.
+        let reopened = Database::open(database_path.clone()).expect("reopen again");
+        assert_eq!(
+            applied_versions(&reopened),
+            (1..=15_i64).collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn partially_migrated_legacy_database_is_brought_up_to_date() {
+        let database_path = temp_database_path("legacy_partial_upgrade");
+        let database = Database::open(database_path.clone()).expect("open database");
+        let project = create_project(&database, &database_path, "legacy_partial");
+
+        // Simulate an older install: only versions 1..=5 recorded, and a table
+        // (plus the v14 indexes) from later versions missing entirely.
+        {
+            let connection = database.connect().expect("connect");
+            connection
+                .execute_batch(
+                    "
+                    DELETE FROM schema_migrations;
+                    DROP TABLE feature_routes;
+                    DROP INDEX idx_change_files_before_hash;
+                    DROP INDEX idx_change_files_after_hash;
+                    ",
+                )
+                .expect("rewind schema");
+            for version in 1..=5_i64 {
+                connection
+                    .execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                        params![version, current_timestamp()],
+                    )
+                    .expect("insert legacy version");
+            }
+        }
+        assert!(!table_exists(&database, "feature_routes"));
+        drop(database);
+
+        // Reopen: the baseline re-runs (guarded DDL restores the missing
+        // table), then v14/v15 — and the existing rows survive.
+        let reopened = Database::open(database_path.clone()).expect("reopen database");
+        assert_eq!(applied_versions(&reopened), vec![1, 2, 3, 4, 5, 13, 14, 15]);
+        assert!(table_exists(&reopened, "feature_routes"));
+        let projects = reopened.list_projects().expect("projects").projects;
+        assert!(projects.iter().any(|entry| entry.id == project.id));
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn change_journal_retention_defaults_and_round_trips() {
+        let database_path = temp_database_path("change_journal_retention");
+        let database = Database::open(database_path.clone()).expect("open database");
+
+        // Unset → the default (counted in messages, not change sets).
+        assert_eq!(database.change_journal_retention().expect("default"), 10);
+
+        assert_eq!(
+            database
+                .set_change_journal_retention(7)
+                .expect("set retention"),
+            7
+        );
+        assert_eq!(database.change_journal_retention().expect("read"), 7);
+
+        // 0 (= unlimited) is a valid stored value, and it survives a reopen.
+        database
+            .set_change_journal_retention(0)
+            .expect("set unlimited");
+        drop(database);
+        let reopened = Database::open(database_path.clone()).expect("reopen database");
+        assert_eq!(reopened.change_journal_retention().expect("read"), 0);
+
         let _ = fs::remove_file(database_path);
     }
 

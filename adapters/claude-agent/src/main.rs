@@ -25,5 +25,10 @@ async fn main() -> anyhow::Result<()> {
         return mcp::run_from_args(&args[1..]).await;
     }
 
+    // Old adapter versions left per-round temp config dirs (with plaintext
+    // credentials) behind whenever the host hard-killed the process; clean
+    // those up before serving requests.
+    auth::sweep_legacy_temp_config_dirs();
+
     mothership_adapter_sdk::run(ClaudeAgentAdapter::default()).await
 }

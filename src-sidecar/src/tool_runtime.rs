@@ -9,25 +9,27 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
+use base64::Engine as _;
 use mothership_core::{
     check_write_file_content_precondition, classify_file_tool, file_permission_action_for_mode,
     file_tool_preview_diff, run_apply_patch_tool, run_command_typed_payload, run_edit_file_tool,
     run_list_files_tool, run_read_file_tool, run_search_text_tool,
     run_write_file_tool_with_limit_and_observation, tool_batch_plan,
     validate_file_tool_args_shallow, ApprovalPreview, BackendOutcome, ChangeRecorder,
-    ChatCancellationToken, FileSystem, FileTool, FileToolOutcome, FileToolSpill,
+    ChatCancellationToken, ConnectorManager, FileSystem, FileTool, FileToolOutcome, FileToolSpill,
     LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResult, MothershipError,
-    PendingToolApprovalGate, ResourceLease, ResourceRequest, Result, SpawnedToolProcess,
-    StdFileSystem, ToolApprovalGate, ToolApprovalModeStore, ToolArtifact, ToolBackend,
-    ToolBatchPlan, ToolCallContext, ToolCancellationToken, ToolCapability, ToolCommand,
-    ToolDecision, ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest,
-    ToolExecutionResult, ToolExecutionStatus, ToolExecutor, ToolKind, ToolOrchestrator,
-    ToolOutputPolicy, ToolOutputStore, ToolPermissionAction, ToolPolicyStore, ToolProcessExit,
-    ToolProcessSandbox, ToolProcessSpec, ToolSupervisor, Workspace, DEFAULT_MAX_WRITE_FILE_BYTES,
-    MAX_TOOL_EVENT_BYTES,
+    PendingToolApprovalGate, ProviderMediaBlob, ResourceLease, ResourceRequest, Result,
+    SpawnedToolProcess, StdFileSystem, ToolApprovalGate, ToolApprovalModeStore, ToolArtifact,
+    ToolBackend, ToolBatchPlan, ToolCallContext, ToolCancellationToken, ToolCapability,
+    ToolCommand, ToolDecision, ToolExecutionEvent, ToolExecutionEventKind, ToolExecutionEventSink,
+    ToolExecutionRegistry, ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus,
+    ToolExecutor, ToolKind, ToolOrchestrator, ToolOutputContext, ToolOutputPolicy, ToolOutputStore,
+    ToolPermissionAction, ToolPolicyStore, ToolProcessExit, ToolProcessSandbox, ToolProcessSpec,
+    ToolSupervisor, Workspace, DEFAULT_MAX_WRITE_FILE_BYTES, MAX_TOOL_EVENT_BYTES,
 };
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncRead;
 
 const DEFAULT_TOOL_TIMEOUT_MS: u64 = 10 * 60 * 1000;
@@ -141,6 +143,8 @@ fn powershell_spec(
 struct ToolProjectContext {
     id: String,
     root: PathBuf,
+    artifact_root: Option<PathBuf>,
+    tmp_root: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +163,10 @@ struct CommandToolExecutor {
     runtime: Arc<tokio::runtime::Runtime>,
     sink: Arc<dyn ToolExecutionEventSink>,
     project: Option<ToolProjectContext>,
+    /// The chat this run executes for; stamped onto every command request so
+    /// the supervisor's permission policy resolves THIS chat's approval mode
+    /// (never another concurrent chat's).
+    chat_id: Option<String>,
     /// Drives the same approval gate the file tools use; the orchestrator blocks
     /// on it during the Ask phase.
     approvals: Arc<PendingToolApprovalGate>,
@@ -181,11 +189,23 @@ struct FileToolExecutor {
     /// default is [`DEFAULT_MAX_WRITE_FILE_BYTES`]).
     max_write_bytes: usize,
     observations: Arc<Mutex<HashMap<FileObservationKey, String>>>,
+    /// The chat this run executes for; file-tool decisions look up THIS chat's
+    /// entry in the shared approval-mode store (falling back to the default
+    /// when no chat is associated).
+    chat_id: Option<String>,
     approval_mode: Arc<ToolApprovalModeStore>,
     /// Records workspace changes produced by mutating tools into the change
     /// journal. `None` when no journal is wired (e.g. the standalone
     /// `run_command` protocol path), in which case capture is skipped.
     change_recorder: Option<Arc<ChangeRecorder>>,
+}
+
+struct ProviderServiceToolExecutor {
+    connector_manager: Arc<ConnectorManager>,
+    sink: Arc<dyn ToolExecutionEventSink>,
+    project: Option<ToolProjectContext>,
+    artifact_root: Option<PathBuf>,
+    tmp_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -207,6 +227,7 @@ struct FileObservationKey {
 pub struct SidecarLlmToolHandler {
     command_executor: Arc<CommandToolExecutor>,
     file_executor: Arc<FileToolExecutor>,
+    service_executor: Arc<ProviderServiceToolExecutor>,
     registry: Arc<ToolExecutionRegistry>,
     /// User-configured tool toggles: a kind in the disabled set is refused
     /// before dispatch (command allow/deny is enforced separately, inside the
@@ -215,41 +236,61 @@ pub struct SidecarLlmToolHandler {
 }
 
 impl SidecarLlmToolHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         supervisor: Arc<ToolSupervisor>,
         registry: Arc<ToolExecutionRegistry>,
         runtime: Arc<tokio::runtime::Runtime>,
         sink: Arc<dyn ToolExecutionEventSink>,
         project: Option<(String, PathBuf)>,
+        chat_id: Option<String>,
         approvals: Arc<PendingToolApprovalGate>,
         output_store: Option<Arc<dyn ToolOutputStore>>,
         change_recorder: Option<Arc<ChangeRecorder>>,
         approval_mode: Arc<ToolApprovalModeStore>,
         tool_policy: Arc<ToolPolicyStore>,
+        connector_manager: Arc<ConnectorManager>,
+        artifact_root: Option<PathBuf>,
+        tmp_root: Option<PathBuf>,
     ) -> Self {
-        let project = project.map(|(id, root)| ToolProjectContext { id, root });
+        let project = project.map(|(id, root)| ToolProjectContext {
+            id,
+            root,
+            artifact_root: artifact_root.clone(),
+            tmp_root: tmp_root.clone(),
+        });
         let command_executor = Arc::new(CommandToolExecutor {
             supervisor,
             runtime: Arc::clone(&runtime),
             sink: Arc::clone(&sink),
             project: project.clone(),
+            chat_id: chat_id.clone(),
             approvals: Arc::clone(&approvals),
         });
         let file_executor = Arc::new(FileToolExecutor {
             runtime,
-            sink,
-            project,
+            sink: Arc::clone(&sink),
+            project: project.clone(),
             approvals,
             file_system: StdFileSystem::new(),
             output_store,
             max_write_bytes: DEFAULT_MAX_WRITE_FILE_BYTES,
             observations: Arc::new(Mutex::new(HashMap::new())),
+            chat_id,
             approval_mode,
             change_recorder,
+        });
+        let service_executor = Arc::new(ProviderServiceToolExecutor {
+            connector_manager,
+            sink,
+            project: project.clone(),
+            artifact_root,
+            tmp_root,
         });
         Self {
             command_executor,
             file_executor,
+            service_executor,
             registry,
             tool_policy,
         }
@@ -315,12 +356,16 @@ impl SidecarLlmToolHandler {
             cancellation: &cancellation,
             chat_cancellation,
         };
-        let result = if kind.is_process() {
-            self.command_executor.execute(ctx)
-        } else {
-            // FileToolExecutor now implements both ToolExecutor (this dispatcher
-            // seam) and ToolBackend (the orchestrator seam); name the trait.
-            ToolExecutor::execute(&*self.file_executor, ctx)
+        let result = match kind {
+            ToolKind::RunCommand => self.command_executor.execute(ctx),
+            ToolKind::ImageGenerate | ToolKind::AudioTranscribe => {
+                self.service_executor.execute(ctx)
+            }
+            _ => {
+                // FileToolExecutor now implements both ToolExecutor (this dispatcher
+                // seam) and ToolBackend (the orchestrator seam); name the trait.
+                ToolExecutor::execute(&*self.file_executor, ctx)
+            }
         };
 
         finished.store(true, Ordering::SeqCst);
@@ -394,15 +439,16 @@ impl ToolExecutor for CommandToolExecutor {
     /// the repeat guard, approval, and the resource lease; the backend supplies
     /// only the command-specific work via the supervisor's ports.
     fn execute(&self, ctx: ToolCallContext<'_>) -> LlmToolCallResult {
-        let request = match command_request_from_ctx(&ctx, self.project.as_ref()) {
-            Ok(request) => request,
-            Err(error) => {
-                return LlmToolCallResult {
-                    ok: false,
-                    content: error,
-                };
-            }
-        };
+        let request =
+            match command_request_from_ctx(&ctx, self.project.as_ref(), self.chat_id.as_deref()) {
+                Ok(request) => request,
+                Err(error) => {
+                    return LlmToolCallResult {
+                        ok: false,
+                        content: error,
+                    };
+                }
+            };
         // Events carry the request's project id (project root, or the cwd
         // fallback) just as the former hand-rolled lifecycle did.
         let event_project_id = request.project_id.clone();
@@ -414,6 +460,484 @@ impl ToolExecutor for CommandToolExecutor {
         let gate: Arc<dyn ToolApprovalGate> = self.approvals.clone();
         let orchestrator = ToolOrchestrator::new(gate, Arc::clone(&self.runtime));
         orchestrator.run(ctx, event_project_id.as_deref(), &backend, &self.sink)
+    }
+}
+
+impl ToolExecutor for ProviderServiceToolExecutor {
+    fn execute(&self, ctx: ToolCallContext<'_>) -> LlmToolCallResult {
+        match ctx.kind {
+            ToolKind::ImageGenerate => self.execute_image(ctx),
+            ToolKind::AudioTranscribe => self.execute_audio_transcribe(ctx),
+            _ => LlmToolCallResult {
+                ok: false,
+                content: format!("unsupported provider service tool `{}`", ctx.kind.as_str()),
+            },
+        }
+    }
+}
+
+impl ProviderServiceToolExecutor {
+    fn execute_image(&self, ctx: ToolCallContext<'_>) -> LlmToolCallResult {
+        let args = match serde_json::from_value::<ImageGenerateArguments>(ctx.arguments.clone()) {
+            Ok(args) if !args.prompt.trim().is_empty() => args,
+            Ok(_) => {
+                return LlmToolCallResult {
+                    ok: false,
+                    content: "image_generate.prompt cannot be empty".to_string(),
+                };
+            }
+            Err(error) => {
+                return LlmToolCallResult {
+                    ok: false,
+                    content: format!("invalid image_generate arguments: {error}"),
+                };
+            }
+        };
+        if ctx.cancellation.is_cancelled() {
+            let message = "image generation was cancelled before it started".to_string();
+            self.emit_terminal(
+                &ctx,
+                ToolExecutionStatus::Cancelled,
+                message.clone(),
+                Vec::new(),
+                None,
+            );
+            return LlmToolCallResult {
+                ok: false,
+                content: message,
+            };
+        }
+
+        self.emit_lifecycle(&ctx, ToolExecutionEventKind::Queued, None, None);
+        self.emit_lifecycle(
+            &ctx,
+            ToolExecutionEventKind::Started,
+            Some("generating image".to_string()),
+            Some(serde_json::json!({
+                "prompt": args.prompt.clone(),
+                "promptPreview": preview_chars(&args.prompt, 240),
+            })),
+        );
+
+        let outcome = self
+            .connector_manager
+            .generate_image(&args.prompt, args.options.clone())
+            .and_then(|(route, result)| {
+                let artifacts = self.store_image_artifacts(&ctx, &result.images)?;
+                if artifacts.is_empty() {
+                    return Err(MothershipError::Runtime(
+                        "provider returned no generated images".to_string(),
+                    ));
+                }
+                Ok((route, result.metadata, artifacts))
+            });
+
+        match outcome {
+            Ok((route, metadata, artifacts)) => {
+                let message =
+                    image_generation_summary(&route.provider_id, &route.model_id, &artifacts);
+                self.emit_terminal(
+                    &ctx,
+                    ToolExecutionStatus::Completed,
+                    message.clone(),
+                    artifacts.clone(),
+                    Some(serde_json::json!({
+                        "feature": route.feature,
+                        "providerId": route.provider_id,
+                        "modelId": route.model_id,
+                        "prompt": args.prompt.clone(),
+                        "promptPreview": preview_chars(&args.prompt, 240),
+                        "imageCount": artifacts.len(),
+                        "metadata": metadata,
+                    })),
+                );
+                LlmToolCallResult {
+                    ok: true,
+                    content: message,
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.emit_terminal(
+                    &ctx,
+                    ToolExecutionStatus::Failed,
+                    message.clone(),
+                    Vec::new(),
+                    None,
+                );
+                LlmToolCallResult {
+                    ok: false,
+                    content: message,
+                }
+            }
+        }
+    }
+
+    fn execute_audio_transcribe(&self, ctx: ToolCallContext<'_>) -> LlmToolCallResult {
+        let args = match serde_json::from_value::<AudioTranscribeArguments>(ctx.arguments.clone()) {
+            Ok(args) if !args.input_path.trim().is_empty() => args,
+            Ok(_) => {
+                return LlmToolCallResult {
+                    ok: false,
+                    content: "audio_transcribe.inputPath cannot be empty".to_string(),
+                };
+            }
+            Err(error) => {
+                return LlmToolCallResult {
+                    ok: false,
+                    content: format!("invalid audio_transcribe arguments: {error}"),
+                };
+            }
+        };
+        if ctx.cancellation.is_cancelled() {
+            let message = "audio transcription was cancelled before it started".to_string();
+            self.emit_terminal(
+                &ctx,
+                ToolExecutionStatus::Cancelled,
+                message.clone(),
+                Vec::new(),
+                None,
+            );
+            return LlmToolCallResult {
+                ok: false,
+                content: message,
+            };
+        }
+        let input_path = match self.resolve_service_input_path(&args.input_path) {
+            Ok(path) => path,
+            Err(error) => {
+                return LlmToolCallResult {
+                    ok: false,
+                    content: error,
+                };
+            }
+        };
+
+        self.emit_lifecycle(&ctx, ToolExecutionEventKind::Queued, None, None);
+        self.emit_lifecycle(
+            &ctx,
+            ToolExecutionEventKind::Started,
+            Some("transcribing audio".to_string()),
+            Some(serde_json::json!({
+                "inputPath": input_path.display().to_string(),
+            })),
+        );
+
+        let outcome = self
+            .connector_manager
+            .transcribe_audio(&input_path.display().to_string(), args.options.clone())
+            .and_then(|(route, result)| {
+                let artifacts = self.store_transcription_artifacts(&ctx, &result)?;
+                Ok((route, result, artifacts))
+            });
+
+        match outcome {
+            Ok((route, result, artifacts)) => {
+                let message = transcription_summary(
+                    &route.provider_id,
+                    &route.model_id,
+                    &result.text,
+                    &artifacts,
+                );
+                self.emit_terminal(
+                    &ctx,
+                    ToolExecutionStatus::Completed,
+                    message.clone(),
+                    artifacts,
+                    Some(serde_json::json!({
+                        "feature": route.feature,
+                        "providerId": route.provider_id,
+                        "modelId": route.model_id,
+                        "language": result.language,
+                        "transcriptChars": result.text.chars().count(),
+                        "metadata": result.metadata,
+                    })),
+                );
+                LlmToolCallResult {
+                    ok: true,
+                    content: message,
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.emit_terminal(
+                    &ctx,
+                    ToolExecutionStatus::Failed,
+                    message.clone(),
+                    Vec::new(),
+                    None,
+                );
+                LlmToolCallResult {
+                    ok: false,
+                    content: message,
+                }
+            }
+        }
+    }
+
+    fn emit_lifecycle(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        kind: ToolExecutionEventKind,
+        message: Option<String>,
+        payload: Option<Value>,
+    ) {
+        self.sink.emit(ToolExecutionEvent {
+            tool_call_id: ctx.tool_call_id.to_string(),
+            run_id: ctx.run_id.map(str::to_string),
+            project_id: self.project.as_ref().map(|project| project.id.clone()),
+            command: None,
+            kind,
+            stream: None,
+            chunk: None,
+            message,
+            result: None,
+            tool_kind: Some(ctx.kind),
+            payload,
+            touched_paths: Vec::new(),
+            artifacts: Vec::new(),
+        });
+    }
+
+    fn emit_terminal(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        status: ToolExecutionStatus,
+        message: String,
+        artifacts: Vec<ToolArtifact>,
+        payload: Option<Value>,
+    ) {
+        let kind = match status {
+            ToolExecutionStatus::Completed => ToolExecutionEventKind::Completed,
+            ToolExecutionStatus::Cancelled => ToolExecutionEventKind::Cancelled,
+            _ => ToolExecutionEventKind::Failed,
+        };
+        let result = ToolExecutionResult {
+            tool_call_id: ctx.tool_call_id.to_string(),
+            status,
+            exit_code: None,
+            stdout_preview: message.clone(),
+            stderr_preview: String::new(),
+            stdout_tail: message.clone(),
+            stderr_tail: String::new(),
+            stdout_bytes: message.len(),
+            stderr_bytes: 0,
+            truncated_for_display: false,
+            truncated_for_agent: false,
+            log_ref: None,
+            message: Some(message.clone()),
+        };
+        self.sink.emit(ToolExecutionEvent {
+            tool_call_id: ctx.tool_call_id.to_string(),
+            run_id: ctx.run_id.map(str::to_string),
+            project_id: self.project.as_ref().map(|project| project.id.clone()),
+            command: None,
+            kind,
+            stream: None,
+            chunk: None,
+            message: Some(message),
+            result: Some(result),
+            tool_kind: Some(ctx.kind),
+            payload,
+            touched_paths: Vec::new(),
+            artifacts,
+        });
+    }
+
+    fn store_image_artifacts(
+        &self,
+        _ctx: &ToolCallContext<'_>,
+        images: &[ProviderMediaBlob],
+    ) -> Result<Vec<ToolArtifact>> {
+        let root = self
+            .artifact_root
+            .as_ref()
+            .or_else(|| {
+                self.project
+                    .as_ref()
+                    .and_then(|project| project.artifact_root.as_ref())
+            })
+            .ok_or_else(|| {
+                MothershipError::Runtime("no artifact root is configured".to_string())
+            })?;
+        let image_dir = root.join("images");
+        fs::create_dir_all(&image_dir)?;
+
+        let mut artifacts = Vec::new();
+        for (index, image) in images.iter().enumerate() {
+            let artifact_id = format!("image_{}", index + 1);
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(image.bytes_base64.as_bytes())
+                .map_err(|error| {
+                    MothershipError::Runtime(format!(
+                        "provider returned invalid base64 for {artifact_id}: {error}"
+                    ))
+                })?;
+            let content_type = if image.content_type.trim().is_empty() {
+                "application/octet-stream".to_string()
+            } else {
+                image.content_type.trim().to_string()
+            };
+            let fallback_name = format!(
+                "{artifact_id}.{}",
+                extension_for_content_type(&content_type)
+            );
+            let file_name = image
+                .filename
+                .as_deref()
+                .map(|name| safe_file_name(name, &fallback_name))
+                .unwrap_or(fallback_name);
+            let path = unique_artifact_path(&image_dir, &format!("{artifact_id}-{file_name}"));
+            fs::write(&path, &bytes)?;
+            let sha256 = hex_sha256(&bytes);
+            artifacts.push(ToolArtifact {
+                artifact_id,
+                kind: "image".to_string(),
+                content_type,
+                preview: format!(
+                    "generated image saved to {} ({} bytes)",
+                    path.display(),
+                    bytes.len()
+                ),
+                log_ref: Some(path.display().to_string()),
+                size_bytes: bytes.len() as u64,
+                sha256: Some(sha256),
+                truncated: false,
+            });
+        }
+        Ok(artifacts)
+    }
+
+    fn store_transcription_artifacts(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        result: &mothership_core::AudioTranscriptionResult,
+    ) -> Result<Vec<ToolArtifact>> {
+        let root = self
+            .artifact_root
+            .as_ref()
+            .or_else(|| {
+                self.project
+                    .as_ref()
+                    .and_then(|project| project.artifact_root.as_ref())
+            })
+            .ok_or_else(|| {
+                MothershipError::Runtime("no artifact root is configured".to_string())
+            })?;
+        let tool_dir = root.join(path_component(ctx.tool_call_id));
+        fs::create_dir_all(&tool_dir)?;
+
+        let transcript_path = tool_dir.join("transcript.txt");
+        fs::write(&transcript_path, result.text.as_bytes())?;
+        let mut artifacts = vec![ToolArtifact {
+            artifact_id: "transcript".to_string(),
+            kind: "transcript".to_string(),
+            content_type: "text/plain; charset=utf-8".to_string(),
+            preview: preview_chars(&result.text, 2000),
+            log_ref: Some(transcript_path.display().to_string()),
+            size_bytes: result.text.len() as u64,
+            sha256: Some(hex_sha256(result.text.as_bytes())),
+            truncated: result.text.chars().count() > 2000,
+        }];
+
+        for (index, artifact) in result.artifacts.iter().enumerate() {
+            let artifact_id = format!("provider_artifact_{}", index + 1);
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(artifact.bytes_base64.as_bytes())
+                .map_err(|error| {
+                    MothershipError::Runtime(format!(
+                        "provider returned invalid base64 for {artifact_id}: {error}"
+                    ))
+                })?;
+            let content_type = if artifact.content_type.trim().is_empty() {
+                "application/octet-stream".to_string()
+            } else {
+                artifact.content_type.trim().to_string()
+            };
+            let fallback_name = format!(
+                "{artifact_id}.{}",
+                extension_for_content_type(&content_type)
+            );
+            let file_name = artifact
+                .filename
+                .as_deref()
+                .map(|name| safe_file_name(name, &fallback_name))
+                .unwrap_or(fallback_name);
+            let path = tool_dir.join(format!("{artifact_id}-{file_name}"));
+            fs::write(&path, &bytes)?;
+            artifacts.push(ToolArtifact {
+                artifact_id,
+                kind: "provider_media".to_string(),
+                content_type,
+                preview: format!("provider artifact saved to {}", path.display()),
+                log_ref: Some(path.display().to_string()),
+                size_bytes: bytes.len() as u64,
+                sha256: Some(hex_sha256(&bytes)),
+                truncated: false,
+            });
+        }
+        Ok(artifacts)
+    }
+
+    fn resolve_service_input_path(&self, raw: &str) -> std::result::Result<PathBuf, String> {
+        let input = PathBuf::from(raw);
+        let resolved = if let Some(project) = &self.project {
+            let workspace = workspace_for_project(project)
+                .map_err(|error| format!("workspace unavailable: {error}"))?;
+            workspace
+                .resolve(&input)
+                .map_err(|error| format!("inputPath is outside allowed roots: {error}"))?
+        } else {
+            if !input.is_absolute() {
+                return Err(
+                    "audio_transcribe.inputPath must be absolute when no project is active"
+                        .to_string(),
+                );
+            }
+            input
+        };
+        let canonical = fs::canonicalize(&resolved)
+            .map_err(|error| format!("audio_transcribe.inputPath is not readable: {error}"))?;
+        if !canonical.is_file() {
+            return Err("audio_transcribe.inputPath must point to a file".to_string());
+        }
+        if self.input_path_allowed(&canonical) {
+            Ok(canonical)
+        } else {
+            Err("audio_transcribe.inputPath must stay inside the current project, artifact root, or tmp root".to_string())
+        }
+    }
+
+    fn input_path_allowed(&self, path: &Path) -> bool {
+        if let Some(project) = &self.project {
+            if fs::canonicalize(&project.root)
+                .ok()
+                .is_some_and(|root| path_within(path, &root))
+            {
+                return true;
+            }
+        }
+        for root in [
+            self.artifact_root.as_ref(),
+            self.tmp_root.as_ref(),
+            self.project
+                .as_ref()
+                .and_then(|project| project.artifact_root.as_ref()),
+            self.project
+                .as_ref()
+                .and_then(|project| project.tmp_root.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if fs::canonicalize(root)
+                .ok()
+                .is_some_and(|root| path_within(path, &root))
+            {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -629,7 +1153,7 @@ impl ToolExecutor for FileToolExecutor {
         let project_id = Some(project.id.clone());
         let run_id = ctx.run_id.map(str::to_string);
 
-        let workspace = match Workspace::new(&project.root) {
+        let workspace = match workspace_for_project(&project) {
             Ok(workspace) => workspace,
             Err(error) => {
                 return LlmToolCallResult {
@@ -730,7 +1254,10 @@ impl ToolBackend for FileToolExecutor {
             }
         }
 
-        let action = file_permission_action_for_mode(self.approval_mode.mode(), capability.action);
+        let action = file_permission_action_for_mode(
+            self.approval_mode.mode_for_chat(self.chat_id.as_deref()),
+            capability.action,
+        );
         match action {
             ToolPermissionAction::Ask => ToolDecision::Ask {
                 reason: capability.summary,
@@ -773,6 +1300,8 @@ impl ToolBackend for FileToolExecutor {
             .map(|store| AsyncOutputStoreSpill {
                 store: Arc::clone(store),
                 runtime: Arc::clone(&self.runtime),
+                run_id: run_id.clone(),
+                project_id: self.project.as_ref().map(|project| project.id.clone()),
             });
         let spill_ref = spill.as_ref().map(|spill| spill as &dyn FileToolSpill);
 
@@ -782,7 +1311,8 @@ impl ToolBackend for FileToolExecutor {
         let capture = if matches!(
             tool,
             FileTool::Write | FileTool::Edit | FileTool::ApplyPatch
-        ) {
+        ) && mutation_targets_project_root(tool, ctx.arguments, &workspace)
+        {
             self.change_recorder.as_ref().map(|recorder| {
                 recorder.begin_capture(Arc::new(self.file_system), workspace.root())
             })
@@ -994,7 +1524,7 @@ impl FileToolExecutor {
                     .to_string(),
             )
         })?;
-        let workspace = Workspace::new(&project.root).map_err(|error| {
+        let workspace = workspace_for_project(project).map_err(|error| {
             MothershipError::InvalidRequest(format!("project root is unavailable: {error}"))
         })?;
         Ok((tool, workspace))
@@ -1085,6 +1615,28 @@ impl FileToolExecutor {
     }
 }
 
+fn workspace_for_project(project: &ToolProjectContext) -> std::io::Result<Workspace> {
+    let mut workspace = Workspace::new(&project.root)?;
+    if let Some(root) = &project.artifact_root {
+        workspace = workspace.with_absolute_root(root, false, "current artifact root")?;
+    }
+    if let Some(root) = &project.tmp_root {
+        workspace = workspace.with_absolute_root(root, true, "current tmp root")?;
+    }
+    Ok(workspace)
+}
+
+fn mutation_targets_project_root(tool: FileTool, arguments: &Value, workspace: &Workspace) -> bool {
+    let Ok(capability) = classify_file_tool(tool, arguments, workspace) else {
+        return false;
+    };
+    capability
+        .touched_paths
+        .iter()
+        .filter_map(|path| workspace.resolve(path).ok())
+        .all(|resolved| resolved.starts_with(workspace.root()))
+}
+
 /// Extract the workspace-relative paths a file-tool outcome touched, from its
 /// semantic `data` payload — a single `path`, and/or a `files` array (of strings
 /// or `{ "path": … }` objects, as `apply_patch` emits).
@@ -1111,6 +1663,8 @@ fn touched_paths_from_data(data: &Value) -> Vec<String> {
 struct AsyncOutputStoreSpill {
     store: Arc<dyn ToolOutputStore>,
     runtime: Arc<tokio::runtime::Runtime>,
+    run_id: Option<String>,
+    project_id: Option<String>,
 }
 
 impl FileToolSpill for AsyncOutputStoreSpill {
@@ -1118,9 +1672,16 @@ impl FileToolSpill for AsyncOutputStoreSpill {
         let store = Arc::clone(&self.store);
         let tool_call_id = tool_call_id.to_string();
         let content = content.to_string();
+        let run_id = self.run_id.clone();
+        let project_id = self.project_id.clone();
         self.runtime.block_on(async move {
             let mut writer = store
-                .open(&tool_call_id)
+                .open_with_context(ToolOutputContext::for_artifact(
+                    tool_call_id.clone(),
+                    run_id,
+                    project_id,
+                    "output",
+                ))
                 .await
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             writer
@@ -1324,6 +1885,22 @@ fn bound_preview(summary: &str, diff: &str) -> String {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ImageGenerateArguments {
+    prompt: String,
+    #[serde(default)]
+    options: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioTranscribeArguments {
+    input_path: String,
+    #[serde(default)]
+    options: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RunCommandArguments {
     program: String,
     #[serde(default)]
@@ -1334,9 +1911,163 @@ struct RunCommandArguments {
     timeout_ms: Option<u64>,
 }
 
+fn image_generation_summary(
+    provider_id: &str,
+    model_id: &str,
+    artifacts: &[ToolArtifact],
+) -> String {
+    let mut lines = vec![format!(
+        "Generated {} image(s) via {provider_id}/{model_id}.",
+        artifacts.len()
+    )];
+    for artifact in artifacts {
+        if let Some(path) = artifact.log_ref.as_deref() {
+            lines.push(format!(
+                "- {}: {} ({} bytes, {}, sha256 {})",
+                artifact.artifact_id,
+                path,
+                artifact.size_bytes,
+                artifact.content_type,
+                artifact.sha256.as_deref().unwrap_or("unknown")
+            ));
+            if artifact.content_type.starts_with("image/") {
+                lines.push(format!(
+                    "  markdown: ![{}](<{}>)",
+                    artifact.artifact_id, path
+                ));
+            }
+        }
+    }
+    lines.push(
+        "Use these AppData-scoped artifact paths directly, or copy files into the project only when the task requires it."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+fn transcription_summary(
+    provider_id: &str,
+    model_id: &str,
+    transcript: &str,
+    artifacts: &[ToolArtifact],
+) -> String {
+    let mut lines = vec![format!("Transcribed audio via {provider_id}/{model_id}.")];
+    lines.push("Transcript preview:".to_string());
+    lines.push(preview_chars(transcript, 4000));
+    for artifact in artifacts {
+        if let Some(path) = artifact.log_ref.as_deref() {
+            lines.push(format!(
+                "- {}: {} ({} bytes, {}, sha256 {})",
+                artifact.artifact_id,
+                path,
+                artifact.size_bytes,
+                artifact.content_type,
+                artifact.sha256.as_deref().unwrap_or("unknown")
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn preview_chars(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index >= max_chars {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn extension_for_content_type(content_type: &str) -> &'static str {
+    match content_type.split(';').next().unwrap_or("").trim() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "bin",
+    }
+}
+
+fn safe_file_name(raw: &str, fallback: &str) -> String {
+    let mut name = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    while name.contains("..") {
+        name = name.replace("..", ".");
+    }
+    name = name.trim_matches('.').trim_matches('_').to_string();
+    if name.is_empty() || name == "." || name == ".." {
+        fallback.to_string()
+    } else {
+        name.chars().take(96).collect()
+    }
+}
+
+fn path_component(raw: &str) -> String {
+    safe_file_name(raw, "tool")
+}
+
+fn unique_artifact_path(dir: &Path, file_name: &str) -> PathBuf {
+    let candidate = dir.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("artifact");
+    let extension = path.extension().and_then(|value| value.to_str());
+
+    for index in 2..=9999 {
+        let name = match extension {
+            Some(extension) if !extension.is_empty() => {
+                format!("{stem}-{index}.{extension}")
+            }
+            _ => format!("{stem}-{index}"),
+        };
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let name = match extension {
+        Some(extension) if !extension.is_empty() => format!("{stem}-{stamp}.{extension}"),
+        _ => format!("{stem}-{stamp}"),
+    };
+    dir.join(name)
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 fn command_request_from_ctx(
     ctx: &ToolCallContext<'_>,
     project: Option<&ToolProjectContext>,
+    chat_id: Option<&str>,
 ) -> std::result::Result<ToolExecutionRequest, String> {
     let arguments = serde_json::from_value::<RunCommandArguments>(ctx.arguments.clone())
         .map_err(|error| format!("invalid run_command arguments: {error}"))?;
@@ -1349,6 +2080,10 @@ fn command_request_from_ctx(
         .unwrap_or(DEFAULT_TOOL_TIMEOUT_MS)
         .min(MAX_TOOL_TIMEOUT_MS);
     let cwd = resolve_tool_cwd(arguments.cwd, project)?;
+    // The canonical project root rides along so the manual-mode read-only
+    // argument screen can test command arguments for workspace escapes even
+    // when the cwd is a subdirectory.
+    let workspace_root = project.and_then(|project| fs::canonicalize(&project.root).ok());
     let project_id = project
         .map(|project| project.id.clone())
         .or_else(|| cwd.as_ref().map(|cwd| cwd.display().to_string()));
@@ -1356,7 +2091,9 @@ fn command_request_from_ctx(
     Ok(ToolExecutionRequest {
         tool_call_id: ctx.tool_call_id.to_string(),
         run_id: ctx.run_id.map(str::to_string),
+        chat_id: chat_id.map(str::to_string),
         project_id,
+        workspace_root,
         cwd,
         command: ToolCommand {
             program: program.to_string(),
@@ -1384,9 +2121,15 @@ fn resolve_tool_cwd(
     };
     let cwd = canonicalize_existing_directory(&cwd, "run_command.cwd")?;
 
-    if !path_within(&cwd, &root) {
+    let in_project = path_within(&cwd, &root);
+    let in_tmp = project
+        .tmp_root
+        .as_ref()
+        .and_then(|tmp_root| canonicalize_existing_directory(tmp_root, "current tmp root").ok())
+        .is_some_and(|tmp_root| path_within(&cwd, &tmp_root));
+    if !in_project && !in_tmp {
         return Err(format!(
-            "run_command.cwd must stay inside the active project root: {}",
+            "run_command.cwd must stay inside the active project root ({}) or current tmp root",
             root.display()
         ));
     }
@@ -1579,12 +2322,15 @@ mod tests {
             project: Some(ToolProjectContext {
                 id: "project_file_tool_test".to_string(),
                 root: root.to_path_buf(),
+                artifact_root: None,
+                tmp_root: None,
             }),
             approvals,
             file_system: StdFileSystem::new(),
             output_store: None,
             max_write_bytes: DEFAULT_MAX_WRITE_FILE_BYTES,
             observations: Arc::new(Mutex::new(HashMap::new())),
+            chat_id: None,
             approval_mode: Arc::new(ToolApprovalModeStore::default()),
             change_recorder: None,
         }
@@ -1750,6 +2496,313 @@ mod tests {
                 .any(|event| event.kind == ToolExecutionEventKind::Completed
                     && event.tool_call_id == "tc_auto_safe_write"),
             "auto-safe write should complete"
+        );
+    }
+
+    #[test]
+    fn concurrent_chats_apply_their_own_approval_mode_to_file_tools() {
+        // Two executors (one per chat run) share ONE approval-mode store, as in
+        // production. The yolo chat's run must auto-approve its own writes
+        // while the manual chat's concurrent run still prompts — yolo must
+        // never leak across chats.
+        let root = temp_project_dir("per_chat_file_modes");
+        let workspace = Workspace::new(&root).expect("workspace");
+        let sink = Arc::new(RecordingEventSink::default());
+        let approvals = PendingToolApprovalGate::new();
+        let store = ToolApprovalModeStore::new(ToolApprovalMode::Manual);
+        let _yolo_run = store.begin_run("chat_yolo", ToolApprovalMode::Yolo);
+        let _manual_run = store.begin_run("chat_manual", ToolApprovalMode::Manual);
+
+        let mut yolo_executor = test_file_executor(&root, sink.clone(), approvals.clone());
+        yolo_executor.chat_id = Some("chat_yolo".to_string());
+        yolo_executor.approval_mode = Arc::clone(&store);
+        let yolo_result = yolo_executor.run_file_tool_inner(
+            FileTool::Write,
+            &json!({ "path": "yolo.txt", "content": "ok\n" }),
+            &workspace,
+            "tc_yolo_write",
+            &Some("run_yolo".to_string()),
+            &Some("project_per_chat".to_string()),
+            &ToolCancellationToken::default(),
+            &ChatCancellationToken::default(),
+        );
+        assert!(yolo_result.ok, "{}", yolo_result.content);
+
+        let mut manual_executor = test_file_executor(&root, sink.clone(), approvals.clone());
+        manual_executor.chat_id = Some("chat_manual".to_string());
+        manual_executor.approval_mode = Arc::clone(&store);
+        let handle = thread::spawn(move || {
+            manual_executor.run_file_tool_inner(
+                FileTool::Write,
+                &json!({ "path": "manual.txt", "content": "ok\n" }),
+                &workspace,
+                "tc_manual_write",
+                &Some("run_manual".to_string()),
+                &Some("project_per_chat".to_string()),
+                &ToolCancellationToken::default(),
+                &ChatCancellationToken::default(),
+            )
+        });
+        let mut decided = false;
+        for _ in 0..400 {
+            if approvals.decide(
+                "tc_manual_write",
+                ToolApprovalDecision::Denied {
+                    reason: "not approved".to_string(),
+                },
+            ) {
+                decided = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let manual_result = handle.join().expect("manual write thread");
+        assert!(
+            decided,
+            "the manual chat's write must request approval despite the concurrent yolo chat"
+        );
+        assert!(!manual_result.ok);
+
+        let events = sink.events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.tool_call_id == "tc_yolo_write")
+                .all(|event| event.kind != ToolExecutionEventKind::PermissionRequested),
+            "the yolo chat's write must not prompt"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.tool_call_id == "tc_manual_write"
+                    && event.kind == ToolExecutionEventKind::PermissionRequested),
+            "the manual chat's write must prompt"
+        );
+    }
+
+    #[test]
+    fn manual_sensitive_read_gates_and_returns_content_on_approval() {
+        // Policy: a sensitive path IS readable in manual mode, but only after an
+        // explicit approval — the same gate mutating tools use.
+        let root = temp_project_dir("manual_sensitive_read_ok");
+        fs::write(root.join(".env"), b"SECRET=value\n").expect("seed .env");
+        let workspace = Workspace::new(&root).expect("workspace");
+        let sink = Arc::new(RecordingEventSink::default());
+        let approvals = PendingToolApprovalGate::new();
+        let executor = test_file_executor(&root, sink.clone(), approvals.clone());
+
+        let handle = thread::spawn(move || {
+            executor.run_file_tool_inner(
+                FileTool::Read,
+                &json!({ "path": ".env" }),
+                &workspace,
+                "tc_env_read",
+                &Some("run_env".to_string()),
+                &Some("project_env".to_string()),
+                &ToolCancellationToken::default(),
+                &ChatCancellationToken::default(),
+            )
+        });
+        let mut approved = false;
+        for _ in 0..400 {
+            if approvals.decide("tc_env_read", ToolApprovalDecision::Approved) {
+                approved = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(approved, "manual sensitive read must request approval");
+        let result = handle.join().expect("read thread");
+
+        assert!(result.ok, "{}", result.content);
+        assert!(
+            result.content.contains("SECRET=value"),
+            "approved read must return the content: {}",
+            result.content
+        );
+        let events = sink.events.lock().unwrap();
+        let permission = events
+            .iter()
+            .find(|event| event.kind == ToolExecutionEventKind::PermissionRequested)
+            .expect("a PermissionRequested event");
+        assert!(
+            permission
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sensitive"),
+            "the approval card must say WHY: {:?}",
+            permission.message
+        );
+    }
+
+    #[test]
+    fn manual_sensitive_read_denial_is_permission_denied() {
+        let root = temp_project_dir("manual_sensitive_read_deny");
+        fs::write(root.join(".env"), b"SECRET=value\n").expect("seed .env");
+        let workspace = Workspace::new(&root).expect("workspace");
+        let sink = Arc::new(RecordingEventSink::default());
+        let approvals = PendingToolApprovalGate::new();
+        let executor = test_file_executor(&root, sink.clone(), approvals.clone());
+
+        let handle = thread::spawn(move || {
+            executor.run_file_tool_inner(
+                FileTool::Read,
+                &json!({ "path": ".env" }),
+                &workspace,
+                "tc_env_read_denied",
+                &Some("run_env".to_string()),
+                &Some("project_env".to_string()),
+                &ToolCancellationToken::default(),
+                &ChatCancellationToken::default(),
+            )
+        });
+        let mut decided = false;
+        for _ in 0..400 {
+            if approvals.decide(
+                "tc_env_read_denied",
+                ToolApprovalDecision::Denied {
+                    reason: "no secrets for you".to_string(),
+                },
+            ) {
+                decided = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(decided, "manual sensitive read must request approval");
+        let result = handle.join().expect("read thread");
+
+        assert!(!result.ok);
+        assert!(
+            !result.content.contains("SECRET=value"),
+            "denied read must not leak content"
+        );
+        let events = sink.events.lock().unwrap();
+        let terminal = events.last().expect("a terminal event");
+        assert_eq!(terminal.kind, ToolExecutionEventKind::PermissionDenied);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != ToolExecutionEventKind::Started),
+            "a denied read must never start executing"
+        );
+    }
+
+    #[test]
+    fn auto_safe_and_yolo_read_sensitive_paths_without_a_gate() {
+        for (label, mode) in [
+            ("auto_safe", ToolApprovalMode::AutoSafe),
+            ("yolo", ToolApprovalMode::Yolo),
+        ] {
+            let root = temp_project_dir(&format!("{label}_sensitive_read"));
+            fs::write(root.join(".env"), b"SECRET=value\n").expect("seed .env");
+            let workspace = Workspace::new(&root).expect("workspace");
+            let sink = Arc::new(RecordingEventSink::default());
+            let mut executor =
+                test_file_executor(&root, sink.clone(), PendingToolApprovalGate::new());
+            executor.approval_mode = ToolApprovalModeStore::new(mode);
+
+            let result = executor.run_file_tool_inner(
+                FileTool::Read,
+                &json!({ "path": ".env" }),
+                &workspace,
+                "tc_env_free_read",
+                &Some(format!("run_{label}")),
+                &Some(format!("project_{label}")),
+                &ToolCancellationToken::default(),
+                &ChatCancellationToken::default(),
+            );
+
+            assert!(result.ok, "{label}: {}", result.content);
+            assert!(
+                result.content.contains("SECRET=value"),
+                "{label}: content must be returned freely"
+            );
+            let events = sink.events.lock().unwrap();
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.kind != ToolExecutionEventKind::PermissionRequested),
+                "{label}: sensitive read must not prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_chats_gate_sensitive_reads_per_chat() {
+        // Per-chat isolation for the new sensitive-read policy: a manual chat
+        // is asked for `.env` while a concurrent yolo chat reads it freely.
+        let root = temp_project_dir("per_chat_sensitive_reads");
+        fs::write(root.join(".env"), b"SECRET=value\n").expect("seed .env");
+        let workspace = Workspace::new(&root).expect("workspace");
+        let sink = Arc::new(RecordingEventSink::default());
+        let approvals = PendingToolApprovalGate::new();
+        let store = ToolApprovalModeStore::new(ToolApprovalMode::Manual);
+        let _yolo_run = store.begin_run("chat_yolo", ToolApprovalMode::Yolo);
+        let _manual_run = store.begin_run("chat_manual", ToolApprovalMode::Manual);
+
+        let mut yolo_executor = test_file_executor(&root, sink.clone(), approvals.clone());
+        yolo_executor.chat_id = Some("chat_yolo".to_string());
+        yolo_executor.approval_mode = Arc::clone(&store);
+        let yolo_result = yolo_executor.run_file_tool_inner(
+            FileTool::Read,
+            &json!({ "path": ".env" }),
+            &workspace,
+            "tc_yolo_env_read",
+            &Some("run_yolo".to_string()),
+            &Some("project_per_chat".to_string()),
+            &ToolCancellationToken::default(),
+            &ChatCancellationToken::default(),
+        );
+        assert!(yolo_result.ok, "{}", yolo_result.content);
+        assert!(yolo_result.content.contains("SECRET=value"));
+
+        let mut manual_executor = test_file_executor(&root, sink.clone(), approvals.clone());
+        manual_executor.chat_id = Some("chat_manual".to_string());
+        manual_executor.approval_mode = Arc::clone(&store);
+        let workspace_for_thread = workspace.clone();
+        let handle = thread::spawn(move || {
+            manual_executor.run_file_tool_inner(
+                FileTool::Read,
+                &json!({ "path": ".env" }),
+                &workspace_for_thread,
+                "tc_manual_env_read",
+                &Some("run_manual".to_string()),
+                &Some("project_per_chat".to_string()),
+                &ToolCancellationToken::default(),
+                &ChatCancellationToken::default(),
+            )
+        });
+        let mut decided = false;
+        for _ in 0..400 {
+            if approvals.decide("tc_manual_env_read", ToolApprovalDecision::Approved) {
+                decided = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let manual_result = handle.join().expect("manual read thread");
+        assert!(
+            decided,
+            "the manual chat's sensitive read must request approval despite the concurrent yolo chat"
+        );
+        assert!(manual_result.ok, "{}", manual_result.content);
+
+        let events = sink.events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.tool_call_id == "tc_yolo_env_read")
+                .all(|event| event.kind != ToolExecutionEventKind::PermissionRequested),
+            "the yolo chat's sensitive read must not prompt"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.tool_call_id == "tc_manual_env_read"
+                    && event.kind == ToolExecutionEventKind::PermissionRequested),
+            "the manual chat's sensitive read must prompt"
         );
     }
 
@@ -1998,6 +3051,8 @@ mod tests {
         let project = ToolProjectContext {
             id: "project_default".to_string(),
             root: root.clone(),
+            artifact_root: None,
+            tmp_root: None,
         };
 
         let cwd = resolve_tool_cwd(None, Some(&project))
@@ -2014,6 +3069,8 @@ mod tests {
         let project = ToolProjectContext {
             id: "project_relative".to_string(),
             root: root.clone(),
+            artifact_root: None,
+            tmp_root: None,
         };
 
         let cwd = resolve_tool_cwd(Some(PathBuf::from("src")), Some(&project))
@@ -2033,6 +3090,8 @@ mod tests {
         let project = ToolProjectContext {
             id: "project_outside".to_string(),
             root,
+            artifact_root: None,
+            tmp_root: None,
         };
 
         let error =
@@ -2100,7 +3159,9 @@ mod tests {
         ToolExecutionRequest {
             tool_call_id: tool_call_id.to_string(),
             run_id: Some("run_cmd".to_string()),
+            chat_id: None,
             project_id: Some("project_cmd".to_string()),
+            workspace_root: None,
             cwd: None,
             command: ToolCommand::new(program, args.iter().copied()),
             timeout_ms: None,

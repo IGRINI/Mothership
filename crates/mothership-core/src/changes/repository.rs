@@ -6,7 +6,7 @@
 //! relationships. Large payloads (the actual before/after bytes) live in the blob
 //! store, referenced here only by content hash.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
@@ -275,6 +275,105 @@ pub fn insert_conflicts(
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Enforce per-project retention: keep every change set belonging to the
+/// newest `keep` MESSAGES for one project scope and delete the rest. An agent
+/// run can record hundreds of sets for a single message, so retention counts
+/// messages, not sets — all of a kept message's sets survive together. Sets
+/// without a message id each count as their own unit. File rows, reverts, and
+/// conflicts cascade with their set; returns the snapshot hashes no longer
+/// referenced by ANY remaining change file — i.e. the blobs now safe to remove
+/// from the store (content-addressed and shared across sets, so the orphan
+/// check is global, not per set).
+pub fn prune_change_sets(
+    db: &Database,
+    project_id: Option<&str>,
+    keep: u32,
+) -> Result<Vec<String>> {
+    let mut connection = db.connect()?;
+    let tx = connection.transaction()?;
+
+    // Bucket sets by message (a NULL message id makes the set its own bucket),
+    // rank buckets by their newest set, keep the newest `keep` buckets, and
+    // make victims of everything in the older buckets.
+    let victims: Vec<String> = {
+        let mut statement = tx.prepare(
+            "WITH scoped AS (
+                 SELECT id, rowid,
+                        COALESCE(message_id, 'set:' || id) AS bucket
+                 FROM change_sets
+                 WHERE (?1 IS NULL AND project_id IS NULL) OR project_id = ?1
+             ),
+             kept AS (
+                 SELECT bucket FROM scoped
+                 GROUP BY bucket
+                 ORDER BY MAX(rowid) DESC
+                 LIMIT ?2
+             )
+             SELECT id FROM scoped
+             WHERE bucket NOT IN (SELECT bucket FROM kept)",
+        )?;
+        let rows = statement.query_map(params![project_id, keep as i64], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if victims.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = (0..victims.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let victim_values = victims.into_iter().map(Value::Text).collect::<Vec<_>>();
+
+    // Gather the snapshot hashes the victims reference BEFORE the delete (their
+    // file rows cascade away with the sets).
+    let mut candidates: HashSet<String> = HashSet::new();
+    {
+        let sql = format!(
+            "SELECT before_hash, after_hash FROM change_files
+             WHERE change_set_id IN ({placeholders})"
+        );
+        let mut statement = tx.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(victim_values.iter().cloned()), |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })?;
+        for row in rows {
+            let (before, after) = row?;
+            candidates.extend(before);
+            candidates.extend(after);
+        }
+    }
+
+    tx.execute(
+        &format!("DELETE FROM change_sets WHERE id IN ({placeholders})"),
+        params_from_iter(victim_values),
+    )?;
+
+    // A candidate blob survives if any remaining file row still references it.
+    let mut orphaned = Vec::with_capacity(candidates.len());
+    {
+        let mut statement = tx.prepare(
+            "SELECT EXISTS(
+                 SELECT 1 FROM change_files WHERE before_hash = ?1 OR after_hash = ?1
+             )",
+        )?;
+        for hash in candidates {
+            let referenced: i64 = statement.query_row(params![hash], |row| row.get(0))?;
+            if referenced == 0 {
+                orphaned.push(hash);
+            }
+        }
+    }
+
+    tx.commit()?;
+    Ok(orphaned)
 }
 
 /// Transition a change set's status and bump `updated_at`.

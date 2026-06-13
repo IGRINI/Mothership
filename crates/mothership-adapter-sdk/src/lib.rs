@@ -19,7 +19,9 @@
 pub use mothership_adapter_protocol as protocol;
 
 pub mod http;
+pub mod media;
 pub mod oauth;
+pub mod provider_metadata;
 pub mod reasoning;
 pub mod sse;
 pub mod tools;
@@ -42,9 +44,10 @@ use tokio::sync::{mpsc, oneshot, Notify};
 const IDLE_TICK: Duration = Duration::from_secs(5);
 
 use protocol::{
-    AuthKind, AuthStatus, ChatMessage, Model, ModelManagement, Outbound, PromptBundle,
-    ReasoningConfig, Request, RuntimeContext, SettingsField, ToolCallInvocation, ToolCallResponse,
-    ToolCallResult, ToolDescriptor, PROTOCOL_VERSION,
+    AudioTranscriptionRequest, AudioTranscriptionResult, AuthKind, AuthStatus, ChatMessage,
+    ImageGenerationRequest, ImageGenerationResult, Model, ModelManagement, Outbound, PromptBundle,
+    ProviderService, ReasoningConfig, Request, RuntimeContext, SettingsField, ToolCallInvocation,
+    ToolCallResponse, ToolCallResult, ToolDescriptor, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Clone)]
@@ -106,6 +109,33 @@ pub trait ProviderAdapter: Send {
     async fn models(&mut self, ctx: &Context) -> Result<(ModelManagement, Vec<Model>)> {
         let _ = ctx;
         Ok((ModelManagement::Fixed, Vec::new()))
+    }
+
+    /// Non-chat provider services (image generation, STT, speech, etc.) this
+    /// adapter can provide independently of the active chat model.
+    async fn services(&mut self, ctx: &Context) -> Result<Vec<ProviderService>> {
+        let _ = ctx;
+        Ok(Vec::new())
+    }
+
+    async fn generate_image(
+        &mut self,
+        request: ImageGenerationRequest,
+        ctx: &Context,
+    ) -> Result<ImageGenerationResult> {
+        let _ = request;
+        let _ = ctx;
+        anyhow::bail!("image generation is not supported by this adapter")
+    }
+
+    async fn transcribe_audio(
+        &mut self,
+        request: AudioTranscriptionRequest,
+        ctx: &Context,
+    ) -> Result<AudioTranscriptionResult> {
+        let _ = request;
+        let _ = ctx;
+        anyhow::bail!("audio transcription is not supported by this adapter")
     }
 
     /// Run the provider's own auth flow (e.g. browser OAuth). Persist any minted
@@ -639,6 +669,10 @@ async fn dispatch<A: ProviderAdapter>(
             ),
             Err(error) => send_error(outbox, id, error),
         },
+        Request::GetServices { id } => match adapter.services(ctx).await {
+            Ok(services) => send(outbox, Outbound::Services { id, services }),
+            Err(error) => send_error(outbox, id, error),
+        },
         Request::Authenticate { id } => match adapter.authenticate(ctx).await {
             Ok(()) => send(outbox, Outbound::Ack { id }),
             Err(error) => send_error(outbox, id, error),
@@ -654,6 +688,18 @@ async fn dispatch<A: ProviderAdapter>(
             id,
             anyhow::anyhow!("tool_result arrived without an active chat_start"),
         ),
+        Request::GenerateImage { id, request } => {
+            match adapter.generate_image(request, ctx).await {
+                Ok(result) => send(outbox, Outbound::ImageGenerated { id, result }),
+                Err(error) => send_error(outbox, id, error),
+            }
+        }
+        Request::TranscribeAudio { id, request } => {
+            match adapter.transcribe_audio(request, ctx).await {
+                Ok(result) => send(outbox, Outbound::AudioTranscribed { id, result }),
+                Err(error) => send_error(outbox, id, error),
+            }
+        }
         Request::Logout { id } => match adapter.logout(ctx).await {
             Ok(()) => send(outbox, Outbound::Ack { id }),
             Err(error) => send_error(outbox, id, error),
@@ -908,5 +954,63 @@ mod tests {
 
         assert!(outcome.state.is_none());
         assert!(outcome.tool_calls.is_empty());
+    }
+
+    struct DefaultServiceAdapter;
+
+    #[async_trait::async_trait]
+    impl ProviderAdapter for DefaultServiceAdapter {
+        fn identity(&self) -> (String, String) {
+            ("test".to_string(), "Test".to_string())
+        }
+
+        async fn chat(
+            &mut self,
+            _request: ChatRequest,
+            _ctx: &Context,
+            _sink: &mut ChatSink,
+        ) -> Result<ChatRoundOutcome> {
+            Ok(ChatRoundOutcome::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_service_methods_are_backward_compatible_unsupported() {
+        let (outbox, _frames) = mpsc::unbounded_channel();
+        let ctx = Context {
+            outbox,
+            chat_request_id: None,
+            cancellation: None,
+            tool_responses: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let mut adapter = DefaultServiceAdapter;
+
+        assert!(adapter.services(&ctx).await.unwrap().is_empty());
+
+        let image_error = adapter
+            .generate_image(
+                ImageGenerationRequest {
+                    model: "image-model".to_string(),
+                    prompt: "test prompt".to_string(),
+                    options: serde_json::Value::Null,
+                },
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(image_error.to_string().contains("not supported"));
+
+        let audio_error = adapter
+            .transcribe_audio(
+                AudioTranscriptionRequest {
+                    model: "stt-model".to_string(),
+                    input_path: "input.wav".to_string(),
+                    options: serde_json::Value::Null,
+                },
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(audio_error.to_string().contains("not supported"));
     }
 }

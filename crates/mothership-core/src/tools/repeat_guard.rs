@@ -356,7 +356,9 @@ mod tests {
         ToolExecutionRequest {
             tool_call_id: tool_call_id.to_string(),
             run_id: run_id.map(str::to_string),
+            chat_id: None,
             project_id: Some("project_1".to_string()),
+            workspace_root: None,
             cwd: Some(Path::new("E:/Mothership").to_path_buf()),
             command: ToolCommand::new("git", args),
             timeout_ms: Some(60_000),

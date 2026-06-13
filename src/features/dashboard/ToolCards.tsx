@@ -1,16 +1,29 @@
-import { For, JSX, Match, Show, Switch, createSignal, createEffect } from "solid-js";
+import {
+  For,
+  JSX,
+  Match,
+  Show,
+  Switch,
+  createEffect,
+  createSignal,
+  onCleanup,
+} from "solid-js";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   ChevronDown,
   FilePlus,
   FileSearch,
   FileText,
   GitCompare,
+  Image,
   ListTree,
+  Mic,
   Terminal,
 } from "lucide-solid";
 
 import {
   getChangeFileDiff,
+  readImageDataUrlWithTimeout,
   type ChangeFileDiff,
   type ToolArtifact,
   type ToolExecutionResult,
@@ -74,6 +87,176 @@ export type LoadArtifactRangeFn = (args: {
   offset: number;
   limit: number;
 }) => Promise<{ content: string; nextOffset: number | null; eof: boolean }>;
+
+export interface ToolImagePreviewItem {
+  id: string;
+  src: string;
+  path: string;
+  label: string;
+  contentType: string;
+  sizeBytes: number;
+  preview: string;
+}
+
+export type PreviewImageFn = (
+  image: ToolImagePreviewItem,
+  images: ToolImagePreviewItem[],
+) => void;
+
+function fileNameFromPath(path: string) {
+  const normalized = path.replace(/\\/g, "/");
+  const name = normalized.split("/").filter(Boolean).pop();
+  return name && name.trim().length > 0 ? name : path;
+}
+
+function isTauriRuntime() {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function artifactImageAssetSrc(path: string) {
+  return isTauriRuntime() ? convertFileSrc(path) : path;
+}
+
+function imagePreviewItems(
+  artifacts: ToolArtifact[] | undefined,
+): ToolImagePreviewItem[] {
+  return (artifacts ?? [])
+    .filter(
+      (artifact) =>
+        artifact.kind === "image" &&
+        artifact.contentType.startsWith("image/") &&
+        typeof artifact.logRef === "string" &&
+        artifact.logRef.trim().length > 0,
+    )
+    .map((artifact, index) => {
+      const path = artifact.logRef!.trim();
+      return {
+        id: artifact.artifactId || `image-${index + 1}`,
+        src: "",
+        path,
+        label: fileNameFromPath(path),
+        contentType: artifact.contentType,
+        sizeBytes: artifact.sizeBytes,
+        preview: artifact.preview,
+      };
+    });
+}
+
+function toolCardErrorText(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function ToolImagePreviewButton(props: {
+  image: ToolImagePreviewItem;
+  images: ToolImagePreviewItem[];
+  onPreviewImage?: PreviewImageFn;
+}) {
+  const [src, setSrc] = createSignal(props.image.src);
+  const [loading, setLoading] = createSignal(false);
+  const [loadError, setLoadError] = createSignal("");
+  let loadRequestId = 0;
+  let triedDataUrl = false;
+
+  createEffect(() => {
+    const path = props.image.path;
+    const initialSrc = props.image.src;
+    loadRequestId += 1;
+    triedDataUrl = false;
+    setSrc(initialSrc || (path ? artifactImageAssetSrc(path) : ""));
+    setLoading(false);
+    setLoadError("");
+
+    if (!path) {
+      setLoadError("Preview unavailable");
+    }
+  });
+
+  onCleanup(() => {
+    loadRequestId += 1;
+  });
+
+  const loadDataUrlFallback = () => {
+    const path = props.image.path;
+    if (!path || triedDataUrl) {
+      setSrc("");
+      setLoading(false);
+      setLoadError("Preview unavailable");
+      return;
+    }
+
+    triedDataUrl = true;
+    const requestId = ++loadRequestId;
+    setSrc("");
+    setLoading(true);
+    setLoadError("");
+    readImageDataUrlWithTimeout(undefined, path)
+      .then((dataUrl) => {
+        if (requestId === loadRequestId) {
+          setSrc(dataUrl);
+          setLoadError("");
+        }
+      })
+      .catch((error: unknown) => {
+        if (requestId === loadRequestId) {
+          setLoadError(toolCardErrorText(error));
+        }
+      })
+      .finally(() => {
+        if (requestId === loadRequestId) {
+          setLoading(false);
+        }
+      });
+  };
+
+  const currentImage = (): ToolImagePreviewItem => ({
+    ...props.image,
+    src: src(),
+  });
+
+  const currentImages = () =>
+    props.images.map((image) =>
+      image.path === props.image.path ? currentImage() : image,
+    );
+
+  return (
+    <button
+      type="button"
+      class="tool-card__image-preview"
+      title={props.image.path}
+      onClick={() => props.onPreviewImage?.(currentImage(), currentImages())}
+      onContextMenu={(event) =>
+        onFileContextMenu(event, {
+          path: props.image.path,
+          copyPath: props.image.path,
+          artifact: true,
+        })
+      }
+    >
+      <Show
+        when={!loadError() && src()}
+        fallback={
+          <span class="tool-card__image-preview-placeholder">
+            {loadError()
+              ? `Preview unavailable: ${loadError()}`
+              : loading()
+                ? "Loading preview..."
+                : "Preview unavailable"}
+          </span>
+        }
+      >
+        {(value) => (
+          <img
+            src={value()}
+            alt={props.image.label}
+            loading="lazy"
+            onError={loadDataUrlFallback}
+          />
+        )}
+      </Show>
+      <span class="tool-card__image-preview-caption">{props.image.label}</span>
+    </button>
+  );
+}
 
 // One generous chunk is enough for the overwhelmingly common case (files under
 // a few hundred KB). Larger files load the first chunk and point at "Открыть".
@@ -188,7 +371,8 @@ function statusTone(status: string | undefined): string {
     normalized === "ok" ||
     normalized === "applied" ||
     normalized === "success" ||
-    normalized === "complete"
+    normalized === "complete" ||
+    normalized === "completed"
   ) {
     return "ok";
   }
@@ -1027,6 +1211,104 @@ function GenericPayloadCard(props: {
   );
 }
 
+function ProviderServiceCard(props: {
+  tool: ToolCardData;
+  payload: Record<string, unknown> | null | undefined;
+  onPreviewImage?: PreviewImageFn;
+}) {
+  const [promptExpanded, setPromptExpanded] = createSignal(false);
+  const isImage = () => props.tool.toolKind === "image_generate";
+  const label = () => (isImage() ? "Image generation" : "Audio transcription");
+  const providerId = () => readString(props.payload, "providerId");
+  const modelId = () => readString(props.payload, "modelId");
+  const prompt = () => readString(props.payload, "prompt") ?? promptPreview();
+  const promptPreview = () => readString(props.payload, "promptPreview");
+  const imageCount = () => readNumber(props.payload, "imageCount");
+  const status = () => props.tool.result?.status;
+  const message = () => props.tool.result?.message ?? props.tool.message ?? "";
+  const images = () => (isImage() ? imagePreviewItems(props.tool.artifacts) : []);
+  const firstImage = () => images()[0];
+
+  return (
+    <div
+      class="tool-body"
+      onContextMenu={(event) => {
+        const image = firstImage();
+        if (!image) {
+          return;
+        }
+        onFileContextMenu(event, {
+          path: image.path,
+          copyPath: image.path,
+          artifact: true,
+        });
+      }}
+    >
+      <div class="tool-body__head">
+        <Show when={isImage()} fallback={<Mic size={13} />}>
+          <Image size={13} />
+        </Show>
+        <span class="tool-card__title">{label()}</span>
+        <StatusPill status={status()} />
+      </div>
+      <div class="tool-card__chips">
+        <Show when={providerId()}>
+          {(value) => <Chip label="provider" value={<code>{value()}</code>} />}
+        </Show>
+        <Show when={modelId()}>
+          {(value) => <Chip label="model" value={<code>{value()}</code>} />}
+        </Show>
+        <Show when={imageCount() !== undefined}>
+          <Chip label="images" value={String(imageCount())} />
+        </Show>
+      </div>
+      <Show when={prompt()}>
+        {(value) => (
+          <div class="tool-card__prompt-block">
+            <button
+              type="button"
+              class="tool-card__prompt-toggle"
+              onClick={() => setPromptExpanded((expanded) => !expanded)}
+            >
+              <ChevronDown
+                size={13}
+                classList={{ "is-open": promptExpanded() }}
+              />
+              <span>Prompt</span>
+            </button>
+            <Show
+              when={promptExpanded()}
+              fallback={
+                <p class="tool-body__note">
+                  Prompt: <code>{promptPreview() ?? value()}</code>
+                </p>
+              }
+            >
+              <pre class="tool-card__prompt-full">{value()}</pre>
+            </Show>
+          </div>
+        )}
+      </Show>
+      <Show when={images().length > 0}>
+        <div class="tool-card__image-grid">
+          <For each={images()}>
+            {(image) => (
+              <ToolImagePreviewButton
+                image={image}
+                images={images()}
+                onPreviewImage={props.onPreviewImage}
+              />
+            )}
+          </For>
+        </div>
+      </Show>
+      <Show when={status() !== "failed" && message().trim()}>
+        <OutputBlock text={message()} />
+      </Show>
+    </div>
+  );
+}
+
 // --- Dispatcher -------------------------------------------------------------
 
 export function ToolCard(props: {
@@ -1034,6 +1316,7 @@ export function ToolCard(props: {
   onOpenPath?: OpenPathFn;
   loadArtifactRange?: LoadArtifactRangeFn;
   findChangeFileId?: FindChangeFileId;
+  onPreviewImage?: PreviewImageFn;
 }) {
   const payload = () => props.tool.payload;
 
@@ -1095,6 +1378,15 @@ export function ToolCard(props: {
         );
       case "search_text":
         return <SearchTextCard payload={payload()} output={props.tool.output} />;
+      case "image_generate":
+      case "audio_transcribe":
+        return (
+          <ProviderServiceCard
+            tool={props.tool}
+            payload={payload()}
+            onPreviewImage={props.onPreviewImage}
+          />
+        );
       default:
         return (
           <GenericPayloadCard toolKind={props.tool.toolKind} payload={payload()} />

@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-use crate::auth::ClaudeAuthRuntime;
+use crate::auth::{ClaudeAuthRuntime, ClaudeAuthState};
 use crate::bridge::ToolBridgeServer;
 use crate::model_catalog::{ClaudeModelCatalog, ClaudeModelInfo};
 use crate::settings::ClaudeAgentSettings;
@@ -96,11 +96,12 @@ struct EffectiveSettings {
 
 pub(crate) async fn supported_models(
     settings: &ClaudeAgentSettings,
+    auth_state: &ClaudeAuthState,
     ctx: &AdapterContext,
 ) -> anyhow::Result<ClaudeModelCatalog> {
     match tokio::time::timeout(
         MODEL_METADATA_TIMEOUT,
-        supported_models_inner(settings, ctx),
+        supported_models_inner(settings, auth_state, ctx),
     )
     .await
     {
@@ -114,10 +115,11 @@ pub(crate) async fn supported_models(
 
 async fn supported_models_inner(
     settings: &ClaudeAgentSettings,
+    auth_state: &ClaudeAuthState,
     ctx: &AdapterContext,
 ) -> anyhow::Result<ClaudeModelCatalog> {
     let executable = resolve_executable(settings)?;
-    let auth = ClaudeAuthRuntime::prepare(settings)?;
+    let auth = ClaudeAuthRuntime::prepare(settings, auth_state)?;
     let mut command = claude_command(&executable, &auth);
     command.kill_on_drop(true);
     command
@@ -252,12 +254,13 @@ async fn supported_models_inner(
 
 pub(crate) async fn stream_chat(
     settings: &ClaudeAgentSettings,
+    auth_state: &ClaudeAuthState,
     request: ChatRequest,
     ctx: &AdapterContext,
     sink: &mut ChatSink,
 ) -> anyhow::Result<ChatRoundOutcome> {
     let executable = resolve_executable(settings)?;
-    let auth = ClaudeAuthRuntime::prepare(settings)?;
+    let auth = ClaudeAuthRuntime::prepare(settings, auth_state)?;
     let mut state = request
         .state
         .clone()

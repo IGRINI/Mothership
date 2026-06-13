@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use ts_rs::TS;
 
 use crate::{ChatCancellationToken, Result};
 use mothership_adapter_host::protocol::{
@@ -18,8 +19,9 @@ use mothership_adapter_host::protocol::{
     ToolDescriptor,
 };
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ProviderRuntimeKind {
     /// Core owns the agent loop and tool execution. The adapter translates one
     /// provider model round at a time.
@@ -38,8 +40,11 @@ impl ProviderRuntimeKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+// `optional_fields`: `reasoning` / `fast_mode` are `#[serde(default)] Option<_>`
+// (absent for models lacking those capabilities), matching the TS `?:` shape.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, optional_fields = nullable)]
 pub struct LlmModel {
     pub provider_id: String,
     pub provider_label: String,
@@ -55,22 +60,40 @@ pub struct LlmModel {
     pub recommended: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct SelectedLlmModel {
     pub provider_id: String,
     pub model_id: String,
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FeatureRoute {
+    pub feature: String,
+    pub provider_id: String,
+    pub model_id: String,
+    #[serde(default)]
+    pub options: Value,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ConnectorSettingsSchema {
     pub model_management: ConnectorModelManagementSchema,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+// `optional_fields` makes the `Option` `add_model_label` optional in TS,
+// matching the original `addModelLabel?`. `accepts_custom_model_ids` stays a
+// required `boolean` (the snapshot always includes it).
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, optional_fields = nullable)]
 pub struct ConnectorModelManagementSchema {
     pub kind: ConnectorModelManagementKind,
     pub title: String,
@@ -80,8 +103,9 @@ pub struct ConnectorModelManagementSchema {
     pub accepts_custom_model_ids: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ConnectorModelManagementKind {
     FixedCatalog,
     RemoteCatalog,

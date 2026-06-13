@@ -19,15 +19,17 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use ts_rs::TS;
 
 use crate::connectors::{
     AdapterSettingPatchValue, ConnectorSettingsEvent, ConnectorSettingsSnapshot,
 };
 use crate::{
-    ChangeFileDiff, ChangeFileSummary, ChangeSetEvent, ChangeSetSummary, ChatConversation,
-    ChatRunCancellationResult, ChatRunEvent, ChatThreadSummary, ChatUpdatedEvent,
-    DashboardSnapshot, MothershipError, PersonalizationSettings, ProjectSnapshot, ReasoningConfig,
-    RevertOutcome, SendChatMessageResult, SidecarStatus, ToolApprovalAnswer, ToolApprovalMode,
+    ActiveRunSummary, ChangeFileDiff, ChangeFileSummary, ChangeSetEvent, ChangeSetSummary,
+    ChatConversation, ChatRunCancellationResult, ChatRunEvent, ChatThreadSummary, ChatUpdatedEvent,
+    DashboardSnapshot, MothershipError, PersonalizationSettings, ProjectSnapshot, PromptPreview,
+    ReasoningConfig, RevertOutcome, SendChatMessageResult, SidecarStatus, ToolApprovalAnswer,
     ToolArtifactRange, ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionEvent,
     ToolExecutionRequest, ToolPolicySettings,
 };
@@ -78,8 +80,9 @@ pub enum ServerFrame {
 
 /// The operations the host can ask Core to perform. Flat and domain-named;
 /// adding a future op (e.g. a run/tool call) is purely additive.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[ts(export)]
 pub enum CoreRequest {
     DashboardSnapshot,
     AppendActivityEvent {
@@ -99,6 +102,11 @@ pub enum CoreRequest {
     GetChat {
         chat_id: String,
         limit: Option<i64>,
+    },
+    /// The exact Core prompt bundle that would be sent for this chat's next
+    /// run, rendered after project context and personalization are applied.
+    GetPromptPreview {
+        chat_id: String,
     },
     SendChatMessage {
         chat_id: Option<String>,
@@ -136,6 +144,35 @@ pub enum CoreRequest {
     CancelChatRun {
         run_id: String,
     },
+    /// Every chat run currently executing, across all projects. Seeds a
+    /// client's agent-activity view; live updates then arrive as run events.
+    ListActiveRuns,
+    /// Sets a chat's display title (user rename).
+    RenameChat {
+        chat_id: String,
+        title: String,
+    },
+    /// Permanently deletes a chat and everything recorded under it.
+    DeleteChat {
+        chat_id: String,
+    },
+    /// Sets a project's display name (the folder on disk is untouched).
+    RenameProject {
+        project_id: String,
+        name: String,
+    },
+    /// Removes a project from Mothership together with all its chats. The
+    /// workspace folder on disk is untouched.
+    DeleteProject {
+        project_id: String,
+    },
+    /// Persists the user-picked sidebar icon (`emoji:…`/`lucide:…`) and accent
+    /// color (`#rrggbb`) for a project. `None` clears back to defaults.
+    SetProjectAppearance {
+        project_id: String,
+        icon: Option<String>,
+        icon_color: Option<String>,
+    },
     RunToolCommand {
         request: ToolExecutionRequest,
     },
@@ -146,10 +183,6 @@ pub enum CoreRequest {
     },
     CancelToolExecution {
         tool_call_id: String,
-    },
-    GetToolApprovalMode,
-    SetToolApprovalMode {
-        mode: ToolApprovalMode,
     },
     /// The full personalization view (global + per-provider + per-model prompt
     /// additions) for the settings screen.
@@ -192,6 +225,13 @@ pub enum CoreRequest {
     SetProviderEnabled {
         provider_id: String,
         enabled: bool,
+    },
+    SetFeatureRoute {
+        feature: String,
+        provider_id: String,
+        model_id: String,
+        #[serde(default)]
+        options: Value,
     },
     SetChatModel {
         chat_id: String,
@@ -265,6 +305,14 @@ pub enum CoreRequest {
         offset: Option<u64>,
         limit: Option<u64>,
     },
+    /// The persisted change-journal retention: how many of the newest change
+    /// sets are kept per project (0 = unlimited).
+    GetChangeJournalRetention,
+    /// Persist the change-journal retention. Applied by the pruning pass that
+    /// runs after each newly recorded change set.
+    SetChangeJournalRetention {
+        value: u32,
+    },
 }
 
 /// Terminal success payloads, one per [`CoreRequest`] shape.
@@ -275,21 +323,26 @@ pub enum CoreRequest {
 // These are wire DTOs exchanged at human-interaction rates and consumed once per
 // request; the size spread between variants doesn't justify boxing each payload.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "ok", content = "data", rename_all = "snake_case")]
+#[ts(export)]
 pub enum CoreResponse {
     Dashboard(DashboardSnapshot),
     ChatList(Vec<ChatThreadSummary>),
     Chat(ChatConversation),
     /// Updated chat summary returned by `set_chat_model`.
     ChatSummary(ChatThreadSummary),
+    PromptPreview(PromptPreview),
     /// The synchronous half of sending a message: the persisted user + assistant
     /// placeholder. The streamed completion follows as `Event::ChatRun`s.
     ChatMessageStarted(SendChatMessageResult),
     ChatRunCancellation(ChatRunCancellationResult),
+    /// In-flight chat runs (`list_active_runs`).
+    ActiveRuns(Vec<ActiveRunSummary>),
+    /// Success with no payload (e.g. `delete_chat`).
+    Ack,
     ToolExecutionAccepted(ToolExecutionAccepted),
     ToolApproval(ToolApprovalAnswer),
-    ToolApprovalMode(ToolApprovalMode),
     Personalization(PersonalizationSettings),
     ToolPolicy(ToolPolicySettings),
     ToolExecutionCancellation(ToolExecutionCancellationResult),
@@ -308,6 +361,9 @@ pub enum CoreResponse {
     ChangeSetReverted(RevertOutcome),
     /// A page of change-file summaries (the "show more" beyond a summary preview).
     ChangeFiles(Vec<ChangeFileSummary>),
+    /// The change-journal retention (newest change sets kept per project;
+    /// 0 = unlimited).
+    ChangeJournalRetention(u32),
 }
 
 /// Streamed, domain-correlated updates. Each variant carries its own identity
@@ -316,8 +372,9 @@ pub enum CoreResponse {
 // The size spread is inherent to having a zero-size `Unknown` fallback next to a
 // real payload; boxing the payload to satisfy the lint buys nothing here.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "event", rename_all = "snake_case")]
+#[ts(export)]
 pub enum CoreEvent {
     ChatRun(ChatRunEvent),
     ToolExecution(ToolExecutionEvent),
@@ -325,7 +382,12 @@ pub enum CoreEvent {
     ChatUpdated(ChatUpdatedEvent),
     /// A workspace change set was created/updated/reverted/restored.
     ChangeSet(ChangeSetEvent),
+    // Forward-compat catch-all for an older host. ts-rs can't model serde's
+    // `other`, and the discriminated union is for documentation/spot-check only
+    // (the frontend consumes the per-event types, not `CoreEvent`), so it is
+    // excluded from the generated TS rather than emitted as a bogus variant.
     #[serde(other)]
+    #[ts(skip)]
     Unknown,
 }
 
@@ -340,8 +402,9 @@ pub enum Notification {
 
 /// A typed error for a failed request. `retryable` tells the host whether
 /// re-issuing might succeed (e.g. after a sidecar restart).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct CoreError {
     pub code: String,
     pub message: String,

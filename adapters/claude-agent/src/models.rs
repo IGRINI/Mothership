@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use mothership_adapter_sdk::protocol::{
     FastModeCapabilities, Model, ReasoningCapabilities, ReasoningEffort, ReasoningOption,
 };
+use mothership_adapter_sdk::provider_metadata::parse_model_ids;
 
 use crate::builtin_models::{ClaudeModelFamily, BUILTIN_CLAUDE_MODELS};
 use crate::model_catalog::{ClaudeModelCatalog, ClaudeModelInfo};
@@ -71,14 +72,6 @@ fn from_catalog_parts(
     }
 
     models
-}
-
-pub(crate) fn parse_model_ids(spec: &str) -> Vec<String> {
-    spec.split(['\n', ','])
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 fn push_model(
@@ -429,14 +422,6 @@ mod tests {
                 ReasoningEffort::High,
                 ReasoningEffort::Max,
             ]
-        );
-    }
-
-    #[test]
-    fn parse_model_ids_accepts_newlines_and_commas() {
-        assert_eq!(
-            parse_model_ids("opus, sonnet\nclaude-opus-4-7"),
-            vec!["opus", "sonnet", "claude-opus-4-7"]
         );
     }
 }

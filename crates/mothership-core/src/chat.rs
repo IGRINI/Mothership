@@ -4,12 +4,18 @@ use std::sync::{
 };
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 use crate::tools::ToolExecutionRecord;
 use mothership_adapter_host::protocol::ReasoningConfig;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// `optional_fields`: every `#[serde(default)] Option<_>` field deserializes fine
+// when absent, and the thin clients (incl. the preview mocks) build partial
+// summaries — so emit them as `field?: T | null`, matching the wire's
+// deserialize tolerance. TS-only; no serde/runtime change.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, optional_fields = nullable)]
 pub struct ChatThreadSummary {
     pub id: String,
     #[serde(default)]
@@ -47,14 +53,16 @@ pub struct ChatThreadSummary {
 /// Pushed when a chat's metadata changes out of band (e.g. its model was set,
 /// possibly on another client). Wire event `chat_updated`; the host forwards it
 /// to the webview as `chat-updated`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ChatUpdatedEvent {
     pub chat: ChatThreadSummary,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, optional_fields = nullable)]
 pub struct ChatMessage {
     pub id: String,
     pub chat_id: String,
@@ -74,15 +82,17 @@ pub struct ChatMessage {
     pub model_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ChatMessageRole {
     Assistant,
     User,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ChatMessageStatus {
     Complete,
     Cancelled,
@@ -90,8 +100,9 @@ pub enum ChatMessageStatus {
     Sending,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ChatConversation {
     pub chat: ChatThreadSummary,
     pub messages: Vec<ChatMessage>,
@@ -101,8 +112,9 @@ pub struct ChatConversation {
     pub message_parts: Vec<ChatMessagePart>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ChatMessagePart {
     pub id: i64,
     pub chat_id: String,
@@ -113,15 +125,17 @@ pub struct ChatMessagePart {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ChatMessagePartKind {
     Text,
     Tool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct SendChatMessageResult {
     pub run_id: String,
     pub chat: ChatThreadSummary,
@@ -154,15 +168,39 @@ pub struct ChatRunContext {
     pub model_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ChatRunCancellationResult {
     pub run_id: String,
     pub accepted: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A chat run currently executing, as reported by `list_active_runs`. Carries
+/// the display fields (chat title, project name) resolved at registration so a
+/// freshly-connected client can render agent activity without extra lookups.
+/// One entry per top-level run — provider-internal subagents are never listed.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, optional_fields = nullable)]
+pub struct ActiveRunSummary {
+    pub run_id: String,
+    pub chat_id: String,
+    pub chat_title: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub project_name: Option<String>,
+    pub message_id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    /// Unix epoch milliseconds when the run registered (provider resolved).
+    pub started_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ChatRunEvent {
     pub run_id: String,
     pub chat_id: String,
@@ -179,8 +217,9 @@ pub struct ChatRunEvent {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ChatRunEventKind {
     Started,
     TransportSelected,

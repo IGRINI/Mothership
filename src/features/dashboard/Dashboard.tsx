@@ -1,53 +1,31 @@
+// The chat workspace controller: owns the client-side state (projects, chats,
+// messages, parts, tool executions, change sets, composer settings), applies
+// the streamed core events, and wires the layout panes together. All rendering
+// beyond the top-level layout lives in ./components; all pure data logic lives
+// in ./message-model and ./model-options.
+
 import {
   createEffect,
   createMemo,
   createSignal,
-  For,
-  Match,
   onCleanup,
   onMount,
-  Show,
-  Switch,
 } from "solid-js";
-import {
-  AlertTriangle,
-  BrainCircuit,
-  Check,
-  ChevronDown,
-  Folder,
-  Play,
-  RefreshCw,
-  Search,
-  Send,
-  ShieldCheck,
-  Square,
-  Terminal,
-  X,
-  Zap,
-} from "lucide-solid";
 import { listen } from "@tauri-apps/api/event";
-import { SolidMarkdown } from "solid-markdown";
-import remarkGfm from "remark-gfm";
 
 import {
   ChatRunEvent,
   ChatMessage,
-  ChatMessagePart,
   ChatThreadSummary,
   ChatUpdatedEvent,
   ChangeSetEvent,
   ChangeSetSummary,
   RevertOutcome,
   ConnectorSettingsEvent,
-  ConnectorProviderSummary,
   ConnectorSettingsSnapshot,
-  LlmModel,
+  PromptPreview,
   ProjectSummary,
   ProjectSnapshot,
-  ReasoningConfig,
-  ReasoningOption,
-  SendChatMessageResult,
-  ToolArtifact,
   ToolApprovalMode,
   ToolExecutionEvent,
   ToolExecutionRecord,
@@ -57,21 +35,26 @@ import {
   cancelToolExecution,
   continueChatMessage,
   createChat,
+  deleteChat,
+  deleteProject,
   editChatUserMessage,
   getChat,
   getChatChangeSets,
   getConnectorSettings,
+  getPromptPreview,
+  isTauriRuntime,
   listChats,
   listProjects,
-  getToolArtifactRange,
   openProject,
-  openToolPath,
   pickProjectDirectory,
+  renameChat,
+  renameProject,
   retryChatMessage,
   revertChangeSet,
   sendChatMessage,
   setChatModel,
   setChatState,
+  setProjectAppearance,
   setSelectedModel,
 } from "../../shared/api/mothership";
 import {
@@ -81,47 +64,65 @@ import {
   rememberProject,
 } from "../../shared/session";
 import {
+  agentFocusRequest,
+  consumeAgentFocusRequest,
+  forgetChatActivity,
+  forgetProjectActivity,
+  reportViewedChat,
+} from "../../shared/agentActivity";
+import {
   modelKey,
   parseReasoningMap,
   serializeReasoningMap,
 } from "../../shared/reasoningMap";
-import { ApprovalPreview, ToolCard, toolDiffStat } from "./ToolCards";
-import { ChangeSetGroup } from "./components/ChangeSetGroup";
-import { chatSettings } from "../../shared/chatSettings";
-import { WorkSpoiler } from "../../shared/ui/WorkSpoiler";
-import { VirtualList } from "../../shared/ui/VirtualList";
-import { FileActions, onFileContextMenu } from "../../shared/ui/FileActions";
-import { startWindowDrag } from "../../shared/window-drag";
-import { BrandMark } from "./components/BrandMark";
-import { Composer, type ReasoningOptionId } from "./components/Composer";
+import type { ToolImagePreviewItem } from "./ToolCards";
+import { type ReasoningOptionId } from "./components/Composer";
+import {
+  CHAT_SCROLL_BOTTOM_THRESHOLD_PX,
+  ConversationPane,
+} from "./components/ConversationPane";
+import {
+  ImagePreviewOverlay,
+  type ImagePreviewState,
+} from "./components/ImagePreviewOverlay";
 import { InspectorPane } from "./components/InspectorPane";
 import { Sidebar } from "./components/Sidebar";
-import { ToolKindIcon } from "./components/ToolKindIcon";
 import {
-  countTextLines,
-  formatToolCommand,
-  formatToolHeadline,
-  formatToolOutput,
-  isTerminalToolKind,
-  shouldShowInlineToolOutput,
-  toolStatusLabel,
-  toolTone,
-} from "./tool-format";
-import type { ToolExecutionView } from "./types";
+  CHAT_MESSAGE_PAGE_SIZE,
+  appendMessageDelta,
+  appendToolOutput,
+  attachMessageIdToToolExecutions,
+  bumpChat,
+  compareToolExecutions,
+  currentUnixTimestamp,
+  errorMessage,
+  limitChatMessages,
+  mergeChatInPlace,
+  mergeMessages,
+  mergeToolArtifacts,
+  mergeTouchedPaths,
+  messagePartsByMessageId,
+  normalizeMessages,
+  payloadObject,
+  removedMessageIdsForRetry,
+  toolExecutionViewFromRecord,
+} from "./message-model";
+import {
+  coerceReasoningOptionId,
+  modelSupportsFastMode,
+  reasoningConfigForOption,
+  selectableConnectorModelFor,
+} from "./model-options";
+import type { MessagePartView, ToolExecutionView } from "./types";
 
-const CHAT_MESSAGE_PAGE_SIZE = 60;
-const CHAT_SCROLL_BOTTOM_THRESHOLD_PX = 8;
-const CHAT_SCROLL_TOP_PADDING_PX = 12;
-const CHAT_SCROLL_BOTTOM_PADDING_PX = 32;
 const CHAT_SCROLL_RESTORE_FRAMES = 12;
-const TOOL_OUTPUT_MAX_VISIBLE_LINES = 10;
 
 interface ChatScrollPosition {
   top: number;
   fromBottom: number;
 }
 
-export function Dashboard(props: { onOpenSettings?: () => void }) {
+export function Dashboard() {
   const [projects, setProjects] = createSignal<ProjectSummary[]>([]);
   const [activeProjectId, setActiveProjectId] = createSignal<string>();
   const [chats, setChats] = createSignal<ChatThreadSummary[]>([]);
@@ -157,9 +158,16 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   const [toolExecutions, setToolExecutions] = createSignal<
     Record<string, ToolExecutionView>
   >({});
+  const [promptPreview, setPromptPreview] =
+    createSignal<PromptPreview | null>(null);
+  const [isLoadingPromptPreview, setIsLoadingPromptPreview] =
+    createSignal(false);
+  const [promptPreviewError, setPromptPreviewError] = createSignal("");
   const [expandedInlineTools, setExpandedInlineTools] = createSignal<
     Record<string, boolean>
   >({});
+  const [imagePreview, setImagePreview] =
+    createSignal<ImagePreviewState | null>(null);
   // Workspace change sets for the ACTIVE chat, keyed by change-set id. Hydrated
   // on chat open and kept live via `change-set-event`. Bounded to one chat.
   const [changeSets, setChangeSets] = createSignal<
@@ -173,6 +181,7 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   let messageScrollElement: HTMLDivElement | undefined;
   let restoreScrollFrame = 0;
   let openChatRequestId = 0;
+  let promptPreviewRequestId = 0;
   let liveMessagePartSequence = 0;
   let draftCommitTimer: number | undefined;
   // The (chat, model) the reasoning signal is currently synced to, so the
@@ -209,6 +218,35 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
       (message) => message.role === "assistant" && message.status === "sending",
     );
 
+  // Agent-activity wiring: report which chat is on screen (finished runs in it
+  // count as reviewed — messenger-style unread), and clear it on unmount
+  // (Settings open) so completions while away stay unread.
+  createEffect(() => {
+    reportViewedChat(activeChatId());
+  });
+  onCleanup(() => reportViewedChat(undefined));
+
+  // Follow a status-pill click: open the agent's project + chat. Deferred
+  // until projects are loaded — on a cold mount the session-restore pass
+  // (requestAgentFocus pre-seeded it) usually lands on the right chat already,
+  // making this a no-op.
+  createEffect(() => {
+    const request = agentFocusRequest();
+    if (!request || isLoadingProjects()) {
+      return;
+    }
+    consumeAgentFocusRequest(request.token);
+    void (async () => {
+      if (request.projectId && request.projectId !== activeProjectId()) {
+        // Pre-seed the per-project chat memory so loadChats opens this chat.
+        rememberChat(request.projectId, request.chatId);
+        await handleSelectProject(request.projectId);
+      } else if (request.chatId !== activeChatId()) {
+        await openChat(request.chatId);
+      }
+    })();
+  });
+
   // Reasoning is remembered PER CHAT, PER MODEL: each chat carries a
   // { model → reasoning } map. Whenever the active chat or its model changes,
   // restore THIS chat's reasoning for THIS model (or the model's recommended
@@ -243,6 +281,14 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     }
 
     setFastModeEnabled(Boolean(chat?.fastMode));
+  });
+
+  createEffect(() => {
+    activeChatId();
+    promptPreviewRequestId += 1;
+    setPromptPreview(null);
+    setPromptPreviewError("");
+    setIsLoadingPromptPreview(false);
   });
 
   function fastModeForSelectedModel() {
@@ -490,6 +536,131 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     }
   }
 
+  async function handleRenameChat(chatId: string, title: string) {
+    const previous = chats().find((chat) => chat.id === chatId);
+    if (!previous) {
+      return;
+    }
+    // Next-frame feedback; reconcile with the persisted summary or roll back.
+    setChats((current) => mergeChatInPlace(current, { ...previous, title }));
+    setError("");
+    try {
+      const updated = await renameChat(chatId, title);
+      setChats((current) => mergeChatInPlace(current, updated));
+    } catch (caughtError) {
+      setChats((current) => mergeChatInPlace(current, previous));
+      setError(errorMessage(caughtError));
+    }
+  }
+
+  async function handleDeleteChat(chatId: string) {
+    const previousChats = chats();
+    const wasActive = activeChatId() === chatId;
+    const fallbackChatId = previousChats.find((chat) => chat.id !== chatId)?.id;
+
+    // Optimistic removal; the agent pill forgets the chat immediately too.
+    setChats((current) => current.filter((chat) => chat.id !== chatId));
+    forgetChatActivity(chatId);
+    setError("");
+    if (wasActive) {
+      if (fallbackChatId) {
+        void openChat(fallbackChatId);
+      } else {
+        openChatRequestId += 1;
+        setActiveChatId(undefined);
+        setMessages([]);
+        setMessageParts({});
+        setToolExecutions({});
+        setChangeSets({});
+        setIsLoadingMessages(false);
+        const projectId = activeProjectId();
+        if (projectId) {
+          rememberChat(projectId, undefined);
+        }
+      }
+    }
+
+    try {
+      await deleteChat(chatId);
+    } catch (caughtError) {
+      setChats(previousChats);
+      if (wasActive) {
+        void openChat(chatId);
+      }
+      setError(errorMessage(caughtError));
+    }
+  }
+
+  async function handleRenameProject(projectId: string, name: string) {
+    const previous = projects();
+    setProjects((current) =>
+      current.map((project) =>
+        project.id === projectId ? { ...project, name } : project,
+      ),
+    );
+    setError("");
+    try {
+      applyProjectSnapshot(await renameProject(projectId, name));
+    } catch (caughtError) {
+      setProjects(previous);
+      setError(errorMessage(caughtError));
+    }
+  }
+
+  async function handleDeleteProject(projectId: string) {
+    const previousProjects = projects();
+    const wasActive = activeProjectId() === projectId;
+    const fallbackProjectId = previousProjects.find(
+      (project) => project.id !== projectId,
+    )?.id;
+
+    setProjects((current) =>
+      current.filter((project) => project.id !== projectId),
+    );
+    forgetProjectActivity(projectId);
+    setError("");
+    if (wasActive) {
+      if (fallbackProjectId) {
+        void handleSelectProject(fallbackProjectId);
+      } else {
+        setActiveProjectId(undefined);
+        setActiveChatId(undefined);
+        setChats([]);
+        setMessages([]);
+        setMessageParts({});
+        setToolExecutions({});
+        setChangeSets({});
+        setIsLoadingMessages(false);
+      }
+    }
+
+    try {
+      applyProjectSnapshot(await deleteProject(projectId));
+    } catch (caughtError) {
+      setProjects(previousProjects);
+      setError(errorMessage(caughtError));
+    }
+  }
+
+  async function handleSetProjectAppearance(
+    projectId: string,
+    icon: string | null,
+    iconColor: string | null,
+  ) {
+    const previous = projects();
+    setProjects((current) =>
+      current.map((project) =>
+        project.id === projectId ? { ...project, icon, iconColor } : project,
+      ),
+    );
+    try {
+      applyProjectSnapshot(await setProjectAppearance(projectId, icon, iconColor));
+    } catch (caughtError) {
+      setProjects(previous);
+      setError(errorMessage(caughtError));
+    }
+  }
+
   async function openChat(chatId: string) {
     saveActiveChatScroll();
     // Save the previous chat's unsent draft before switching away.
@@ -563,6 +734,48 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     }
   }
 
+  async function handleLoadPromptPreview() {
+    const chatId = activeChatId();
+    if (!chatId) {
+      setPromptPreviewError("No chat selected.");
+      return;
+    }
+
+    const requestId = ++promptPreviewRequestId;
+    setIsLoadingPromptPreview(true);
+    setPromptPreviewError("");
+
+    try {
+      const preview = await getPromptPreview(chatId);
+      if (requestId !== promptPreviewRequestId || activeChatId() !== chatId) {
+        return;
+      }
+      setPromptPreview(preview);
+    } catch (caughtError) {
+      if (requestId === promptPreviewRequestId) {
+        setPromptPreviewError(errorMessage(caughtError));
+      }
+    } finally {
+      if (requestId === promptPreviewRequestId) {
+        setIsLoadingPromptPreview(false);
+      }
+    }
+  }
+
+  async function handleCopyPromptPreview() {
+    const preview = promptPreview();
+    if (!preview) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(preview.renderedText);
+      setPromptPreviewError("");
+    } catch (caughtError) {
+      setPromptPreviewError(errorMessage(caughtError));
+    }
+  }
+
   async function handleRevertChangeSet(
     changeSetId: string,
   ): Promise<RevertOutcome> {
@@ -574,6 +787,10 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     return outcome;
   }
 
+  // Set while an optimistically shown New Chat is still being created in Core,
+  // so flows that need the REAL chat id (e.g. send) can await it.
+  let pendingChatCreation: Promise<unknown> | undefined;
+
   async function handleNewChat() {
     const projectId = activeProjectId();
     if (!projectId) {
@@ -582,29 +799,95 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     }
 
     saveActiveChatScroll();
-    // Persist the current chat's latest state (approval/reasoning/draft) BEFORE
-    // copying it into the new chat — awaited so create_chat reads fresh values,
-    // not a stale fire-and-forget write (e.g. a reasoning change a moment ago).
     const sourceChatId = activeChatId();
     cancelDraftCommit();
-    if (sourceChatId) {
-      await commitChatState(sourceChatId);
-    }
     openChatRequestId += 1;
     setIsLoadingMessages(false);
     setError("");
 
+    // Persist the current chat's latest state (approval/reasoning/draft) BEFORE
+    // copying it into the new chat. The values are captured synchronously here —
+    // the optimistic switch below resets the composer signals, so this must not
+    // read them later — and create_chat is sequenced after the write.
+    const sourceChat = chats().find((chat) => chat.id === sourceChatId);
+    const sourceCommit = sourceChatId
+      ? setChatState(
+          sourceChatId,
+          toolApprovalMode(),
+          sourceChat?.reasoning ?? null,
+          fastModeForSelectedModel() ? true : null,
+          draft() || null,
+        )
+          .then((updated) => {
+            setChats((current) => mergeChatInPlace(current, updated));
+          })
+          .catch((caughtError: unknown) => {
+            setError(errorMessage(caughtError));
+          })
+      : Promise.resolve();
+
+    // Next-frame feedback: show and activate the new chat immediately; the
+    // created chat replaces it (or the switch rolls back) when the IPC settles.
+    const now = new Date().toISOString();
+    const optimisticChat: ChatThreadSummary = {
+      id: `optimistic:chat:${Date.now()}`,
+      projectId,
+      title: "New Chat",
+      preview: "",
+      messageCount: 0,
+      providerId: sourceChat?.providerId ?? null,
+      modelId: sourceChat?.modelId ?? null,
+      approvalMode: sourceChat?.approvalMode ?? null,
+      reasoning: sourceChat?.reasoning ?? null,
+      fastMode: sourceChat?.fastMode ?? null,
+      draft: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const sourceMessages = messages();
+    setChats((current) => bumpChat(current, optimisticChat));
+    setActiveChatId(optimisticChat.id);
+    seedChatStateFromChat(optimisticChat);
+    setMessages([]);
+    setMessageParts({});
+
+    const creation = sourceCommit.then(() =>
+      createChat(projectId, sourceChatId),
+    );
+    pendingChatCreation = creation;
     try {
-      const conversation = await createChat(projectId, sourceChatId);
-      setChats((current) => bumpChat(current, conversation.chat));
-      setActiveChatId(conversation.chat.id);
-      seedChatStateFromChat(conversation.chat);
-      rememberChat(projectId, conversation.chat.id);
-      setMessages(normalizeMessages(conversation.messages));
-      setMessageParts({});
-      restoreChatScroll(conversation.chat.id);
+      const conversation = await creation;
+      setChats((current) =>
+        bumpChat(
+          current.filter((chat) => chat.id !== optimisticChat.id),
+          conversation.chat,
+        ),
+      );
+      // Adopt only if the user hasn't already switched somewhere else.
+      if (activeChatId() === optimisticChat.id) {
+        setActiveChatId(conversation.chat.id);
+        seedChatStateFromChat(conversation.chat);
+        rememberChat(projectId, conversation.chat.id);
+        setMessages(normalizeMessages(conversation.messages));
+        setMessageParts({});
+        restoreChatScroll(conversation.chat.id);
+      }
     } catch (caughtError) {
+      setChats((current) =>
+        current.filter((chat) => chat.id !== optimisticChat.id),
+      );
+      if (activeChatId() === optimisticChat.id) {
+        setActiveChatId(sourceChatId);
+        setMessages(sourceMessages);
+        if (sourceChatId) {
+          restoreChatScroll(sourceChatId);
+        }
+      }
       setError(errorMessage(caughtError));
+    } finally {
+      if (pendingChatCreation === creation) {
+        pendingChatCreation = undefined;
+      }
     }
   }
 
@@ -625,14 +908,41 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     setIsSending(true);
     setError("");
 
+    // Next-frame feedback: the user's bubble appears immediately; the persisted
+    // pair (user + assistant placeholder) replaces it when the send settles.
+    const optimisticId = `optimistic:user:${Date.now()}`;
+    const optimisticMessage: ChatMessage = {
+      id: optimisticId,
+      chatId: currentChatId ?? "",
+      position:
+        messages().reduce(
+          (max, message) => Math.max(max, message.position),
+          0,
+        ) + 1,
+      role: "user",
+      content,
+      status: "complete",
+      createdAt: new Date().toISOString(),
+    };
+    setMessages((current) => mergeMessages(current, [optimisticMessage]));
+
     try {
+      let chatId = currentChatId;
+      // A New Chat shown optimistically may still be settling in Core — wait
+      // for the real id instead of sending into the temporary one.
+      if (chatId?.startsWith("optimistic:")) {
+        await pendingChatCreation?.catch(() => undefined);
+        chatId = activeChatId();
+        if (chatId?.startsWith("optimistic:")) {
+          chatId = undefined;
+        }
+      }
       // The run seeds its approval mode from the CHAT's stored value, so the
       // chat must carry the composer's current settings BEFORE the run starts.
       // For an existing chat they're already persisted (set on change); for a
       // not-yet-created one, create it and persist the settings first — otherwise
       // the first message would run under the default mode, ignoring a selected
       // Auto/YOLO. (The draft column is cleared transactionally by the send.)
-      let chatId = currentChatId;
       if (!chatId) {
         const created = await createChat(projectId);
         // Seed the new chat with the composer's current settings: approval mode
@@ -674,13 +984,18 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
       setActiveChatId(result.chat.id);
       rememberChat(projectId, result.chat.id);
       setMessages((current) => {
-        const base = currentChatId === result.chat.id ? current : [];
+        const base = (
+          currentChatId === result.chat.id ? current : []
+        ).filter((message) => message.id !== optimisticId);
         return mergeMessages(base, [result.userMessage, result.assistantMessage]);
       });
       if (currentChatId !== result.chat.id) {
         setMessageParts({});
       }
     } catch (caughtError) {
+      setMessages((current) =>
+        current.filter((message) => message.id !== optimisticId),
+      );
       setDraft(content);
       setError(errorMessage(caughtError));
     } finally {
@@ -816,12 +1131,17 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     }
   }
 
+  // Retry/Continue in-flight state: folded into the conversation's `isSending`
+  // so the ErrorCard buttons and the composer disable on the next frame.
+  const [isRecoveringRun, setIsRecoveringRun] = createSignal(false);
+
   async function handleRetry() {
     const chatId = activeChatId();
-    if (!chatId || isChatRunning()) {
+    if (!chatId || isChatRunning() || isRecoveringRun()) {
       return;
     }
     setError("");
+    setIsRecoveringRun(true);
 
     try {
       const result = await retryChatMessage(chatId);
@@ -846,15 +1166,18 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
       );
     } catch (caughtError) {
       setError(errorMessage(caughtError));
+    } finally {
+      setIsRecoveringRun(false);
     }
   }
 
   async function handleContinue() {
     const chatId = activeChatId();
-    if (!chatId || isChatRunning()) {
+    if (!chatId || isChatRunning() || isRecoveringRun()) {
       return;
     }
     setError("");
+    setIsRecoveringRun(true);
 
     try {
       const result = await continueChatMessage(chatId);
@@ -869,6 +1192,8 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
       );
     } catch (caughtError) {
       setError(errorMessage(caughtError));
+    } finally {
+      setIsRecoveringRun(false);
     }
   }
 
@@ -1024,13 +1349,27 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
       providerId,
       modelId,
     );
-    try {
-      if (chatId) {
-        // Per-chat model: persisted on the chat and synced to other clients via
-        // the chat-updated event. We also patch the local summary in place so the
-        // selector reflects it immediately.
+    const supportsFast = modelSupportsFastMode(nextModel);
+    if (chatId) {
+      // Per-chat model: the header selector derives from the chat summary, so
+      // patch it locally FIRST (next-frame feedback) and reconcile with the
+      // persisted summary — or roll back — when the IPC settles.
+      const previousChat = chats().find((chat) => chat.id === chatId);
+      const previousFastEnabled = fastModeEnabled();
+      if (previousChat) {
+        setChats((current) =>
+          mergeChatInPlace(current, {
+            ...previousChat,
+            providerId,
+            modelId,
+            fastMode: supportsFast ? previousChat.fastMode : false,
+          }),
+        );
+      }
+      setFastModeEnabled(Boolean(supportsFast && previousChat?.fastMode));
+      try {
         let chat = await setChatModel(chatId, providerId, modelId);
-        if (!modelSupportsFastMode(nextModel) && chat.fastMode) {
+        if (!supportsFast && chat.fastMode) {
           chat = await setChatState(
             chat.id,
             toolApprovalMode(),
@@ -1039,17 +1378,44 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
             draft() || null,
           );
         }
-        setFastModeEnabled(Boolean(chat.fastMode && modelSupportsFastMode(nextModel)));
+        setFastModeEnabled(Boolean(chat.fastMode && supportsFast));
         setChats((current) => mergeChatInPlace(current, chat));
-      } else {
-        // No active chat → set the global default applied to new chats.
-        setConnectorSettings(await setSelectedModel(providerId, modelId));
-        if (!modelSupportsFastMode(nextModel)) {
-          setFastModeEnabled(false);
+      } catch (caughtError) {
+        if (previousChat) {
+          setChats((current) => mergeChatInPlace(current, previousChat));
         }
+        setFastModeEnabled(previousFastEnabled);
+        setError(errorMessage(caughtError));
       }
-    } catch (caughtError) {
-      setError(errorMessage(caughtError));
+    } else {
+      // No active chat → set the global default applied to new chats. Patch the
+      // snapshot's selected model locally first; reconcile or roll back after.
+      const previousSettings = connectorSettings();
+      const previousFastEnabled = fastModeEnabled();
+      if (previousSettings) {
+        setConnectorSettings({
+          ...previousSettings,
+          selectedModel: {
+            providerId,
+            modelId,
+            updatedAt: new Date().toISOString(),
+          },
+          providers: previousSettings.providers.map((provider) => ({
+            ...provider,
+            selectedModelId: provider.id === providerId ? modelId : null,
+          })),
+        });
+      }
+      if (!supportsFast) {
+        setFastModeEnabled(false);
+      }
+      try {
+        setConnectorSettings(await setSelectedModel(providerId, modelId));
+      } catch (caughtError) {
+        setConnectorSettings(previousSettings);
+        setFastModeEnabled(previousFastEnabled);
+        setError(errorMessage(caughtError));
+      }
     }
   }
 
@@ -1067,26 +1433,81 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
     }
   }
 
+  // Optimistically transition a tool record so the approval buttons react on
+  // the next frame. The authoritative tool-execution event stream overwrites
+  // the record; a rejected IPC call restores the prior state (only if no real
+  // event got there first).
+  function transitionToolExecution(
+    toolCallId: string,
+    patch: Partial<ToolExecutionView>,
+  ): ToolExecutionView | undefined {
+    const previous = toolExecutions()[toolCallId];
+    if (!previous) {
+      return undefined;
+    }
+    setToolExecutions((current) => ({
+      ...current,
+      [toolCallId]: { ...previous, ...patch, updatedAt: Date.now() },
+    }));
+    return previous;
+  }
+
+  function restoreToolExecution(
+    toolCallId: string,
+    previous: ToolExecutionView | undefined,
+    optimisticKind: ToolExecutionView["kind"],
+  ) {
+    if (!previous) {
+      return;
+    }
+    setToolExecutions((current) =>
+      current[toolCallId]?.kind === optimisticKind
+        ? { ...current, [toolCallId]: previous }
+        : current,
+    );
+  }
+
   async function handleApproveTool(toolCallId: string) {
     setError("");
+    const tool = toolExecutions()[toolCallId];
+    const previous =
+      tool?.kind === "permission_requested"
+        ? transitionToolExecution(toolCallId, {
+            kind: "queued",
+            message: "Approving…",
+          })
+        : undefined;
     try {
       await approveToolExecution(toolCallId, true);
     } catch (caughtError) {
+      restoreToolExecution(toolCallId, previous, "queued");
       setError(errorMessage(caughtError));
     }
   }
 
   async function handleDenyTool(toolCallId: string) {
     setError("");
+    const tool = toolExecutions()[toolCallId];
+    const previous =
+      tool?.kind === "permission_requested"
+        ? transitionToolExecution(toolCallId, {
+            kind: "permission_denied",
+            message: "Denied by user",
+          })
+        : undefined;
     try {
       await approveToolExecution(toolCallId, false, "Denied by user");
     } catch (caughtError) {
+      restoreToolExecution(toolCallId, previous, "permission_denied");
       setError(errorMessage(caughtError));
     }
   }
 
   async function handleCancelTool(toolCallId: string) {
     setError("");
+    // Cosmetic next-frame cue only — the tool keeps streaming until Core
+    // confirms the cancellation, so the kind is left untouched.
+    transitionToolExecution(toolCallId, { message: "Cancelling…" });
     try {
       await cancelToolExecution(toolCallId);
     } catch (caughtError) {
@@ -1099,6 +1520,35 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
       ...current,
       [toolCallId]: !current[toolCallId],
     }));
+  }
+
+  function handlePreviewToolImage(
+    image: ToolImagePreviewItem,
+    images: ToolImagePreviewItem[],
+  ) {
+    if (images.length === 0) {
+      return;
+    }
+    const index = Math.max(
+      0,
+      images.findIndex(
+        (candidate) =>
+          candidate.id === image.id && candidate.path === image.path,
+      ),
+    );
+    setImagePreview({ items: images, index });
+  }
+
+  function handleSelectPreviewImage(index: number) {
+    setImagePreview((current) => {
+      if (!current) {
+        return current;
+      }
+      return {
+        ...current,
+        index: Math.min(Math.max(index, 0), current.items.length - 1),
+      };
+    });
   }
 
   function applyChatRunEvent(event: ChatRunEvent) {
@@ -1357,8 +1807,8 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
           result: event.result ?? previous?.result,
           // Typed-tool fields: keep the newest non-null value, never regress to
           // undefined when a later event (e.g. an `output` chunk) omits them.
-          toolKind: event.toolKind ?? previous?.toolKind,
-          payload: event.payload ?? previous?.payload,
+          toolKind: event.toolKind ?? previous?.toolKind ?? undefined,
+          payload: payloadObject(event.payload) ?? previous?.payload,
           touchedPaths: mergeTouchedPaths(
             previous?.touchedPaths,
             event.touchedPaths,
@@ -1480,2784 +1930,99 @@ export function Dashboard(props: { onOpenSettings?: () => void }) {
   });
 
   return (
-    <main class="workspace-shell">
-      <Sidebar
-        activeChatId={activeChatId()}
-        activeProjectId={activeProjectId()}
-        chats={chats()}
-        isLoadingChats={isLoadingChats()}
-        isLoadingProjects={isLoadingProjects()}
-        isOpeningProject={isOpeningProject()}
-        onNewChat={handleNewChat}
-        onOpenChat={(chatId) => void openChat(chatId)}
-        onOpenProject={() => void handlePickProjectDirectory()}
-        onOpenSettings={props.onOpenSettings}
-        onSelectProject={(projectId) => void handleSelectProject(projectId)}
-        projects={projects()}
-      />
-      <ConversationPane
-        activeChat={activeChat()}
-        activeProject={activeProject()}
-        connectorSettings={connectorSettings()}
-        draft={draft()}
-        error={error()}
-        editingDraft={editingDraft()}
-        editingMessageId={editingMessageId()}
-        isLoading={isLoadingMessages()}
-        isSending={isSending() || isSubmittingEdit() || isChatRunning()}
-        messages={messages()}
-        runTransports={runTransports()}
-        activeRunId={activeRunId()}
-        toolApprovalMode={toolApprovalMode()}
-        reasoningOptionId={reasoningOptionId()}
-        fastModeEnabled={fastModeEnabled()}
-        expandedInlineTools={expandedInlineTools()}
-        messagePartsByMessageId={messageParts()}
-        toolExecutionsByMessageId={toolExecutionsByMessageId()}
-        changeSetsByMessageId={changeSetsByMessageId()}
-        onApproveTool={handleApproveTool}
-        onRevertChangeSet={handleRevertChangeSet}
-        onMessageScrollElement={handleMessageScrollElement}
-        onCancelRun={handleCancelRun}
-        onCancelTool={handleCancelTool}
-        onContinue={handleContinue}
-        onBranchMessage={(message) => void handleBranchMessage(message)}
-        onCancelEdit={handleCancelEdit}
-        onDenyTool={handleDenyTool}
-        onDraftChange={handleDraftChange}
-        onEditDraftChange={setEditingDraft}
-        onRetry={handleRetry}
-        onReasoningOptionChange={handleReasoningOptionChange}
-        onFastModeChange={(enabled) => void handleFastModeChange(enabled)}
-        onSelectModel={handleSelectModel}
-        onToolApprovalModeChange={(mode) =>
-          void handleToolApprovalModeChange(mode)
-        }
-        onSendMessage={handleSendMessage}
-        onStartEdit={handleStartEdit}
-        onSubmitEdit={(messageId) => void handleSubmitEdit(messageId)}
-        onToggleInlineTool={handleToggleInlineTool}
-      />
-      <InspectorPane
-        activeChat={activeChat()}
-        messageCount={messages().length}
-        toolExecutions={visibleToolExecutions()}
-        onApproveTool={handleApproveTool}
-        onCancelTool={handleCancelTool}
-        onDenyTool={handleDenyTool}
-      />
-    </main>
-  );
-}
-
-function ConversationPane(props: {
-  activeChat: ChatThreadSummary | null;
-  activeProject: ProjectSummary | null;
-  activeRunId?: string;
-  connectorSettings?: ConnectorSettingsSnapshot;
-  draft: string;
-  editingDraft: string;
-  editingMessageId?: string;
-  error: string;
-  expandedInlineTools: Record<string, boolean>;
-  isLoading: boolean;
-  isSending: boolean;
-  messagePartsByMessageId: Record<string, MessagePartView[]>;
-  messages: ChatMessage[];
-  reasoningOptionId?: ReasoningOptionId;
-  fastModeEnabled: boolean;
-  runTransports: Record<string, string>;
-  toolApprovalMode: ToolApprovalMode;
-  toolExecutionsByMessageId: Record<string, ToolExecutionView[]>;
-  changeSetsByMessageId: Record<string, ChangeSetSummary[]>;
-  onApproveTool: (toolCallId: string) => void;
-  onRevertChangeSet: (changeSetId: string) => Promise<RevertOutcome>;
-  onBranchMessage: (message: ChatMessage) => void;
-  onCancelEdit: () => void;
-  onCancelRun: () => void;
-  onCancelTool: (toolCallId: string) => void;
-  onContinue: () => void;
-  onDenyTool: (toolCallId: string) => void;
-  onDraftChange: (value: string) => void;
-  onEditDraftChange: (value: string) => void;
-  onMessageScrollElement: (element: HTMLDivElement | undefined) => void;
-  onReasoningOptionChange: (optionId: ReasoningOptionId) => void;
-  onFastModeChange: (enabled: boolean) => void;
-  onRetry: () => void;
-  onSelectModel: (providerId: string, modelId: string) => void;
-  onToolApprovalModeChange: (mode: ToolApprovalMode) => void;
-  onSendMessage: () => void;
-  onStartEdit: (message: ChatMessage) => void;
-  onSubmitEdit: (messageId: string) => void;
-  onToggleInlineTool: (toolCallId: string) => void;
-}) {
-  const timelineItems = createMemo(() =>
-    buildConversationTimeline(props.messages),
-  );
-
-  // Live, by-id lookups. Because timeline items hold only ids, a row reads its
-  // current message/tool from these maps reactively: a streaming delta or a
-  // tool-output chunk updates only the looked-up value, so the row stays mounted
-  // and SolidMarkdown's "reconcile" strategy patches just the changed nodes
-  // instead of tearing the row down and re-parsing the whole markdown AST.
-  const messagesById = createMemo(() => {
-    const map: Record<string, ChatMessage> = {};
-    for (const message of props.messages) {
-      map[message.id] = message;
-    }
-    return map;
-  });
-  const toolsById = createMemo(() => {
-    const map: Record<string, ToolExecutionView> = {};
-    for (const tools of Object.values(props.toolExecutionsByMessageId)) {
-      for (const tool of tools) {
-        map[tool.toolCallId] = tool;
-      }
-    }
-    return map;
-  });
-  // The open chat owns its model (provider + model id); fall back to the global
-  // default-for-new-chats. The header selectors + status dot derive from this, so
-  // they reflect the open chat rather than a global setting.
-  const chatModel = createMemo(() => {
-    const chat = props.activeChat;
-    const settings = props.connectorSettings;
-    return {
-      providerId: chat?.providerId ?? settings?.selectedModel.providerId,
-      modelId: chat?.modelId ?? settings?.selectedModel.modelId,
-    };
-  });
-  const activeProvider = createMemo(() =>
-    selectableConnectorProviderFor(props.connectorSettings, chatModel().providerId),
-  );
-  // Reasoning options must follow the OPEN CHAT's model, not the global one —
-  // otherwise the composer offers reasoning levels for the wrong model.
-  const activeModel = createMemo(() =>
-    selectableConnectorModelFor(
-      props.connectorSettings,
-      chatModel().providerId,
-      chatModel().modelId,
-    ),
-  );
-
-  return (
-    <section class="conversation-pane" aria-label="Active chat">
-      <header class="conversation-header" onMouseDown={startWindowDrag}>
-        <div class="conversation-header__title">
-          <h1>{props.activeChat?.title ?? "New chat"}</h1>
-        </div>
-
-        <Show when={props.activeProject}>
-          {(project) => (
-            <div class="project-badge" title={project().path}>
-              <Folder size={14} />
-              <span>{project().name}</span>
-            </div>
-          )}
-        </Show>
-
-        <div class="agent-status-chip">
-          <Terminal size={16} />
-          <ModelSelector
-            selected={chatModel()}
-            settings={props.connectorSettings}
-            onSelectModel={props.onSelectModel}
-          />
-          <ProviderStatusDot provider={activeProvider()} />
-          <ProviderSelector
-            selected={chatModel()}
-            settings={props.connectorSettings}
-            onSelectModel={props.onSelectModel}
-          />
-        </div>
-
-      </header>
-
-      <VirtualList
-        adjustScrollOnItemResize={false}
-        ariaLabel="Chat messages"
-        class="message-list"
-        empty={
-          <ConversationState
-            error={props.error}
-            hasProject={Boolean(props.activeProject)}
-            isLoading={props.isLoading}
-          />
-        }
-        estimateSize={140}
-        getItemKey={(item) => item.id}
-        items={timelineItems()}
-        overscan={8}
-        paddingEnd={CHAT_SCROLL_BOTTOM_PADDING_PX}
-        paddingStart={CHAT_SCROLL_TOP_PADDING_PX}
-        scrollRef={props.onMessageScrollElement}
-        stickToEnd
-        stickToEndThreshold={CHAT_SCROLL_BOTTOM_THRESHOLD_PX}
-      >
-        {(item) => {
-          // Per-row memo: it re-runs on every messages/tools change but, thanks to
-          // createMemo's `===` dedup, only *notifies* (and so only re-renders the
-          // markdown) when this row's own message/tool object actually changes.
-          // Without it, every row would re-parse on each streaming delta because
-          // they all read the shared by-id map.
-          const message = createMemo(() => messagesById()[item.messageId]);
-          return (
-            <Show when={message()}>
-              {(rowMessage) => (
-                <MessageRow
-                  message={rowMessage()}
-                  projectId={props.activeProject?.id}
-                  transport={props.runTransports[item.messageId]}
-                  expandedInlineTools={props.expandedInlineTools}
-                  editingDraft={props.editingDraft}
-                  isEditing={props.editingMessageId === item.messageId}
-                  isBusy={props.isSending}
-                  parts={props.messagePartsByMessageId[item.messageId] ?? []}
-                  onBranchMessage={props.onBranchMessage}
-                  onCancelEdit={props.onCancelEdit}
-                  onCancelTool={props.onCancelTool}
-                  onContinue={props.onContinue}
-                  onDenyTool={props.onDenyTool}
-                  onEditDraftChange={props.onEditDraftChange}
-                  onRetry={props.onRetry}
-                  settings={props.connectorSettings}
-                  onStartEdit={props.onStartEdit}
-                  onSubmitEdit={props.onSubmitEdit}
-                  onApproveTool={props.onApproveTool}
-                  onToggleInlineTool={props.onToggleInlineTool}
-                  tools={props.toolExecutionsByMessageId[item.messageId] ?? []}
-                  toolsById={toolsById()}
-                  changeSets={props.changeSetsByMessageId[item.messageId] ?? []}
-                  onRevertChangeSet={props.onRevertChangeSet}
-                />
-              )}
-            </Show>
-          );
-        }}
-      </VirtualList>
-
-      <Show when={props.error}>
-        <div class="chat-error" role="alert">
-          {props.error}
-        </div>
-      </Show>
-
-      <Composer
-        activeRunId={props.activeRunId}
-        draft={props.draft}
-        hasProject={Boolean(props.activeProject)}
-        isSending={props.isSending}
-        model={activeModel()}
-        reasoningOptionId={props.reasoningOptionId}
-        fastModeEnabled={props.fastModeEnabled}
-        toolApprovalMode={props.toolApprovalMode}
-        onCancelRun={props.onCancelRun}
-        onDraftChange={props.onDraftChange}
-        onReasoningOptionChange={props.onReasoningOptionChange}
-        onFastModeChange={props.onFastModeChange}
-        onToolApprovalModeChange={props.onToolApprovalModeChange}
-        onSend={props.onSendMessage}
-        ReasoningSelector={ReasoningSelector}
-        FastModeToggle={FastModeToggle}
-        ApprovalModeMenu={ApprovalModeMenu}
-      />
-    </section>
-  );
-}
-
-// IMPORTANT: branch with <Switch>, not early `return`s. A component body runs
-// once; `if (!props.hasProject) return ...` would freeze on whatever was true at
-// mount (e.g. "No project selected" while the snapshot is still loading) and
-// never update when the project resolves — even though the header badge and
-// sidebar highlight (both reactive <Show>s) correctly show the project.
-function ConversationState(props: {
-  error: string;
-  hasProject: boolean;
-  isLoading: boolean;
-}) {
-  return (
-    <Switch
-      fallback={
-        <div class="conversation-state">
-          <BrandMark compact />
-          <strong>New chat</strong>
-          <span>Describe a task for the agent and press Enter to start.</span>
-        </div>
-      }
-    >
-      <Match when={props.error}>
-        <div class="conversation-state conversation-state--error">
-          {props.error}
-        </div>
-      </Match>
-      <Match when={props.isLoading}>
-        <div class="conversation-state conversation-state--loading">
-          <div class="message-skeleton message-skeleton--assistant" />
-          <div class="message-skeleton message-skeleton--user" />
-          <div class="message-skeleton message-skeleton--assistant message-skeleton--short" />
-        </div>
-      </Match>
-      <Match when={!props.hasProject}>
-        <div class="conversation-state">
-          <Folder size={22} />
-          <strong>Open a project</strong>
-          <span>No project selected.</span>
-        </div>
-      </Match>
-    </Switch>
-  );
-}
-
-const TOOL_APPROVAL_MODE_OPTIONS: Array<{
-  mode: ToolApprovalMode;
-  label: string;
-  title: string;
-}> = [
-  {
-    mode: "manual",
-    label: "Manual",
-    title: "Ask before mutating tools and non-read-only commands.",
-  },
-  {
-    mode: "auto_safe",
-    label: "Auto",
-    title:
-      "Auto-run ordinary future approval checks; keep prompts for dangerous commands.",
-  },
-  {
-    mode: "yolo",
-    label: "YOLO",
-    title: "Run without approval prompts and approve currently pending prompts.",
-  },
-];
-
-// Menu-select for the tool approval mode (Manual / Auto / YOLO), styled to match
-// the reasoning selector — they sit side by side under the composer input. The
-// trigger is tinted by mode (green for auto, orange for yolo) to keep the
-// at-a-glance signal the old segmented control had.
-function ApprovalModeMenu(props: {
-  mode: ToolApprovalMode;
-  disabled?: boolean;
-  onChange: (mode: ToolApprovalMode) => void;
-}) {
-  const [isOpen, setIsOpen] = createSignal(false);
-  let rootRef: HTMLDivElement | undefined;
-  const selected = () =>
-    TOOL_APPROVAL_MODE_OPTIONS.find((option) => option.mode === props.mode) ??
-    TOOL_APPROVAL_MODE_OPTIONS[0];
-
-  onMount(() => {
-    const handlePointerDown = (event: PointerEvent) => {
-      if (!isOpen() || !rootRef) {
-        return;
-      }
-      if (event.target instanceof Node && !rootRef.contains(event.target)) {
-        setIsOpen(false);
-      }
-    };
-    document.addEventListener("pointerdown", handlePointerDown);
-    onCleanup(() =>
-      document.removeEventListener("pointerdown", handlePointerDown),
-    );
-  });
-
-  const choose = (mode: ToolApprovalMode) => {
-    props.onChange(mode);
-    setIsOpen(false);
-  };
-
-  return (
-    <div
-      ref={rootRef}
-      classList={{
-        "reasoning-selector": true,
-        "approval-menu": true,
-        "approval-menu--auto_safe": props.mode === "auto_safe",
-        "approval-menu--yolo": props.mode === "yolo",
-      }}
-    >
-      <button
-        class="reasoning-selector__trigger"
-        type="button"
-        aria-expanded={isOpen()}
-        aria-haspopup="menu"
-        disabled={props.disabled}
-        title={selected().title}
-        onClick={() => {
-          if (!props.disabled) {
-            setIsOpen((value) => !value);
+    <>
+      <main class="workspace-shell">
+        <Sidebar
+          activeChatId={activeChatId()}
+          activeProjectId={activeProjectId()}
+          chats={chats()}
+          isLoadingChats={isLoadingChats()}
+          isLoadingProjects={isLoadingProjects()}
+          isOpeningProject={isOpeningProject()}
+          onNewChat={handleNewChat}
+          onOpenChat={(chatId) => void openChat(chatId)}
+          onOpenProject={() => void handlePickProjectDirectory()}
+          onSelectProject={(projectId) => void handleSelectProject(projectId)}
+          onRenameChat={(chatId, title) => void handleRenameChat(chatId, title)}
+          onDeleteChat={(chatId) => void handleDeleteChat(chatId)}
+          onRenameProject={(projectId, name) =>
+            void handleRenameProject(projectId, name)
           }
-        }}
-        onKeyDown={(event) => {
-          if (event.key === "Escape") {
-            setIsOpen(false);
+          onDeleteProject={(projectId) => void handleDeleteProject(projectId)}
+          onSetProjectAppearance={(projectId, icon, iconColor) =>
+            void handleSetProjectAppearance(projectId, icon, iconColor)
           }
-        }}
-      >
-        <ShieldCheck size={15} />
-        <span>{selected().label}</span>
-        <ChevronDown
-          classList={{
-            "reasoning-selector__chevron": true,
-            "reasoning-selector__chevron--open": isOpen(),
-          }}
-          size={13}
+          projects={projects()}
         />
-      </button>
-
-      <Show when={isOpen()}>
-        <div class="reasoning-selector__popover" role="menu">
-          <div class="reasoning-selector__heading">Approval mode</div>
-          <For each={TOOL_APPROVAL_MODE_OPTIONS}>
-            {(option) => (
-              <button
-                classList={{
-                  "reasoning-selector__item": true,
-                  "reasoning-selector__item--selected": option.mode === props.mode,
-                }}
-                type="button"
-                role="menuitemradio"
-                aria-checked={option.mode === props.mode}
-                title={option.title}
-                onClick={() => choose(option.mode)}
-              >
-                <span>{option.label}</span>
-                <Show when={option.mode === props.mode}>
-                  <Check size={14} />
-                </Show>
-              </button>
-            )}
-          </For>
-        </div>
-      </Show>
-    </div>
-  );
-}
-
-function FastModeToggle(props: {
-  disabled: boolean;
-  enabled: boolean;
-  model?: LlmModel;
-  onChange: (enabled: boolean) => void;
-}) {
-  return (
-    <Show when={modelSupportsFastMode(props.model)}>
-      <button
-        classList={{
-          "fast-mode-toggle": true,
-          "fast-mode-toggle--active": props.enabled,
-        }}
-        type="button"
-        role="switch"
-        aria-checked={props.enabled}
-        disabled={props.disabled}
-        title={fastModeToggleTitle(props.model, props.enabled)}
-        onClick={() => props.onChange(!props.enabled)}
-      >
-        <Zap size={14} />
-        <span>{fastModeLabel(props.model)}</span>
-      </button>
-    </Show>
-  );
-}
-
-function ModelSelector(props: {
-  onSelectModel: (providerId: string, modelId: string) => void;
-  selected?: { providerId?: string | null; modelId?: string | null };
-  settings?: ConnectorSettingsSnapshot;
-}) {
-  const activeProvider = () =>
-    selectableConnectorProviderFor(
-      props.settings,
-      props.selected?.providerId ?? props.settings?.selectedModel.providerId,
-    );
-  const models = () => activeProvider()?.models ?? [];
-  const isRefreshing = () => {
-    const provider = activeProvider();
-    const providers = props.settings?.providers;
-
-    if (!provider) {
-      return providers?.some(
-        (item) =>
-          item.refreshStatus === "pending" ||
-          item.refreshStatus === "refreshing",
-      ) ?? true;
-    }
-
-    return (
-      provider.refreshStatus === "pending" ||
-      provider.refreshStatus === "refreshing"
-    );
-  };
-  const hasConnectorError = () => {
-    const provider = activeProvider();
-    if (provider) {
-      return Boolean(provider.modelError && provider.models.length === 0);
-    }
-
-    return (
-      props.settings?.providers.some(
-        (item) => item.modelError && item.models.length === 0,
-      ) ?? false
-    );
-  };
-  const selectedValue = () => {
-    const providerId =
-      props.selected?.providerId ?? props.settings?.selectedModel.providerId;
-    const modelId =
-      props.selected?.modelId ?? props.settings?.selectedModel.modelId;
-    return providerId && modelId
-      ? modelOptionValue(providerId, modelId)
-      : "";
-  };
-  const placeholder = () =>
-    isRefreshing()
-      ? "Loading models..."
-      : hasConnectorError()
-        ? "Connector unavailable"
-        : activeProvider()
-          ? "No models for provider"
-          : "No models connected";
-  const options = createMemo<SearchSelectOption[]>(() =>
-    withSelectedCustomModelOption(
-      models().map((model) => ({
-        detail: model.id === model.label ? model.providerLabel : model.id,
-        label: model.label,
-        searchText: `${model.providerLabel} ${model.label} ${model.id}`,
-        value: modelOptionValue(model.providerId, model.id),
-      })),
-      activeProvider(),
-      props.selected?.modelId ?? props.settings?.selectedModel.modelId,
-    ),
-  );
-
-  return (
-    <SearchSelect
-      ariaLabel="Active model"
-      class="model-search-select"
-      emptyLabel={placeholder()}
-      options={options()}
-      placeholder={placeholder()}
-      value={selectedValue()}
-      createOption={(query) => customModelOption(activeProvider(), models(), query)}
-      onSelect={(value) => {
-        const [providerId, modelId] = parseModelOptionValue(value);
-        if (providerId && modelId) {
-          props.onSelectModel(providerId, modelId);
-        }
-      }}
-    />
-  );
-}
-
-function ProviderStatusDot(props: { provider?: ConnectorProviderSummary }) {
-  const status = () => providerStatusSummary(props.provider);
-
-  return (
-    <span
-      class={`provider-status-dot provider-status-dot--${status().tone}`}
-      title={status().tooltip}
-      aria-label={status().label}
-    />
-  );
-}
-
-function ProviderSelector(props: {
-  onSelectModel: (providerId: string, modelId: string) => void;
-  selected?: { providerId?: string | null; modelId?: string | null };
-  settings?: ConnectorSettingsSnapshot;
-}) {
-  const providers = () =>
-    (props.settings?.providers ?? []).filter(isProviderSelectableForChat);
-  const currentProviderId = () =>
-    props.selected?.providerId ?? props.settings?.selectedModel.providerId;
-  const selectedProviderId = () => currentProviderId() ?? "";
-  const activeProvider = () =>
-    providers().find((provider) => provider.id === currentProviderId());
-  const status = () => providerStatusSummary(activeProvider());
-  const options = createMemo<SearchSelectOption[]>(() =>
-    providers().map((provider) => {
-      const providerStatus = providerStatusSummary(provider);
-      const modelId = selectableProviderModelId(provider);
-      const modelCount = provider.models.length;
-
-      return {
-        detail: modelId
-          ? `${modelCount} ${modelCount === 1 ? "model" : "models"}`
-          : providerStatus.tooltip,
-        disabled: !modelId,
-        label: provider.label,
-        searchText: [
-          provider.label,
-          providerStatus.label,
-          providerStatus.tooltip,
-          ...provider.models.map((model) => `${model.label} ${model.id}`),
-        ].join(" "),
-        status: {
-          label: providerStatusBadgeLabel(providerStatus),
-          tone: providerStatus.tone,
-        },
-        title: providerStatus.tooltip,
-        value: provider.id,
-      };
-    }),
-  );
-
-  return (
-    <SearchSelect
-      ariaLabel="Active provider"
-      class="provider-search-select"
-      emptyLabel="No providers"
-      options={options()}
-      placeholder="No provider"
-      title={status().tooltip}
-      value={selectedProviderId()}
-      onSelect={(providerId) => {
-        const provider = providers().find((item) => item.id === providerId);
-        const modelId = provider ? selectableProviderModelId(provider) : undefined;
-        if (provider && modelId) {
-          props.onSelectModel(provider.id, modelId);
-        }
-      }}
-    />
-  );
-}
-
-interface SearchSelectOption {
-  detail?: string;
-  disabled?: boolean;
-  label: string;
-  searchText?: string;
-  status?: {
-    label: string;
-    tone: ProviderStatusTone;
-  };
-  title?: string;
-  value: string;
-}
-
-function SearchSelect(props: {
-  ariaLabel: string;
-  class?: string;
-  emptyLabel: string;
-  options: SearchSelectOption[];
-  placeholder: string;
-  title?: string;
-  value?: string;
-  createOption?: (query: string) => SearchSelectOption | undefined;
-  onSelect: (value: string) => void;
-}) {
-  const [isOpen, setIsOpen] = createSignal(false);
-  const [query, setQuery] = createSignal("");
-  const [activeIndex, setActiveIndex] = createSignal(-1);
-  let rootRef: HTMLDivElement | undefined;
-  let inputRef: HTMLInputElement | undefined;
-
-  const selectedOption = () =>
-    props.options.find((option) => option.value === props.value);
-  const emptyLabel = () =>
-    query().trim().length > 0 ? "No matches" : props.emptyLabel;
-  const filteredOptions = createMemo(() => {
-    const normalizedQuery = normalizeSearchQuery(query());
-    const filtered = normalizedQuery
-      ? props.options.filter((option) =>
-          normalizeSearchQuery(
-            [option.label, option.detail, option.searchText, option.status?.label]
-              .filter(Boolean)
-              .join(" "),
-          ).includes(normalizedQuery),
-        )
-      : props.options;
-    const created = normalizedQuery ? props.createOption?.(query().trim()) : undefined;
-    if (!created || filtered.some((option) => option.value === created.value)) {
-      return filtered;
-    }
-    return [...filtered, created];
-  });
-
-  createEffect(() => {
-    if (!isOpen()) {
-      return;
-    }
-
-    const options = filteredOptions();
-    const current = activeIndex();
-    if (current >= 0 && current < options.length && !options[current]?.disabled) {
-      return;
-    }
-
-    setActiveIndex(firstSelectableOptionIndex(options));
-  });
-
-  onMount(() => {
-    const handlePointerDown = (event: PointerEvent) => {
-      if (!isOpen() || !rootRef) {
-        return;
-      }
-
-      if (event.target instanceof Node && !rootRef.contains(event.target)) {
-        closeDropdown();
-      }
-    };
-
-    document.addEventListener("pointerdown", handlePointerDown);
-    onCleanup(() => {
-      document.removeEventListener("pointerdown", handlePointerDown);
-    });
-  });
-
-  const openDropdown = () => {
-    setIsOpen(true);
-    setQuery("");
-    setActiveIndex(firstSelectableOptionIndex(filteredOptions()));
-    window.setTimeout(() => inputRef?.focus(), 0);
-  };
-  const closeDropdown = () => {
-    setIsOpen(false);
-    setQuery("");
-    setActiveIndex(-1);
-  };
-  const toggleDropdown = () => {
-    if (isOpen()) {
-      closeDropdown();
-    } else {
-      openDropdown();
-    }
-  };
-  const selectOption = (option: SearchSelectOption) => {
-    if (option.disabled) {
-      return;
-    }
-
-    props.onSelect(option.value);
-    closeDropdown();
-  };
-  const moveActiveOption = (delta: number) => {
-    const options = filteredOptions();
-    if (options.length === 0) {
-      setActiveIndex(-1);
-      return;
-    }
-
-    let nextIndex = activeIndex();
-    for (let attempts = 0; attempts < options.length; attempts += 1) {
-      nextIndex = (nextIndex + delta + options.length) % options.length;
-      if (!options[nextIndex]?.disabled) {
-        setActiveIndex(nextIndex);
-        return;
-      }
-    }
-
-    setActiveIndex(-1);
-  };
-  const selectActiveOption = () => {
-    const option = filteredOptions()[activeIndex()];
-    if (option) {
-      selectOption(option);
-    }
-  };
-  const handleTriggerKeyDown = (event: KeyboardEvent) => {
-    if (event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      openDropdown();
-    }
-  };
-  const handleSearchKeyDown = (event: KeyboardEvent) => {
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      moveActiveOption(1);
-    }
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      moveActiveOption(-1);
-    }
-    if (event.key === "Enter") {
-      event.preventDefault();
-      selectActiveOption();
-    }
-    if (event.key === "Escape") {
-      event.preventDefault();
-      closeDropdown();
-    }
-  };
-
-  return (
-    <div class={`search-select ${props.class ?? ""}`} ref={rootRef}>
-      <button
-        class="search-select__trigger"
-        type="button"
-        aria-expanded={isOpen()}
-        aria-haspopup="listbox"
-        aria-label={props.ariaLabel}
-        title={props.title ?? selectedOption()?.label ?? props.placeholder}
-        onClick={toggleDropdown}
-        onKeyDown={handleTriggerKeyDown}
-      >
-        <span class="search-select__value">
-          {selectedOption()?.label ?? props.placeholder}
-        </span>
-        <ChevronDown
-          classList={{
-            "search-select__chevron": true,
-            "search-select__chevron--open": isOpen(),
-          }}
-          size={14}
+        <ConversationPane
+          activeChat={activeChat()}
+          activeProject={activeProject()}
+          connectorSettings={connectorSettings()}
+          draft={draft()}
+          error={error()}
+          editingDraft={editingDraft()}
+          editingMessageId={editingMessageId()}
+          isLoading={isLoadingMessages()}
+          isSending={
+            isSending() ||
+            isSubmittingEdit() ||
+            isChatRunning() ||
+            isRecoveringRun()
+          }
+          messages={messages()}
+          runTransports={runTransports()}
+          activeRunId={activeRunId()}
+          toolApprovalMode={toolApprovalMode()}
+          reasoningOptionId={reasoningOptionId()}
+          fastModeEnabled={fastModeEnabled()}
+          expandedInlineTools={expandedInlineTools()}
+          messagePartsByMessageId={messageParts()}
+          toolExecutionsByMessageId={toolExecutionsByMessageId()}
+          changeSetsByMessageId={changeSetsByMessageId()}
+          onApproveTool={handleApproveTool}
+          onRevertChangeSet={handleRevertChangeSet}
+          onMessageScrollElement={handleMessageScrollElement}
+          onCancelRun={handleCancelRun}
+          onCancelTool={handleCancelTool}
+          onContinue={handleContinue}
+          onBranchMessage={(message) => void handleBranchMessage(message)}
+          onCancelEdit={handleCancelEdit}
+          onDenyTool={handleDenyTool}
+          onDraftChange={handleDraftChange}
+          onError={setError}
+          onEditDraftChange={setEditingDraft}
+          onPreviewToolImage={handlePreviewToolImage}
+          onRetry={handleRetry}
+          onReasoningOptionChange={handleReasoningOptionChange}
+          onFastModeChange={(enabled) => void handleFastModeChange(enabled)}
+          onSelectModel={handleSelectModel}
+          onToolApprovalModeChange={(mode) =>
+            void handleToolApprovalModeChange(mode)
+          }
+          onSendMessage={handleSendMessage}
+          onStartEdit={handleStartEdit}
+          onSubmitEdit={(messageId) => void handleSubmitEdit(messageId)}
+          onToggleInlineTool={handleToggleInlineTool}
         />
-      </button>
-
-      <Show when={isOpen()}>
-        <div class="search-select__popover">
-          <label class="search-select__search">
-            <Search size={13} />
-            <input
-              ref={inputRef}
-              aria-label={`Search ${props.ariaLabel.toLowerCase()}`}
-              autocomplete="off"
-              spellcheck={false}
-              placeholder="Search..."
-              value={query()}
-              onInput={(event) => setQuery(event.currentTarget.value)}
-              onKeyDown={handleSearchKeyDown}
-            />
-          </label>
-
-          <div class="search-select__list" role="listbox">
-            <For
-              each={filteredOptions()}
-              fallback={<div class="search-select__empty">{emptyLabel()}</div>}
-            >
-              {(option, index) => (
-                <button
-                  classList={{
-                    "search-select__option": true,
-                    "search-select__option--active": index() === activeIndex(),
-                    "search-select__option--selected": option.value === props.value,
-                  }}
-                  type="button"
-                  role="option"
-                  aria-selected={option.value === props.value}
-                  disabled={option.disabled}
-                  title={option.title}
-                  onMouseEnter={() => {
-                    if (!option.disabled) {
-                      setActiveIndex(index());
-                    }
-                  }}
-                  onClick={() => selectOption(option)}
-                >
-                  <span class="search-select__option-text">
-                    <span class="search-select__option-label">{option.label}</span>
-                    <Show when={option.detail}>
-                      <span class="search-select__option-detail">
-                        {option.detail}
-                      </span>
-                    </Show>
-                  </span>
-                  <Show when={option.status}>
-                    <span
-                      class={`search-select__option-status search-select__option-status--${option.status!.tone}`}
-                    >
-                      {option.status!.label}
-                    </span>
-                  </Show>
-                  <Show when={option.value === props.value}>
-                    <Check class="search-select__check" size={14} />
-                  </Show>
-                </button>
-              )}
-            </For>
-          </div>
-        </div>
-      </Show>
-    </div>
-  );
-}
-
-function firstSelectableOptionIndex(options: SearchSelectOption[]) {
-  return options.findIndex((option) => !option.disabled);
-}
-
-function normalizeSearchQuery(value: string) {
-  return value.trim().toLowerCase();
-}
-
-function providerStatusBadgeLabel(status: ProviderStatusSummary) {
-  const labels: Record<ProviderStatusTone, string> = {
-    error: "Error",
-    idle: "Setup",
-    loading: "Loading",
-    ready: "Ready",
-    warmup: "Warmup",
-  };
-
-  return labels[status.tone];
-}
-
-function modelOptionValue(providerId: string, modelId: string) {
-  return JSON.stringify([providerId, modelId]);
-}
-
-function customModelOption(
-  provider: ConnectorProviderSummary | undefined,
-  models: LlmModel[],
-  query: string,
-): SearchSelectOption | undefined {
-  if (!provider || !providerAcceptsCustomModelIds(provider)) {
-    return undefined;
-  }
-
-  const modelId = normalizeCustomModelId(query);
-  if (!modelId || models.some((model) => model.id === modelId)) {
-    return undefined;
-  }
-  if (providerVisibilityModelIds(provider).has(modelId)) {
-    return undefined;
-  }
-
-  return {
-    detail: "Custom model id",
-    label: `Use ${modelId}`,
-    searchText: modelId,
-    value: modelOptionValue(provider.id, modelId),
-  };
-}
-
-function withSelectedCustomModelOption(
-  options: SearchSelectOption[],
-  provider: ConnectorProviderSummary | undefined,
-  selectedModelId: string | null | undefined,
-) {
-  if (
-    !provider ||
-    !providerAcceptsCustomModelIds(provider) ||
-    !selectedModelId ||
-    providerVisibilityModelIds(provider).has(selectedModelId) ||
-    options.some((option) => option.value === modelOptionValue(provider.id, selectedModelId))
-  ) {
-    return options;
-  }
-
-  return [
-    ...options,
-    {
-      detail: "Custom model id",
-      label: selectedModelId,
-      searchText: selectedModelId,
-      value: modelOptionValue(provider.id, selectedModelId),
-    },
-  ];
-}
-
-function normalizeCustomModelId(value: string) {
-  const modelId = value.trim();
-  if (
-    modelId.length === 0 ||
-    modelId.length > 256 ||
-    /[\s\x00-\x1f\x7f]/.test(modelId)
-  ) {
-    return "";
-  }
-  return modelId;
-}
-
-function parseModelOptionValue(value: string): [string, string] {
-  try {
-    const parsed = JSON.parse(value);
-    return typeof parsed?.[0] === "string" && typeof parsed?.[1] === "string"
-      ? [parsed[0], parsed[1]]
-      : ["", ""];
-  } catch {
-    return ["", ""];
-  }
-}
-
-type ProviderStatusTone = "ready" | "warmup" | "loading" | "error" | "idle";
-
-interface ProviderStatusSummary {
-  label: string;
-  tone: ProviderStatusTone;
-  tooltip: string;
-}
-
-function connectorProviderFor(
-  settings: ConnectorSettingsSnapshot | undefined,
-  providerId: string | null | undefined,
-) {
-  if (!providerId) {
-    return undefined;
-  }
-  return settings?.providers.find((provider) => provider.id === providerId);
-}
-
-function selectableConnectorProviderFor(
-  settings: ConnectorSettingsSnapshot | undefined,
-  providerId: string | null | undefined,
-) {
-  const provider = connectorProviderFor(settings, providerId);
-  return provider && isProviderSelectableForChat(provider) ? provider : undefined;
-}
-
-function selectableConnectorModelFor(
-  settings: ConnectorSettingsSnapshot | undefined,
-  providerId: string | null | undefined,
-  modelId: string | null | undefined,
-) {
-  const provider = selectableConnectorProviderFor(settings, providerId);
-  if (!provider || !modelId) {
-    return undefined;
-  }
-
-  return (
-    provider.models.find((model) => model.id === modelId) ??
-    customConnectorModelFor(provider, modelId)
-  );
-}
-
-function customConnectorModelFor(
-  provider: ConnectorProviderSummary,
-  modelId: string,
-): LlmModel | undefined {
-  if (!providerAcceptsCustomModelIds(provider) || !normalizeCustomModelId(modelId)) {
-    return undefined;
-  }
-  if (providerVisibilityModelIds(provider).has(modelId)) {
-    return undefined;
-  }
-
-  const template = customModelCapabilityTemplate(provider, modelId);
-  return {
-    providerId: provider.id,
-    providerLabel: provider.label,
-    id: modelId,
-    label: modelId,
-    family: template?.family ?? "Custom",
-    description: "Custom model id",
-    capabilities: template?.capabilities ? [...template.capabilities] : ["text"],
-    reasoning: template?.reasoning,
-    fastMode: template?.fastMode,
-    recommended: false,
-  };
-}
-
-function customModelCapabilityTemplate(
-  provider: ConnectorProviderSummary,
-  modelId: string,
-) {
-  const targetTokens = significantModelTokens(modelId);
-  if (targetTokens.size === 0) {
-    return undefined;
-  }
-
-  let bestModel: LlmModel | undefined;
-  let bestScore = 0;
-  for (const model of provider.models) {
-    const modelTokens = significantModelTokens(
-      `${model.id} ${model.label} ${model.family}`,
-    );
-    let score = 0;
-    for (const token of targetTokens) {
-      if (modelTokens.has(token)) {
-        score += 1;
-      }
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestModel = model;
-    }
-  }
-
-  return bestScore > 0 ? bestModel : undefined;
-}
-
-function significantModelTokens(value: string) {
-  const ignored = new Set([
-    "claude",
-    "model",
-    "default",
-    "recommended",
-    "context",
-    "with",
-    "custom",
-  ]);
-  return new Set(
-    value
-      .toLowerCase()
-      .split(/[^a-z0-9]+/)
-      .map((token) => token.trim())
-      .filter((token) => token.length >= 3 && !ignored.has(token)),
-  );
-}
-
-interface ReasoningSelectorOption {
-  label: string;
-  option: ReasoningOption;
-  title: string;
-  value: ReasoningOptionId;
-}
-
-function reasoningSelectorOptions(model?: LlmModel): ReasoningSelectorOption[] {
-  const reasoning = model?.reasoning;
-  if (!reasoning?.supported) {
-    return [];
-  }
-
-  return (reasoning.options ?? [])
-    .filter((option) => option.id.trim().length > 0)
-    .map((option) => {
-      const label = reasoningOptionLabel(option);
-      return {
-        label,
-        option,
-        title: reasoningOptionTitle(option, label),
-        value: option.id,
-      };
-    });
-}
-
-function coerceReasoningOptionId(
-  optionId: ReasoningOptionId | undefined,
-  model?: LlmModel,
-): ReasoningOptionId | undefined {
-  const options = reasoningSelectorOptions(model);
-  if (options.length === 0) {
-    return undefined;
-  }
-
-  if (optionId && options.some((option) => option.value === optionId)) {
-    return optionId;
-  }
-
-  return options.find((option) => option.option.recommended)?.value ?? options[0].value;
-}
-
-function reasoningConfigForOption(
-  optionId: ReasoningOptionId | undefined,
-  model?: LlmModel,
-): ReasoningConfig | null {
-  const selected = reasoningSelectorOptions(model).find(
-    (option) => option.value === optionId,
-  );
-  if (!selected || isReasoningConfigEmpty(selected.option.config)) {
-    return null;
-  }
-
-  return selected.option.config;
-}
-
-function modelSupportsFastMode(model?: LlmModel) {
-  return Boolean(model?.fastMode?.supported);
-}
-
-function fastModeLabel(model?: LlmModel) {
-  return model?.fastMode?.label?.trim() || "Fast";
-}
-
-function fastModeToggleTitle(model: LlmModel | undefined, enabled: boolean) {
-  const label = fastModeLabel(model);
-  const description = model?.fastMode?.description?.trim();
-  const state = enabled ? "enabled" : "standard speed";
-  return description ? `${label}: ${description}` : `${label} (${state})`;
-}
-
-function reasoningOptionLabel(option: ReasoningOption) {
-  const id = option.id.trim().toLowerCase();
-  const effort = option.config?.effort?.trim().toLowerCase();
-
-  switch (id || effort) {
-    case "auto":
-      return "Авто";
-    case "none":
-      return "Отключено";
-    case "minimal":
-      return "Минимальный";
-    case "low":
-      return "Низкий";
-    case "medium":
-      return "Средний";
-    case "high":
-      return "Высокий";
-    case "xhigh":
-      return "Очень высокий";
-    case "max":
-      return "Максимальный";
-    default:
-      return option.label.trim() || option.id;
-  }
-}
-
-function reasoningOptionTitle(option: ReasoningOption, label: string) {
-  const description = option.description?.trim();
-  if (description) {
-    return description;
-  }
-
-  const id = option.id.trim().toLowerCase();
-  if (id === "auto") {
-    return "Дефолтный режим выбранной модели";
-  }
-  if (id === "none") {
-    return "Не отправлять настройку рассуждения";
-  }
-
-  return `${label} уровень рассуждения`;
-}
-
-function isReasoningConfigEmpty(config?: ReasoningConfig | null) {
-  return !config?.effort && !config?.budgetTokens && !config?.summary;
-}
-
-function selectableProviderModelId(provider: ConnectorProviderSummary) {
-  const selectedModelId = provider.selectedModelId;
-  if (selectedModelId) {
-    if (provider.models.some((model) => model.id === selectedModelId)) {
-      return selectedModelId;
-    }
-    if (
-      providerAcceptsCustomModelIds(provider) &&
-      !providerVisibilityModelIds(provider).has(selectedModelId)
-    ) {
-      return selectedModelId;
-    }
-  }
-
-  return provider.models[0]?.id;
-}
-
-function isProviderSelectableForChat(provider: ConnectorProviderSummary) {
-  if (provider.enabled === false) {
-    return false;
-  }
-
-  if (requiresInteractiveAuth(provider)) {
-    return false;
-  }
-
-  if (missingRequiredAdapterSettings(provider).length > 0) {
-    return false;
-  }
-
-  return Boolean(selectableProviderModelId(provider));
-}
-
-function providerAcceptsCustomModelIds(provider: ConnectorProviderSummary | undefined) {
-  return Boolean(provider?.settingsSchema.modelManagement.acceptsCustomModelIds);
-}
-
-function providerVisibilityModelIds(provider: ConnectorProviderSummary | undefined) {
-  const fields = provider?.adapterSettings?.fields ?? [];
-  return new Set(
-    fields
-      .filter((field) => field.kind === "model_visibility_list")
-      .flatMap((field) => field.options.map((option) => option.value)),
-  );
-}
-
-function providerStatusSummary(
-  provider: ConnectorProviderSummary | undefined,
-): ProviderStatusSummary {
-  if (!provider) {
-    return {
-      label: "No provider",
-      tone: "idle",
-      tooltip: "No model provider is selected.",
-    };
-  }
-
-  const name = provider.label;
-  if (provider.refreshStatus === "failed") {
-    return {
-      label: "Provider failed",
-      tone: "error",
-      tooltip: provider.modelError
-        ? `${name}: ${provider.modelError}`
-        : `${name}: provider refresh failed.`,
-    };
-  }
-
-  if (provider.refreshStatus === "pending") {
-    return {
-      label: "Provider pending",
-      tone: "loading",
-      tooltip: `${name}: provider catalog has not loaded yet.`,
-    };
-  }
-
-  if (provider.refreshStatus === "refreshing") {
-    return {
-      label: "Provider loading",
-      tone: "loading",
-      tooltip: `${name}: loading provider catalog and settings.`,
-    };
-  }
-
-  if (requiresInteractiveAuth(provider)) {
-    return {
-      label: "Provider needs auth",
-      tone: "warmup",
-      tooltip: `${name}: authorization is required before chat.`,
-    };
-  }
-
-  const missingSettings = missingRequiredAdapterSettings(provider);
-  if (missingSettings.length > 0) {
-    return {
-      label: "Provider needs settings",
-      tone: "warmup",
-      tooltip: `${name}: required settings missing (${missingSettings.join(", ")}).`,
-    };
-  }
-
-  if (provider.models.length === 0) {
-    return {
-      label: "Provider needs model",
-      tone: "warmup",
-      tooltip: `${name}: no chat model is available yet.`,
-    };
-  }
-
-  if (!provider.runtimeReady) {
-    return {
-      label: "Provider needs warmup",
-      tone: "warmup",
-      tooltip: `${name}: catalog is ready, adapter will warm up on the next request.`,
-    };
-  }
-
-  return {
-    label: "Provider ready",
-    tone: "ready",
-    tooltip: `${name}: adapter is loaded and ready.`,
-  };
-}
-
-function requiresInteractiveAuth(provider: ConnectorProviderSummary) {
-  return (
-    (provider.authKind === "oauth_internal" ||
-      provider.authKind === "external_process") &&
-    !provider.authenticated
-  );
-}
-
-function missingRequiredAdapterSettings(provider: ConnectorProviderSummary) {
-  const settings = provider.adapterSettings;
-  if (!settings) {
-    return [];
-  }
-
-  return settings.fields
-    .filter((field) => field.required)
-    .filter((field) => {
-      if (field.kind === "secret") {
-        return !settings.secrets[field.key]?.hasValue;
-      }
-
-      if (field.kind === "bool") {
-        return false;
-      }
-
-      return !settings.values[field.key]?.trim();
-    })
-    .map((field) => field.label);
-}
-
-export function InlineToolCall(props: {
-  expanded: boolean;
-  tool: ToolExecutionView;
-  changeSets?: ChangeSetSummary[];
-  onApprove: () => void;
-  onCancel: () => void;
-  onDeny: () => void;
-  onToggle: () => void;
-}) {
-  const command = () => formatToolCommand(props.tool);
-  // The change file (in the journal) recording THIS tool call's edit to a path,
-  // so the card shows the live, foldable per-edit diff (its own before/after
-  // snapshot) instead of a frozen compact one. Undefined → fall back to the
-  // stored artifact diff.
-  const findChangeFileId = (path: string): string | undefined => {
-    for (const set of props.changeSets ?? []) {
-      if (set.toolCallId && set.toolCallId === props.tool.toolCallId) {
-        const file = set.files?.find((entry) => entry.path === path);
-        if (file) {
-          return file.id;
-        }
-      }
-    }
-    return undefined;
-  };
-  const output = () => formatToolOutput(props.tool);
-  const outputLineCount = () => countTextLines(output());
-  const isOutputScrollable = () =>
-    outputLineCount() > TOOL_OUTPUT_MAX_VISIBLE_LINES;
-  const canApprove = () => props.tool.kind === "permission_requested";
-  const canCancel = () =>
-    !canApprove() && !isTerminalToolKind(props.tool.kind);
-  // Prefer the typed semantic card whenever the backend supplied both a tool
-  // kind and a payload; otherwise fall back to the generic text rendering.
-  const hasSemanticCard = () =>
-    Boolean(props.tool.toolKind && props.tool.payload);
-  // Header diff-stat for a completed edit/patch (+N −M and an op badge).
-  const headerStat = () =>
-    props.tool.kind === "completed" ? toolDiffStat(props.tool) : undefined;
-
-  // Open a workspace path via the capability-checked Core command. Surface a
-  // rejection (containment refused / opener failed) instead of swallowing it.
-  const [openError, setOpenError] = createSignal<string | undefined>();
-  const handleOpenPath = (path: string) => {
-    setOpenError(undefined);
-    openToolPath(props.tool.projectId, path).catch((error: unknown) => {
-      const message =
-        typeof error === "string"
-          ? error
-          : error instanceof Error
-            ? error.message
-            : "не удалось открыть файл";
-      setOpenError(message);
-    });
-  };
-  // The file this tool touched (read/write/edit payload path, else the first
-  // patched path) — drives the row's hover actions + right-click menu.
-  const primaryPath = (): string | undefined => {
-    const payload = props.tool.payload;
-    const fromPayload =
-      payload && typeof payload.path === "string" ? payload.path : undefined;
-    return fromPayload ?? props.tool.touchedPaths?.[0];
-  };
-  // Lazily fetch a range of the call's persisted output artifact (the snapshot,
-  // not the live file).
-  const loadArtifactRange = async (args: {
-    toolCallId: string;
-    logRef: string;
-    offset: number;
-    limit: number;
-  }) => {
-    const range = await getToolArtifactRange(
-      args.toolCallId,
-      args.logRef,
-      args.offset,
-      args.limit,
-    );
-    return {
-      content: range.content,
-      nextOffset: range.nextOffset ?? null,
-      eof: range.eof,
-    };
-  };
-
-  return (
-    <div class="inline-tool-call">
-      <div
-        class="inline-tool-call__row"
-        onContextMenu={(event) => {
-          const path = primaryPath();
-          if (path) {
-            onFileContextMenu(event, {
-              projectId: props.tool.projectId ?? undefined,
-              path,
-              onOpen: handleOpenPath,
-            });
-          }
-        }}
-      >
-        <button
-          class="inline-tool-call__summary"
-          type="button"
-          aria-expanded={props.expanded}
-          onClick={props.onToggle}
-        >
-          <span class="inline-tool-call__icon">
-            <ToolKindIcon kind={props.tool.toolKind} />
-          </span>
-          <span
-            class="inline-tool-call__title"
-            title={formatToolHeadline(props.tool)}
-          >
-            {formatToolHeadline(props.tool)}
-          </span>
-        </button>
-        {/* Hover file actions sit to the LEFT of the diff-stat — identical to the
-            change-set rows. */}
-        <Show when={primaryPath()}>
-          {(path) => (
-            <FileActions
-              class="inline-tool-call__file-actions"
-              projectId={props.tool.projectId ?? undefined}
-              path={path()}
-              onOpen={handleOpenPath}
-            />
-          )}
-        </Show>
-        {/* A completed edit/patch shows a diff-stat (+N −M); otherwise surface a
-            status that needs attention (running, denied, failed). A plain
-            "Completed" is implied by the row, so it shows nothing. */}
-        <Show
-          when={headerStat()}
-          fallback={
-            <Show when={props.tool.kind !== "completed"}>
-              <span
-                class={`tool-status tool-status--${toolTone(props.tool.kind)}`}
-              >
-                {toolStatusLabel(props.tool.kind)}
-              </span>
-            </Show>
-          }
-        >
-          {(stat) => (
-            <span class="tool-stat">
-              <Show when={stat().add}>
-                <span class="tool-stat__add">+{stat().add}</span>
-              </Show>
-              <Show when={stat().del}>
-                <span class="tool-stat__del">−{stat().del}</span>
-              </Show>
-              <Show when={stat().op}>
-                <span class={`tool-stat__op tool-stat__op--${stat().op}`}>
-                  {stat().op}
-                </span>
-              </Show>
-            </span>
-          )}
-        </Show>
-        <button
-          class="inline-tool-call__toggle"
-          type="button"
-          aria-label={props.expanded ? "Свернуть" : "Развернуть"}
-          onClick={props.onToggle}
-        >
-          <ChevronDown
-            classList={{
-              "inline-tool-call__chevron": true,
-              "inline-tool-call__chevron--open": props.expanded,
-            }}
-            size={14}
-          />
-        </button>
-      </div>
-
-      <Show when={props.expanded}>
-        <div class="inline-tool-call__body">
-          <Show
-            when={hasSemanticCard()}
-            fallback={
-              <>
-                <Show when={command()}>
-                  <pre class="inline-tool-call__command">{command()}</pre>
-                </Show>
-
-                <Show when={!canApprove() && props.tool.message}>
-                  <p class="inline-tool-call__message">{props.tool.message}</p>
-                </Show>
-
-                <Show when={shouldShowInlineToolOutput(props.tool, output())}>
-                  <pre
-                    classList={{
-                      "inline-tool-call__output": true,
-                      "inline-tool-call__output--scrollable":
-                        isOutputScrollable(),
-                    }}
-                    style={`--tool-output-lines: ${TOOL_OUTPUT_MAX_VISIBLE_LINES}`}
-                  >
-                    {output()}
-                  </pre>
-                </Show>
-              </>
-            }
-          >
-            <ToolCard
-              tool={props.tool}
-              onOpenPath={handleOpenPath}
-              loadArtifactRange={loadArtifactRange}
-              findChangeFileId={findChangeFileId}
-            />
-          </Show>
-
-          <Show when={openError()}>
-            {(message) => <p class="tool-body__error">{message()}</p>}
-          </Show>
-
-          {/* Show the pending change prominently before the human approves it,
-              in both the semantic and fallback paths. */}
-          <Show when={canApprove() && props.tool.message}>
-            {(message) => (
-              <ApprovalPreview
-                message={message()}
-                artifacts={props.tool.artifacts}
-              />
-            )}
-          </Show>
-
-          <Show when={canApprove() || canCancel()}>
-            <div class="inline-tool-call__actions">
-              <Show when={canApprove()}>
-                <button type="button" onClick={props.onApprove}>
-                  <Check size={14} />
-                  Approve
-                </button>
-                <button type="button" onClick={props.onDeny}>
-                  <X size={14} />
-                  Deny
-                </button>
-              </Show>
-              <Show when={canCancel()}>
-                <button type="button" onClick={props.onCancel}>
-                  <Square size={13} />
-                  Cancel
-                </button>
-              </Show>
-            </div>
-          </Show>
-        </div>
-      </Show>
-    </div>
-  );
-}
-
-function MessageRow(props: {
-  message: ChatMessage;
-  projectId?: string;
-  transport?: string;
-  expandedInlineTools: Record<string, boolean>;
-  editingDraft: string;
-  isEditing: boolean;
-  isBusy?: boolean;
-  parts: MessagePartView[];
-  tools: ToolExecutionView[];
-  toolsById: Record<string, ToolExecutionView>;
-  changeSets: ChangeSetSummary[];
-  onApproveTool: (toolCallId: string) => void;
-  onRevertChangeSet: (changeSetId: string) => Promise<RevertOutcome>;
-  onBranchMessage: (message: ChatMessage) => void;
-  onCancelEdit: () => void;
-  onCancelTool: (toolCallId: string) => void;
-  onContinue?: () => void;
-  onDenyTool: (toolCallId: string) => void;
-  onEditDraftChange: (value: string) => void;
-  onRetry?: () => void;
-  settings?: ConnectorSettingsSnapshot;
-  onStartEdit: (message: ChatMessage) => void;
-  onSubmitEdit: (messageId: string) => void;
-  onToggleInlineTool: (toolCallId: string) => void;
-}) {
-  const message = () => props.message;
-  const isUser = () => message().role === "user";
-  const isFailed = () =>
-    message().role === "assistant" && message().status === "failed";
-  const attribution = () =>
-    resolveAttribution(props.settings, message().providerId, message().modelId);
-  const body = () =>
-    message().content ||
-    (message().status === "cancelled"
-      ? "Response cancelled."
-      : message().status === "sending"
-        ? thinkingLabel(props.transport)
-        : "No content.");
-  const assistantParts = createMemo(() =>
-    buildRenderableMessageParts(
-      message(),
-      props.parts,
-      props.tools,
-      props.toolsById,
-      props.transport,
-    ),
-  );
-
-  // Messenger layout: user on the right in a colored bubble, agent on the left
-  // with an avatar. A failed run keeps the partial assistant response visible
-  // and appends the error controls underneath it.
-  return (
-    <article
-      classList={{
-        "message-row": true,
-        "message-row--user": isUser(),
-        "message-row--assistant": !isUser(),
-      }}
-    >
-      <Show when={!isUser()}>
-        <Avatar role="assistant" iconUrl={attribution().icon} />
-      </Show>
-      <div class="message-row__content">
-        <Show when={!isUser()}>
-          <div class="message-meta">
-            <strong>{attribution().name}</strong>
-            <span>{formatMessageTime(message().createdAt)}</span>
-          </div>
-        </Show>
-        <Show
-          when={props.isEditing}
-          fallback={
-            <>
-              <Show
-                when={!isUser()}
-                fallback={<MessageMarkdown content={body()} />}
-              >
-                <MessageParts
-                  expandedInlineTools={props.expandedInlineTools}
-                  parts={assistantParts()}
-                  working={message().status === "sending"}
-                  changeSets={props.changeSets}
-                  onApproveTool={props.onApproveTool}
-                  onCancelTool={props.onCancelTool}
-                  onDenyTool={props.onDenyTool}
-                  onToggleTool={props.onToggleInlineTool}
-                />
-              </Show>
-            </>
-          }
-        >
-          <MessageEditor
-            disabled={Boolean(props.isBusy)}
-            messageId={message().id}
-            value={props.editingDraft}
-            onCancel={props.onCancelEdit}
-            onChange={props.onEditDraftChange}
-            onSubmit={props.onSubmitEdit}
-          />
-        </Show>
-        <Show when={!isUser() && props.changeSets.length > 0}>
-          <div class="change-sets">
-            <ChangeSetGroup
-              changeSets={props.changeSets}
-              projectId={props.projectId}
-              onRevert={props.onRevertChangeSet}
-            />
-          </div>
-        </Show>
-        <Show when={isFailed()}>
-          <ErrorCard
-            error={message().error ?? "The run failed before Core recorded an error."}
-            disabled={Boolean(props.isBusy)}
-            onContinue={props.onContinue}
-            onRetry={props.onRetry}
-          />
-        </Show>
-      </div>
-    </article>
-  );
-}
-
-interface MessagePartsProps {
-  expandedInlineTools: Record<string, boolean>;
-  parts: RenderableMessagePart[];
-  /** True while the run is still streaming (drives the "Working…" spoiler). */
-  working: boolean;
-  changeSets?: ChangeSetSummary[];
-  onApproveTool: (toolCallId: string) => void;
-  onCancelTool: (toolCallId: string) => void;
-  onDenyTool: (toolCallId: string) => void;
-  onToggleTool: (toolCallId: string) => void;
-}
-
-/** Index of the final answer: the last non-empty text part. Everything else is
- * "work" that the collapse-work pref hides behind one spoiler. */
-function finalTextIndex(parts: RenderableMessagePart[]): number {
-  // The final answer is a TRAILING text part — one with no tool call after it.
-  // Scanning from the end, a tool before any non-empty text means the run is
-  // still mid-work (no final yet), so nothing is pulled out of the spoiler; an
-  // intermediate "let me check…" preamble that precedes tools is NOT mistaken
-  // for the final answer while the run streams.
-  for (let index = parts.length - 1; index >= 0; index -= 1) {
-    const part = parts[index];
-    if (part.kind === "text" && part.text?.trim()) {
-      return index;
-    }
-    if (part.kind === "tool") {
-      return -1;
-    }
-  }
-  return -1;
-}
-
-/** Wall-clock span of the work, from the earliest tool start to the latest tool
- * end, or undefined when no tool carries timing yet. */
-function workDurationMs(workParts: RenderableMessagePart[]): number | undefined {
-  const tools = workParts
-    .map((part) => part.tool)
-    .filter((tool): tool is ToolExecutionView => Boolean(tool));
-  if (tools.length === 0) {
-    return undefined;
-  }
-  const start = Math.min(...tools.map((tool) => tool.createdAt));
-  const end = Math.max(...tools.map((tool) => tool.updatedAt));
-  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
-    return undefined;
-  }
-  return end - start;
-}
-
-function formatWorkDuration(ms: number): string {
-  const totalSeconds = Math.max(0, Math.round(ms / 1000));
-  if (totalSeconds < 60) {
-    return `${totalSeconds}s`;
-  }
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes < 60) {
-    return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
-  }
-  const hours = Math.floor(minutes / 60);
-  const remMinutes = minutes % 60;
-  return remMinutes ? `${hours}h ${remMinutes}m` : `${hours}h`;
-}
-
-function MessageParts(props: MessagePartsProps) {
-  // Live chat pref: hide everything except the final answer behind one spoiler.
-  const collapse = () => chatSettings().collapseWork;
-
-  const split = createMemo(() => {
-    const finalIndex = finalTextIndex(props.parts);
-    const finalPart = finalIndex >= 0 ? props.parts[finalIndex] : undefined;
-    const workParts = props.parts.filter((_, index) => index !== finalIndex);
-    return { finalPart, workParts };
-  });
-
-  const workLabel = () => {
-    if (props.working) {
-      return "Working…";
-    }
-    const ms = workDurationMs(split().workParts);
-    return ms != null ? `Worked for ${formatWorkDuration(ms)}` : "Worked";
-  };
-  const workToolCount = () =>
-    split().workParts.filter((part) => part.kind === "tool").length;
-
-  return (
-    <div class="message-parts">
-      <Show
-        when={collapse()}
-        fallback={
-          <For each={props.parts}>
-            {(part) => (
-              <Show
-                when={part.kind === "tool"}
-                fallback={
-                  <div class="message-part message-part--text">
-                    <MessageMarkdown content={part.text ?? ""} />
-                  </div>
-                }
-              >
-                <ToolPart part={part} {...props} />
-              </Show>
-            )}
-          </For>
-        }
-      >
-        <Show when={split().workParts.length > 0}>
-          <WorkSpoiler
-            label={workLabel()}
-            count={workToolCount() > 0 ? workToolCount() : undefined}
-            busy={props.working}
-          >
-            <For each={split().workParts}>
-              {(part) => (
-                <Show
-                  when={part.kind === "tool"}
-                  fallback={
-                    <div class="message-part message-part--text work-spoiler__text">
-                      <MessageMarkdown content={part.text ?? ""} />
-                    </div>
-                  }
-                >
-                  <ToolPart part={part} {...props} />
-                </Show>
-              )}
-            </For>
-          </WorkSpoiler>
-        </Show>
-        <Show when={split().finalPart}>
-          {(finalPart) => (
-            <div class="message-part message-part--text">
-              <MessageMarkdown content={finalPart().text ?? ""} />
-            </div>
-          )}
-        </Show>
-      </Show>
-    </div>
-  );
-}
-
-/** One tool part: the resolved inline tool card, or a queued placeholder. */
-function ToolPart(props: MessagePartsProps & { part: RenderableMessagePart }) {
-  return (
-    <div class="message-part message-part--tool">
-      <Show
-        when={props.part.tool}
-        fallback={
-          <div class="inline-tool-call inline-tool-call--pending">
-            <div class="inline-tool-call__summary">
-              <ChevronDown class="inline-tool-call__chevron" size={14} />
-              <Terminal size={15} />
-              <span class="inline-tool-call__title">Tool call</span>
-              <span class="tool-status tool-status--pending">Queued</span>
-            </div>
-          </div>
-        }
-      >
-        {(tool) => (
-          <InlineToolCall
-            expanded={Boolean(props.expandedInlineTools[tool().toolCallId])}
-            tool={tool()}
-            changeSets={props.changeSets}
-            onApprove={() => props.onApproveTool(tool().toolCallId)}
-            onCancel={() => props.onCancelTool(tool().toolCallId)}
-            onDeny={() => props.onDenyTool(tool().toolCallId)}
-            onToggle={() => props.onToggleTool(tool().toolCallId)}
-          />
-        )}
-      </Show>
-    </div>
-  );
-}
-
-function MessageMarkdown(props: { content: string }) {
-  return (
-    <div class="message-md">
-      <SolidMarkdown
-        renderingStrategy="reconcile"
-        remarkPlugins={[remarkGfm]}
-        children={props.content}
+        <InspectorPane
+          activeChat={activeChat()}
+          messageCount={messages().length}
+          promptError={promptPreviewError()}
+          promptLoading={isLoadingPromptPreview()}
+          promptPreview={promptPreview()}
+          toolExecutions={visibleToolExecutions()}
+          onApproveTool={handleApproveTool}
+          onCancelTool={handleCancelTool}
+          onCopyPrompt={handleCopyPromptPreview}
+          onDenyTool={handleDenyTool}
+          onLoadPrompt={() => void handleLoadPromptPreview()}
+        />
+      </main>
+      <ImagePreviewOverlay
+        state={imagePreview()}
+        onClose={() => setImagePreview(null)}
+        onSelectIndex={handleSelectPreviewImage}
       />
-    </div>
+    </>
   );
-}
-
-function MessageEditor(props: {
-  disabled: boolean;
-  messageId: string;
-  value: string;
-  onCancel: () => void;
-  onChange: (value: string) => void;
-  onSubmit: (messageId: string) => void;
-}) {
-  const canSubmit = () => props.value.trim().length > 0 && !props.disabled;
-  let textareaRef: HTMLTextAreaElement | undefined;
-
-  onMount(() => {
-    textareaRef?.focus();
-    textareaRef?.setSelectionRange(textareaRef.value.length, textareaRef.value.length);
-  });
-
-  return (
-    <form
-      class="message-editor"
-      onSubmit={(event) => {
-        event.preventDefault();
-        props.onSubmit(props.messageId);
-      }}
-    >
-      <textarea
-        ref={textareaRef}
-        rows={3}
-        value={props.value}
-        disabled={props.disabled}
-        onInput={(event) => props.onChange(event.currentTarget.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
-            event.preventDefault();
-            props.onSubmit(props.messageId);
-          }
-          if (event.key === "Escape") {
-            event.preventDefault();
-            props.onCancel();
-          }
-        }}
-      />
-      <div class="message-editor__actions">
-        <button
-          class="message-editor__button"
-          type="submit"
-          title="Send edited message"
-          disabled={!canSubmit()}
-        >
-          <Send size={14} />
-        </button>
-        <button
-          class="message-editor__button"
-          type="button"
-          title="Cancel edit"
-          disabled={props.disabled}
-          onClick={props.onCancel}
-        >
-          <X size={14} />
-        </button>
-      </div>
-    </form>
-  );
-}
-
-function ErrorCard(props: {
-  error: string;
-  disabled: boolean;
-  onContinue?: () => void;
-  onRetry?: () => void;
-}) {
-  return (
-    <div class="chat-error-card" role="alert">
-      <div class="chat-error-card__head">
-        <AlertTriangle size={16} />
-        <strong>Couldn't get a response</strong>
-      </div>
-      <p class="chat-error-card__summary">{humanizeError(props.error)}</p>
-      <div class="chat-error-card__actions">
-        <Show when={props.onContinue}>
-          <button
-            class="chat-error-card__continue"
-            type="button"
-            disabled={props.disabled}
-            onClick={() => props.onContinue?.()}
-          >
-            <Play size={14} />
-            Continue
-          </button>
-        </Show>
-        <Show when={props.onRetry}>
-          <button
-            class="chat-error-card__retry"
-            type="button"
-            disabled={props.disabled}
-            onClick={() => props.onRetry?.()}
-          >
-            <RefreshCw size={14} />
-            Retry
-          </button>
-        </Show>
-        <details class="chat-error-card__details">
-          <summary>
-            Details
-            <ChevronDown size={13} />
-          </summary>
-          <pre class="chat-error-card__raw">{props.error}</pre>
-        </details>
-      </div>
-    </div>
-  );
-}
-
-function ReasoningSelector(props: {
-  disabled: boolean;
-  model?: LlmModel;
-  value?: ReasoningOptionId;
-  onChange: (optionId: ReasoningOptionId) => void;
-}) {
-  const [isOpen, setIsOpen] = createSignal(false);
-  const [activeIndex, setActiveIndex] = createSignal(-1);
-  let rootRef: HTMLDivElement | undefined;
-
-  const options = createMemo(() => reasoningSelectorOptions(props.model));
-  const supported = () => options().length > 0;
-  const selectedOption = () =>
-    options().find((option) => option.value === props.value) ??
-    options().find((option) => option.option.recommended) ??
-    options()[0];
-
-  createEffect(() => {
-    if (!isOpen()) {
-      return;
-    }
-
-    const currentOptions = options();
-    const current = activeIndex();
-    if (current >= 0 && current < currentOptions.length) {
-      return;
-    }
-
-    setActiveIndex(firstSelectableReasoningOptionIndex(currentOptions));
-  });
-
-  onMount(() => {
-    const handlePointerDown = (event: PointerEvent) => {
-      if (!isOpen() || !rootRef) {
-        return;
-      }
-
-      if (event.target instanceof Node && !rootRef.contains(event.target)) {
-        closeMenu();
-      }
-    };
-
-    document.addEventListener("pointerdown", handlePointerDown);
-    onCleanup(() => {
-      document.removeEventListener("pointerdown", handlePointerDown);
-    });
-  });
-
-  const closeMenu = () => {
-    setIsOpen(false);
-    setActiveIndex(-1);
-  };
-  const openMenu = () => {
-    if (props.disabled || !supported()) {
-      return;
-    }
-
-    setIsOpen(true);
-    setActiveIndex(firstSelectableReasoningOptionIndex(options()));
-  };
-  const toggleMenu = () => {
-    if (isOpen()) {
-      closeMenu();
-    } else {
-      openMenu();
-    }
-  };
-  const selectOption = (option: ReasoningSelectorOption) => {
-    props.onChange(option.value);
-    closeMenu();
-  };
-  const moveActiveOption = (delta: number) => {
-    const currentOptions = options();
-    if (currentOptions.length === 0) {
-      setActiveIndex(-1);
-      return;
-    }
-
-    let nextIndex = activeIndex();
-    for (let attempts = 0; attempts < currentOptions.length; attempts += 1) {
-      nextIndex =
-        (nextIndex + delta + currentOptions.length) % currentOptions.length;
-      if (currentOptions[nextIndex]) {
-        setActiveIndex(nextIndex);
-        return;
-      }
-    }
-
-    setActiveIndex(-1);
-  };
-  const selectActiveOption = () => {
-    const option = options()[activeIndex()];
-    if (option) {
-      selectOption(option);
-    }
-  };
-  const handleTriggerKeyDown = (event: KeyboardEvent) => {
-    if (!isOpen()) {
-      if (
-        event.key === "ArrowDown" ||
-        event.key === "Enter" ||
-        event.key === " "
-      ) {
-        event.preventDefault();
-        openMenu();
-      }
-      return;
-    }
-
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      moveActiveOption(1);
-    }
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      moveActiveOption(-1);
-    }
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      selectActiveOption();
-    }
-    if (event.key === "Escape") {
-      event.preventDefault();
-      closeMenu();
-    }
-  };
-
-  return (
-    <div
-      ref={rootRef}
-      classList={{
-        "reasoning-selector": true,
-        "reasoning-selector--disabled": !supported(),
-      }}
-    >
-      <button
-        class="reasoning-selector__trigger"
-        type="button"
-        aria-expanded={isOpen()}
-        aria-haspopup="menu"
-        disabled={props.disabled || !supported()}
-        title={
-          supported()
-            ? "Рассуждение для следующего сообщения"
-            : "Выбранная модель не поддерживает настройку рассуждения"
-        }
-        onClick={toggleMenu}
-        onKeyDown={handleTriggerKeyDown}
-      >
-        <BrainCircuit size={15} />
-        <span>{selectedOption()?.label ?? "Рассуждение"}</span>
-        <ChevronDown
-          classList={{
-            "reasoning-selector__chevron": true,
-            "reasoning-selector__chevron--open": isOpen(),
-          }}
-          size={13}
-        />
-      </button>
-
-      <Show when={isOpen()}>
-        <div class="reasoning-selector__popover" role="menu">
-          <div class="reasoning-selector__heading">Рассуждение</div>
-          <For each={options()}>
-            {(option, index) => (
-              <button
-                classList={{
-                  "reasoning-selector__item": true,
-                  "reasoning-selector__item--active": index() === activeIndex(),
-                  "reasoning-selector__item--selected":
-                    option.value === selectedOption()?.value,
-                }}
-                type="button"
-                role="menuitemradio"
-                aria-checked={option.value === selectedOption()?.value}
-                title={option.title}
-                onMouseEnter={() => setActiveIndex(index())}
-                onClick={() => selectOption(option)}
-              >
-                <span>{option.label}</span>
-                <Show when={option.value === selectedOption()?.value}>
-                  <Check size={14} />
-                </Show>
-              </button>
-            )}
-          </For>
-        </div>
-      </Show>
-    </div>
-  );
-}
-
-function firstSelectableReasoningOptionIndex(options: ReasoningSelectorOption[]) {
-  return options.length > 0 ? 0 : -1;
-}
-
-function Avatar(props: { role: "assistant" | "user"; iconUrl?: string | null }) {
-  if (props.role === "user") {
-    return <div class="avatar avatar--message avatar--user">You</div>;
-  }
-
-  return (
-    <div class="avatar avatar--message avatar--agent">
-      <Show when={props.iconUrl} fallback={<BrandMark compact />}>
-        <img
-          class="avatar__adapter-icon"
-          src={props.iconUrl!}
-          alt=""
-          draggable={false}
-        />
-      </Show>
-    </div>
-  );
-}
-
-function mergeChatInPlace(
-  current: ChatThreadSummary[],
-  chat: ChatThreadSummary,
-): ChatThreadSummary[] {
-  const existingIndex = current.findIndex((item) => item.id === chat.id);
-  if (existingIndex === -1) {
-    return [...current, chat];
-  }
-
-  const next = [...current];
-  next[existingIndex] = chat;
-  return next;
-}
-
-function bumpChat(
-  current: ChatThreadSummary[],
-  chat: ChatThreadSummary,
-): ChatThreadSummary[] {
-  return [chat, ...current.filter((item) => item.id !== chat.id)];
-}
-
-function mergeMessages(
-  current: readonly unknown[],
-  incoming: readonly unknown[],
-): ChatMessage[] {
-  const messagesById = new Map<string, ChatMessage>();
-  for (const message of current) {
-    if (!isChatMessage(message)) {
-      continue;
-    }
-    messagesById.set(message.id, message);
-  }
-  for (const message of incoming) {
-    if (!isChatMessage(message)) {
-      continue;
-    }
-    messagesById.set(message.id, message);
-  }
-
-  return Array.from(messagesById.values()).sort(compareMessages);
-}
-
-function removedMessageIdsForRetry(
-  result: SendChatMessageResult,
-  current: ChatMessage[],
-): string[] {
-  if (result.removedMessageIds && result.removedMessageIds.length > 0) {
-    return result.removedMessageIds;
-  }
-
-  return current
-    .filter(
-      (message) =>
-        message.chatId === result.chat.id &&
-        message.position > result.userMessage.position,
-    )
-    .map((message) => message.id);
-}
-
-function appendMessageDelta(
-  current: ChatMessage[],
-  messageId: string,
-  delta: string,
-): ChatMessage[] {
-  let changed = false;
-  const next = current.map((message) => {
-    if (message.id !== messageId) {
-      return message;
-    }
-    changed = true;
-    return {
-      ...message,
-      content: `${message.content}${delta}`,
-    };
-  });
-
-  return changed ? next : current;
-}
-
-function messagePartsByMessageId(
-  parts: ChatMessagePart[],
-): Record<string, MessagePartView[]> {
-  const grouped: Record<string, MessagePartView[]> = {};
-
-  for (const part of parts) {
-    grouped[part.messageId] ??= [];
-    grouped[part.messageId].push(messagePartViewFromApi(part));
-  }
-
-  for (const messageParts of Object.values(grouped)) {
-    messageParts.sort(compareMessageParts);
-  }
-
-  return grouped;
-}
-
-function messagePartViewFromApi(part: ChatMessagePart): MessagePartView {
-  return {
-    id: `part:${part.id}`,
-    kind: part.kind,
-    messageId: part.messageId,
-    text: part.text ?? undefined,
-    toolCallId: part.toolCallId ?? undefined,
-    createdAt: timestampToMillis(part.createdAt),
-    sequence: part.id,
-  };
-}
-
-function compareMessageParts(left: MessagePartView, right: MessagePartView) {
-  if (left.sequence !== undefined && right.sequence !== undefined) {
-    return left.sequence - right.sequence;
-  }
-
-  if (left.createdAt !== right.createdAt) {
-    return left.createdAt - right.createdAt;
-  }
-
-  return left.id.localeCompare(right.id);
-}
-
-function buildRenderableMessageParts(
-  message: ChatMessage,
-  parts: MessagePartView[],
-  tools: ToolExecutionView[],
-  toolsById: Record<string, ToolExecutionView>,
-  transport?: string,
-): RenderableMessagePart[] {
-  const orderedParts = [...parts].sort(compareMessageParts);
-  const renderedTools = new Set<string>();
-  const renderedParts: RenderableMessagePart[] = [];
-
-  for (const part of orderedParts) {
-    if (part.kind === "text") {
-      if (part.text) {
-        renderedParts.push({
-          id: part.id,
-          kind: "text",
-          text: part.text,
-        });
-      }
-      continue;
-    }
-
-    if (!part.toolCallId) {
-      continue;
-    }
-
-    renderedTools.add(part.toolCallId);
-    renderedParts.push({
-      id: part.id,
-      kind: "tool",
-      tool: toolsById[part.toolCallId],
-      toolCallId: part.toolCallId,
-    });
-  }
-
-  if (orderedParts.length === 0) {
-    const fallback = fallbackMessageBody(message, transport);
-    if (fallback) {
-      renderedParts.push({
-        id: `text:${message.id}:fallback`,
-        kind: "text",
-        text: fallback,
-      });
-    }
-  }
-
-  for (const tool of tools) {
-    if (renderedTools.has(tool.toolCallId)) {
-      continue;
-    }
-
-    renderedParts.push({
-      id: `tool:${tool.toolCallId}`,
-      kind: "tool",
-      tool,
-      toolCallId: tool.toolCallId,
-    });
-  }
-
-  if (renderedParts.length === 0) {
-    const fallback = fallbackMessageBody(message, transport);
-    if (fallback) {
-      renderedParts.push({
-        id: `text:${message.id}:fallback`,
-        kind: "text",
-        text: fallback,
-      });
-    }
-  }
-
-  return renderedParts;
-}
-
-function fallbackMessageBody(message: ChatMessage, transport?: string) {
-  return (
-    message.content ||
-    (message.status === "cancelled"
-      ? "Response cancelled."
-      : message.status === "sending"
-        ? thinkingLabel(transport)
-        : message.status === "failed"
-          ? ""
-        : "No content.")
-  );
-}
-
-function attachMessageIdToToolExecutions(
-  current: Record<string, ToolExecutionView>,
-  runId: string,
-  messageId: string,
-): Record<string, ToolExecutionView> {
-  let changed = false;
-  const next: Record<string, ToolExecutionView> = {};
-
-  for (const [toolCallId, tool] of Object.entries(current)) {
-    if (tool.runId === runId && tool.messageId !== messageId) {
-      changed = true;
-      next[toolCallId] = { ...tool, messageId };
-    } else {
-      next[toolCallId] = tool;
-    }
-  }
-
-  return changed ? next : current;
-}
-
-function toolExecutionViewFromRecord(
-  record: ToolExecutionRecord,
-): ToolExecutionView {
-  return {
-    toolCallId: record.toolCallId,
-    runId: record.runId,
-    chatId: record.chatId,
-    messageId: record.messageId,
-    projectId: record.projectId,
-    command: record.command,
-    kind: record.kind,
-    message: record.message,
-    output: record.output,
-    result: record.result,
-    toolKind: record.toolKind,
-    payload: record.payload,
-    touchedPaths: record.touchedPaths,
-    artifacts: record.artifacts,
-    createdAt: timestampToMillis(record.createdAt),
-    updatedAt: timestampToMillis(record.updatedAt),
-  };
-}
-
-// Accumulate workspace-relative paths across events, preserving first-seen
-// order and dropping duplicates. Returns undefined when nothing is known yet.
-function mergeTouchedPaths(
-  previous: string[] | undefined,
-  incoming: string[] | undefined,
-): string[] | undefined {
-  if (!incoming || incoming.length === 0) {
-    return previous;
-  }
-  if (!previous || previous.length === 0) {
-    return [...incoming];
-  }
-
-  const merged = [...previous];
-  const seen = new Set(previous);
-  for (const path of incoming) {
-    if (!seen.has(path)) {
-      seen.add(path);
-      merged.push(path);
-    }
-  }
-  return merged;
-}
-
-// Accumulate artifacts across events, deduping by artifactId and letting a
-// later event replace an earlier artifact with the same id (e.g. a diff that
-// grew and spilled to a logRef).
-function mergeToolArtifacts(
-  previous: ToolArtifact[] | undefined,
-  incoming: ToolArtifact[] | undefined,
-): ToolArtifact[] | undefined {
-  if (!incoming || incoming.length === 0) {
-    return previous;
-  }
-  if (!previous || previous.length === 0) {
-    return [...incoming];
-  }
-
-  const merged = [...previous];
-  for (const artifact of incoming) {
-    const index = merged.findIndex(
-      (existing) => existing.artifactId === artifact.artifactId,
-    );
-    if (index === -1) {
-      merged.push(artifact);
-    } else {
-      merged[index] = artifact;
-    }
-  }
-  return merged;
-}
-
-function compareToolExecutions(
-  left: ToolExecutionView,
-  right: ToolExecutionView,
-) {
-  if (left.createdAt !== right.createdAt) {
-    return left.createdAt - right.createdAt;
-  }
-
-  return left.toolCallId.localeCompare(right.toolCallId);
-}
-
-function buildConversationTimeline(messages: ChatMessage[]): ConversationTimelineItem[] {
-  return messages
-    .filter(isChatMessage)
-    .map((message) => ({
-      id: `message:${message.id}`,
-      kind: "message",
-      messageId: message.id,
-    }));
-}
-
-function normalizeMessages(messages: ChatMessage[]) {
-  return mergeMessages([], messages);
-}
-
-function isChatMessage(value: unknown): value is ChatMessage {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-
-  const message = value as Partial<ChatMessage>;
-  return (
-    typeof message.id === "string" &&
-    typeof message.chatId === "string" &&
-    typeof message.position === "number" &&
-    (message.role === "user" || message.role === "assistant") &&
-    typeof message.content === "string" &&
-    (message.status === "complete" ||
-      message.status === "cancelled" ||
-      message.status === "failed" ||
-      message.status === "sending") &&
-    typeof message.createdAt === "string"
-  );
-}
-
-function limitChatMessages(messages: ChatMessage[]) {
-  return messages.slice(-CHAT_MESSAGE_PAGE_SIZE);
-}
-
-function compareMessages(left: ChatMessage, right: ChatMessage) {
-  if (left.position !== right.position) {
-    return left.position - right.position;
-  }
-
-  const leftTime = Number(left.createdAt);
-  const rightTime = Number(right.createdAt);
-  if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) {
-    return leftTime - rightTime;
-  }
-
-  const roleOrder = (message: ChatMessage) => (message.role === "user" ? 0 : 1);
-  const roleDifference = roleOrder(left) - roleOrder(right);
-  if (roleDifference !== 0) {
-    return roleDifference;
-  }
-
-  return left.id.localeCompare(right.id);
-}
-
-function formatMessageTime(timestamp: string) {
-  const date = unixTimestampToDate(timestamp);
-  return date.toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function thinkingLabel(transport?: string) {
-  if (!transport) {
-    return "Thinking...";
-  }
-
-  const label: Record<string, string> = {
-    http_json: "HTTP JSON",
-    http_sse: "HTTP streaming",
-    websocket: "WebSocket",
-  };
-
-  return `Thinking via ${label[transport] ?? transport}...`;
-}
-
-function unixTimestampToDate(timestamp: string) {
-  const numericTimestamp = Number(timestamp);
-  return new Date(
-    Number.isFinite(numericTimestamp) ? numericTimestamp * 1000 : Date.now(),
-  );
-}
-
-function timestampToMillis(timestamp: string) {
-  const numericTimestamp = Number(timestamp);
-  return Number.isFinite(numericTimestamp) ? numericTimestamp * 1000 : Date.now();
-}
-
-function currentUnixTimestamp() {
-  return Math.floor(Date.now() / 1000).toString();
-}
-
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-/**
- * Resolves an assistant message's provider/model into a display name + adapter
- * icon, using the live connector list. Falls back to "Mothership" (and the
- * built-in logo) for user messages or when the producing adapter is unknown.
- */
-function resolveAttribution(
-  settings: ConnectorSettingsSnapshot | undefined,
-  providerId?: string | null,
-  modelId?: string | null,
-): { name: string; icon?: string | null } {
-  if (!providerId) {
-    return { name: "Mothership", icon: undefined };
-  }
-  const provider = settings?.providers.find((item) => item.id === providerId);
-  const model = provider?.models.find((item) => item.id === modelId);
-  const name = model?.label ?? modelId ?? provider?.label ?? "Mothership";
-  return { name, icon: provider?.icon ?? undefined };
-}
-
-/**
- * Turns a raw run error into a one-line human summary: strips our internal
- * wrapper prefixes and, if the provider returned a JSON body, surfaces its
- * detail/message. The full original string is still shown under "Details".
- */
-function humanizeError(raw: string): string {
-  let message = (raw ?? "").trim();
-
-  for (const prefix of [
-    "invalid request:",
-    "adapter chat failed:",
-    "adapter chat error:",
-  ]) {
-    if (message.toLowerCase().startsWith(prefix)) {
-      message = message.slice(prefix.length).trim();
-    }
-  }
-
-  const jsonStart = message.indexOf("{");
-  if (jsonStart !== -1) {
-    try {
-      const parsed = JSON.parse(message.slice(jsonStart));
-      const detail =
-        parsed?.detail ??
-        parsed?.message ??
-        parsed?.error?.message ??
-        (typeof parsed?.error === "string" ? parsed.error : undefined);
-      if (typeof detail === "string" && detail.trim()) {
-        return detail.trim();
-      }
-    } catch {
-      // Not JSON — fall through to the cleaned string.
-    }
-  }
-
-  return message || "The model provider could not complete this request.";
-}
-
-function appendToolOutput(
-  current: string,
-  stream: "stdout" | "stderr" | null | undefined,
-  chunk: string,
-) {
-  const prefix = stream === "stderr" ? "[stderr] " : "";
-  const next = `${current}${prefix}${chunk}`;
-  const max = 12_000;
-  return next.length > max ? `... output trimmed ...\n${next.slice(-max)}` : next;
-}
-
-function isTauriRuntime() {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
-
-type ConversationTimelineItem = MessageTimelineItem;
-
-// Timeline items intentionally carry only ids — never the message/tool objects
-// themselves. That keeps an item's identity stable across content changes (a
-// streaming delta, a tool-output chunk), so the row stays mounted and updates in
-// place. Rows read the live message/tool by id from a reactive lookup.
-interface MessageTimelineItem {
-  id: string;
-  kind: "message";
-  messageId: string;
-}
-
-interface MessagePartView {
-  id: string;
-  kind: "text" | "tool";
-  messageId: string;
-  text?: string;
-  toolCallId?: string;
-  createdAt: number;
-  sequence?: number;
-}
-
-interface RenderableMessagePart {
-  id: string;
-  kind: "text" | "tool";
-  text?: string;
-  tool?: ToolExecutionView;
-  toolCallId?: string;
 }

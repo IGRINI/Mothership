@@ -8,7 +8,7 @@ import {
   type ChatSettings,
 } from "../../../shared/chatSettings";
 import { WorkSpoiler } from "../../../shared/ui/WorkSpoiler";
-import { InlineToolCall } from "../../dashboard/Dashboard";
+import { InlineToolCall } from "../../dashboard/components/InlineToolCall";
 import { BrandMark } from "../../dashboard/components/BrandMark";
 import type { ToolExecutionView } from "../../dashboard/types";
 
@@ -268,6 +268,7 @@ function SampleTools() {
             onApprove={() => {}}
             onCancel={() => {}}
             onDeny={() => {}}
+            onPreviewImage={() => {}}
             onToggle={() => {}}
           />
         </div>

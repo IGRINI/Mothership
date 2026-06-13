@@ -14,7 +14,8 @@
 //!   terminal reply — streams are correlated by their own domain ids;
 //! - if the sidecar dies, every pending request fails deterministically with
 //!   [`CoreError::sidecar_lost`] and the supervisor restarts it with backoff,
-//!   giving up (and reporting unhealthy) after a few rapid failures.
+//!   parking in the terminal `failed` state after a few rapid failures until
+//!   a manual `restart_sidecar` command wakes it with a fresh budget.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,6 +26,7 @@ use std::time::Duration;
 use mothership_core::ipc::{
     ClientFrame, CoreError, CoreEvent, CoreRequest, CoreResponse, ServerFrame, PROTOCOL_VERSION,
 };
+use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
@@ -34,11 +36,51 @@ use crate::job::JobHandle;
 
 const SIDECAR_NAME: &str = "mothership-sidecar";
 /// How many rapid (never-readied) crashes before we stop trying and report
-/// unhealthy. A connection that successfully readies resets the budget.
+/// `failed`. A connection that successfully readies resets the budget.
 const MAX_RESTART_ATTEMPTS: u32 = 3;
 /// How long a command waits for the sidecar to become ready before failing,
 /// rather than hanging forever when the sidecar is unhealthy.
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Backoff between automatic restart attempts: starts here and doubles up to
+/// [`MAX_BACKOFF`].
+const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
+/// How long a manual restart waits for the new sidecar to become ready before
+/// reporting failure (covers a full retry cycle: ~3.5s of backoff + spawns).
+const RESTART_TIMEOUT: Duration = Duration::from_secs(20);
+/// Error returned to request callers while the supervisor is parked in the
+/// terminal `failed` state (only `restart_sidecar` leaves it).
+const SIDECAR_FAILED_MESSAGE: &str =
+    "core sidecar is stopped after repeated crashes; restart it manually";
+
+/// Supervisor-level health of the Core sidecar, as seen by the host process.
+///
+/// Every transition is pushed to the webview as a `sidecar-status` event with
+/// exactly this serialized shape, and the current value is returned by the
+/// `get_sidecar_health` / `restart_sidecar` commands (so a listener that
+/// mounts after an event already fired can still seed itself).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SidecarHealth {
+    /// The sidecar is being launched (first boot or a manual restart); the
+    /// handshake has not completed yet.
+    Starting,
+    /// Handshake complete; requests are served.
+    Ready,
+    /// The connection died; the supervisor is restarting it with backoff.
+    /// `attempt` is the upcoming restart attempt (1-based) out of
+    /// `max_attempts`. Transient: `ready` or `failed` follows.
+    Down {
+        attempt: u32,
+        #[serde(rename = "maxAttempts")]
+        max_attempts: u32,
+    },
+    /// Terminal: the restart budget is exhausted and the supervisor stopped
+    /// trying. Only a manual `restart_sidecar` leaves this state. `permanent`
+    /// is always `true` — a stable flag so the UI can tell this apart from
+    /// the transient `down` without matching on state names.
+    Failed { permanent: bool },
+}
 
 type ResponseResult = Result<CoreResponse, CoreError>;
 type Pending = Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>;
@@ -49,7 +91,12 @@ struct Shared {
     /// The live sidecar's stdin handle; `None` while down or restarting.
     child: Mutex<Option<CommandChild>>,
     next_id: AtomicU64,
-    ready_tx: watch::Sender<bool>,
+    /// Single source of truth for supervisor-level health; every send is
+    /// mirrored to the webview by [`publish_health`].
+    health_tx: watch::Sender<SidecarHealth>,
+    /// Restart generation, bumped by [`Sidecar::restart`] to wake a supervisor
+    /// parked in the `failed` state.
+    restart_tx: watch::Sender<u64>,
     /// Windows kill-on-close job the sidecar is assigned to (no-op elsewhere).
     job: Option<JobHandle>,
 }
@@ -60,25 +107,32 @@ struct Shared {
 #[derive(Clone)]
 pub struct Sidecar {
     shared: Arc<Shared>,
-    ready_rx: watch::Receiver<bool>,
+    health_rx: watch::Receiver<SidecarHealth>,
 }
 
 impl Sidecar {
     /// Spawns the sidecar and its supervisor task. Returns immediately; the
     /// handshake completes asynchronously and requests wait for readiness.
     pub fn start(app: &AppHandle, db_path: PathBuf) -> Self {
-        let (ready_tx, ready_rx) = watch::channel(false);
+        let (health_tx, health_rx) = watch::channel(SidecarHealth::Starting);
+        let (restart_tx, restart_rx) = watch::channel(0u64);
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
             child: Mutex::new(None),
             next_id: AtomicU64::new(1),
-            ready_tx,
+            health_tx,
+            restart_tx,
             job: JobHandle::create(),
         });
 
-        tauri::async_runtime::spawn(supervise(app.clone(), Arc::clone(&shared), db_path));
+        tauri::async_runtime::spawn(supervise(
+            app.clone(),
+            Arc::clone(&shared),
+            db_path,
+            restart_rx,
+        ));
 
-        Self { shared, ready_rx }
+        Self { shared, health_rx }
     }
 
     /// Sends a request and awaits its single terminal reply. Errors (including a
@@ -104,24 +158,78 @@ impl Sidecar {
     }
 
     /// Resolves once the sidecar is ready, or errors after [`READY_TIMEOUT`].
+    /// Fails fast (no timeout wait) when the supervisor has given up: only a
+    /// manual restart leaves that state, so waiting would just hang callers.
     async fn wait_ready(&self) -> Result<(), String> {
-        if *self.ready_rx.borrow() {
-            return Ok(());
-        }
-        let mut rx = self.ready_rx.clone();
+        let mut rx = self.health_rx.clone();
         let wait = async {
             loop {
+                match *rx.borrow_and_update() {
+                    SidecarHealth::Ready => return Ok(()),
+                    SidecarHealth::Failed { .. } => return Err(SIDECAR_FAILED_MESSAGE.to_string()),
+                    SidecarHealth::Starting | SidecarHealth::Down { .. } => {}
+                }
                 if rx.changed().await.is_err() {
                     return Err(CoreError::sidecar_lost().message);
-                }
-                if *rx.borrow() {
-                    return Ok(());
                 }
             }
         };
         match tokio::time::timeout(READY_TIMEOUT, wait).await {
             Ok(result) => result,
             Err(_) => Err("core sidecar did not become ready in time".to_string()),
+        }
+    }
+
+    /// Current supervisor-level health (the same value the latest
+    /// `sidecar-status` event carried).
+    pub fn health(&self) -> SidecarHealth {
+        *self.health_rx.borrow()
+    }
+
+    /// Manual restart for the gave-up state.
+    ///
+    /// - Alive or already restarting (`starting`/`ready`/`down`): kills
+    ///   nothing, returns the current health unchanged.
+    /// - `failed`: wakes the parked supervisor with a fresh restart budget on
+    ///   this same handle (the pending map and child slot keep working), then
+    ///   resolves with `Ready` once the new sidecar handshakes, or errors if
+    ///   it fails again or [`RESTART_TIMEOUT`] elapses.
+    pub async fn restart(&self) -> Result<SidecarHealth, String> {
+        let mut rx = self.health_rx.clone();
+        let current = *rx.borrow_and_update();
+        if !matches!(current, SidecarHealth::Failed { .. }) {
+            return Ok(current);
+        }
+
+        // Wake the parked supervisor. Safe even if it raced out of `failed`:
+        // the supervisor marks the generation seen *before* publishing
+        // `failed`, so a stale bump is ignored by the next park.
+        self.shared
+            .restart_tx
+            .send_modify(|generation| *generation += 1);
+
+        let wait = async {
+            loop {
+                if rx.changed().await.is_err() {
+                    return Err("core sidecar supervisor is gone".to_string());
+                }
+                match *rx.borrow_and_update() {
+                    SidecarHealth::Ready => return Ok(SidecarHealth::Ready),
+                    SidecarHealth::Failed { .. } => {
+                        return Err(format!(
+                            "sidecar restart failed: it crashed {MAX_RESTART_ATTEMPTS} times in a row and gave up again"
+                        ))
+                    }
+                    SidecarHealth::Starting | SidecarHealth::Down { .. } => {}
+                }
+            }
+        };
+        match tokio::time::timeout(RESTART_TIMEOUT, wait).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "sidecar did not become ready within {}s after restart",
+                RESTART_TIMEOUT.as_secs()
+            )),
         }
     }
 }
@@ -148,35 +256,70 @@ fn fail_all_pending(shared: &Shared) {
     }
 }
 
-/// Spawns and re-spawns the sidecar, surfacing health to the webview.
-async fn supervise(app: AppHandle, shared: Arc<Shared>, db_path: PathBuf) {
+/// Records the new supervisor-level health and mirrors it to the webview as a
+/// `sidecar-status` event, so the queryable watch and the event stream can
+/// never disagree.
+fn publish_health(app: &AppHandle, shared: &Shared, health: SidecarHealth) {
+    let _ = shared.health_tx.send(health);
+    let _ = app.emit("sidecar-status", health);
+}
+
+/// Spawns and re-spawns the sidecar, surfacing health to the webview. When the
+/// restart budget is exhausted it parks in the terminal `failed` state instead
+/// of returning, so [`Sidecar::restart`] can wake it with a fresh budget on
+/// the same shared handle.
+async fn supervise(
+    app: AppHandle,
+    shared: Arc<Shared>,
+    db_path: PathBuf,
+    mut restart_rx: watch::Receiver<u64>,
+) {
     let mut attempts = 0u32;
-    let mut backoff = Duration::from_millis(500);
+    let mut backoff = INITIAL_BACKOFF;
 
     loop {
         let readied = run_connection(&app, &shared, db_path.clone()).await;
 
-        // The connection ended: tear down shared state and notify the UI.
-        let _ = shared.ready_tx.send(false);
+        // The connection ended: tear down shared state so no caller hangs.
         *shared.child.lock().unwrap() = None;
         fail_all_pending(&shared);
-        let _ = app.emit("sidecar-status", "down");
 
         if readied {
             // A healthy session that later died gets a fresh restart budget.
             attempts = 0;
-            backoff = Duration::from_millis(500);
+            backoff = INITIAL_BACKOFF;
         }
 
         attempts += 1;
         if attempts > MAX_RESTART_ATTEMPTS {
-            eprintln!("sidecar: giving up after {} failed attempts", attempts - 1);
-            let _ = app.emit("sidecar-status", "unhealthy");
-            return;
+            eprintln!(
+                "sidecar: giving up after {} failed attempts; waiting for a manual restart",
+                attempts - 1
+            );
+            // Mark the current restart generation seen *before* publishing
+            // `failed`: a restart command only bumps it after observing
+            // `failed`, so its wake-up can never be swallowed as stale.
+            restart_rx.borrow_and_update();
+            publish_health(&app, &shared, SidecarHealth::Failed { permanent: true });
+            if restart_rx.changed().await.is_err() {
+                return; // Restart handle dropped; nothing left to supervise for.
+            }
+            attempts = 0;
+            backoff = INITIAL_BACKOFF;
+            publish_health(&app, &shared, SidecarHealth::Starting);
+            continue;
         }
 
+        publish_health(
+            &app,
+            &shared,
+            SidecarHealth::Down {
+                attempt: attempts,
+                max_attempts: MAX_RESTART_ATTEMPTS,
+            },
+        );
         tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(5));
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
@@ -247,8 +390,7 @@ async fn run_connection(app: &AppHandle, shared: &Arc<Shared>, db_path: PathBuf)
                         }
                         ServerFrame::Ready => {
                             readied = true;
-                            let _ = shared.ready_tx.send(true);
-                            let _ = app.emit("sidecar-status", "ready");
+                            publish_health(app, shared, SidecarHealth::Ready);
                         }
                         ServerFrame::Response { id, result } => {
                             if let Some(tx) = shared.pending.lock().unwrap().remove(&id) {
@@ -336,4 +478,37 @@ fn invalid_frame_preview(line: &str) -> String {
         first,
         prefix_hex
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The UI switches on this exact wire shape (the `sidecar-status` event
+    /// payload and the `get_sidecar_health` / `restart_sidecar` results), so
+    /// lock every variant down.
+    #[test]
+    fn sidecar_health_serializes_to_the_documented_contract() {
+        assert_eq!(
+            serde_json::to_value(SidecarHealth::Starting).unwrap(),
+            json!({ "state": "starting" })
+        );
+        assert_eq!(
+            serde_json::to_value(SidecarHealth::Ready).unwrap(),
+            json!({ "state": "ready" })
+        );
+        assert_eq!(
+            serde_json::to_value(SidecarHealth::Down {
+                attempt: 2,
+                max_attempts: MAX_RESTART_ATTEMPTS,
+            })
+            .unwrap(),
+            json!({ "state": "down", "attempt": 2, "maxAttempts": 3 })
+        );
+        assert_eq!(
+            serde_json::to_value(SidecarHealth::Failed { permanent: true }).unwrap(),
+            json!({ "state": "failed", "permanent": true })
+        );
+    }
 }

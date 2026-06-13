@@ -28,9 +28,11 @@ mod types;
 
 pub use cancellation::ToolCancellationToken;
 pub use catalog::{
-    canonical_catalog_bytes, canonical_json, catalog_fingerprint, default_tool_catalog,
-    CatalogDrift, CatalogPin, APPLY_PATCH_TOOL_ID, APPLY_PATCH_TOOL_NAME, EDIT_FILE_TOOL_ID,
-    EDIT_FILE_TOOL_NAME, LIST_FILES_TOOL_ID, LIST_FILES_TOOL_NAME, READ_FILE_TOOL_ID,
+    audio_transcribe_tool_descriptor, canonical_catalog_bytes, canonical_json, catalog_fingerprint,
+    default_tool_catalog, image_generate_tool_descriptor, CatalogDrift, CatalogPin,
+    APPLY_PATCH_TOOL_ID, APPLY_PATCH_TOOL_NAME, AUDIO_TRANSCRIBE_TOOL_ID,
+    AUDIO_TRANSCRIBE_TOOL_NAME, EDIT_FILE_TOOL_ID, EDIT_FILE_TOOL_NAME, IMAGE_GENERATE_TOOL_ID,
+    IMAGE_GENERATE_TOOL_NAME, LIST_FILES_TOOL_ID, LIST_FILES_TOOL_NAME, READ_FILE_TOOL_ID,
     READ_FILE_TOOL_NAME, RUN_COMMAND_TOOL_ID, RUN_COMMAND_TOOL_NAME, SEARCH_TEXT_TOOL_ID,
     SEARCH_TEXT_TOOL_NAME, WRITE_FILE_TOOL_ID, WRITE_FILE_TOOL_NAME,
 };
@@ -49,13 +51,13 @@ pub use orchestrator::{
     ApprovalPreview, BackendOutcome, ResourceLease, ResourceRequest, ToolBackend, ToolCapability,
     ToolDecision, ToolOrchestrator,
 };
-pub use output::{FileToolOutputStore, ToolOutputStore};
+pub use output::{FileToolOutputStore, ToolOutputContext, ToolOutputStore};
 pub use permissions::{
     command_permission_for_mode, file_permission_action_for_mode,
     ConservativeCommandPermissionPolicy, ModeAwareCommandPermissionPolicy, PendingToolApprovalGate,
     StaticToolApprovalGate, ToolApprovalDecision, ToolApprovalGate, ToolApprovalMode,
-    ToolApprovalModeStore, ToolPermissionAction, ToolPermissionEvaluation, ToolPermissionPolicy,
-    ToolPolicySettings, ToolPolicyStore, UserAwareCommandPermissionPolicy,
+    ToolApprovalModeStore, ToolApprovalRunGuard, ToolPermissionAction, ToolPermissionEvaluation,
+    ToolPermissionPolicy, ToolPolicySettings, ToolPolicyStore, UserAwareCommandPermissionPolicy,
 };
 pub use pipeline::{ToolCallContext, ToolExecutor, ToolKind};
 pub use process::{SpawnedToolProcess, ToolProcessExit, ToolProcessSandbox, ToolProcessSpec};

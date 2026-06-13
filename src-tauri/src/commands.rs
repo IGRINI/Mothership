@@ -6,22 +6,31 @@
 //! (run in the sidecar process). Streaming chat output is not returned here; it
 //! arrives as `chat-run-event`s the sidecar supervisor forwards to the webview.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
+use base64::Engine;
 use mothership_core::ipc::{CoreRequest, CoreResponse};
 use mothership_core::{
-    AdapterSettingPatchValue, ChangeFileDiff, ChangeFileSummary, ChangeSetSummary,
-    ChatConversation, ChatRunCancellationResult, ChatThreadSummary, ConnectorSettingsSnapshot,
-    DashboardSnapshot, PersonalizationSettings, ProjectSnapshot, ReasoningConfig, RevertOutcome,
-    SendChatMessageResult, SidecarStatus, ToolApprovalAnswer, ToolApprovalMode, ToolArtifactRange,
+    ActiveRunSummary, AdapterSettingPatchValue, ChangeFileDiff, ChangeFileSummary,
+    ChangeSetSummary, ChatConversation, ChatRunCancellationResult, ChatThreadSummary,
+    ConnectorSettingsSnapshot,
+    DashboardSnapshot, PersonalizationSettings, ProjectSnapshot, PromptPreview, ReasoningConfig,
+    RevertOutcome, SendChatMessageResult, SidecarStatus, ToolApprovalAnswer, ToolArtifactRange,
     ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionRequest,
     ToolPolicySettings,
 };
-use tauri::{AppHandle, State, Window};
+use serde_json::Value;
+use tauri::{AppHandle, Manager, State, Window};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
+use crate::sidecar::SidecarHealth;
 use crate::state::AppState;
+
+const MAX_IMAGE_PREVIEW_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Unwraps the expected [`CoreResponse`] variant, or turns an unexpected reply
 /// into a command error (only possible on a protocol bug / version skew).
@@ -32,6 +41,62 @@ macro_rules! expect_variant {
             other => Err(format!("unexpected sidecar response: {other:?}")),
         }
     };
+}
+
+fn resolve_artifact_path(app: &AppHandle, path: &str) -> Result<PathBuf, String> {
+    let raw = PathBuf::from(path);
+    if !raw.is_absolute() {
+        return Err("artifact path must be absolute".to_string());
+    }
+
+    let artifacts_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("artifacts");
+    let artifacts_root = std::fs::canonicalize(&artifacts_root)
+        .map_err(|error| format!("artifact root is unavailable: {error}"))?;
+    let resolved = std::fs::canonicalize(&raw)
+        .map_err(|error| format!("artifact path is unavailable: {error}"))?;
+
+    if !resolved.starts_with(&artifacts_root) {
+        return Err("artifact path is outside the Mothership artifacts directory".to_string());
+    }
+    Ok(resolved)
+}
+
+fn image_data_url(path: &Path) -> Result<String, String> {
+    let content_type =
+        image_content_type(path).ok_or_else(|| "file is not a supported image".to_string())?;
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("image path is not a file".to_string());
+    }
+    if metadata.len() > MAX_IMAGE_PREVIEW_BYTES {
+        return Err(format!(
+            "image is too large for inline preview ({} bytes)",
+            metadata.len()
+        ));
+    }
+
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{content_type};base64,{encoded}"))
+}
+
+fn image_content_type(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "apng" => Some("image/apng"),
+        "avif" => Some("image/avif"),
+        "bmp" => Some("image/bmp"),
+        "gif" => Some("image/gif"),
+        "ico" => Some("image/x-icon"),
+        "jfif" | "jpeg" | "jpg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "svg" => Some("image/svg+xml"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
 }
 
 #[tauri::command]
@@ -102,6 +167,19 @@ pub async fn get_chat(
         .request(CoreRequest::GetChat { chat_id, limit })
         .await?;
     expect_variant!(response, CoreResponse::Chat)
+}
+
+#[tauri::command]
+pub async fn get_prompt_preview(
+    state: State<'_, AppState>,
+    chat_id: String,
+) -> Result<PromptPreview, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::GetPromptPreview { chat_id })
+        .await?;
+    expect_variant!(response, CoreResponse::PromptPreview)
 }
 
 #[tauri::command]
@@ -274,6 +352,91 @@ pub async fn cancel_chat_run(
 }
 
 #[tauri::command]
+pub async fn list_active_runs(
+    state: State<'_, AppState>,
+) -> Result<Vec<ActiveRunSummary>, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::ListActiveRuns)
+        .await?;
+    expect_variant!(response, CoreResponse::ActiveRuns)
+}
+
+#[tauri::command]
+pub async fn rename_chat(
+    state: State<'_, AppState>,
+    chat_id: String,
+    title: String,
+) -> Result<ChatThreadSummary, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::RenameChat { chat_id, title })
+        .await?;
+    expect_variant!(response, CoreResponse::ChatSummary)
+}
+
+#[tauri::command]
+pub async fn delete_chat(state: State<'_, AppState>, chat_id: String) -> Result<(), String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::DeleteChat { chat_id })
+        .await?;
+    match response {
+        CoreResponse::Ack => Ok(()),
+        other => Err(format!("unexpected sidecar response: {other:?}")),
+    }
+}
+
+#[tauri::command]
+pub async fn rename_project(
+    state: State<'_, AppState>,
+    project_id: String,
+    name: String,
+) -> Result<ProjectSnapshot, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::RenameProject { project_id, name })
+        .await?;
+    expect_variant!(response, CoreResponse::ProjectSnapshot)
+}
+
+#[tauri::command]
+pub async fn delete_project(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<ProjectSnapshot, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::DeleteProject { project_id })
+        .await?;
+    expect_variant!(response, CoreResponse::ProjectSnapshot)
+}
+
+#[tauri::command]
+pub async fn set_project_appearance(
+    state: State<'_, AppState>,
+    project_id: String,
+    icon: Option<String>,
+    icon_color: Option<String>,
+) -> Result<ProjectSnapshot, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::SetProjectAppearance {
+            project_id,
+            icon,
+            icon_color,
+        })
+        .await?;
+    expect_variant!(response, CoreResponse::ProjectSnapshot)
+}
+
+#[tauri::command]
 pub async fn run_tool_command(
     state: State<'_, AppState>,
     request: ToolExecutionRequest,
@@ -316,31 +479,6 @@ pub async fn cancel_tool_execution(
         .request(CoreRequest::CancelToolExecution { tool_call_id })
         .await?;
     expect_variant!(response, CoreResponse::ToolExecutionCancellation)
-}
-
-#[tauri::command]
-pub async fn get_tool_approval_mode(
-    state: State<'_, AppState>,
-) -> Result<ToolApprovalMode, String> {
-    let response = state
-        .sidecar()
-        .clone()
-        .request(CoreRequest::GetToolApprovalMode)
-        .await?;
-    expect_variant!(response, CoreResponse::ToolApprovalMode)
-}
-
-#[tauri::command]
-pub async fn set_tool_approval_mode(
-    state: State<'_, AppState>,
-    mode: ToolApprovalMode,
-) -> Result<ToolApprovalMode, String> {
-    let response = state
-        .sidecar()
-        .clone()
-        .request(CoreRequest::SetToolApprovalMode { mode })
-        .await?;
-    expect_variant!(response, CoreResponse::ToolApprovalMode)
 }
 
 #[tauri::command]
@@ -441,6 +579,69 @@ pub async fn open_tool_path(
         .map_err(|error| error.to_string())
 }
 
+/// Resolve a workspace path without opening it. Used by the UI to render safe
+/// local previews after Core has enforced project containment.
+#[tauri::command]
+pub async fn resolve_tool_path(
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+    path: String,
+) -> Result<String, String> {
+    let Some(project_id) = project_id else {
+        return Err("cannot resolve a path without a project".to_string());
+    };
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::ResolveWorkspacePath { project_id, path })
+        .await?;
+    expect_variant!(response, CoreResponse::ResolvedPath)
+}
+
+#[tauri::command]
+pub async fn read_image_data_url(
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+    path: String,
+) -> Result<String, String> {
+    // Closed, single-user desktop app with a trusted agent: any absolute local
+    // image path may be previewed. The UI only ever hands us local file paths
+    // (internet refs are filtered out before they reach a preview), and
+    // `image_data_url` still enforces "is an image" + the 25 MB size cap.
+    // Relative paths are resolved against the owning project's workspace.
+    let candidate = PathBuf::from(&path);
+    if candidate.is_absolute() {
+        return image_data_url(&candidate);
+    }
+
+    let Some(project_id) = project_id else {
+        return Err("cannot resolve a relative image path without a project".to_string());
+    };
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::ResolveWorkspacePath { project_id, path })
+        .await?;
+    let resolved = PathBuf::from(expect_variant!(response, CoreResponse::ResolvedPath)?);
+    image_data_url(&resolved)
+}
+
+#[tauri::command]
+pub async fn open_artifact_path(app: AppHandle, path: String) -> Result<(), String> {
+    let resolved = resolve_artifact_path(&app, &path)?;
+    app.opener()
+        .open_path(resolved.display().to_string(), None::<&str>)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn reveal_artifact_path(app: AppHandle, path: String) -> Result<(), String> {
+    let resolved = resolve_artifact_path(&app, &path)?;
+    app.opener()
+        .reveal_item_in_dir(resolved.display().to_string())
+        .map_err(|error| error.to_string())
+}
+
 /// Reveal a workspace path in the OS file manager (Explorer / Finder). Like
 /// [`open_tool_path`], Core resolves + contains the path against the owning
 /// project's root before it reaches the opener.
@@ -506,6 +707,27 @@ pub async fn set_provider_enabled(
         .request(CoreRequest::SetProviderEnabled {
             provider_id,
             enabled,
+        })
+        .await?;
+    expect_variant!(response, CoreResponse::ConnectorSettings)
+}
+
+#[tauri::command]
+pub async fn set_feature_route(
+    state: State<'_, AppState>,
+    feature: String,
+    provider_id: String,
+    model_id: String,
+    options: Value,
+) -> Result<ConnectorSettingsSnapshot, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::SetFeatureRoute {
+            feature,
+            provider_id,
+            model_id,
+            options,
         })
         .await?;
     expect_variant!(response, CoreResponse::ConnectorSettings)
@@ -619,6 +841,24 @@ pub async fn run_sidecar_status(state: State<'_, AppState>) -> Result<SidecarSta
     expect_variant!(response, CoreResponse::SidecarStatus)
 }
 
+/// Host-level supervisor health, answered without talking to the sidecar
+/// (unlike `run_sidecar_status`, which needs it ready). Safe in any state —
+/// lets the UI seed its `sidecar-status` listener with the current value.
+#[tauri::command]
+pub fn get_sidecar_health(state: State<'_, AppState>) -> SidecarHealth {
+    state.sidecar().health()
+}
+
+/// Manually restarts the Core sidecar after the supervisor gave up
+/// (`sidecar-status` = `failed`). If the sidecar is alive or already
+/// restarting this kills nothing and returns the current health; otherwise it
+/// resets the restart budget, wakes the supervisor, and resolves once the new
+/// sidecar is ready (or errors after a bounded wait).
+#[tauri::command]
+pub async fn restart_sidecar(state: State<'_, AppState>) -> Result<SidecarHealth, String> {
+    state.sidecar().clone().restart().await
+}
+
 #[tauri::command]
 pub async fn get_chat_change_sets(
     state: State<'_, AppState>,
@@ -677,6 +917,29 @@ pub async fn revert_change_set(
         .request(CoreRequest::RevertChangeSet { change_set_id })
         .await?;
     expect_variant!(response, CoreResponse::ChangeSetReverted)
+}
+
+#[tauri::command]
+pub async fn get_change_journal_retention(state: State<'_, AppState>) -> Result<u32, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::GetChangeJournalRetention)
+        .await?;
+    expect_variant!(response, CoreResponse::ChangeJournalRetention)
+}
+
+#[tauri::command]
+pub async fn set_change_journal_retention(
+    state: State<'_, AppState>,
+    value: u32,
+) -> Result<u32, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::SetChangeJournalRetention { value })
+        .await?;
+    expect_variant!(response, CoreResponse::ChangeJournalRetention)
 }
 
 #[tauri::command]

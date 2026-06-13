@@ -3,10 +3,13 @@
 //!
 //! Both walk the project tree with the ripgrep [`ignore`] walker so they honor
 //! `.gitignore`/`.ignore`/hidden filters by default (and can surface ignored
-//! entries on request via `includeIgnored`). Both ALWAYS skip
-//! [`Workspace::is_sensitive`] paths — even with `includeIgnored:true` — so a
-//! credential file is never listed or grepped. Symlinks are never followed
-//! (`follow_links(false)`), so the walk cannot escape the workspace.
+//! entries on request via `includeIgnored`). A broad walk always skips
+//! [`Workspace::is_sensitive`] entries — even with `includeIgnored:true` — so a
+//! credential file is never listed or grepped incidentally; only a walk whose
+//! ROOT is itself a sensitive path (an explicitly targeted, policy-gated read:
+//! `Ask` in manual mode, allowed in auto_safe/yolo) surfaces the entries
+//! beneath it. Symlinks are never followed (`follow_links(false)`), so the walk
+//! cannot escape the workspace.
 //!
 //! Like the file tools, these handlers never call `std::fs` for byte IO of file
 //! contents: `search_text` reads each candidate through the injected
@@ -15,9 +18,10 @@
 //! `run_command` shells out to the real fs — but it is fully contained to the
 //! resolved, workspace-checked walk root and never follows a symlink out.)
 //!
-//! Both tools are pure reads inside the workspace: [`classify_search`] reports
-//! [`ToolPermissionAction::Allow`] within the workspace and `Deny` for a `dir`
-//! that escapes or points at a sensitive path.
+//! Both tools are pure reads inside the workspace: [`classify_list_files`] /
+//! [`classify_search_text`] report [`ToolPermissionAction::Allow`] within the
+//! workspace, `Ask` for a sensitive `dir` (the per-chat approval mode decides),
+//! and `Deny` for a `dir` that escapes the workspace.
 
 #![allow(dead_code)]
 
@@ -107,16 +111,22 @@ pub struct SearchTextInput {
 // ===========================================================================
 
 /// Classify `list_files` into a read [`FileToolCapability`]. The walk root
-/// (`dir`, default the workspace root) must resolve inside the workspace and must
-/// not be a sensitive path; otherwise the call is denied. Sensitive *entries*
-/// inside an allowed root are skipped during the walk, not denied here.
+/// (`dir`, default the workspace root) must resolve inside the workspace —
+/// otherwise the call is denied. A sensitive root is a mode-gated `Ask` (manual
+/// prompts; auto_safe/yolo allow). Sensitive *entries* inside a non-sensitive
+/// root are skipped during the walk, not decided here.
 pub fn classify_list_files(
     arguments: &Value,
     workspace: &Workspace,
 ) -> Result<FileToolCapability, FileToolError> {
     let input: ListFilesInput = parse_args(arguments)?;
     let touched = vec![input.dir.clone().unwrap_or_else(|| ".".to_string())];
-    match guard_dir(workspace, input.dir.as_deref()) {
+    match resolve_dir(workspace, input.dir.as_deref()) {
+        Ok(root) if workspace.is_sensitive(&root) => Ok(FileToolCapability {
+            action: ToolPermissionAction::Ask,
+            summary: format!("list files in {} — reads a sensitive path", touched[0]),
+            touched_paths: touched,
+        }),
         Ok(_) => Ok(FileToolCapability {
             action: ToolPermissionAction::Allow,
             summary: format!("list files in {}", touched[0]),
@@ -134,7 +144,15 @@ pub fn classify_search_text(
 ) -> Result<FileToolCapability, FileToolError> {
     let input: SearchTextInput = parse_args(arguments)?;
     let touched = vec![input.dir.clone().unwrap_or_else(|| ".".to_string())];
-    match guard_dir(workspace, input.dir.as_deref()) {
+    match resolve_dir(workspace, input.dir.as_deref()) {
+        Ok(root) if workspace.is_sensitive(&root) => Ok(FileToolCapability {
+            action: ToolPermissionAction::Ask,
+            summary: format!(
+                "search for `{}` in {} — reads a sensitive path",
+                input.pattern, touched[0]
+            ),
+            touched_paths: touched,
+        }),
         Ok(_) => Ok(FileToolCapability {
             action: ToolPermissionAction::Allow,
             summary: format!("search for `{}` in {}", input.pattern, touched[0]),
@@ -167,10 +185,17 @@ pub fn list_files(
 ) -> Result<FileToolOutcome, FileToolError> {
     let input: ListFilesInput = parse_args(arguments)?;
 
-    let root = match guard_dir(workspace, input.dir.as_deref()) {
+    let root = match resolve_dir(workspace, input.dir.as_deref()) {
         Ok(root) => root,
         Err(reason) => return Ok(path_failure(&input, reason)),
     };
+    // A sensitive walk ROOT was explicitly targeted and policy-gated upstream
+    // (Ask in manual, auto-allowed in auto_safe/yolo), so its entries must
+    // surface — every path under it inherits a sensitive component and the
+    // per-entry skip below would otherwise return a silently empty result. A
+    // non-sensitive root keeps the per-entry skip, so a broad walk never
+    // vacuums up secrets incidentally in any mode.
+    let root_is_sensitive = workspace.is_sensitive(&root);
 
     let matcher = match build_glob_matcher(input.glob.as_deref()) {
         Ok(matcher) => matcher,
@@ -200,8 +225,9 @@ pub fn list_files(
         let Some(relative) = workspace_relative(workspace, entry.path()) else {
             continue;
         };
-        // Sensitive paths are ALWAYS skipped, even with includeIgnored.
-        if super::filesystem::is_sensitive_relative(Path::new(&relative)) {
+        // Sensitive entries are skipped — even with includeIgnored — unless the
+        // walk root itself is the (already gated) sensitive target.
+        if !root_is_sensitive && super::filesystem::is_sensitive_relative(Path::new(&relative)) {
             continue;
         }
         if let Some(matcher) = &matcher {
@@ -305,10 +331,13 @@ pub fn search_text(
 ) -> Result<FileToolOutcome, FileToolError> {
     let input: SearchTextInput = parse_args(arguments)?;
 
-    let root = match guard_dir(workspace, input.dir.as_deref()) {
+    let root = match resolve_dir(workspace, input.dir.as_deref()) {
         Ok(root) => root,
         Err(reason) => return Ok(search_path_failure(&input, reason)),
     };
+    // Same surfacing rule as `list_files`: an explicitly targeted, policy-gated
+    // sensitive root is searchable; a broad walk still skips sensitive entries.
+    let root_is_sensitive = workspace.is_sensitive(&root);
 
     let matcher = match build_glob_matcher(input.glob.as_deref()) {
         Ok(matcher) => matcher,
@@ -368,7 +397,7 @@ pub fn search_text(
         let Some(relative) = workspace_relative(workspace, entry.path()) else {
             continue;
         };
-        if super::filesystem::is_sensitive_relative(Path::new(&relative)) {
+        if !root_is_sensitive && super::filesystem::is_sensitive_relative(Path::new(&relative)) {
             continue;
         }
         if let Some(matcher) = &matcher {
@@ -509,23 +538,18 @@ fn parse_args<T: for<'de> Deserialize<'de>>(arguments: &Value) -> Result<T, File
         .map_err(|error| FileToolError::InvalidArguments(error.to_string()))
 }
 
-/// Resolve and screen the walk root `dir` (default the workspace root): it must
-/// resolve inside the workspace and must not itself be a sensitive path. Returns
-/// the resolved absolute root, or a human-readable denial reason.
-fn guard_dir(workspace: &Workspace, dir: Option<&str>) -> Result<PathBuf, String> {
-    let resolved = match dir {
+/// Resolve the walk root `dir` (default the workspace root) for containment.
+/// Returns the resolved absolute root, or a human-readable denial reason when
+/// the dir escapes the workspace. Sensitivity of the root is NOT a refusal
+/// here: [`classify_list_files`] / [`classify_search_text`] report it as a
+/// mode-gated `Ask`, so a call reaching a handler was approved or auto-allowed.
+fn resolve_dir(workspace: &Workspace, dir: Option<&str>) -> Result<PathBuf, String> {
+    match dir {
         Some(dir) => workspace
             .resolve(dir)
-            .map_err(|error: PathError| error.to_string())?,
-        None => workspace.root().to_path_buf(),
-    };
-    if workspace.is_sensitive(&resolved) {
-        return Err(format!(
-            "`{}` is a sensitive path and is blocked",
-            dir.unwrap_or(".")
-        ));
+            .map_err(|error: PathError| error.to_string()),
+        None => Ok(workspace.root().to_path_buf()),
     }
-    Ok(resolved)
 }
 
 /// Build a [`GlobMatcher`] from an optional glob, rejecting a glob that could
@@ -1103,6 +1127,82 @@ mod tests {
         .unwrap();
         assert!(!out.ok);
         assert_eq!(out.data["status"], "denied");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classify_sensitive_dir_asks_instead_of_denying() {
+        let (ws, dir) = temp_workspace("classify_sensitive_dir");
+        fs::create_dir_all(dir.join(".ssh")).unwrap();
+
+        let list = classify_list_files(&json!({ "dir": ".ssh" }), &ws).unwrap();
+        assert_eq!(list.action, ToolPermissionAction::Ask);
+        assert!(
+            list.summary.contains("sensitive"),
+            "the approval card must say WHY: {}",
+            list.summary
+        );
+        let search =
+            classify_search_text(&json!({ "pattern": "key", "dir": ".ssh" }), &ws).unwrap();
+        assert_eq!(search.action, ToolPermissionAction::Ask);
+        assert!(search.summary.contains("sensitive"), "{}", search.summary);
+
+        // Containment violations are still hard denials.
+        let escape = classify_list_files(&json!({ "dir": "../.." }), &ws).unwrap();
+        assert_eq!(escape.action, ToolPermissionAction::Deny);
+        // A normal dir stays a plain read Allow.
+        let normal = classify_list_files(&json!({}), &ws).unwrap();
+        assert_eq!(normal.action, ToolPermissionAction::Allow);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sensitive_walk_root_surfaces_its_entries_after_policy_gate() {
+        // A call whose `dir` IS the sensitive path was explicitly targeted and
+        // policy-gated (approved in manual / auto-allowed in auto+yolo); the
+        // handler must surface its entries rather than skip them all and return
+        // a silently empty result.
+        let (ws, dir) = temp_workspace("sensitive_root_walk");
+        fs::create_dir_all(dir.join(".ssh")).unwrap();
+        fs::write(dir.join(".ssh/id_rsa"), b"PRIVATE KEY BODY\n").unwrap();
+        fs::write(dir.join(".ssh/known_hosts"), b"host fingerprint\n").unwrap();
+
+        let listed = list_files(&json!({ "dir": ".ssh" }), &ws, "tc", None).unwrap();
+        assert!(listed.ok, "{}", listed.model_text);
+        assert!(
+            listed.model_text.contains("id_rsa"),
+            "gated sensitive root must list its entries: {}",
+            listed.model_text
+        );
+
+        let searched = search_text(
+            &json!({ "pattern": "PRIVATE", "dir": ".ssh" }),
+            &ws,
+            &StdFileSystem::new(),
+            "tc",
+            None,
+        )
+        .unwrap();
+        assert!(searched.ok, "{}", searched.model_text);
+        assert_eq!(searched.data["count"], 1);
+        assert_eq!(searched.data["matches"][0]["path"], ".ssh/id_rsa");
+
+        // A broad walk over the project root still skips the sensitive subtree.
+        let broad = search_text(
+            &json!({ "pattern": "PRIVATE", "includeIgnored": true }),
+            &ws,
+            &StdFileSystem::new(),
+            "tc",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            broad.data["count"], 0,
+            "a broad walk must not vacuum up sensitive entries: {}",
+            broad.model_text
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

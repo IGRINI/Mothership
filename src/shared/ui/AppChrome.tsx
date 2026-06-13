@@ -3,6 +3,7 @@ import {
   ArrowDown,
   ArrowUp,
   Search,
+  Settings,
   Minus,
   Square,
   X,
@@ -10,7 +11,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import { appearance, PALETTE_OPTIONS } from "../appearance";
+import { AgentStatusPill } from "./AgentStatusPill";
 
 // Resolve the Tauri window lazily and only inside the Tauri runtime. Calling
 // getCurrentWindow() at module load reads window.__TAURI_INTERNALS__.metadata,
@@ -56,6 +57,7 @@ declare global {
 
 interface AppChromeProps {
   children: JSX.Element;
+  onOpenSettings?: () => void;
 }
 
 export function AppChrome(props: AppChromeProps) {
@@ -86,7 +88,7 @@ export function AppChrome(props: AppChromeProps) {
           onQueryChange={search.setQuery}
         />
       </Show>
-      <StatusBar />
+      <StatusBar onOpenSettings={props.onOpenSettings} />
     </div>
   );
 }
@@ -487,22 +489,23 @@ function WindowControlButton(props: WindowControlButtonProps) {
   );
 }
 
-function StatusBar() {
+function StatusBar(props: { onOpenSettings?: () => void }) {
   return (
     <footer class="app-statusbar">
       <div class="app-statusbar__group">
-        <span class="status-pill">
-          {PALETTE_OPTIONS.find((option) => option.id === appearance().palette)
-            ?.label ?? "Aurora"}
-        </span>
-        <span>main</span>
-        <span>No issues</span>
+        <span class="status-profile">Local Profile</span>
+        <button
+          class="status-iconbutton"
+          type="button"
+          title="Settings"
+          aria-label="Settings"
+          onClick={() => props.onOpenSettings?.()}
+        >
+          <Settings size={14} />
+        </button>
       </div>
       <div class="app-statusbar__group">
-        <span>UTF-8</span>
-        <span>LF</span>
-        <span>TypeScript</span>
-        <span class="status-pill status-pill--online">Agent Online</span>
+        <AgentStatusPill />
       </div>
     </footer>
   );

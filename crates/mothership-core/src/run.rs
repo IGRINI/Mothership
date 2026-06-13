@@ -4,12 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use mothership_adapter_host::protocol::{PromptBundle, PromptSection, RuntimeContext};
+use mothership_adapter_host::protocol::{PromptBundle, RuntimeContext, ToolDescriptor};
 
+use crate::adapter_pool::{with_adapter_use_observer, AdapterKillHandle};
 use crate::agentic::AgenticLoopPolicy;
 use crate::auth::FileCredentialVault;
 use crate::chat::{
-    ChatCancellationToken, ChatRunEvent, ChatRunEventKind, ChatRunEventSink, SendChatMessageResult,
+    ActiveRunSummary, ChatCancellationToken, ChatRunEvent, ChatRunEventKind, ChatRunEventSink,
+    SendChatMessageResult,
 };
 use crate::connectors::{ensure_adapter_can_run_chat, find_trusted_adapter_entry};
 use crate::llm::{
@@ -17,7 +19,10 @@ use crate::llm::{
     LlmChatRoundRequest, LlmToolCallHandler, LlmToolCallRequest, LlmToolCallResponse,
     LlmTransportKind, ProviderRequestPipeline, ProviderRuntimeKind,
 };
-use crate::prompt::runtime_prompt_bundle_for;
+use crate::prompt::{
+    append_personalization_sections, prompt_preview_for_bundle, runtime_prompt_bundle_for,
+    PromptPreview,
+};
 use crate::provider_runtime::ProviderRuntimeManager;
 use crate::tools::{default_tool_catalog, CatalogPin};
 use crate::{Database, MothershipError, Result};
@@ -40,6 +45,13 @@ struct ChatRunRegistryState {
 struct ActiveChatRun {
     provider_id: String,
     cancellation: ChatCancellationToken,
+    /// Kill handle for the adapter process serving the run's current round,
+    /// present only while a round is in flight. This is the *actual* process —
+    /// resident or ephemeral — so the cancel fallback never has to guess.
+    kill_handle: Option<AdapterKillHandle>,
+    /// Display snapshot served by `list_active_runs`, so a client connecting
+    /// mid-run can show agent activity without re-deriving chat/project names.
+    summary: ActiveRunSummary,
 }
 
 impl ChatRunRegistry {
@@ -52,7 +64,7 @@ impl ChatRunRegistry {
     fn register(
         &self,
         run_id: &str,
-        provider_id: String,
+        summary: ActiveRunSummary,
         cancellation: ChatCancellationToken,
     ) -> bool {
         let mut state = self.inner.lock().unwrap();
@@ -63,11 +75,38 @@ impl ChatRunRegistry {
         state.active.insert(
             run_id.to_string(),
             ActiveChatRun {
-                provider_id,
+                provider_id: summary.provider_id.clone(),
                 cancellation,
+                kill_handle: None,
+                summary,
             },
         );
         already_cancelled
+    }
+
+    /// Snapshot of every in-flight run, for `list_active_runs`. Order is
+    /// unspecified; clients sort for display.
+    pub fn snapshot(&self) -> Vec<ActiveRunSummary> {
+        let state = self.inner.lock().unwrap();
+        state.active.values().map(|run| run.summary.clone()).collect()
+    }
+
+    /// Records the adapter process currently serving `run_id`'s round.
+    fn note_adapter_use(&self, run_id: &str, handle: AdapterKillHandle) {
+        let mut state = self.inner.lock().unwrap();
+        if let Some(run) = state.active.get_mut(run_id) {
+            run.kill_handle = Some(handle);
+        }
+    }
+
+    /// Drops the recorded adapter process once a round finishes: a resident
+    /// may immediately serve other runs, so it must no longer be a kill target
+    /// for this one.
+    fn clear_adapter_use(&self, run_id: &str) {
+        let mut state = self.inner.lock().unwrap();
+        if let Some(run) = state.active.get_mut(run_id) {
+            run.kill_handle = None;
+        }
     }
 
     /// Marks a run cancelled. If it is active, returns its provider id so the
@@ -84,13 +123,17 @@ impl ChatRunRegistry {
         None
     }
 
-    pub fn active_cancelled_provider(&self, run_id: &str) -> Option<String> {
+    /// The kill handle of the adapter process serving `run_id`, if that run is
+    /// still active and has been cancelled. `None` means the run already
+    /// finished, was never cancelled, or is not currently inside an adapter
+    /// round — in all of which cases there is nothing safe to kill.
+    fn cancelled_kill_target(&self, run_id: &str) -> Option<AdapterKillHandle> {
         let state = self.inner.lock().unwrap();
-        state.active.get(run_id).and_then(|run| {
-            run.cancellation
-                .is_cancelled()
-                .then(|| run.provider_id.clone())
-        })
+        state
+            .active
+            .get(run_id)
+            .filter(|run| run.cancellation.is_cancelled())
+            .and_then(|run| run.kill_handle.clone())
     }
 
     fn finish(&self, run_id: &str) {
@@ -98,6 +141,14 @@ impl ChatRunRegistry {
         state.active.remove(run_id);
         state.pending_cancelled.remove(run_id);
     }
+}
+
+/// Wall-clock unix milliseconds, for `ActiveRunSummary.started_at_ms`.
+fn unix_timestamp_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 /// Orchestrates a single streaming chat run inside Core.
@@ -111,6 +162,7 @@ pub struct ChatRunService<'a> {
     database: &'a Database,
     providers: Arc<ProviderRuntimeManager>,
     tool_handler: Option<Arc<dyn LlmToolCallHandler>>,
+    extra_tools: Vec<ToolDescriptor>,
     provider_pipeline: ProviderRequestPipeline,
 }
 
@@ -120,12 +172,18 @@ impl<'a> ChatRunService<'a> {
             database,
             providers,
             tool_handler: None,
+            extra_tools: Vec::new(),
             provider_pipeline: ProviderRequestPipeline::default(),
         }
     }
 
     pub fn with_tool_handler(mut self, handler: Arc<dyn LlmToolCallHandler>) -> Self {
         self.tool_handler = Some(handler);
+        self
+    }
+
+    pub fn with_extra_tools(mut self, tools: Vec<ToolDescriptor>) -> Self {
+        self.extra_tools = tools;
         self
     }
 
@@ -230,8 +288,21 @@ impl<'a> ChatRunService<'a> {
         let project = database.chat_project(&run.chat.id)?;
 
         let cancellation = ChatCancellationToken::default();
-        let already_cancelled =
-            registry.register(&run.run_id, provider_id.clone(), cancellation.clone());
+        let already_cancelled = registry.register(
+            &run.run_id,
+            ActiveRunSummary {
+                run_id: run.run_id.clone(),
+                chat_id: run.chat.id.clone(),
+                chat_title: run.chat.title.clone(),
+                project_id: project.as_ref().map(|project| project.id.clone()),
+                project_name: project.as_ref().map(|project| project.name.clone()),
+                message_id: run.assistant_message.id.clone(),
+                provider_id: provider_id.clone(),
+                model_id: model_id.clone(),
+                started_at_ms: unix_timestamp_ms(),
+            },
+            cancellation.clone(),
+        );
         if already_cancelled {
             schedule_cancel_fallback(
                 Arc::clone(&self.providers),
@@ -255,14 +326,18 @@ impl<'a> ChatRunService<'a> {
         let tools = self
             .tool_handler
             .as_ref()
-            .map(|_| default_tool_catalog())
+            .map(|_| {
+                let mut tools = default_tool_catalog();
+                tools.extend(self.extra_tools.clone());
+                tools
+            })
             .unwrap_or_default();
         // Catalog stability: pin the catalog's canonical bytes for the process and
         // warn if they ever drift — a silent tool-definition change between
         // rebuilds poisons the provider's prefix cache. When MCP/dynamic tools are
         // merged into `tools`, this check should run on the merged set (the
         // MCP-byte-pin attaches here).
-        if !tools.is_empty() {
+        if !tools.is_empty() && self.extra_tools.is_empty() {
             static CATALOG_PIN: std::sync::OnceLock<CatalogPin> = std::sync::OnceLock::new();
             if let Err(drift) = CATALOG_PIN
                 .get_or_init(|| CatalogPin::pin(&tools))
@@ -274,12 +349,12 @@ impl<'a> ChatRunService<'a> {
         // Compose the prompt: Core's locked base/project sections, then the
         // user's personalization (global → provider → model) appended after them.
         // Look up by provider/model BEFORE they're moved into the request.
-        let mut prompt = runtime_prompt_bundle_for(project.as_ref(), runtime_kind);
-        append_personalization_sections(
-            &mut prompt,
-            database
-                .personalization_for(&provider_id, &model_id)
-                .unwrap_or_default(),
+        let prompt = compose_runtime_prompt(
+            database,
+            project.as_ref(),
+            runtime_kind,
+            &provider_id,
+            &model_id,
         );
         let request = self.provider_pipeline.apply(LlmChatCompletionRequest {
             provider_id,
@@ -294,10 +369,18 @@ impl<'a> ChatRunService<'a> {
 
         match runtime_kind {
             ProviderRuntimeKind::CoreManaged => {
-                self.complete_agentic_loop(entry, vault, request, &cancellation, &mut llm_sink)?;
+                self.complete_agentic_loop(
+                    &registry,
+                    entry,
+                    vault,
+                    request,
+                    &cancellation,
+                    &mut llm_sink,
+                )?;
             }
             ProviderRuntimeKind::SelfManaged => {
                 self.complete_self_managed_agent(
+                    &registry,
                     entry,
                     vault,
                     request,
@@ -324,6 +407,7 @@ impl<'a> ChatRunService<'a> {
 
     fn complete_agentic_loop(
         &self,
+        registry: &Arc<ChatRunRegistry>,
         entry: mothership_adapter_host::AdapterEntry,
         vault: FileCredentialVault,
         request: LlmChatCompletionRequest,
@@ -331,18 +415,21 @@ impl<'a> ChatRunService<'a> {
         sink: &mut DbForwardingSink<'_>,
     ) -> Result<()> {
         let policy = AgenticLoopPolicy::default();
+        let run_id = sink.run_id;
         let mut round_request = LlmChatRoundRequest::from_completion(request.clone());
 
         for _ in 0..policy.max_rounds() {
-            let round = self.providers.complete_subprocess_round(
-                entry.clone(),
-                vault.clone(),
-                Some(sink.run_id.to_string()),
-                round_request,
-                None,
-                cancellation,
-                sink,
-            )?;
+            let round = track_round_adapter(registry, run_id, || {
+                self.providers.complete_subprocess_round(
+                    entry.clone(),
+                    vault.clone(),
+                    Some(run_id.to_string()),
+                    round_request,
+                    None,
+                    cancellation,
+                    sink,
+                )
+            })?;
             sink.flush();
 
             if cancellation.is_cancelled() {
@@ -375,15 +462,17 @@ impl<'a> ChatRunService<'a> {
             false,
         );
 
-        match self.providers.complete_subprocess_round(
-            entry,
-            vault,
-            Some(sink.run_id.to_string()),
-            final_request,
-            None,
-            cancellation,
-            sink,
-        ) {
+        match track_round_adapter(registry, run_id, || {
+            self.providers.complete_subprocess_round(
+                entry,
+                vault,
+                Some(run_id.to_string()),
+                final_request,
+                None,
+                cancellation,
+                sink,
+            )
+        }) {
             Ok(round) if round.tool_calls.is_empty() && !round.text.trim().is_empty() => Ok(()),
             Ok(_) | Err(_) => {
                 sink.delta(policy.fallback_message());
@@ -394,6 +483,7 @@ impl<'a> ChatRunService<'a> {
 
     fn complete_self_managed_agent(
         &self,
+        registry: &Arc<ChatRunRegistry>,
         entry: mothership_adapter_host::AdapterEntry,
         vault: FileCredentialVault,
         request: LlmChatCompletionRequest,
@@ -401,20 +491,23 @@ impl<'a> ChatRunService<'a> {
         sink: &mut DbForwardingSink<'_>,
     ) -> Result<()> {
         let provider_id = request.provider_id.clone();
+        let run_id = sink.run_id;
         let mut round_request = LlmChatRoundRequest::from_completion(request);
         round_request.state = self
             .database
             .chat_provider_state(sink.chat_id, &provider_id)?;
 
-        let round = self.providers.complete_subprocess_round(
-            entry,
-            vault,
-            Some(sink.run_id.to_string()),
-            round_request,
-            self.tool_handler.clone(),
-            cancellation,
-            sink,
-        )?;
+        let round = track_round_adapter(registry, run_id, || {
+            self.providers.complete_subprocess_round(
+                entry,
+                vault,
+                Some(run_id.to_string()),
+                round_request,
+                self.tool_handler.clone(),
+                cancellation,
+                sink,
+            )
+        })?;
         sink.flush();
 
         if !round.tool_calls.is_empty() {
@@ -466,20 +559,64 @@ impl<'a> ChatRunService<'a> {
     }
 }
 
-/// Append the user's personalization instructions as prompt sections after
-/// Core's locked base sections (priority 100+), so the provider renders them
-/// last — appended to, never overriding, the product prompt. Verbatim: each
-/// scope (global/provider/model) becomes its own section in broad→specific order.
-fn append_personalization_sections(prompt: &mut PromptBundle, instructions: Vec<(String, String)>) {
-    for (index, (scope, content)) in instructions.into_iter().enumerate() {
-        prompt.sections.push(PromptSection {
-            id: format!("user.{scope}"),
-            source: "user".to_string(),
-            priority: 100 + index as i32,
-            locked: false,
-            content,
-        });
+pub fn chat_prompt_preview(database: &Database, chat_id: &str) -> Result<PromptPreview> {
+    let conversation = database.get_chat(chat_id, 1)?;
+    let selected = database.selected_llm_model()?;
+    let (provider_id, model_id) = match (
+        conversation.chat.provider_id.as_deref(),
+        conversation.chat.model_id.as_deref(),
+    ) {
+        (Some(provider_id), Some(model_id))
+            if !provider_id.trim().is_empty() && !model_id.trim().is_empty() =>
+        {
+            (provider_id.to_string(), model_id.to_string())
+        }
+        _ => (selected.provider_id, selected.model_id),
+    };
+    if model_id.trim().is_empty() {
+        return Err(MothershipError::InvalidRequest(
+            "no LLM model selected; install a provider adapter and choose a model first"
+                .to_string(),
+        ));
     }
+
+    let entry = find_trusted_adapter_entry(&plugins_store_path(database), &provider_id)?;
+    let runtime_kind =
+        ensure_adapter_can_run_chat(&entry).map_err(MothershipError::InvalidRequest)?;
+    let project = database.chat_project(chat_id)?;
+    let prompt = compose_runtime_prompt(
+        database,
+        project.as_ref(),
+        runtime_kind,
+        &provider_id,
+        &model_id,
+    );
+
+    Ok(prompt_preview_for_bundle(
+        chat_id.to_string(),
+        provider_id,
+        model_id,
+        runtime_kind,
+        project.as_ref(),
+        prompt,
+    ))
+}
+
+fn compose_runtime_prompt(
+    database: &Database,
+    project: Option<&crate::ProjectSummary>,
+    runtime_kind: ProviderRuntimeKind,
+    provider_id: &str,
+    model_id: &str,
+) -> PromptBundle {
+    let mut prompt = runtime_prompt_bundle_for(project, runtime_kind);
+    append_personalization_sections(
+        &mut prompt,
+        database
+            .personalization_for(provider_id, model_id)
+            .unwrap_or_default(),
+    );
+    prompt
 }
 
 fn runtime_context_for(project: Option<&crate::ProjectSummary>) -> RuntimeContext {
@@ -514,22 +651,53 @@ fn next_round_request(
     }
 }
 
+/// Schedules the process-level fallback for a cancelled run: if cooperative
+/// cancellation hasn't ended the run within the grace period, kill the adapter
+/// process actually serving it — the resident (evicting it from the pool) or
+/// the run's own ephemeral spawn — never another run's healthy adapter.
+///
+/// `_providers` / `_provider_id` are kept for caller compatibility; targeting
+/// now flows through the registry's per-run kill handle instead of blanket
+/// provider eviction.
 pub fn schedule_cancel_fallback(
-    providers: Arc<ProviderRuntimeManager>,
+    _providers: Arc<ProviderRuntimeManager>,
     registry: Arc<ChatRunRegistry>,
     run_id: String,
-    provider_id: String,
+    _provider_id: String,
 ) {
     thread::spawn(move || {
         thread::sleep(CHAT_CANCEL_PROCESS_GRACE);
-        if registry.active_cancelled_provider(&run_id).as_deref() == Some(provider_id.as_str()) {
-            providers.force_evict(&provider_id);
+        if let Some(handle) = registry.cancelled_kill_target(&run_id) {
+            handle.kill();
         }
     });
 }
 
+/// Runs one provider round with kill-handle tracking: the adapter process the
+/// pool serves the round on is recorded in the registry for the cancel
+/// fallback, and cleared again as soon as the round returns (a freed resident
+/// may immediately serve other runs).
+fn track_round_adapter<T>(
+    registry: &Arc<ChatRunRegistry>,
+    run_id: &str,
+    round: impl FnOnce() -> T,
+) -> T {
+    let observer_registry = Arc::clone(registry);
+    let observer_run_id = run_id.to_string();
+    let result = with_adapter_use_observer(
+        move |handle| observer_registry.note_adapter_use(&observer_run_id, handle),
+        round,
+    );
+    registry.clear_adapter_use(run_id);
+    result
+}
+
 /// Bridges the LLM gateway's streaming callbacks to durable database state and
-/// the run event sink.
+/// the run event sink. Both consumers are COALESCED on the same cadence
+/// (`CHAT_DELTA_FLUSH_BYTES` / `CHAT_DELTA_FLUSH_INTERVAL`): a fast model
+/// otherwise produces one full sidecar→host→webview hop per token, which is
+/// pure fan-out overhead — the UI animates the reveal client-side, so it only
+/// needs the text in batches.
 struct DbForwardingSink<'a> {
     database: &'a Database,
     run_id: &'a str,
@@ -537,6 +705,7 @@ struct DbForwardingSink<'a> {
     assistant_message_id: &'a str,
     sink: &'a mut dyn ChatRunEventSink,
     pending_delta: String,
+    pending_event_delta: String,
     last_flush: Instant,
 }
 
@@ -555,6 +724,7 @@ impl<'a> DbForwardingSink<'a> {
             assistant_message_id,
             sink,
             pending_delta: String::new(),
+            pending_event_delta: String::new(),
             last_flush: Instant::now(),
         }
     }
@@ -564,16 +734,46 @@ impl<'a> DbForwardingSink<'a> {
     }
 
     fn flush(&mut self) {
+        // UI first: the visible stream must never lag behind the DB write, and
+        // a failed write must not swallow text the user should see.
+        if !self.pending_event_delta.is_empty() {
+            let delta = std::mem::take(&mut self.pending_event_delta);
+            self.sink.emit(ChatRunEvent {
+                run_id: self.run_id.to_string(),
+                chat_id: self.chat_id.to_string(),
+                message_id: self.assistant_message_id.to_string(),
+                kind: ChatRunEventKind::Delta,
+                delta: Some(delta),
+                message: None,
+                chat: None,
+                transport: None,
+                tool_call_id: None,
+                removed_message_ids: Vec::new(),
+                error: None,
+            });
+        }
         if self.pending_delta.is_empty() {
             return;
         }
         let delta = std::mem::take(&mut self.pending_delta);
-        if self
-            .database
-            .append_chat_run_delta(self.run_id, self.chat_id, self.assistant_message_id, &delta)
-            .is_ok()
-        {
-            self.last_flush = Instant::now();
+        match self.database.append_chat_run_delta(
+            self.run_id,
+            self.chat_id,
+            self.assistant_message_id,
+            &delta,
+        ) {
+            Ok(()) => {
+                self.last_flush = Instant::now();
+            }
+            Err(error) => {
+                // The terminal complete/fail write persists the full message, so
+                // a dropped intermediate flush self-heals — but never silently.
+                eprintln!(
+                    "chat run {}: failed to persist streamed delta ({} bytes): {error}",
+                    self.run_id,
+                    delta.len()
+                );
+            }
         }
     }
 }
@@ -595,19 +795,7 @@ impl LlmChatCompletionEventSink for DbForwardingSink<'_> {
             return;
         }
         self.pending_delta.push_str(delta);
-        self.sink.emit(ChatRunEvent {
-            run_id: self.run_id.to_string(),
-            chat_id: self.chat_id.to_string(),
-            message_id: self.assistant_message_id.to_string(),
-            kind: ChatRunEventKind::Delta,
-            delta: Some(delta.to_string()),
-            message: None,
-            chat: None,
-            transport: None,
-            tool_call_id: None,
-            removed_message_ids: Vec::new(),
-            error: None,
-        });
+        self.pending_event_delta.push_str(delta);
         if self.pending_delta.len() >= CHAT_DELTA_FLUSH_BYTES
             || self.last_flush.elapsed() >= CHAT_DELTA_FLUSH_INTERVAL
         {
@@ -756,6 +944,66 @@ mod tests {
             removed_message_ids: Vec::new(),
             context: Default::default(),
         }
+    }
+
+    fn test_summary(run_id: &str, provider_id: &str) -> ActiveRunSummary {
+        ActiveRunSummary {
+            run_id: run_id.to_string(),
+            chat_id: "chat_1".to_string(),
+            chat_title: "Test chat".to_string(),
+            project_id: Some("project_1".to_string()),
+            project_name: Some("Test project".to_string()),
+            message_id: "message_1".to_string(),
+            provider_id: provider_id.to_string(),
+            model_id: "model_a".to_string(),
+            started_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn cancel_fallback_targets_the_recorded_adapter_process() {
+        let registry = ChatRunRegistry::new();
+        let token = ChatCancellationToken::default();
+        registry.register("run_1", test_summary("run_1", "provider_a"), token.clone());
+        registry.note_adapter_use("run_1", AdapterKillHandle::ephemeral_for_tests(4242));
+
+        // Not cancelled yet: nothing to kill.
+        assert!(registry.cancelled_kill_target("run_1").is_none());
+
+        assert_eq!(registry.cancel("run_1").as_deref(), Some("provider_a"));
+        let target = registry
+            .cancelled_kill_target("run_1")
+            .expect("cancelled active run with a round in flight has a target");
+        assert_eq!(target.pid(), 4242);
+
+        // Round finished: the process may serve other runs — no longer a target.
+        registry.clear_adapter_use("run_1");
+        assert!(registry.cancelled_kill_target("run_1").is_none());
+
+        // Finished runs are never targets.
+        registry.note_adapter_use("run_1", AdapterKillHandle::ephemeral_for_tests(4243));
+        registry.finish("run_1");
+        assert!(registry.cancelled_kill_target("run_1").is_none());
+    }
+
+    #[test]
+    fn snapshot_lists_runs_until_finished() {
+        let registry = ChatRunRegistry::new();
+        assert!(registry.snapshot().is_empty());
+
+        registry.register(
+            "run_1",
+            test_summary("run_1", "provider_a"),
+            ChatCancellationToken::default(),
+        );
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].run_id, "run_1");
+        assert_eq!(snapshot[0].chat_title, "Test chat");
+        assert_eq!(snapshot[0].project_name.as_deref(), Some("Test project"));
+
+        registry.finish("run_1");
+        assert!(registry.snapshot().is_empty());
     }
 
     #[test]

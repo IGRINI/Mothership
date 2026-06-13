@@ -7,10 +7,12 @@
 //! clients consume them directly — mirroring the rest of [`crate::ipc`].
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// What happened to a single file inside a change set. Serialized as the single
 /// letters the UI contract uses (`A`/`M`/`D`/`R`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub enum ChangeOp {
     #[serde(rename = "A")]
     Added,
@@ -44,8 +46,9 @@ impl ChangeOp {
 }
 
 /// Lifecycle status of a change set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ChangeSetStatus {
     /// The change is applied and present in the workspace.
     Active,
@@ -83,8 +86,9 @@ impl ChangeSetStatus {
 }
 
 /// Why a single file could not be reverted/restored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ConflictReason {
     /// The file on disk no longer matches the state the agent produced — the
     /// user (or another process) edited it after the change. Reverting would
@@ -138,8 +142,11 @@ impl RevertStatus {
 }
 
 /// Per-file summary as seen by clients (the expanded change-set view).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// `optional_fields`: the `Option<_>` members mirror the hand-written TS `?:`
+// shape (and the change-journal preview builds partial summaries). TS-only.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, optional_fields = nullable)]
 pub struct ChangeFileSummary {
     pub id: String,
     pub path: String,
@@ -153,8 +160,9 @@ pub struct ChangeFileSummary {
 
 /// A change-set summary (collapsed headline + expanded file list) for clients.
 /// This is what the Dashboard renders — never reconstructed from tool output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, optional_fields = nullable)]
 pub struct ChangeSetSummary {
     pub id: String,
     pub status: ChangeSetStatus,
@@ -173,8 +181,9 @@ pub struct ChangeSetSummary {
 }
 
 /// A lazily-loaded window of a single file's unified diff.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ChangeFileDiff {
     pub change_file_id: String,
     pub path: String,
@@ -196,8 +205,9 @@ pub struct ChangeFileDiff {
 }
 
 /// A single conflict surfaced by a refused revert/restore.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, optional_fields = nullable)]
 pub struct ChangeConflict {
     pub path: String,
     pub reason: ConflictReason,
@@ -208,8 +218,9 @@ pub struct ChangeConflict {
 
 /// The outcome of a revert command: the updated change-set summary plus any
 /// conflicts. When `reverted` is false the workspace was left untouched.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct RevertOutcome {
     pub change_set: ChangeSetSummary,
     pub conflicts: Vec<ChangeConflict>,
@@ -217,8 +228,9 @@ pub struct RevertOutcome {
 }
 
 /// Kinds of change-set lifecycle event pushed to subscribed clients.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ChangeSetEventKind {
     Created,
     Updated,
@@ -229,8 +241,9 @@ pub enum ChangeSetEventKind {
 
 /// A streamed change-set update carrying the full summary so clients can render
 /// without a follow-up query.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ChangeSetEvent {
     pub kind: ChangeSetEventKind,
     pub summary: ChangeSetSummary,

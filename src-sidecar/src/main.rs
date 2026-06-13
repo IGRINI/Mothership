@@ -16,6 +16,7 @@
 
 use std::fs;
 use std::io::{BufRead, Read, Write};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -26,7 +27,8 @@ use mothership_core::ipc::{
     ClientFrame, CoreError, CoreEvent, CoreRequest, CoreResponse, ServerFrame, PROTOCOL_VERSION,
 };
 use mothership_core::{
-    default_credential_guard, redact_event, schedule_cancel_fallback,
+    audio_transcribe_tool_descriptor, chat_prompt_preview, default_credential_guard,
+    image_generate_tool_descriptor, redact_event, schedule_cancel_fallback,
     trusted_built_in_adapter_sha256, AdapterPool, AuthProcessRegistry, ChangeEventSink,
     ChangeRecorder, ChangeSetEvent, ChangeSetEventKind, ChangesService, ChatRunCancellationResult,
     ChatRunEvent, ChatRunEventSink, ChatRunRegistry, ChatRunService, ChatUpdatedEvent,
@@ -34,10 +36,11 @@ use mothership_core::{
     FileToolOutputStore, LlmToolCallHandler, PendingToolApprovalGate, ProviderRuntimeManager,
     RedactingOutputStore, RevertOutcome, SendChatMessageResult, SnapshotBlobStore, StdFileSystem,
     ToolApprovalAnswer, ToolApprovalDecision, ToolApprovalMode, ToolApprovalModeStore,
-    ToolCancellationToken, ToolExecutionAccepted, ToolExecutionCancellationResult,
-    ToolExecutionEvent, ToolExecutionEventSink, ToolExecutionRegistry, ToolExecutionRequest,
-    ToolPolicyStore, ToolRepeatGuard, ToolResourceLimits, ToolSupervisor,
-    UserAwareCommandPermissionPolicy, Workspace,
+    ToolCancellationToken, ToolDescriptor, ToolExecutionAccepted, ToolExecutionCancellationResult,
+    ToolExecutionEvent, ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRegistry,
+    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolKind, ToolPolicyStore,
+    ToolRepeatGuard, ToolResourceLimits, ToolSupervisor, UserAwareCommandPermissionPolicy,
+    Workspace,
 };
 use sha2::{Digest, Sha256};
 
@@ -61,6 +64,7 @@ const BUILT_IN_ADAPTERS: &[BuiltInAdapter] = &[
             "settings.read",
             "auth.interactive",
             "auth.logout",
+            "media.image.generate",
             "network",
             "browser.open",
             "localhost.listen",
@@ -76,6 +80,7 @@ const BUILT_IN_ADAPTERS: &[BuiltInAdapter] = &[
             "llm.chat",
             "settings.read",
             "settings.write",
+            "media.image.generate",
             "network",
         ],
     },
@@ -95,6 +100,9 @@ const BUILT_IN_ADAPTERS: &[BuiltInAdapter] = &[
         ],
     },
 ];
+
+const FEATURE_IMAGE_GENERATE: &str = "media.image.generate";
+const FEATURE_AUDIO_TRANSCRIBE: &str = "audio.transcribe";
 
 /// Frames queued for the writer thread, which alone owns stdout.
 type Outbox = mpsc::Sender<ServerFrame>;
@@ -167,6 +175,12 @@ fn serve() -> anyhow::Result<()> {
     // Permissions screen.
     let tool_policy = ToolPolicyStore::new(database.tool_policy_settings().unwrap_or_default());
     let tool_repeat_guard = Arc::new(ToolRepeatGuard::default());
+    let app_data_root = db_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let artifacts_root = app_data_root.join("artifacts");
+    let tmp_root = app_data_root.join("tmp");
     // Shared output store: the supervisor uses it to spill command output, and
     // the file-tool runner reuses it to spill oversized read_file content.
     let tool_output_store: Option<Arc<dyn mothership_core::ToolOutputStore>> =
@@ -174,8 +188,10 @@ fn serve() -> anyhow::Result<()> {
             // Credential firewall: durable spilled blobs (command output, file-tool
             // diffs/reads/search results) are redacted on the way to disk, so the
             // full content behind a logRef never leaks a secret — not just previews.
-            let base = Arc::new(FileToolOutputStore::new(parent.join("tool-logs")))
-                as Arc<dyn mothership_core::ToolOutputStore>;
+            let base = Arc::new(
+                FileToolOutputStore::new(artifacts_root.clone())
+                    .with_legacy_root(parent.join("tool-logs")),
+            ) as Arc<dyn mothership_core::ToolOutputStore>;
             Arc::new(RedactingOutputStore::new(
                 base,
                 Arc::new(mothership_core::PatternCredentialGuard::new()),
@@ -245,25 +261,35 @@ fn serve() -> anyhow::Result<()> {
                 let change_blob_store = Arc::clone(&change_blob_store);
                 let tool_approval_mode = Arc::clone(&tool_approval_mode);
                 let tool_policy = Arc::clone(&tool_policy);
+                let artifacts_root = artifacts_root.clone();
+                let tmp_root = tmp_root.clone();
                 thread::spawn(move || {
-                    handle_request(
-                        id,
-                        request,
-                        database,
-                        outbox,
-                        auth_registry,
-                        connector_manager,
-                        provider_manager,
-                        tool_supervisor,
-                        tool_approvals,
-                        tool_output_store,
-                        tool_registry,
-                        async_runtime,
-                        chat_registry,
-                        change_blob_store,
-                        tool_approval_mode,
-                        tool_policy,
-                    )
+                    // Panic isolation: a panicking handler must answer its
+                    // request id (with a structured error) instead of dying
+                    // silently and leaving the client waiting forever.
+                    let panic_outbox = outbox.clone();
+                    handle_request_isolated(id, &panic_outbox, move || {
+                        handle_request(
+                            id,
+                            request,
+                            database,
+                            outbox,
+                            auth_registry,
+                            connector_manager,
+                            provider_manager,
+                            tool_supervisor,
+                            tool_approvals,
+                            tool_output_store,
+                            tool_registry,
+                            async_runtime,
+                            chat_registry,
+                            change_blob_store,
+                            tool_approval_mode,
+                            tool_policy,
+                            artifacts_root,
+                            tmp_root,
+                        )
+                    });
                 });
             }
             ClientFrame::Shutdown => break,
@@ -394,6 +420,22 @@ fn file_sha256_hex(path: &Path) -> anyhow::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn app_data_path_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "item".to_string()
+    } else {
+        out
+    }
+}
+
 /// Reads frames until an `Initialize` arrives, returning its database path.
 /// Returns `Ok(None)` if stdin closes (or `Shutdown` arrives) first.
 fn wait_for_initialize(input: &mut impl BufRead) -> anyhow::Result<Option<std::path::PathBuf>> {
@@ -428,6 +470,38 @@ fn write_frames(frames: mpsc::Receiver<ServerFrame>) {
     }
 }
 
+/// Run one request handler body with panic isolation: a panic is contained,
+/// logged to stderr, and answered as a structured `internal_panic` error frame
+/// for `id`, so the requesting client is never left waiting forever and the
+/// serve loop keeps going. The outbox (and the writer thread that owns stdout)
+/// stays fully usable afterwards.
+fn handle_request_isolated(id: u64, outbox: &Outbox, body: impl FnOnce()) {
+    if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(body)) {
+        let message = panic_message(panic.as_ref());
+        eprintln!("sidecar: request {id} handler panicked: {message}");
+        let _ = outbox.send(ServerFrame::Error {
+            id,
+            error: CoreError::new(
+                "internal_panic",
+                format!("internal error: the request handler panicked: {message}"),
+                false,
+            ),
+        });
+    }
+}
+
+/// Best-effort extraction of a panic payload's message (`&str` and `String`
+/// cover `panic!` / `unwrap` / `expect`; anything else is reported as opaque).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 /// Dispatches one request to the matching Core service and writes its terminal
 /// `Response`/`Error`. `SendChatMessage` is special: it answers immediately with
 /// the persisted placeholder, then streams the run as `Event::ChatRun`s.
@@ -448,6 +522,8 @@ fn handle_request(
     change_blob_store: Arc<dyn SnapshotBlobStore>,
     tool_approval_mode: Arc<ToolApprovalModeStore>,
     tool_policy: Arc<ToolPolicyStore>,
+    artifacts_root: PathBuf,
+    tmp_root: PathBuf,
 ) {
     // Streaming requests answer immediately with the persisted placeholder, then
     // stream the run; handle them before the uniform request/response path.
@@ -471,6 +547,7 @@ fn handle_request(
             started,
             database,
             outbox,
+            Arc::clone(&connector_manager),
             provider_manager,
             tool_supervisor,
             tool_approvals,
@@ -481,6 +558,8 @@ fn handle_request(
             change_blob_store,
             Arc::clone(&tool_approval_mode),
             Arc::clone(&tool_policy),
+            artifacts_root.clone(),
+            tmp_root.clone(),
         );
         return;
     }
@@ -496,6 +575,7 @@ fn handle_request(
             started,
             database,
             outbox,
+            Arc::clone(&connector_manager),
             provider_manager,
             tool_supervisor,
             tool_approvals,
@@ -506,6 +586,8 @@ fn handle_request(
             change_blob_store,
             Arc::clone(&tool_approval_mode),
             Arc::clone(&tool_policy),
+            artifacts_root.clone(),
+            tmp_root.clone(),
         );
         return;
     }
@@ -516,6 +598,7 @@ fn handle_request(
             started,
             database,
             outbox,
+            Arc::clone(&connector_manager),
             provider_manager,
             tool_supervisor,
             tool_approvals,
@@ -526,6 +609,8 @@ fn handle_request(
             change_blob_store,
             Arc::clone(&tool_approval_mode),
             Arc::clone(&tool_policy),
+            artifacts_root.clone(),
+            tmp_root.clone(),
         );
         return;
     }
@@ -536,6 +621,7 @@ fn handle_request(
             started,
             database,
             outbox,
+            Arc::clone(&connector_manager),
             provider_manager,
             tool_supervisor,
             tool_approvals,
@@ -546,6 +632,8 @@ fn handle_request(
             change_blob_store,
             Arc::clone(&tool_approval_mode),
             Arc::clone(&tool_policy),
+            artifacts_root.clone(),
+            tmp_root.clone(),
         );
         return;
     }
@@ -665,6 +753,9 @@ fn compute(
         CoreRequest::GetChat { chat_id, limit } => response(CoreResponse::Chat(
             database.get_chat(&chat_id, limit.unwrap_or(200))?,
         )),
+        CoreRequest::GetPromptPreview { chat_id } => response(CoreResponse::PromptPreview(
+            chat_prompt_preview(database, &chat_id)?,
+        )),
         CoreRequest::BranchChatFromMessage {
             chat_id,
             message_id,
@@ -687,6 +778,70 @@ fn compute(
                 },
             ))
         }
+        CoreRequest::ListActiveRuns => {
+            response(CoreResponse::ActiveRuns(chat_registry.snapshot()))
+        }
+        CoreRequest::RenameChat { chat_id, title } => {
+            let chat = database.rename_chat(&chat_id, &title)?;
+            RequestOutcome {
+                response: CoreResponse::ChatSummary(chat.clone()),
+                event: Some(CoreEvent::ChatUpdated(ChatUpdatedEvent { chat })),
+                connector_refresh: None,
+            }
+        }
+        CoreRequest::DeleteChat { chat_id } => {
+            // Stop any in-flight run first — its events/persistence must not
+            // race the row deletion (and the agent pill drops it via the
+            // cancellation event).
+            for run in chat_registry.snapshot() {
+                if run.chat_id == chat_id {
+                    if let Some(provider_id) = chat_registry.cancel(&run.run_id) {
+                        schedule_cancel_fallback(
+                            Arc::clone(provider_manager),
+                            Arc::clone(chat_registry),
+                            run.run_id.clone(),
+                            provider_id,
+                        );
+                    }
+                }
+            }
+            database.delete_chat(&chat_id)?;
+            response(CoreResponse::Ack)
+        }
+        CoreRequest::RenameProject { project_id, name } => {
+            response(CoreResponse::ProjectSnapshot(
+                database.rename_project(&project_id, &name)?,
+            ))
+        }
+        CoreRequest::DeleteProject { project_id } => {
+            // Deleting the project deletes its chats — stop their runs first.
+            for run in chat_registry.snapshot() {
+                if run.project_id.as_deref() == Some(project_id.as_str()) {
+                    if let Some(provider_id) = chat_registry.cancel(&run.run_id) {
+                        schedule_cancel_fallback(
+                            Arc::clone(provider_manager),
+                            Arc::clone(chat_registry),
+                            run.run_id.clone(),
+                            provider_id,
+                        );
+                    }
+                }
+            }
+            response(CoreResponse::ProjectSnapshot(
+                database.delete_project(&project_id)?,
+            ))
+        }
+        CoreRequest::SetProjectAppearance {
+            project_id,
+            icon,
+            icon_color,
+        } => response(CoreResponse::ProjectSnapshot(
+            database.set_project_appearance(
+                &project_id,
+                icon.as_deref(),
+                icon_color.as_deref(),
+            )?,
+        )),
         CoreRequest::ApproveToolExecution {
             tool_call_id,
             approved,
@@ -714,16 +869,6 @@ fn compute(
                 },
             ))
         }
-        CoreRequest::GetToolApprovalMode => {
-            response(CoreResponse::ToolApprovalMode(tool_approval_mode.mode()))
-        }
-        CoreRequest::SetToolApprovalMode { mode } => {
-            let mode = tool_approval_mode.set_mode(mode);
-            if mode == ToolApprovalMode::Yolo {
-                tool_approvals.decide_all(ToolApprovalDecision::Approved);
-            }
-            response(CoreResponse::ToolApprovalMode(mode))
-        }
         CoreRequest::GetPersonalization => response(CoreResponse::Personalization(
             database.personalization_settings()?,
         )),
@@ -734,6 +879,12 @@ fn compute(
         } => response(CoreResponse::Personalization(
             database.set_personalization(provider_id.as_deref(), model_id.as_deref(), &content)?,
         )),
+        CoreRequest::GetChangeJournalRetention => response(CoreResponse::ChangeJournalRetention(
+            database.change_journal_retention()?,
+        )),
+        CoreRequest::SetChangeJournalRetention { value } => response(
+            CoreResponse::ChangeJournalRetention(database.set_change_journal_retention(value)?),
+        ),
         CoreRequest::GetToolPolicy => response(CoreResponse::ToolPolicy(tool_policy.settings())),
         CoreRequest::SetToolPolicy { settings } => {
             // Update the live store first (sanitizing), then persist exactly the
@@ -762,6 +913,16 @@ fn compute(
             connector_manager.set_provider_enabled(&provider_id, enabled)?,
             None,
         ),
+        CoreRequest::SetFeatureRoute {
+            feature,
+            provider_id,
+            model_id,
+            options,
+        } => connector_settings_changed(
+            ConnectorSettingsEventKind::ProviderUpdated,
+            connector_manager.set_feature_route(&feature, &provider_id, &model_id, options)?,
+            None,
+        ),
         CoreRequest::SetChatModel {
             chat_id,
             provider_id,
@@ -783,13 +944,24 @@ fn compute(
             reasoning,
             fast_mode,
             draft,
-        } => response(CoreResponse::ChatSummary(database.set_chat_state(
-            &chat_id,
-            approval_mode.as_deref(),
-            reasoning.as_deref(),
-            fast_mode,
-            draft.as_deref(),
-        )?)),
+        } => {
+            let chat = database.set_chat_state(
+                &chat_id,
+                approval_mode.as_deref(),
+                reasoning.as_deref(),
+                fast_mode,
+                draft.as_deref(),
+            )?;
+            // Live-propagate the saved mode to this chat's in-flight run (if
+            // any), scoped to THIS chat only — concurrent runs in other chats
+            // keep their own gating. Idle chats are not registered; their next
+            // run seeds from the value just persisted.
+            tool_approval_mode.update_chat_mode(
+                &chat_id,
+                parse_chat_approval_mode(chat.approval_mode.as_deref()),
+            );
+            response(CoreResponse::ChatSummary(chat))
+        }
         CoreRequest::SaveAdapterSettings {
             provider_id,
             values,
@@ -918,16 +1090,64 @@ fn run_tool_command(
     // worker. A spawn failure or non-zero exit surfaces as the orchestrator's own
     // terminal event — no hand-rolled failure path here.
     std::thread::spawn(move || {
-        tool_runtime::run_command_via_orchestrator(
-            request,
-            cancellation,
-            tool_supervisor,
-            tool_approvals,
-            async_runtime,
-            sink,
-        );
+        // Panic isolation: the protocol reply (Accepted) already went out, so a
+        // panicking orchestrator would otherwise leave the call registered
+        // forever with clients watching a tool that never terminates.
+        let panic_sink = Arc::clone(&sink);
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(move || {
+            tool_runtime::run_command_via_orchestrator(
+                request,
+                cancellation,
+                tool_supervisor,
+                tool_approvals,
+                async_runtime,
+                sink,
+            );
+        }));
+        if let Err(panic) = outcome {
+            let message = panic_message(panic.as_ref());
+            eprintln!("sidecar: run_command orchestrator panicked for {tool_call_id}: {message}");
+            panic_sink.emit(failed_tool_event(
+                &tool_call_id,
+                format!("internal error: tool execution panicked: {message}"),
+            ));
+        }
         tool_registry.finish(&tool_call_id);
     });
+}
+
+/// A synthetic terminal `Failed` event for a tool call whose worker died
+/// abnormally, so clients tracking the call see it end instead of hanging.
+fn failed_tool_event(tool_call_id: &str, message: String) -> ToolExecutionEvent {
+    ToolExecutionEvent {
+        tool_call_id: tool_call_id.to_string(),
+        run_id: None,
+        project_id: None,
+        command: None,
+        kind: ToolExecutionEventKind::Failed,
+        stream: None,
+        chunk: None,
+        message: Some(message.clone()),
+        result: Some(ToolExecutionResult {
+            tool_call_id: tool_call_id.to_string(),
+            status: ToolExecutionStatus::Failed,
+            exit_code: None,
+            stdout_preview: String::new(),
+            stderr_preview: String::new(),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            truncated_for_display: false,
+            truncated_for_agent: false,
+            log_ref: None,
+            message: Some(message),
+        }),
+        tool_kind: Some(ToolKind::RunCommand),
+        payload: None,
+        touched_paths: Vec::new(),
+        artifacts: Vec::new(),
+    }
 }
 
 fn response(response: CoreResponse) -> RequestOutcome {
@@ -991,6 +1211,64 @@ fn parse_chat_approval_mode(value: Option<&str>) -> ToolApprovalMode {
     }
 }
 
+fn routed_service_tools(
+    connector_manager: &ConnectorManager,
+    database: &Database,
+) -> Vec<ToolDescriptor> {
+    let routes = database.feature_routes().unwrap_or_default();
+    let image_routes = routes
+        .iter()
+        .filter(|route| route.feature == FEATURE_IMAGE_GENERATE)
+        .collect::<Vec<_>>();
+    let audio_routes = routes
+        .iter()
+        .filter(|route| route.feature == FEATURE_AUDIO_TRANSCRIBE)
+        .collect::<Vec<_>>();
+    if image_routes.is_empty() && audio_routes.is_empty() {
+        return Vec::new();
+    }
+
+    for route in image_routes.iter().chain(audio_routes.iter()) {
+        connector_manager.refresh_provider(&route.provider_id, |_| {});
+    }
+    let Ok(snapshot) = connector_manager.snapshot() else {
+        return Vec::new();
+    };
+
+    let service_available = |feature: &str, provider_id: &str, model_id: &str| {
+        snapshot
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .filter(|provider| provider.enabled && provider.authenticated)
+            .and_then(|provider| {
+                provider
+                    .services
+                    .iter()
+                    .find(|service| service.feature == feature)
+            })
+            .is_some_and(|service| service.models.iter().any(|model| model.id == model_id))
+    };
+
+    let mut tools = Vec::new();
+    if image_routes
+        .iter()
+        .any(|route| service_available(FEATURE_IMAGE_GENERATE, &route.provider_id, &route.model_id))
+    {
+        tools.push(image_generate_tool_descriptor());
+    }
+    if audio_routes.iter().any(|route| {
+        service_available(
+            FEATURE_AUDIO_TRANSCRIBE,
+            &route.provider_id,
+            &route.model_id,
+        )
+    }) {
+        tools.push(audio_transcribe_tool_descriptor());
+    }
+    tools
+}
+
 /// The streaming path: given the begun run (a fresh send or a retry), answer the
 /// request with the persisted placeholder, then drive the completion, forwarding
 /// every run event. A failure to even begin the run is a terminal error reply.
@@ -999,6 +1277,7 @@ fn run_chat_message(
     started: mothership_core::Result<SendChatMessageResult>,
     database: Database,
     outbox: Outbox,
+    connector_manager: Arc<ConnectorManager>,
     provider_manager: Arc<ProviderRuntimeManager>,
     tool_supervisor: Arc<ToolSupervisor>,
     tool_approvals: Arc<PendingToolApprovalGate>,
@@ -1009,16 +1288,41 @@ fn run_chat_message(
     change_blob_store: Arc<dyn SnapshotBlobStore>,
     tool_approval_mode: Arc<ToolApprovalModeStore>,
     tool_policy: Arc<ToolPolicyStore>,
+    artifacts_root: PathBuf,
+    tmp_root: PathBuf,
 ) {
     match started {
         Ok(started) => {
             let project = database.chat_project(&started.chat.id).ok().flatten();
-            // Per-chat approval mode: seed the runtime store from this chat's
-            // saved setting so the run honors the chat's mode (the UI shows and
-            // edits approval mode per chat now, not as one global toggle).
-            tool_approval_mode.set_mode(parse_chat_approval_mode(
-                started.chat.approval_mode.as_deref(),
-            ));
+            let run_tmp_root = tmp_root
+                .join("runs")
+                .join(app_data_path_component(&started.run_id));
+            let scoped_artifact_root = Some(if let Some(project) = project.as_ref() {
+                artifacts_root
+                    .join("projects")
+                    .join(app_data_path_component(&project.id))
+                    .join("chats")
+                    .join(app_data_path_component(&started.chat.id))
+            } else {
+                artifacts_root
+                    .join("chats")
+                    .join(app_data_path_component(&started.chat.id))
+            });
+            let _ = std::fs::create_dir_all(&run_tmp_root);
+            if let Some(root) = &scoped_artifact_root {
+                let _ = std::fs::create_dir_all(root);
+            }
+            let extra_tools = routed_service_tools(&connector_manager, &database);
+            // Per-chat approval mode: register this run under ITS chat's saved
+            // setting. Tool decisions for the run look up the chat's entry in
+            // the shared store, so a concurrent run in another chat (e.g. one
+            // set to yolo) can never loosen this chat's gating. The guard
+            // releases the entry when the run reaches a terminal state (also
+            // on unwind), keeping the store bounded by in-flight runs.
+            let _approval_mode_run = tool_approval_mode.begin_run(
+                &started.chat.id,
+                parse_chat_approval_mode(started.chat.approval_mode.as_deref()),
+            );
             let _ = outbox.send(ServerFrame::Response {
                 id,
                 result: CoreResponse::ChatMessageStarted(started.clone()),
@@ -1052,15 +1356,20 @@ fn run_chat_message(
                     async_runtime,
                     tool_sink,
                     project.map(|project| (project.id, PathBuf::from(project.path))),
+                    Some(started.chat.id.clone()),
                     tool_approvals,
                     tool_output_store,
                     change_recorder,
                     tool_approval_mode,
                     tool_policy,
+                    Arc::clone(&connector_manager),
+                    scoped_artifact_root,
+                    Some(run_tmp_root),
                 ));
             let mut sink = ProtocolChatRunSink { outbox };
             ChatRunService::new(&database, provider_manager)
                 .with_tool_handler(tool_handler)
+                .with_extra_tools(extra_tools)
                 .run(&started, chat_registry, &mut sink);
         }
         Err(error) => {
@@ -1226,4 +1535,82 @@ fn revert_change_set(
         .map_err(|error| CoreError::new("workspace_unavailable", error.to_string(), false))?;
     let fs = StdFileSystem::new();
     Ok(service.revert(change_set_id, &workspace, &fs)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panicking_request_handler_answers_with_internal_panic_error() {
+        let (outbox, frames) = mpsc::channel::<ServerFrame>();
+
+        handle_request_isolated(7, &outbox, || panic!("boom"));
+
+        match frames
+            .try_recv()
+            .expect("an error frame for the request id")
+        {
+            ServerFrame::Error { id, error } => {
+                assert_eq!(id, 7);
+                assert_eq!(error.code, "internal_panic");
+                assert!(!error.retryable);
+                assert!(error.message.contains("boom"), "got: {}", error.message);
+            }
+            other => panic!("expected an Error frame, got {other:?}"),
+        }
+
+        // The outbox must remain usable from the catch path onwards.
+        outbox
+            .send(ServerFrame::Ready)
+            .expect("outbox stays usable after a contained panic");
+        assert!(matches!(frames.try_recv(), Ok(ServerFrame::Ready)));
+    }
+
+    #[test]
+    fn successful_request_handler_emits_no_panic_frame() {
+        let (outbox, frames) = mpsc::channel::<ServerFrame>();
+        handle_request_isolated(8, &outbox, || {});
+        assert!(frames.try_recv().is_err());
+    }
+
+    #[test]
+    fn contained_panic_does_not_poison_the_approval_mode_store() {
+        let (outbox, _frames) = mpsc::channel::<ServerFrame>();
+        let store = ToolApprovalModeStore::new(ToolApprovalMode::Manual);
+
+        let store_for_handler = Arc::clone(&store);
+        handle_request_isolated(9, &outbox, move || {
+            let _guard = store_for_handler.begin_run("chat_panic", ToolApprovalMode::Yolo);
+            panic!("worker died mid-run");
+        });
+
+        // The unwound run released its chat entry, and the store still works.
+        assert_eq!(
+            store.mode_for_chat(Some("chat_panic")),
+            ToolApprovalMode::Manual
+        );
+        let _run = store.begin_run("chat_after", ToolApprovalMode::AutoSafe);
+        assert_eq!(
+            store.mode_for_chat(Some("chat_after")),
+            ToolApprovalMode::AutoSafe
+        );
+    }
+
+    #[test]
+    fn parse_chat_approval_mode_defaults_to_manual() {
+        assert_eq!(parse_chat_approval_mode(None), ToolApprovalMode::Manual);
+        assert_eq!(
+            parse_chat_approval_mode(Some("bogus")),
+            ToolApprovalMode::Manual
+        );
+        assert_eq!(
+            parse_chat_approval_mode(Some("auto_safe")),
+            ToolApprovalMode::AutoSafe
+        );
+        assert_eq!(
+            parse_chat_approval_mode(Some("yolo")),
+            ToolApprovalMode::Yolo
+        );
+    }
 }

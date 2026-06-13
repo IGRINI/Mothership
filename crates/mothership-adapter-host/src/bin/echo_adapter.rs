@@ -59,6 +59,13 @@ fn main() -> anyhow::Result<()> {
                     }],
                 },
             )?,
+            Request::GetServices { id } => emit(
+                &mut stdout,
+                &Outbound::Services {
+                    id,
+                    services: Vec::new(),
+                },
+            )?,
             Request::GetSettingsSchema { id } => emit(
                 &mut stdout,
                 &Outbound::SettingsSchema {
@@ -154,6 +161,20 @@ fn main() -> anyhow::Result<()> {
             }
             Request::ChatCancel { id } => emit(&mut stdout, &Outbound::Ack { id })?,
             Request::ToolResult { id, .. } => emit(&mut stdout, &Outbound::Ack { id })?,
+            Request::GenerateImage { id, .. } => emit(
+                &mut stdout,
+                &Outbound::Error {
+                    id,
+                    message: "image generation is not supported by echo adapter".to_string(),
+                },
+            )?,
+            Request::TranscribeAudio { id, .. } => emit(
+                &mut stdout,
+                &Outbound::Error {
+                    id,
+                    message: "audio transcription is not supported by echo adapter".to_string(),
+                },
+            )?,
             Request::Logout { id } => emit(&mut stdout, &Outbound::Ack { id })?,
         }
     }

@@ -1,19 +1,23 @@
 //! Credential firewall foundation.
 //!
-//! Mothership's standing invariant is that secrets must not leak to the model or
-//! into persisted/displayed history. Sensitive *paths* (`.env`, `.ssh`, key
-//! files, …) are already skipped/denied by the workspace policy. This module adds
-//! the second layer: detection + redaction of obvious secrets that appear in tool
-//! *output* — command stdout/stderr, diff previews, artifact previews, event
-//! messages — before they are persisted or shown.
+//! The guard's invariant is scoped to PERSISTED and DISPLAYED data: obvious
+//! secrets must not land in stored or rendered tool *output* — command
+//! stdout/stderr, diff previews, artifact previews, event messages. This module
+//! detects and redacts them at the event sink (the single chokepoint for
+//! everything stored and pushed to the UI).
 //!
-//! This is the foundation, applied at the event sink (the single chokepoint for
-//! everything stored and pushed to the UI). It deliberately does NOT yet redact
-//! the model-facing tool *result* text, because the model frequently needs to see
-//! real file contents to do its job (and known-secret files are already blocked
-//! by path policy). The [`CredentialGuard`] trait is the seam where a stricter,
-//! policy-driven model-visible redaction (and a full managed-gateway / proxy) can
-//! later attach.
+//! What reaches the MODEL is deliberately a different policy axis, owned by the
+//! approval flow rather than this guard: model-facing reads of secret material
+//! are an explicit, mode-gated capability the user controls via the per-chat
+//! approval mode. Sensitive *paths* (`.env`, `.ssh`, key files, …) are readable
+//! by the agent — freely in `yolo`/`auto_safe`, and only after an approval
+//! prompt in `manual` — while WRITES to them stay denied by the workspace path
+//! policy in every mode. The model frequently needs real file contents to do
+//! its job, so the guard never rewrites the model-facing tool *result* text; it
+//! redacts the copies that would otherwise persist in history or appear on
+//! screen. The [`CredentialGuard`] trait is the seam where a stricter,
+//! policy-driven model-visible redaction (and a full managed-gateway / proxy)
+//! can later attach.
 
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
@@ -24,7 +28,7 @@ use serde_json::Value;
 
 use crate::Result;
 
-use super::output::{ToolOutputStore, ToolOutputWriter};
+use super::output::{ToolOutputContext, ToolOutputStore, ToolOutputWriter};
 use super::types::{ToolArtifact, ToolExecutionEvent, ToolOutputStream};
 
 /// Redacts obvious secrets from text destined for storage or display.
@@ -268,6 +272,18 @@ impl RedactingOutputStore {
 impl ToolOutputStore for RedactingOutputStore {
     async fn open(&self, tool_call_id: &str) -> Result<Box<dyn ToolOutputWriter>> {
         let inner = self.inner.open(tool_call_id).await?;
+        Ok(Box::new(RedactingOutputWriter {
+            inner,
+            stdout: BoundedRedactor::new(Arc::clone(&self.guard)),
+            stderr: BoundedRedactor::new(Arc::clone(&self.guard)),
+        }))
+    }
+
+    async fn open_with_context(
+        &self,
+        context: ToolOutputContext,
+    ) -> Result<Box<dyn ToolOutputWriter>> {
+        let inner = self.inner.open_with_context(context).await?;
         Ok(Box::new(RedactingOutputWriter {
             inner,
             stdout: BoundedRedactor::new(Arc::clone(&self.guard)),

@@ -2,5 +2,13 @@
   "provider_id": "openrouter",
   "provider_label": "OpenRouter",
   "program": "openrouter-adapter.exe",
-  "icon": "icon.svg"
+  "icon": "icon.svg",
+  "capabilities": [
+    "llm.models",
+    "llm.chat",
+    "settings.read",
+    "settings.write",
+    "media.image.generate",
+    "network"
+  ]
 }

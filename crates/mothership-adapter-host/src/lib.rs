@@ -30,9 +30,10 @@ use sha2::{Digest, Sha256};
 pub use mothership_adapter_protocol as protocol;
 
 use protocol::{
-    AuthKind, AuthStatus, ChatMessage, Model, ModelManagement, Outbound, PromptBundle, Request,
-    RuntimeContext, SettingsField, ToolCallInvocation, ToolCallResponse, ToolCallResult,
-    ToolDescriptor,
+    AudioTranscriptionRequest, AudioTranscriptionResult, AuthKind, AuthStatus, ChatMessage,
+    ImageGenerationRequest, ImageGenerationResult, Model, ModelManagement, Outbound, PromptBundle,
+    ProviderService, Request, RuntimeContext, SettingsField, ToolCallInvocation, ToolCallResponse,
+    ToolCallResult, ToolDescriptor,
 };
 
 /// Handler the host registers to persist secrets an adapter pushes via the
@@ -181,6 +182,16 @@ impl Adapter {
         }
     }
 
+    /// Reads the adapter's non-chat service catalog (image generation, STT, etc.).
+    pub fn services(&mut self) -> Result<Vec<ProviderService>> {
+        let id = self.next_id();
+        self.send(&Request::GetServices { id })?;
+        match self.recv()? {
+            Outbound::Services { services, .. } => Ok(services),
+            other => bail!("unexpected reply to get_services: {other:?}"),
+        }
+    }
+
     /// Reads the settings fields the adapter wants the UI to render.
     pub fn settings_schema(&mut self) -> Result<Vec<SettingsField>> {
         let id = self.next_id();
@@ -247,6 +258,36 @@ impl Adapter {
         match self.recv()? {
             Outbound::Ack { id: got } if got == id => Ok(()),
             other => bail!("unexpected reply to logout: {other:?}"),
+        }
+    }
+
+    pub fn generate_image(
+        &mut self,
+        request: ImageGenerationRequest,
+    ) -> Result<ImageGenerationResult> {
+        let id = self.next_id();
+        self.send(&Request::GenerateImage { id, request })?;
+        match self.recv()? {
+            Outbound::ImageGenerated { id: got, result } if got == id => Ok(result),
+            Outbound::Error { id: got, message } if got == id => {
+                bail!("adapter image generation failed: {message}")
+            }
+            other => bail!("unexpected reply to generate_image: {other:?}"),
+        }
+    }
+
+    pub fn transcribe_audio(
+        &mut self,
+        request: AudioTranscriptionRequest,
+    ) -> Result<AudioTranscriptionResult> {
+        let id = self.next_id();
+        self.send(&Request::TranscribeAudio { id, request })?;
+        match self.recv()? {
+            Outbound::AudioTranscribed { id: got, result } if got == id => Ok(result),
+            Outbound::Error { id: got, message } if got == id => {
+                bail!("adapter audio transcription failed: {message}")
+            }
+            other => bail!("unexpected reply to transcribe_audio: {other:?}"),
         }
     }
 
@@ -453,7 +494,8 @@ pub struct AdapterRegistry {
 
 impl AdapterRegistry {
     /// Scans `dir` for `<name>/adapter.json` manifests. A missing directory is an
-    /// empty registry; malformed or unreadable manifests are skipped.
+    /// empty registry; malformed or unreadable manifests are skipped with a
+    /// diagnostic (folders without a manifest are silently ignored).
     pub fn scan(dir: &Path) -> Self {
         let mut entries = Vec::new();
         let mut diagnostics = Vec::new();
@@ -470,8 +512,20 @@ impl AdapterRegistry {
                     continue;
                 }
                 let manifest_path = folder.join("adapter.json");
-                let Ok(text) = std::fs::read_to_string(&manifest_path) else {
-                    continue;
+                let text = match std::fs::read_to_string(&manifest_path) {
+                    Ok(text) => text,
+                    // A folder without a manifest simply isn't an adapter.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        push_diagnostic(
+                            &mut diagnostics,
+                            &manifest_path,
+                            None,
+                            None,
+                            format!("unreadable adapter manifest: {error}"),
+                        );
+                        continue;
+                    }
                 };
                 let Ok(manifest) = serde_json::from_str::<ManifestFile>(&text) else {
                     push_diagnostic(

@@ -2,27 +2,20 @@ use std::collections::BTreeMap;
 
 use anyhow::Context as _;
 use mothership_adapter_sdk::http;
-use mothership_adapter_sdk::protocol::{
-    FastModeCapabilities, Model, ReasoningCapabilities, ReasoningEffort,
-};
-use mothership_adapter_sdk::reasoning::{
-    collect_effort_values, collect_nested_efforts, collect_parameter_names, dedupe_efforts,
-    value_signals_reasoning,
+use mothership_adapter_sdk::protocol::{FastModeCapabilities, Model, ReasoningCapabilities};
+use mothership_adapter_sdk::provider_metadata::{
+    harvest_reasoning_capabilities, ReasoningHarvestOptions, ReasoningMetadataFields,
 };
 use serde::Deserialize;
+
+// `parse_model_ids` now lives in the SDK (shared with the Claude adapter).
+// Re-export it so existing `crate::models::parse_model_ids` call sites resolve.
+pub(crate) use mothership_adapter_sdk::provider_metadata::parse_model_ids;
 use serde_json::Value;
 
 use crate::settings::{auth_headers, OpenRouterSettings, HTTP_CONNECT_TIMEOUT};
 
 pub(crate) const OPENROUTER_FAST_SERVICE_TIER: &str = "priority";
-
-pub(crate) fn parse_model_ids(spec: &str) -> Vec<String> {
-    spec.split(['\n', ','])
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
 
 pub(crate) fn models_from_user_list(
     ids: Vec<String>,
@@ -58,45 +51,87 @@ pub(crate) fn openrouter_fast_service_tier_for_model(
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct OpenRouterModelsResponse {
-    #[serde(default)]
-    data: Vec<OpenRouterModelMetadata>,
+struct OpenRouterModelEndpointResponse {
+    data: OpenRouterModelMetadata,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct OpenRouterModelMetadata {
-    id: String,
+    pub(crate) id: String,
     #[serde(default)]
-    canonical_slug: Option<String>,
+    pub(crate) canonical_slug: Option<String>,
     #[serde(default)]
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     #[serde(default)]
-    supported_parameters: Value,
+    pub(crate) architecture: Option<OpenRouterModelArchitecture>,
     #[serde(default)]
-    reasoning_efforts: Value,
+    pub(crate) supported_parameters: Value,
     #[serde(default)]
-    supported_reasoning_efforts: Value,
+    pub(crate) reasoning_efforts: Value,
     #[serde(default)]
-    effort_levels: Value,
+    pub(crate) supported_reasoning_efforts: Value,
     #[serde(default)]
-    supported_effort_levels: Value,
+    pub(crate) effort_levels: Value,
     #[serde(default)]
-    reasoning_levels: Value,
+    pub(crate) supported_effort_levels: Value,
     #[serde(default)]
-    supported_reasoning_levels: Value,
+    pub(crate) reasoning_levels: Value,
     #[serde(default)]
-    reasoning: Option<Value>,
+    pub(crate) supported_reasoning_levels: Value,
     #[serde(default)]
-    capabilities: Option<Value>,
+    pub(crate) reasoning: Option<Value>,
     #[serde(default)]
-    features: Option<Value>,
+    pub(crate) capabilities: Option<Value>,
+    #[serde(default)]
+    pub(crate) features: Option<Value>,
 }
 
-pub(crate) async fn fetch_model_metadata(
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct OpenRouterModelArchitecture {
+    #[serde(default)]
+    pub(crate) output_modalities: Vec<String>,
+    #[serde(default)]
+    pub(crate) modality: Option<String>,
+}
+
+pub(crate) async fn fetch_model_metadata_for_ids(
     client: &reqwest::Client,
     settings: &OpenRouterSettings,
-) -> anyhow::Result<BTreeMap<String, OpenRouterModelMetadata>> {
-    let url = format!("{}/models", settings.base_url().trim_end_matches('/'));
+    model_ids: &[String],
+) -> BTreeMap<String, OpenRouterModelMetadata> {
+    let mut indexed = BTreeMap::new();
+    for model_id in model_ids {
+        match fetch_model_endpoint_metadata(client, settings, model_id).await {
+            Ok(metadata) => {
+                indexed.insert(model_id.clone(), metadata.clone());
+                insert_model_metadata(&mut indexed, metadata);
+            }
+            Err(error) => {
+                eprintln!("openrouter-adapter: metadata refresh failed for {model_id}: {error:#}");
+            }
+        }
+    }
+    indexed
+}
+
+pub(crate) async fn fetch_model_endpoint_metadata(
+    client: &reqwest::Client,
+    settings: &OpenRouterSettings,
+    model_id: &str,
+) -> anyhow::Result<OpenRouterModelMetadata> {
+    let (author, slug) = model_id
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("OpenRouter model id `{model_id}` must be `author/slug`"))?;
+    let base_url = settings.base_url().trim_end_matches('/');
+    let url = format!("{base_url}/models/{author}/{slug}/endpoints");
+    fetch_model_endpoint(client, settings, &url).await
+}
+
+async fn fetch_model_endpoint(
+    client: &reqwest::Client,
+    settings: &OpenRouterSettings,
+    url: &str,
+) -> anyhow::Result<OpenRouterModelMetadata> {
     let mut request = client.get(url).timeout(HTTP_CONNECT_TIMEOUT);
     let api_key = settings.api_key();
     let headers = if api_key.is_empty() {
@@ -111,7 +146,7 @@ pub(crate) async fn fetch_model_metadata(
     let response = request
         .send()
         .await
-        .context("fetch OpenRouter model catalog")?;
+        .context("fetch OpenRouter model metadata")?;
     let response = http::ensure_success_redacted(
         response,
         http::DEFAULT_ERROR_BODY_TIMEOUT,
@@ -120,73 +155,76 @@ pub(crate) async fn fetch_model_metadata(
         &[api_key],
     )
     .await?;
-    let payload: OpenRouterModelsResponse = response
+    let payload: OpenRouterModelEndpointResponse = response
         .json()
         .await
-        .context("decode OpenRouter model catalog")?;
-    let mut indexed = BTreeMap::new();
-    for metadata in payload.data {
-        if let Some(canonical_slug) = metadata.canonical_slug.as_ref() {
-            indexed.insert(canonical_slug.clone(), metadata.clone());
-        }
-        indexed.insert(metadata.id.clone(), metadata);
+        .context("decode OpenRouter model metadata")?;
+    Ok(payload.data)
+}
+
+fn insert_model_metadata(
+    indexed: &mut BTreeMap<String, OpenRouterModelMetadata>,
+    metadata: OpenRouterModelMetadata,
+) {
+    if let Some(canonical_slug) = metadata.canonical_slug.as_ref() {
+        indexed.insert(canonical_slug.clone(), metadata.clone());
     }
-    Ok(indexed)
+    indexed.insert(metadata.id.clone(), metadata);
+}
+
+pub(crate) fn image_output_modalities(metadata: &OpenRouterModelMetadata) -> Vec<String> {
+    let output_modalities = metadata
+        .architecture
+        .as_ref()
+        .map(|architecture| architecture.output_modalities.as_slice())
+        .unwrap_or_default();
+    if output_modalities
+        .iter()
+        .any(|modality| modality.eq_ignore_ascii_case("text"))
+    {
+        vec!["image".to_string(), "text".to_string()]
+    } else {
+        vec!["image".to_string()]
+    }
+}
+
+pub(crate) fn supports_image_output(metadata: &OpenRouterModelMetadata) -> bool {
+    metadata.architecture.as_ref().is_some_and(|architecture| {
+        architecture
+            .output_modalities
+            .iter()
+            .any(|modality| modality.eq_ignore_ascii_case("image"))
+            || architecture
+                .modality
+                .as_deref()
+                .map(|modality| modality.to_ascii_lowercase().contains("->image"))
+                .unwrap_or(false)
+    })
 }
 
 fn openrouter_reasoning_capabilities(
     metadata: &OpenRouterModelMetadata,
 ) -> Option<ReasoningCapabilities> {
-    let mut efforts = Vec::new();
-    collect_effort_values(&metadata.reasoning_efforts, &mut efforts);
-    collect_effort_values(&metadata.supported_reasoning_efforts, &mut efforts);
-    collect_effort_values(&metadata.effort_levels, &mut efforts);
-    collect_effort_values(&metadata.supported_effort_levels, &mut efforts);
-    collect_effort_values(&metadata.reasoning_levels, &mut efforts);
-    collect_effort_values(&metadata.supported_reasoning_levels, &mut efforts);
-    if let Some(reasoning) = &metadata.reasoning {
-        collect_nested_efforts(reasoning, &mut efforts);
-    }
-
-    let parameters = collect_parameter_names(&metadata.supported_parameters);
-    let has_reasoning = parameters.contains("reasoning");
-    let has_reasoning_effort = parameters.contains("reasoning_effort");
-    let has_include_reasoning = parameters.contains("include_reasoning");
-    let has_reasoning_flag = metadata
-        .reasoning
-        .as_ref()
-        .map(value_signals_reasoning)
-        .unwrap_or(false)
-        || metadata
-            .capabilities
-            .as_ref()
-            .map(value_signals_reasoning)
-            .unwrap_or(false)
-        || metadata
-            .features
-            .as_ref()
-            .map(value_signals_reasoning)
-            .unwrap_or(false);
-    if !(has_reasoning
-        || has_reasoning_effort
-        || has_include_reasoning
-        || has_reasoning_flag
-        || !efforts.is_empty())
-    {
-        return None;
-    }
-
-    if efforts.is_empty() && (has_reasoning || has_reasoning_effort) {
-        efforts.extend(ReasoningEffort::openai_responses_values());
-    }
-    dedupe_efforts(&mut efforts);
-
-    Some(ReasoningCapabilities::from_efforts(
-        efforts,
-        has_reasoning,
-        has_reasoning || has_include_reasoning,
-        false,
-    ))
+    harvest_reasoning_capabilities(
+        ReasoningMetadataFields {
+            supported_parameters: &metadata.supported_parameters,
+            reasoning_efforts: &metadata.reasoning_efforts,
+            supported_reasoning_efforts: &metadata.supported_reasoning_efforts,
+            effort_levels: &metadata.effort_levels,
+            supported_effort_levels: &metadata.supported_effort_levels,
+            reasoning_levels: &metadata.reasoning_levels,
+            supported_reasoning_levels: &metadata.supported_reasoning_levels,
+            reasoning: metadata.reasoning.as_ref(),
+            capabilities: metadata.capabilities.as_ref(),
+            features: metadata.features.as_ref(),
+        },
+        ReasoningHarvestOptions {
+            // OpenRouter exposes `include_reasoning` (reasoning exclusion) but
+            // does not surface a reasoning summary.
+            include_reasoning_parameter: true,
+            detect_summary: false,
+        },
+    )
 }
 
 fn openrouter_fast_mode_capabilities(
@@ -229,6 +267,7 @@ fn openrouter_model_supports_fast_mode(model_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mothership_adapter_sdk::protocol::ReasoningEffort;
     use serde_json::json;
 
     #[test]
@@ -237,6 +276,7 @@ mod tests {
             id: "openai/gpt-test".to_string(),
             canonical_slug: Some("openai/gpt-test".to_string()),
             name: Some("GPT Test".to_string()),
+            architecture: None,
             supported_parameters: json!(["temperature", "reasoning", "reasoning_effort"]),
             reasoning_efforts: Value::Null,
             supported_reasoning_efforts: Value::Null,
@@ -270,6 +310,7 @@ mod tests {
             id: "anthropic/claude-test".to_string(),
             canonical_slug: None,
             name: None,
+            architecture: None,
             supported_parameters: json!(["reasoning"]),
             reasoning_efforts: Value::Null,
             supported_reasoning_efforts: Value::Null,
@@ -310,6 +351,7 @@ mod tests {
             id: "openai/gpt-5.5".to_string(),
             canonical_slug: Some("openai/gpt-5.5".to_string()),
             name: Some("GPT-5.5".to_string()),
+            architecture: None,
             supported_parameters: Value::Null,
             reasoning_efforts: Value::Null,
             supported_reasoning_efforts: Value::Null,

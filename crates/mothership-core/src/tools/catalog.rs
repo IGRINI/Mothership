@@ -26,6 +26,11 @@ pub const LIST_FILES_TOOL_NAME: &str = "list_files";
 pub const SEARCH_TEXT_TOOL_ID: &str = "core.search_text";
 pub const SEARCH_TEXT_TOOL_NAME: &str = "search_text";
 
+pub const IMAGE_GENERATE_TOOL_ID: &str = "core.image_generate";
+pub const IMAGE_GENERATE_TOOL_NAME: &str = "image_generate";
+pub const AUDIO_TRANSCRIBE_TOOL_ID: &str = "core.audio_transcribe";
+pub const AUDIO_TRANSCRIBE_TOOL_NAME: &str = "audio_transcribe";
+
 pub fn default_tool_catalog() -> Vec<ToolDescriptor> {
     vec![
         run_command_tool_descriptor(),
@@ -36,6 +41,58 @@ pub fn default_tool_catalog() -> Vec<ToolDescriptor> {
         list_files_tool_descriptor(),
         search_text_tool_descriptor(),
     ]
+}
+
+pub fn image_generate_tool_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        id: IMAGE_GENERATE_TOOL_ID.to_string(),
+        name: IMAGE_GENERATE_TOOL_NAME.to_string(),
+        description: "Generate an image through the image generation provider selected in Mothership settings. Returns artifact paths and metadata; never returns inline base64.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Image prompt to send to the selected image generation provider."
+                },
+                "options": {
+                    "type": "object",
+                    "description": "Optional provider-supported options for this request, such as size, quality, style, or number of images.",
+                    "additionalProperties": true
+                }
+            },
+            "required": ["prompt"],
+            "additionalProperties": false
+        }),
+        strict: false,
+        annotations: BTreeMap::new(),
+    }
+}
+
+pub fn audio_transcribe_tool_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        id: AUDIO_TRANSCRIBE_TOOL_ID.to_string(),
+        name: AUDIO_TRANSCRIBE_TOOL_NAME.to_string(),
+        description: "Transcribe an audio file through the STT provider selected in Mothership settings. The input path must be inside the project, current artifact root, or current tmp root.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "inputPath": {
+                    "type": "string",
+                    "description": "Project-relative path, or absolute path inside the current project/artifact/tmp scope."
+                },
+                "options": {
+                    "type": "object",
+                    "description": "Optional provider-supported transcription options for this request.",
+                    "additionalProperties": true
+                }
+            },
+            "required": ["inputPath"],
+            "additionalProperties": false
+        }),
+        strict: false,
+        annotations: BTreeMap::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------

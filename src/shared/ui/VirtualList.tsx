@@ -1,5 +1,9 @@
 import { createEffect, createMemo, For, JSX, onCleanup, Show } from "solid-js";
-import { createVirtualizer, type Virtualizer } from "@tanstack/solid-virtual";
+import {
+  createVirtualizer,
+  type VirtualItem,
+  type Virtualizer,
+} from "@tanstack/solid-virtual";
 
 type VirtualListKey = string | number | bigint;
 type VirtualListScrollBehavior = "auto" | "smooth" | "instant";
@@ -21,10 +25,16 @@ export interface VirtualListProps<TItem> {
   children: (item: TItem, index: number) => JSX.Element;
 }
 
+// How long (ms) scroll events after our own follow-scroll are attributed to the
+// follow movement instead of the user. Within this window a scroll event may
+// confirm the pin but never break it — the user's wheel gets its own listener.
+const PROGRAMMATIC_SCROLL_WINDOW_MS = 150;
+
 export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
   let scrollElement: HTMLDivElement | undefined;
   let pinnedToEnd = true;
   let followEndFrame = 0;
+  let programmaticScrollUntil = 0;
 
   onCleanup(() => {
     cancelAnimationFrame(followEndFrame);
@@ -40,18 +50,24 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
   // `getItemKey` lets us keep identity stable: an incoming item that is
   // shallow-equal to the one previously rendered under the same key is swapped for
   // its previous reference. <For> then reuses the existing DOM for every unchanged
-  // row and only (re)builds the rows whose content really changed (e.g. the single
-  // message currently streaming). Without a key we fall back to the raw items.
+  // row and only (re)builds the rows whose content really changed. When EVERY item
+  // swaps stable (the common streaming case: rows read live state through by-id
+  // maps and the items themselves are unchanged), the previous ARRAY is returned
+  // so the memo doesn't notify at all and no row work happens.
   let previousByKey = new Map<VirtualListKey, TItem>();
+  let previousItems: readonly TItem[] | undefined;
   const stableItems = createMemo<readonly TItem[]>(() => {
     const getKey = props.getItemKey;
     const items = props.items;
     if (!getKey) {
       previousByKey = new Map();
+      previousItems = items;
       return items;
     }
 
     const nextByKey = new Map<VirtualListKey, TItem>();
+    let unchanged =
+      previousItems !== undefined && previousItems.length === items.length;
     const result = items.map((item, index) => {
       const key = getKey(item, index);
       const previous = previousByKey.get(key);
@@ -60,9 +76,16 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
           ? previous
           : item;
       nextByKey.set(key, stable);
+      if (unchanged && previousItems![index] !== stable) {
+        unchanged = false;
+      }
       return stable;
     });
     previousByKey = nextByKey;
+    if (unchanged) {
+      return previousItems!;
+    }
+    previousItems = result;
     return result;
   });
 
@@ -74,7 +97,47 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
     return props.stickToEnd === true ? "auto" : props.stickToEnd;
   };
 
-  const endThreshold = () => props.stickToEndThreshold ?? 1;
+  const endThreshold = () => props.stickToEndThreshold ?? 24;
+
+  // Pin/unpin is driven by USER intent only:
+  //  - a wheel-up (or scroll that lands away from the end outside the
+  //    programmatic window) unpins immediately — the follow loop stops fighting
+  //    the user, which is exactly the "yanks me back down" failure mode;
+  //  - scrolling back to within the threshold of the end re-pins.
+  // Scroll events caused by our own follow-scroll fall inside the programmatic
+  // window and may only confirm the pin, never flip it.
+  const handleWheel = (event: WheelEvent) => {
+    if (!props.stickToEnd) {
+      return;
+    }
+    if (event.deltaY < 0) {
+      pinnedToEnd = false;
+      cancelAnimationFrame(followEndFrame);
+      followEndFrame = 0;
+    }
+  };
+
+  const handleScroll = () => {
+    if (!scrollElement) {
+      return;
+    }
+    resetHorizontalScroll(scrollElement);
+    if (!props.stickToEnd) {
+      pinnedToEnd = false;
+      return;
+    }
+
+    const distance = distanceFromEnd(scrollElement);
+    if (performance.now() <= programmaticScrollUntil) {
+      if (distance <= endThreshold()) {
+        // Our follow-scroll landed at the end; leave the window early so the
+        // user's next gesture is attributed to them.
+        programmaticScrollUntil = 0;
+      }
+      return;
+    }
+    pinnedToEnd = distance <= endThreshold();
+  };
 
   const updatePinnedToEnd = () => {
     if (!props.stickToEnd || !scrollElement) {
@@ -104,8 +167,9 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
         return;
       }
 
+      programmaticScrollUntil =
+        performance.now() + PROGRAMMATIC_SCROLL_WINDOW_MS;
       instance.scrollToEnd({ behavior: followOnAppend() || "auto" });
-      pinnedToEnd = true;
     });
   };
 
@@ -138,11 +202,13 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
     get anchorTo() {
       return props.stickToEnd ? "end" : "start";
     },
-    get followOnAppend() {
-      return followOnAppend();
-    },
+    // The follow behavior is owned entirely by schedulePinnedEndScroll above:
+    // TanStack's own append-follow is disabled so exactly ONE mechanism moves
+    // the scroll position (two competing followers caused the bottom "yank"
+    // while the user scrolled up during streaming).
+    followOnAppend: false,
     get scrollEndThreshold() {
-      return props.stickToEndThreshold ?? 1;
+      return endThreshold();
     },
     onChange: (instance) => {
       schedulePinnedEndScroll(instance);
@@ -151,15 +217,60 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
   });
 
   createEffect(() => {
+    const mode = props.adjustScrollOnItemResize;
+    // Default ("smart"): while the user reads history (unpinned), resizing rows
+    // above the viewport must not shift what they're looking at; while pinned
+    // to the end the follow loop owns the position and adjustment would fight
+    // it. `true` forces TanStack's default-on behavior, `false` forces off.
     virtualizer.shouldAdjustScrollPositionOnItemSizeChange =
-      props.adjustScrollOnItemResize === false ? () => false : undefined;
+      mode === false
+        ? () => false
+        : mode === true
+          ? undefined
+          : () => !pinnedToEnd;
   });
 
-  const virtualItems = createMemo(() => virtualizer.getVirtualItems());
-  const windowOffset = createMemo(() => virtualItems()[0]?.start ?? 0);
+  // TanStack rebuilds VirtualItem objects whenever ANY measurement changes —
+  // during streaming the growing row gets a fresh object every delta, which
+  // would make <For> tear down and remount that row (and its markdown) per
+  // token. Swap each incoming VirtualItem for the previous object with the same
+  // key+index: rows only care about key/index (offsets are read separately
+  // below), so identity survives pure size changes and <For> keeps the DOM.
+  let previousRowsByKey = new Map<VirtualListKey, VirtualItem>();
+  let previousRows: VirtualItem[] | undefined;
+  const rowVirtualItems = createMemo<VirtualItem[]>(() => {
+    const incoming = virtualizer.getVirtualItems();
+    const nextByKey = new Map<VirtualListKey, VirtualItem>();
+    let unchanged =
+      previousRows !== undefined && previousRows.length === incoming.length;
+    const rows = incoming.map((virtualItem, position) => {
+      const key = virtualItem.key as VirtualListKey;
+      const previous = previousRowsByKey.get(key);
+      const stable =
+        previous !== undefined && previous.index === virtualItem.index
+          ? previous
+          : virtualItem;
+      nextByKey.set(key, stable);
+      if (unchanged && previousRows![position] !== stable) {
+        unchanged = false;
+      }
+      return stable;
+    });
+    previousRowsByKey = nextByKey;
+    if (unchanged) {
+      return previousRows!;
+    }
+    previousRows = rows;
+    return rows;
+  });
+
+  // Offsets are intentionally read from the LIVE virtual items (not the stable
+  // wrappers), so the window keeps translating while row identity stays fixed.
+  const windowOffset = createMemo(
+    () => virtualizer.getVirtualItems()[0]?.start ?? 0,
+  );
 
   const rowItem = (index: number) => stableItems()[index];
-  const rowIndex = (virtualIndex: number) => virtualIndex;
 
   const measureRow = (element: HTMLDivElement, index: number) => {
     // TanStack reads the row index from `data-index` when measuring. In Solid the
@@ -187,7 +298,8 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
       class={`virtual-list ${props.class ?? ""}`}
       role="list"
       aria-label={props.ariaLabel}
-      onScroll={updatePinnedToEnd}
+      onScroll={handleScroll}
+      onWheel={handleWheel}
     >
       <Show when={stableItems().length > 0} fallback={props.empty}>
         <div
@@ -198,7 +310,7 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
             class="virtual-list__window"
             style={{ transform: `translateY(${windowOffset()}px)` }}
           >
-            <For each={virtualItems()}>
+            <For each={rowVirtualItems()}>
               {(virtualItem) => (
                 <div
                   ref={(element) => measureRow(element, virtualItem.index)}
@@ -208,7 +320,7 @@ export function VirtualList<TItem>(props: VirtualListProps<TItem>) {
                 >
                   {props.children(
                     rowItem(virtualItem.index)!,
-                    rowIndex(virtualItem.index),
+                    virtualItem.index,
                   )}
                 </div>
               )}

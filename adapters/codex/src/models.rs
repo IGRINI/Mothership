@@ -2,12 +2,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use mothership_adapter_sdk::http;
-use mothership_adapter_sdk::protocol::{
-    FastModeCapabilities, Model, ReasoningCapabilities, ReasoningEffort,
-};
-use mothership_adapter_sdk::reasoning::{
-    collect_effort_values, collect_nested_efforts, collect_parameter_names, dedupe_efforts,
-    value_signals_reasoning, value_signals_reasoning_summary,
+use mothership_adapter_sdk::protocol::{FastModeCapabilities, Model, ReasoningCapabilities};
+use mothership_adapter_sdk::provider_metadata::{
+    harvest_reasoning_capabilities, ReasoningHarvestOptions, ReasoningMetadataFields,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -117,58 +114,26 @@ fn should_show_codex_model(model: &RemoteModel) -> bool {
 }
 
 fn codex_reasoning_capabilities(model: &RemoteModel) -> Option<ReasoningCapabilities> {
-    let mut efforts = Vec::new();
-    collect_effort_values(&model.reasoning_efforts, &mut efforts);
-    collect_effort_values(&model.supported_reasoning_efforts, &mut efforts);
-    collect_effort_values(&model.effort_levels, &mut efforts);
-    collect_effort_values(&model.supported_effort_levels, &mut efforts);
-    collect_effort_values(&model.reasoning_levels, &mut efforts);
-    collect_effort_values(&model.supported_reasoning_levels, &mut efforts);
-    if let Some(reasoning) = &model.reasoning {
-        collect_nested_efforts(reasoning, &mut efforts);
-    }
-
-    let parameters = collect_parameter_names(&model.supported_parameters);
-    let has_reasoning_parameter = parameters.contains("reasoning");
-    let has_reasoning_effort_parameter = parameters.contains("reasoning_effort");
-    let has_reasoning_flag = model
-        .reasoning
-        .as_ref()
-        .map(value_signals_reasoning)
-        .unwrap_or(false)
-        || model
-            .capabilities
-            .as_ref()
-            .map(value_signals_reasoning)
-            .unwrap_or(false)
-        || model
-            .features
-            .as_ref()
-            .map(value_signals_reasoning)
-            .unwrap_or(false);
-
-    let supported = has_reasoning_parameter
-        || has_reasoning_effort_parameter
-        || has_reasoning_flag
-        || !efforts.is_empty();
-    if !supported {
-        return None;
-    }
-    if efforts.is_empty() && (has_reasoning_parameter || has_reasoning_effort_parameter) {
-        efforts.extend(ReasoningEffort::openai_responses_values());
-    }
-    dedupe_efforts(&mut efforts);
-
-    Some(ReasoningCapabilities::from_efforts(
-        efforts,
-        has_reasoning_parameter,
-        false,
-        model
-            .reasoning
-            .as_ref()
-            .map(value_signals_reasoning_summary)
-            .unwrap_or(false),
-    ))
+    harvest_reasoning_capabilities(
+        ReasoningMetadataFields {
+            supported_parameters: &model.supported_parameters,
+            reasoning_efforts: &model.reasoning_efforts,
+            supported_reasoning_efforts: &model.supported_reasoning_efforts,
+            effort_levels: &model.effort_levels,
+            supported_effort_levels: &model.supported_effort_levels,
+            reasoning_levels: &model.reasoning_levels,
+            supported_reasoning_levels: &model.supported_reasoning_levels,
+            reasoning: model.reasoning.as_ref(),
+            capabilities: model.capabilities.as_ref(),
+            features: model.features.as_ref(),
+        },
+        ReasoningHarvestOptions {
+            // Codex has no `include_reasoning` parameter and never advertises
+            // exclusion; it does surface a reasoning summary.
+            include_reasoning_parameter: false,
+            detect_summary: true,
+        },
+    )
 }
 
 fn codex_fast_mode_capabilities(model: &RemoteModel) -> Option<FastModeCapabilities> {
@@ -243,6 +208,7 @@ fn value_contains_string(value: &Value, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mothership_adapter_sdk::protocol::ReasoningEffort;
 
     #[test]
     fn codex_model_parser_extracts_reasoning_efforts() {

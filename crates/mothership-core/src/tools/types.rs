@@ -3,11 +3,13 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use ts_rs::TS;
 
 use super::pipeline::ToolKind;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ToolCommand {
     pub program: String,
     #[serde(default)]
@@ -29,12 +31,30 @@ impl ToolCommand {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+// `#[ts(optional_fields)]` emits every `Option<_>` field as `field?: T | null`
+// (optional key, still nullable), matching both serde's `#[serde(default)]`
+// deserialize tolerance and the thin client, which builds this request and only
+// sets a subset of fields (`chat_id` / `workspace_root` are host-only and never
+// sent by the UI). Does not affect serde/runtime behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, optional_fields = nullable)]
 pub struct ToolExecutionRequest {
     pub tool_call_id: String,
     pub run_id: Option<String>,
+    /// The chat whose approval mode governs this call, when the call runs on
+    /// behalf of a chat run. `None` (e.g. the protocol-level `run_command`)
+    /// falls back to the approval-mode store's default.
+    #[serde(default)]
+    pub chat_id: Option<String>,
     pub project_id: Option<String>,
+    /// The canonical workspace root governing this call, when known. Used by the
+    /// manual-mode read-only argument screen to test whether a command argument
+    /// references a path outside the workspace. `None` (e.g. a protocol-level
+    /// `run_command` from a client that does not send it) falls back to
+    /// screening against `cwd` alone.
+    #[serde(default)]
+    pub workspace_root: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub command: ToolCommand,
     pub timeout_ms: Option<u64>,
@@ -42,28 +62,32 @@ pub struct ToolExecutionRequest {
     pub output_policy: ToolOutputPolicy,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ToolExecutionAccepted {
     pub tool_call_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ToolExecutionCancellationResult {
     pub tool_call_id: String,
     pub accepted: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ToolApprovalAnswer {
     pub tool_call_id: String,
     pub accepted: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ToolOutputPolicy {
     pub memory_preview_bytes: usize,
     pub ui_stream_bytes_per_sec: usize,
@@ -82,15 +106,17 @@ impl Default for ToolOutputPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ToolOutputStream {
     Stdout,
     Stderr,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ToolExecutionStatus {
     Completed,
     Failed,
@@ -100,8 +126,9 @@ pub enum ToolExecutionStatus {
     LoopBlocked,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ToolExecutionResult {
     pub tool_call_id: String,
     pub status: ToolExecutionStatus,
@@ -118,8 +145,9 @@ pub struct ToolExecutionResult {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Default, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ToolExecutionEventKind {
     #[default]
     Queued,
@@ -140,8 +168,9 @@ pub enum ToolExecutionEventKind {
 /// is referenced by `log_ref`; only bounded metadata and a short preview are
 /// carried inline so the database and event stream never hold multi-megabyte
 /// payloads.
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ToolArtifact {
     /// Stable id within the tool call (e.g. "diff", "stdout", "results").
     pub artifact_id: String,
@@ -170,8 +199,9 @@ pub struct ToolArtifact {
 /// can `seek` straight to them); `content` is that window with the writer's
 /// stream-header lines stripped. Callers page by echoing `next_offset` back as
 /// the next `offset` — they never compute offsets in the stripped space.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ToolArtifactRange {
     /// The decoded text for the requested range, with stream headers stripped.
     pub content: String,
@@ -187,8 +217,9 @@ pub struct ToolArtifactRange {
     pub eof: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ToolExecutionEvent {
     pub tool_call_id: String,
     pub run_id: Option<String>,
@@ -215,8 +246,9 @@ pub struct ToolExecutionEvent {
     pub artifacts: Vec<ToolArtifact>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ToolExecutionRecord {
     pub tool_call_id: String,
     pub run_id: Option<String>,

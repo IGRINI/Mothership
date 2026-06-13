@@ -49,6 +49,7 @@ export function ConnectorsTab(
     loading: boolean;
     providers: ConnectorProviderSummary[];
     authorizingId: string | undefined;
+    savingId?: string | undefined;
   } & ConnectorActions,
 ) {
   const [detailId, setDetailId] = createSignal<string>();
@@ -89,6 +90,7 @@ export function ConnectorsTab(
             onSaveSettings={(patch) =>
               props.onSaveSettings(provider().id, patch)
             }
+            saving={props.savingId === provider().id}
           />
         )}
       </Show>
@@ -216,6 +218,7 @@ function ConnectorDetail(
     onLogout: () => void;
     onSelectModel: (modelId: string) => void;
     onSaveSettings: (patch: Record<string, AdapterSettingPatchValue>) => void;
+    saving?: boolean;
   },
 ) {
   const provider = () => props.provider;
@@ -363,6 +366,7 @@ function ConnectorDetail(
               <AdapterSettingsForm
                 view={settings()}
                 onSave={props.onSaveSettings}
+                saving={props.saving}
               />
             </section>
           </Show>
@@ -447,6 +451,7 @@ function authDetail(provider: ConnectorProviderSummary) {
 function AdapterSettingsForm(props: {
   view: AdapterSettingsView;
   onSave: (patch: Record<string, AdapterSettingPatchValue>) => void;
+  saving?: boolean;
 }) {
   // Secret inputs intentionally start empty: the backend returns only sanitized
   // metadata, and an empty secret input means "leave existing value unchanged".
@@ -736,8 +741,13 @@ function AdapterSettingsForm(props: {
           </Show>
         )}
       </Index>
-      <button class="settings-primary-button" type="button" onClick={submit}>
-        Save settings
+      <button
+        class="settings-primary-button"
+        type="button"
+        disabled={props.saving}
+        onClick={submit}
+      >
+        {props.saving ? "Saving…" : "Save settings"}
       </button>
     </div>
   );
