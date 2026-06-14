@@ -2595,9 +2595,7 @@ mod tests {
         let fs = StdFileSystem::new();
 
         let huge = "a".repeat(DEFAULT_MAX_WRITE_FILE_BYTES + 1);
-        let patch = format!(
-            "*** Begin Patch\n*** Add File: big.txt\n+{huge}\n*** End Patch\n"
-        );
+        let patch = format!("*** Begin Patch\n*** Add File: big.txt\n+{huge}\n*** End Patch\n");
         let out = apply_patch(&json!({ "patch": patch }), &ws, &fs).unwrap();
         assert!(!out.ok);
         assert_eq!(out.data["status"], "too_large");

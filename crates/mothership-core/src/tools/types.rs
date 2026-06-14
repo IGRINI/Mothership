@@ -59,6 +59,12 @@ pub struct ToolExecutionRequest {
     pub command: ToolCommand,
     pub timeout_ms: Option<u64>,
     #[serde(default)]
+    pub yield_ms: Option<u64>,
+    #[serde(default)]
+    pub background: bool,
+    #[serde(default)]
+    pub notify_on_complete: bool,
+    #[serde(default)]
     pub output_policy: ToolOutputPolicy,
 }
 
@@ -118,6 +124,7 @@ pub enum ToolOutputStream {
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum ToolExecutionStatus {
+    Backgrounded,
     Completed,
     Failed,
     Cancelled,
@@ -156,6 +163,7 @@ pub enum ToolExecutionEventKind {
     WaitingForResource,
     Started,
     Output,
+    Backgrounded,
     Completed,
     Failed,
     Cancelled,
@@ -277,6 +285,14 @@ pub trait ToolExecutionEventSink: Send + Sync {
     fn emit(&self, event: ToolExecutionEvent);
 }
 
+pub trait ToolBackgroundCompletionSink: Send + Sync {
+    fn on_background_command_complete(
+        &self,
+        request: &ToolExecutionRequest,
+        result: &ToolExecutionResult,
+    );
+}
+
 #[derive(Debug, Default)]
 pub struct NoopToolExecutionEventSink;
 
@@ -320,6 +336,7 @@ pub fn run_command_typed_payload(
         "program": command.program,
         "args": command.args,
         "commandIntent": command_intent(command),
+        "status": result.status,
         "exitCode": result.exit_code,
         "stdoutPreview": result.stdout_preview,
         "stderrPreview": result.stderr_preview,
@@ -354,9 +371,7 @@ fn command_intent(command: &ToolCommand) -> &'static str {
         "pwd" => "location",
         "npm" | "pnpm" | "yarn" | "bun" => package_manager_intent(&command.args),
         "cargo" => cargo_intent(&command.args),
-        "powershell" | "pwsh" => {
-            shell_command_intent(&powershell_command_text(&command.args))
-        }
+        "powershell" | "pwsh" => shell_command_intent(&powershell_command_text(&command.args)),
         "cmd" => cmd_command_intent(&command.args),
         "bash" | "sh" => shell_script_arg_intent(&command.args),
         _ => "generic",
@@ -523,7 +538,10 @@ mod tests {
     #[test]
     fn run_command_payload_classifies_common_command_intents() {
         assert_eq!(payload_intent("git", &["diff"]), "git_diff");
-        assert_eq!(payload_intent("git.exe", &["status", "--short"]), "git_status");
+        assert_eq!(
+            payload_intent("git.exe", &["status", "--short"]),
+            "git_status"
+        );
         assert_eq!(payload_intent("npm", &["run", "build"]), "build");
         assert_eq!(payload_intent("cargo", &["check", "--workspace"]), "check");
         assert_eq!(

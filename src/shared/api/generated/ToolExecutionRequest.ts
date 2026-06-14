@@ -23,5 +23,8 @@ export type ToolExecutionRequest = {
   cwd?: string | null;
   command: ToolCommand;
   timeoutMs?: number | null;
+  yieldMs?: number | null;
+  background: boolean;
+  notifyOnComplete: boolean;
   outputPolicy: ToolOutputPolicy;
 };

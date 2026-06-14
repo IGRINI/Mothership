@@ -203,7 +203,21 @@ fn run_command_tool_descriptor() -> ToolDescriptor {
                     "type": "integer",
                     "minimum": 1000,
                     "maximum": 1800000,
-                    "description": "Optional timeout in milliseconds."
+                    "description": "Optional kill timeout in milliseconds. When this deadline is reached the process tree is terminated."
+                },
+                "yieldMs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 300000,
+                    "description": "Optional foreground wait budget in milliseconds. If the command is still running after this, it continues in the background and returns a task status to the model."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Start the command in the background immediately. Use for long-running servers, watchers, builds, and tests that should not block the conversation."
+                },
+                "notifyOnComplete": {
+                    "type": "boolean",
+                    "description": "When the command is backgrounded, notify the active run after it finishes with status, tails, and output reference. Defaults to true for background or yielded commands."
                 }
             },
             "required": ["program"],

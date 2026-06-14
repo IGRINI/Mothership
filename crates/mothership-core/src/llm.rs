@@ -319,6 +319,7 @@ pub struct LlmToolCallRequest {
 pub struct LlmToolCallResult {
     pub ok: bool,
     pub content: String,
+    pub backgrounded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -1291,6 +1291,9 @@ mod tests {
                 env: BTreeMap::new(),
             },
             timeout_ms: None,
+            yield_ms: None,
+            background: false,
+            notify_on_complete: false,
             output_policy: ToolOutputPolicy::default(),
         }
     }
@@ -1317,6 +1320,9 @@ mod tests {
                 env: BTreeMap::new(),
             },
             timeout_ms: None,
+            yield_ms: None,
+            background: false,
+            notify_on_complete: false,
             output_policy: ToolOutputPolicy::default(),
         }
     }

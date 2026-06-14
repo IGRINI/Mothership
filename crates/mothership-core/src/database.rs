@@ -3932,6 +3932,7 @@ fn tool_event_kind_to_db(kind: ToolExecutionEventKind) -> &'static str {
         ToolExecutionEventKind::WaitingForResource => "waiting_for_resource",
         ToolExecutionEventKind::Started => "started",
         ToolExecutionEventKind::Output => "output",
+        ToolExecutionEventKind::Backgrounded => "backgrounded",
         ToolExecutionEventKind::Completed => "completed",
         ToolExecutionEventKind::Failed => "failed",
         ToolExecutionEventKind::Cancelled => "cancelled",
@@ -3948,6 +3949,7 @@ fn tool_event_kind_from_db(value: &str, column: usize) -> rusqlite::Result<ToolE
         "waiting_for_resource" => Ok(ToolExecutionEventKind::WaitingForResource),
         "started" => Ok(ToolExecutionEventKind::Started),
         "output" => Ok(ToolExecutionEventKind::Output),
+        "backgrounded" => Ok(ToolExecutionEventKind::Backgrounded),
         "completed" => Ok(ToolExecutionEventKind::Completed),
         "failed" => Ok(ToolExecutionEventKind::Failed),
         "cancelled" => Ok(ToolExecutionEventKind::Cancelled),
@@ -4012,7 +4014,9 @@ fn tool_call_status_for_event(kind: ToolExecutionEventKind) -> &'static str {
         ToolExecutionEventKind::PermissionRequested => "awaiting_approval",
         ToolExecutionEventKind::PermissionDenied => "denied",
         ToolExecutionEventKind::WaitingForResource => "waiting",
-        ToolExecutionEventKind::Started | ToolExecutionEventKind::Output => "running",
+        ToolExecutionEventKind::Started
+        | ToolExecutionEventKind::Output
+        | ToolExecutionEventKind::Backgrounded => "running",
         ToolExecutionEventKind::Completed => "completed",
         ToolExecutionEventKind::Failed => "failed",
         ToolExecutionEventKind::Cancelled => "cancelled",
@@ -4027,7 +4031,7 @@ fn permission_state_for_event(kind: ToolExecutionEventKind) -> Option<&'static s
     match kind {
         ToolExecutionEventKind::PermissionRequested => Some("requested"),
         ToolExecutionEventKind::PermissionDenied => Some("denied"),
-        ToolExecutionEventKind::Started => Some("allowed"),
+        ToolExecutionEventKind::Started | ToolExecutionEventKind::Backgrounded => Some("allowed"),
         _ => None,
     }
 }
@@ -5275,7 +5279,9 @@ mod tests {
         let run = database
             .begin_chat_run(None, Some(&project.id), "Another", None, false)
             .expect("begin run");
-        let snapshot = database.delete_project(&project.id).expect("delete project");
+        let snapshot = database
+            .delete_project(&project.id)
+            .expect("delete project");
         assert!(snapshot.projects.iter().all(|item| item.id != project.id));
         assert!(snapshot.active_project_id.is_none());
         assert!(database.get_chat(&run.chat.id, 10).is_err());

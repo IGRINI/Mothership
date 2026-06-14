@@ -42,6 +42,7 @@ export type CoreRequest =
   | { "op": "retry_chat_message"; chat_id: string }
   | { "op": "continue_chat_message"; chat_id: string }
   | { "op": "cancel_chat_run"; run_id: string }
+  | { "op": "steer_chat_run"; run_id: string; content: string }
   | { "op": "list_active_runs" }
   | { "op": "rename_chat"; chat_id: string; title: string }
   | { "op": "delete_chat"; chat_id: string }

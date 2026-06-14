@@ -644,6 +644,7 @@ fn handle_request(
             tool_registry,
             tool_approvals,
             async_runtime,
+            chat_registry,
         );
         return;
     }
@@ -776,9 +777,24 @@ fn compute(
                 },
             ))
         }
-        CoreRequest::ListActiveRuns => {
-            response(CoreResponse::ActiveRuns(chat_registry.snapshot()))
+        CoreRequest::SteerChatRun { run_id, content } => {
+            if content.trim().is_empty() {
+                return Err(CoreError::new(
+                    "invalid_request",
+                    "steering message cannot be empty",
+                    false,
+                ));
+            }
+            if !chat_registry.push_user_input(&run_id, &content) {
+                return Err(CoreError::new(
+                    "run_not_active",
+                    "chat run is no longer active",
+                    false,
+                ));
+            }
+            response(CoreResponse::Ack)
         }
+        CoreRequest::ListActiveRuns => response(CoreResponse::ActiveRuns(chat_registry.snapshot())),
         CoreRequest::RenameChat { chat_id, title } => {
             let chat = database.rename_chat(&chat_id, &title)?;
             RequestOutcome {
@@ -806,11 +822,9 @@ fn compute(
             database.delete_chat(&chat_id)?;
             response(CoreResponse::Ack)
         }
-        CoreRequest::RenameProject { project_id, name } => {
-            response(CoreResponse::ProjectSnapshot(
-                database.rename_project(&project_id, &name)?,
-            ))
-        }
+        CoreRequest::RenameProject { project_id, name } => response(CoreResponse::ProjectSnapshot(
+            database.rename_project(&project_id, &name)?,
+        )),
         CoreRequest::DeleteProject { project_id } => {
             // Deleting the project deletes its chats — stop their runs first.
             for run in chat_registry.snapshot() {
@@ -834,11 +848,7 @@ fn compute(
             icon,
             icon_color,
         } => response(CoreResponse::ProjectSnapshot(
-            database.set_project_appearance(
-                &project_id,
-                icon.as_deref(),
-                icon_color.as_deref(),
-            )?,
+            database.set_project_appearance(&project_id, icon.as_deref(), icon_color.as_deref())?,
         )),
         CoreRequest::ApproveToolExecution {
             tool_call_id,
@@ -1043,6 +1053,7 @@ fn run_tool_command(
     tool_registry: Arc<ToolExecutionRegistry>,
     tool_approvals: Arc<PendingToolApprovalGate>,
     async_runtime: Arc<tokio::runtime::Runtime>,
+    chat_registry: Arc<ChatRunRegistry>,
 ) {
     if request.tool_call_id.trim().is_empty() {
         let _ = outbox.send(ServerFrame::Error {
@@ -1083,6 +1094,11 @@ fn run_tool_command(
         chat_id: None,
         message_id: None,
     });
+    let completion_sink: Arc<dyn mothership_core::ToolBackgroundCompletionSink> =
+        Arc::new(tool_runtime::CommandCompletionSink {
+            registry: Arc::clone(&tool_registry),
+            chat_registry: Some(chat_registry),
+        });
     // The orchestrator is synchronous (it blocks on the runtime for approval and
     // process I/O), so it must run on a dedicated thread, never an async-runtime
     // worker. A spawn failure or non-zero exit surfaces as the orchestrator's own
@@ -1100,17 +1116,24 @@ fn run_tool_command(
                 tool_approvals,
                 async_runtime,
                 sink,
-            );
+                Some(completion_sink),
+            )
         }));
-        if let Err(panic) = outcome {
-            let message = panic_message(panic.as_ref());
-            eprintln!("sidecar: run_command orchestrator panicked for {tool_call_id}: {message}");
-            panic_sink.emit(failed_tool_event(
-                &tool_call_id,
-                format!("internal error: tool execution panicked: {message}"),
-            ));
+        match outcome {
+            Ok(result) if result.backgrounded => {}
+            Ok(_) => tool_registry.finish(&tool_call_id),
+            Err(panic) => {
+                let message = panic_message(panic.as_ref());
+                eprintln!(
+                    "sidecar: run_command orchestrator panicked for {tool_call_id}: {message}"
+                );
+                panic_sink.emit(failed_tool_event(
+                    &tool_call_id,
+                    format!("internal error: tool execution panicked: {message}"),
+                ));
+                tool_registry.finish(&tool_call_id);
+            }
         }
-        tool_registry.finish(&tool_call_id);
     });
 }
 
@@ -1338,6 +1361,7 @@ fn run_chat_message(
                 Arc::new(tool_runtime::SidecarLlmToolHandler::new(
                     tool_supervisor,
                     tool_registry,
+                    Arc::clone(&chat_registry),
                     async_runtime,
                     tool_sink,
                     project.map(|project| (project.id, PathBuf::from(project.path))),

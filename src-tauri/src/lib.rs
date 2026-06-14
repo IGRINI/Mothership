@@ -90,6 +90,7 @@ pub fn run() {
             commands::set_change_journal_retention,
             commands::set_chat_model,
             commands::set_chat_state,
+            commands::steer_chat_run,
             commands::set_personalization,
             commands::set_project_appearance,
             commands::set_feature_route,

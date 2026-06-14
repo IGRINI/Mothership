@@ -16,11 +16,10 @@ use mothership_core::ipc::{CoreRequest, CoreResponse};
 use mothership_core::{
     ActiveRunSummary, AdapterSettingPatchValue, ChangeFileDiff, ChangeFileSummary,
     ChangeSetSummary, ChatConversation, ChatRunCancellationResult, ChatThreadSummary,
-    ConnectorSettingsSnapshot,
-    DashboardSnapshot, PersonalizationSettings, ProjectSnapshot, PromptPreview, ReasoningConfig,
-    RevertOutcome, SendChatMessageResult, SidecarStatus, ToolApprovalAnswer, ToolArtifactRange,
-    ToolExecutionAccepted, ToolExecutionCancellationResult, ToolExecutionRequest,
-    ToolPolicySettings,
+    ConnectorSettingsSnapshot, DashboardSnapshot, PersonalizationSettings, ProjectSnapshot,
+    PromptPreview, ReasoningConfig, RevertOutcome, SendChatMessageResult, SidecarStatus,
+    ToolApprovalAnswer, ToolArtifactRange, ToolExecutionAccepted, ToolExecutionCancellationResult,
+    ToolExecutionRequest, ToolPolicySettings,
 };
 use serde_json::Value;
 use tauri::{AppHandle, Manager, State, Window};
@@ -352,9 +351,24 @@ pub async fn cancel_chat_run(
 }
 
 #[tauri::command]
-pub async fn list_active_runs(
+pub async fn steer_chat_run(
     state: State<'_, AppState>,
-) -> Result<Vec<ActiveRunSummary>, String> {
+    run_id: String,
+    content: String,
+) -> Result<(), String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::SteerChatRun { run_id, content })
+        .await?;
+    match response {
+        CoreResponse::Ack => Ok(()),
+        other => Err(format!("unexpected sidecar response: {other:?}")),
+    }
+}
+
+#[tauri::command]
+pub async fn list_active_runs(state: State<'_, AppState>) -> Result<Vec<ActiveRunSummary>, String> {
     let response = state
         .sidecar()
         .clone()

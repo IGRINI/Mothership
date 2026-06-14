@@ -68,8 +68,8 @@ pub use search::{classify_search_text, search_text};
 pub use supervisor::ToolSupervisor;
 pub use types::{
     run_command_typed_payload, NoopToolExecutionEventSink, ToolApprovalAnswer, ToolArtifact,
-    ToolArtifactRange, ToolCommand, ToolExecutionAccepted, ToolExecutionCancellationResult,
-    ToolExecutionEvent, ToolExecutionEventKind, ToolExecutionEventSink, ToolExecutionRecord,
-    ToolExecutionRequest, ToolExecutionResult, ToolExecutionStatus, ToolOutputPolicy,
-    ToolOutputStream,
+    ToolArtifactRange, ToolBackgroundCompletionSink, ToolCommand, ToolExecutionAccepted,
+    ToolExecutionCancellationResult, ToolExecutionEvent, ToolExecutionEventKind,
+    ToolExecutionEventSink, ToolExecutionRecord, ToolExecutionRequest, ToolExecutionResult,
+    ToolExecutionStatus, ToolOutputPolicy, ToolOutputStream,
 };

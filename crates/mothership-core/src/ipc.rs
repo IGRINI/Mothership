@@ -144,6 +144,12 @@ pub enum CoreRequest {
     CancelChatRun {
         run_id: String,
     },
+    /// Deliver a user correction to an active run. Core injects it into the next
+    /// provider round; if the run already ended the request fails.
+    SteerChatRun {
+        run_id: String,
+        content: String,
+    },
     /// Every chat run currently executing, across all projects. Seeds a
     /// client's agent-activity view; live updates then arrive as run events.
     ListActiveRuns,

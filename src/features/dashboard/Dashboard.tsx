@@ -56,6 +56,7 @@ import {
   setChatState,
   setProjectAppearance,
   setSelectedModel,
+  steerChatRun,
 } from "../../shared/api/mothership";
 import {
   lastChatId,
@@ -145,6 +146,7 @@ export function Dashboard() {
   const [isOpeningProject, setIsOpeningProject] = createSignal(false);
   const [isLoadingMessages, setIsLoadingMessages] = createSignal(false);
   const [isSending, setIsSending] = createSignal(false);
+  const [isSteeringRun, setIsSteeringRun] = createSignal(false);
   const [editingMessageId, setEditingMessageId] = createSignal<string>();
   const [editingDraft, setEditingDraft] = createSignal("");
   const [isSubmittingEdit, setIsSubmittingEdit] = createSignal(false);
@@ -893,7 +895,29 @@ export function Dashboard() {
 
   async function handleSendMessage() {
     const content = draft().trim();
-    if (!content || isSending() || isSubmittingEdit() || isChatRunning()) {
+    if (!content || isSubmittingEdit()) {
+      return;
+    }
+    const runId = activeRunId();
+    if (runId) {
+      if (isSteeringRun()) {
+        return;
+      }
+      cancelDraftCommit();
+      setDraft("");
+      setError("");
+      setIsSteeringRun(true);
+      try {
+        await steerChatRun(runId, content);
+      } catch (caughtError) {
+        setDraft(content);
+        setError(errorMessage(caughtError));
+      } finally {
+        setIsSteeringRun(false);
+      }
+      return;
+    }
+    if (isSending() || isChatRunning()) {
       return;
     }
     const projectId = activeProjectId();

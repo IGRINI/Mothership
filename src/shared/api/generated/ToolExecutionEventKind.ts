@@ -7,6 +7,7 @@ export type ToolExecutionEventKind =
   | "waiting_for_resource"
   | "started"
   | "output"
+  | "backgrounded"
   | "completed"
   | "failed"
   | "cancelled"

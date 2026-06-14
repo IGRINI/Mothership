@@ -31,6 +31,8 @@ const CHAT_CONTEXT_LIMIT: i64 = 80;
 const CHAT_DELTA_FLUSH_BYTES: usize = 1024;
 const CHAT_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const CHAT_CANCEL_PROCESS_GRACE: Duration = Duration::from_secs(10);
+const MAX_PENDING_RUN_INPUTS: usize = 64;
+const MAX_PENDING_RUN_INPUT_CHARS: usize = 8_000;
 #[derive(Default)]
 pub struct ChatRunRegistry {
     inner: Mutex<ChatRunRegistryState>,
@@ -52,6 +54,10 @@ struct ActiveChatRun {
     /// Display snapshot served by `list_active_runs`, so a client connecting
     /// mid-run can show agent activity without re-deriving chat/project names.
     summary: ActiveRunSummary,
+    /// User steering messages and runtime notifications that arrived while the
+    /// current provider round was busy. Core injects them into the next round's
+    /// `extra_messages`; the UI remains a thin sender.
+    pending_inputs: Vec<LlmChatMessage>,
 }
 
 impl ChatRunRegistry {
@@ -79,6 +85,7 @@ impl ChatRunRegistry {
                 cancellation,
                 kill_handle: None,
                 summary,
+                pending_inputs: Vec::new(),
             },
         );
         already_cancelled
@@ -88,7 +95,11 @@ impl ChatRunRegistry {
     /// unspecified; clients sort for display.
     pub fn snapshot(&self) -> Vec<ActiveRunSummary> {
         let state = self.inner.lock().unwrap();
-        state.active.values().map(|run| run.summary.clone()).collect()
+        state
+            .active
+            .values()
+            .map(|run| run.summary.clone())
+            .collect()
     }
 
     /// Records the adapter process currently serving `run_id`'s round.
@@ -123,6 +134,47 @@ impl ChatRunRegistry {
         None
     }
 
+    pub fn push_user_input(&self, run_id: &str, content: &str) -> bool {
+        self.push_input(
+            run_id,
+            LlmChatMessage {
+                role: LlmChatRole::User,
+                content: bounded_pending_input(content),
+            },
+        )
+    }
+
+    pub fn push_runtime_input(&self, run_id: &str, content: String) -> bool {
+        self.push_input(
+            run_id,
+            LlmChatMessage {
+                role: LlmChatRole::User,
+                content: bounded_pending_input(&content),
+            },
+        )
+    }
+
+    pub(crate) fn drain_pending_inputs(&self, run_id: &str) -> Vec<LlmChatMessage> {
+        let mut state = self.inner.lock().unwrap();
+        state
+            .active
+            .get_mut(run_id)
+            .map(|run| std::mem::take(&mut run.pending_inputs))
+            .unwrap_or_default()
+    }
+
+    fn push_input(&self, run_id: &str, input: LlmChatMessage) -> bool {
+        let mut state = self.inner.lock().unwrap();
+        let Some(run) = state.active.get_mut(run_id) else {
+            return false;
+        };
+        if run.cancellation.is_cancelled() || run.pending_inputs.len() >= MAX_PENDING_RUN_INPUTS {
+            return false;
+        }
+        run.pending_inputs.push(input);
+        true
+    }
+
     /// The kill handle of the adapter process serving `run_id`, if that run is
     /// still active and has been cancelled. `None` means the run already
     /// finished, was never cancelled, or is not currently inside an adapter
@@ -141,6 +193,19 @@ impl ChatRunRegistry {
         state.active.remove(run_id);
         state.pending_cancelled.remove(run_id);
     }
+}
+
+fn bounded_pending_input(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.chars().count() <= MAX_PENDING_RUN_INPUT_CHARS {
+        return trimmed.to_string();
+    }
+    let mut out = trimmed
+        .chars()
+        .take(MAX_PENDING_RUN_INPUT_CHARS)
+        .collect::<String>();
+    out.push_str("\n[message truncated]");
+    out
 }
 
 /// Wall-clock unix milliseconds, for `ActiveRunSummary.started_at_ms`.
@@ -419,6 +484,9 @@ impl<'a> ChatRunService<'a> {
         let mut round_request = LlmChatRoundRequest::from_completion(request.clone());
 
         for _ in 0..policy.max_rounds() {
+            round_request
+                .extra_messages
+                .extend(registry.drain_pending_inputs(run_id));
             let round = track_round_adapter(registry, run_id, || {
                 self.providers.complete_subprocess_round(
                     entry.clone(),
@@ -436,7 +504,18 @@ impl<'a> ChatRunService<'a> {
                 return Ok(());
             }
             if round.tool_calls.is_empty() {
-                return Ok(());
+                let extra_messages = registry.drain_pending_inputs(run_id);
+                if extra_messages.is_empty() {
+                    return Ok(());
+                }
+                round_request = next_round_request(
+                    &request,
+                    round.state.unwrap_or(serde_json::Value::Null),
+                    Vec::new(),
+                    extra_messages,
+                    true,
+                );
+                continue;
             }
             let state = round.state.ok_or_else(|| {
                 MothershipError::InvalidRequest(
@@ -448,7 +527,8 @@ impl<'a> ChatRunService<'a> {
                 return Ok(());
             }
 
-            round_request = next_round_request(&request, state, tool_results, Vec::new(), true);
+            let extra_messages = registry.drain_pending_inputs(run_id);
+            round_request = next_round_request(&request, state, tool_results, extra_messages, true);
         }
 
         let final_request = next_round_request(

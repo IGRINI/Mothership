@@ -363,6 +363,14 @@ export function cancelChatRun(
   return invoke<ChatRunCancellationResult>("cancel_chat_run", { runId });
 }
 
+export function steerChatRun(runId: string, content: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve();
+  }
+
+  return invoke<void>("steer_chat_run", { runId, content });
+}
+
 /** Every chat run currently executing, across all projects. Seeds the
  * agent-activity status pill; live updates then arrive as `chat-run-event`s. */
 export function listActiveRuns(): Promise<ActiveRunSummary[]> {

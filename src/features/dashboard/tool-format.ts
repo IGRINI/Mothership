@@ -85,6 +85,7 @@ export function toolStatusLabel(kind: ToolExecutionEventKind) {
     waiting_for_resource: "Waiting",
     started: "Running",
     output: "Running",
+    backgrounded: "Background",
     completed: "Completed",
     failed: "Failed",
     cancelled: "Cancelled",

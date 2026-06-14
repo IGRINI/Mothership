@@ -391,23 +391,29 @@ impl ToolOrchestrator {
         sink: &Arc<dyn ToolExecutionEventSink>,
         outcome: BackendOutcome,
     ) -> LlmToolCallResult {
-        let ok = outcome.status == ToolExecutionStatus::Completed;
-        sink.emit(ToolExecutionEvent {
-            tool_call_id: ctx.tool_call_id.to_string(),
-            run_id: ctx.run_id.map(str::to_string),
-            project_id: project_id.map(str::to_string),
-            kind: terminal_kind(outcome.status),
-            message: outcome.result.message.clone(),
-            result: Some(outcome.result),
-            tool_kind: Some(ctx.kind),
-            payload: outcome.payload,
-            touched_paths: outcome.touched_paths,
-            artifacts: outcome.artifacts,
-            ..Default::default()
-        });
+        let ok = matches!(
+            outcome.status,
+            ToolExecutionStatus::Completed | ToolExecutionStatus::Backgrounded
+        );
+        if outcome.status != ToolExecutionStatus::Backgrounded {
+            sink.emit(ToolExecutionEvent {
+                tool_call_id: ctx.tool_call_id.to_string(),
+                run_id: ctx.run_id.map(str::to_string),
+                project_id: project_id.map(str::to_string),
+                kind: terminal_kind(outcome.status),
+                message: outcome.result.message.clone(),
+                result: Some(outcome.result),
+                tool_kind: Some(ctx.kind),
+                payload: outcome.payload,
+                touched_paths: outcome.touched_paths,
+                artifacts: outcome.artifacts,
+                ..Default::default()
+            });
+        }
         LlmToolCallResult {
             ok,
             content: outcome.model_text,
+            backgrounded: outcome.status == ToolExecutionStatus::Backgrounded,
         }
     }
 
@@ -444,6 +450,7 @@ impl ToolOrchestrator {
 
 fn terminal_kind(status: ToolExecutionStatus) -> ToolExecutionEventKind {
     match status {
+        ToolExecutionStatus::Backgrounded => ToolExecutionEventKind::Backgrounded,
         ToolExecutionStatus::Completed => ToolExecutionEventKind::Completed,
         ToolExecutionStatus::Failed => ToolExecutionEventKind::Failed,
         ToolExecutionStatus::Cancelled => ToolExecutionEventKind::Cancelled,

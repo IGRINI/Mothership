@@ -277,7 +277,9 @@ fn command_label(request: &ToolExecutionRequest) -> String {
 fn should_ignore_result(status: ToolExecutionStatus) -> bool {
     matches!(
         status,
-        ToolExecutionStatus::Cancelled | ToolExecutionStatus::LoopBlocked
+        ToolExecutionStatus::Backgrounded
+            | ToolExecutionStatus::Cancelled
+            | ToolExecutionStatus::LoopBlocked
     )
 }
 
@@ -362,6 +364,9 @@ mod tests {
             cwd: Some(Path::new("E:/Mothership").to_path_buf()),
             command: ToolCommand::new("git", args),
             timeout_ms: Some(60_000),
+            yield_ms: None,
+            background: false,
+            notify_on_complete: false,
             output_policy: ToolOutputPolicy::default(),
         }
     }
