@@ -16,10 +16,9 @@
 //!   `LoopBlocked` terminal) that runs before any approval or execution;
 //! - `decide` is the **policy** step (Allow / Ask / Deny / Reject);
 //! - `preview` is a side-effect-free approval card (diff/summary);
-//! - `acquire` takes a resource lease (held across `execute`) when the
-//!   capability asks for one;
+//! - `acquire` takes a resource lease when the capability asks for one;
 //! - `execute` does the actual work (spawn+stream+wait for a process; a pure
-//!   handler for a typed tool) and returns an already-bounded outcome;
+//!   handler for a typed tool) and owns the lease until the side effect is over;
 //! - `record` is post-terminal bookkeeping (the repeat guard) — the orchestrator
 //!   calls it ONLY for an executed outcome, never for a pre-execution terminal.
 //!
@@ -158,8 +157,9 @@ pub trait ToolBackend: Send + Sync {
 
     /// Acquire a resource lease before execution — called only when the
     /// capability's `resource_request` asks for one. The returned
-    /// [`ResourceLease`] is held by the orchestrator across `execute` and dropped
-    /// after, so any permits/guards inside it stay held for the call's duration.
+    /// [`ResourceLease`] is moved into `execute`, so a backend can hold it across
+    /// deferred/background side effects instead of only across the synchronous
+    /// tool-call return path.
     /// Default: no lease.
     fn acquire(
         &self,
@@ -175,6 +175,7 @@ pub trait ToolBackend: Send + Sync {
         &self,
         ctx: &ToolCallContext<'_>,
         sink: &Arc<dyn ToolExecutionEventSink>,
+        lease: ResourceLease,
     ) -> Result<BackendOutcome>;
 
     /// Record an **executed** outcome for cross-call bookkeeping (e.g. the repeat
@@ -322,11 +323,11 @@ impl ToolOrchestrator {
             );
         }
 
-        // resource lease — acquired only when the capability asks for one (e.g. a
-        // process needs a concurrency/git lease; a typed file tool does not). Held
-        // across execute and dropped when this call returns, so its permits stay
-        // for the whole side effect.
-        let _lease = if capability
+        // Resource lease — acquired only when the capability asks for one (e.g. a
+        // process needs a concurrency/git lease; a typed file tool does not).
+        // Ownership moves into `execute`, so background-capable backends can keep
+        // permits until their real side effect completes.
+        let lease = if capability
             .resource_request
             .as_ref()
             .is_some_and(|request| request.needs_lease)
@@ -364,8 +365,7 @@ impl ToolOrchestrator {
         // recorded for cross-call bookkeeping. Pre-execution terminals — cancel,
         // guard, reject, denial, lease failure — must NOT feed the repeat guard, so
         // a user's repeated *denial* is never suppressed as a repeated *execution*.
-        // `_lease` is held through execute + terminal, then dropped on return.
-        let outcome = match backend.execute(&ctx, sink) {
+        let outcome = match backend.execute(&ctx, sink, lease) {
             Ok(outcome) => outcome,
             Err(error) => {
                 let mut outcome = terminal_outcome(
@@ -559,6 +559,7 @@ mod tests {
             &self,
             ctx: &ToolCallContext<'_>,
             _sink: &Arc<dyn ToolExecutionEventSink>,
+            _lease: ResourceLease,
         ) -> Result<BackendOutcome> {
             *self.executed.lock().unwrap() = true;
             let mut outcome = terminal_outcome(

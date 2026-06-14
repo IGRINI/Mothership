@@ -14,11 +14,12 @@
 //! request is handled on its own worker thread, so a long flow (browser OAuth, a
 //! streaming chat turn) never blocks the reader or another request.
 
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, Read, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 mod tool_runtime;
@@ -104,6 +105,99 @@ const FEATURE_IMAGE_GENERATE: &str = "media.image.generate";
 
 /// Frames queued for the writer thread, which alone owns stdout.
 type Outbox = mpsc::Sender<ServerFrame>;
+
+#[derive(Clone, Default)]
+struct BackgroundWakeQueue {
+    inner: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
+}
+
+impl BackgroundWakeQueue {
+    fn push(&self, chat_id: &str, content: String) -> bool {
+        let mut queues = self.inner.lock().unwrap();
+        let should_spawn = !queues.contains_key(chat_id);
+        queues
+            .entry(chat_id.to_string())
+            .or_default()
+            .push_back(content);
+        should_spawn
+    }
+
+    fn pop_next(&self, chat_id: &str) -> Option<String> {
+        let mut queues = self.inner.lock().unwrap();
+        let Some(queue) = queues.get_mut(chat_id) else {
+            return None;
+        };
+        if let Some(content) = queue.pop_front() {
+            return Some(content);
+        }
+        queues.remove(chat_id);
+        None
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeWakeDispatcher {
+    database: Database,
+    outbox: Outbox,
+    connector_manager: Arc<ConnectorManager>,
+    provider_manager: Arc<ProviderRuntimeManager>,
+    tool_supervisor: Arc<ToolSupervisor>,
+    tool_approvals: Arc<PendingToolApprovalGate>,
+    tool_output_store: Option<Arc<dyn mothership_core::ToolOutputStore>>,
+    tool_registry: Arc<ToolExecutionRegistry>,
+    async_runtime: Arc<tokio::runtime::Runtime>,
+    chat_registry: Arc<ChatRunRegistry>,
+    change_blob_store: Arc<dyn SnapshotBlobStore>,
+    tool_approval_mode: Arc<ToolApprovalModeStore>,
+    tool_policy: Arc<ToolPolicyStore>,
+    artifacts_root: PathBuf,
+    tmp_root: PathBuf,
+    wake_queue: BackgroundWakeQueue,
+}
+
+impl tool_runtime::BackgroundRunWakeSink for RuntimeWakeDispatcher {
+    fn wake_background_run(&self, chat_id: &str, content: String) {
+        if !self.wake_queue.push(chat_id, content) {
+            return;
+        }
+        let runner = self.clone();
+        let chat_id = chat_id.to_string();
+        thread::spawn(move || {
+            while let Some(content) = runner.wake_queue.pop_next(&chat_id) {
+                let started = runner.database.begin_runtime_chat_run(&chat_id, &content);
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    run_chat_message(
+                        None,
+                        started,
+                        runner.database.clone(),
+                        runner.outbox.clone(),
+                        Arc::clone(&runner.connector_manager),
+                        Arc::clone(&runner.provider_manager),
+                        Arc::clone(&runner.tool_supervisor),
+                        Arc::clone(&runner.tool_approvals),
+                        runner.tool_output_store.clone(),
+                        Arc::clone(&runner.tool_registry),
+                        Arc::clone(&runner.async_runtime),
+                        Arc::clone(&runner.chat_registry),
+                        Arc::clone(&runner.change_blob_store),
+                        Arc::clone(&runner.tool_approval_mode),
+                        Arc::clone(&runner.tool_policy),
+                        runner.artifacts_root.clone(),
+                        runner.tmp_root.clone(),
+                        runner.wake_queue.clone(),
+                        false,
+                    );
+                }));
+                if let Err(panic) = result {
+                    eprintln!(
+                        "sidecar: background wake for chat {chat_id} panicked: {}",
+                        panic_message(panic.as_ref())
+                    );
+                }
+            }
+        });
+    }
+}
 
 struct RequestOutcome {
     response: CoreResponse,
@@ -221,6 +315,7 @@ fn serve() -> anyhow::Result<()> {
     );
     let tool_registry = Arc::new(ToolExecutionRegistry::new());
     let chat_registry = Arc::new(ChatRunRegistry::new());
+    let wake_queue = BackgroundWakeQueue::default();
     let _ = outbox.send(ServerFrame::Ready);
     start_connector_refresh(
         Arc::clone(&connector_manager),
@@ -256,6 +351,7 @@ fn serve() -> anyhow::Result<()> {
                 let tool_registry = Arc::clone(&tool_registry);
                 let async_runtime = Arc::clone(&async_runtime);
                 let chat_registry = Arc::clone(&chat_registry);
+                let wake_queue = wake_queue.clone();
                 let change_blob_store = Arc::clone(&change_blob_store);
                 let tool_approval_mode = Arc::clone(&tool_approval_mode);
                 let tool_policy = Arc::clone(&tool_policy);
@@ -281,6 +377,7 @@ fn serve() -> anyhow::Result<()> {
                             tool_registry,
                             async_runtime,
                             chat_registry,
+                            wake_queue,
                             change_blob_store,
                             tool_approval_mode,
                             tool_policy,
@@ -517,6 +614,7 @@ fn handle_request(
     tool_registry: Arc<ToolExecutionRegistry>,
     async_runtime: Arc<tokio::runtime::Runtime>,
     chat_registry: Arc<ChatRunRegistry>,
+    wake_queue: BackgroundWakeQueue,
     change_blob_store: Arc<dyn SnapshotBlobStore>,
     tool_approval_mode: Arc<ToolApprovalModeStore>,
     tool_policy: Arc<ToolPolicyStore>,
@@ -541,7 +639,7 @@ fn handle_request(
             *fast_mode,
         );
         run_chat_message(
-            id,
+            Some(id),
             started,
             database,
             outbox,
@@ -558,6 +656,8 @@ fn handle_request(
             Arc::clone(&tool_policy),
             artifacts_root.clone(),
             tmp_root.clone(),
+            wake_queue,
+            true,
         );
         return;
     }
@@ -569,7 +669,7 @@ fn handle_request(
     {
         let started = database.begin_edited_chat_run(chat_id, message_id, content);
         run_chat_message(
-            id,
+            Some(id),
             started,
             database,
             outbox,
@@ -586,13 +686,15 @@ fn handle_request(
             Arc::clone(&tool_policy),
             artifacts_root.clone(),
             tmp_root.clone(),
+            wake_queue,
+            true,
         );
         return;
     }
     if let CoreRequest::RetryChatMessage { chat_id } = &request {
         let started = database.begin_retry_run(chat_id);
         run_chat_message(
-            id,
+            Some(id),
             started,
             database,
             outbox,
@@ -609,13 +711,15 @@ fn handle_request(
             Arc::clone(&tool_policy),
             artifacts_root.clone(),
             tmp_root.clone(),
+            wake_queue,
+            true,
         );
         return;
     }
     if let CoreRequest::ContinueChatMessage { chat_id } = &request {
         let started = database.begin_continue_run(chat_id);
         run_chat_message(
-            id,
+            Some(id),
             started,
             database,
             outbox,
@@ -632,6 +736,8 @@ fn handle_request(
             Arc::clone(&tool_policy),
             artifacts_root.clone(),
             tmp_root.clone(),
+            wake_queue,
+            true,
         );
         return;
     }
@@ -1098,6 +1204,7 @@ fn run_tool_command(
         Arc::new(tool_runtime::CommandCompletionSink {
             registry: Arc::clone(&tool_registry),
             chat_registry: Some(chat_registry),
+            wake_sink: None,
         });
     // The orchestrator is synchronous (it blocks on the runtime for approval and
     // process I/O), so it must run on a dedicated thread, never an async-runtime
@@ -1281,7 +1388,7 @@ fn routed_service_tools(
 /// request with the persisted placeholder, then drive the completion, forwarding
 /// every run event. A failure to even begin the run is a terminal error reply.
 fn run_chat_message(
-    id: u64,
+    response_id: Option<u64>,
     started: mothership_core::Result<SendChatMessageResult>,
     database: Database,
     outbox: Outbox,
@@ -1298,6 +1405,8 @@ fn run_chat_message(
     tool_policy: Arc<ToolPolicyStore>,
     artifacts_root: PathBuf,
     tmp_root: PathBuf,
+    wake_queue: BackgroundWakeQueue,
+    proactive_wake_enabled: bool,
 ) {
     match started {
         Ok(started) => {
@@ -1331,10 +1440,12 @@ fn run_chat_message(
                 &started.chat.id,
                 parse_chat_approval_mode(started.chat.approval_mode.as_deref()),
             );
-            let _ = outbox.send(ServerFrame::Response {
-                id,
-                result: CoreResponse::ChatMessageStarted(started.clone()),
-            });
+            if let Some(id) = response_id {
+                let _ = outbox.send(ServerFrame::Response {
+                    id,
+                    result: CoreResponse::ChatMessageStarted(started.clone()),
+                });
+            }
             let tool_sink: Arc<dyn ToolExecutionEventSink> = Arc::new(ProtocolToolExecutionSink {
                 outbox: outbox.clone(),
                 database: Some(database.clone()),
@@ -1357,11 +1468,32 @@ fn run_chat_message(
                     started.assistant_message.id.clone(),
                 )))
             };
+            let wake_sink = proactive_wake_enabled.then(|| {
+                Arc::new(RuntimeWakeDispatcher {
+                    database: database.clone(),
+                    outbox: outbox.clone(),
+                    connector_manager: Arc::clone(&connector_manager),
+                    provider_manager: Arc::clone(&provider_manager),
+                    tool_supervisor: Arc::clone(&tool_supervisor),
+                    tool_approvals: Arc::clone(&tool_approvals),
+                    tool_output_store: tool_output_store.clone(),
+                    tool_registry: Arc::clone(&tool_registry),
+                    async_runtime: Arc::clone(&async_runtime),
+                    chat_registry: Arc::clone(&chat_registry),
+                    change_blob_store: Arc::clone(&change_blob_store),
+                    tool_approval_mode: Arc::clone(&tool_approval_mode),
+                    tool_policy: Arc::clone(&tool_policy),
+                    artifacts_root: artifacts_root.clone(),
+                    tmp_root: tmp_root.clone(),
+                    wake_queue: wake_queue.clone(),
+                }) as Arc<dyn tool_runtime::BackgroundRunWakeSink>
+            });
             let tool_handler: Arc<dyn LlmToolCallHandler> =
                 Arc::new(tool_runtime::SidecarLlmToolHandler::new(
                     tool_supervisor,
                     tool_registry,
                     Arc::clone(&chat_registry),
+                    wake_sink,
                     async_runtime,
                     tool_sink,
                     project.map(|project| (project.id, PathBuf::from(project.path))),
@@ -1382,10 +1514,14 @@ fn run_chat_message(
                 .run(&started, chat_registry, &mut sink);
         }
         Err(error) => {
-            let _ = outbox.send(ServerFrame::Error {
-                id,
-                error: error.into(),
-            });
+            if let Some(id) = response_id {
+                let _ = outbox.send(ServerFrame::Error {
+                    id,
+                    error: error.into(),
+                });
+            } else {
+                eprintln!("sidecar: background wake failed: {error}");
+            }
         }
     }
 }
@@ -1549,6 +1685,23 @@ fn revert_change_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_wake_queue_coalesces_by_chat_until_drained() {
+        let queue = BackgroundWakeQueue::default();
+
+        assert!(queue.push("chat_1", "first".to_string()));
+        assert!(!queue.push("chat_1", "second".to_string()));
+        assert!(queue.push("chat_2", "other".to_string()));
+
+        assert_eq!(queue.pop_next("chat_1").as_deref(), Some("first"));
+        assert_eq!(queue.pop_next("chat_1").as_deref(), Some("second"));
+        assert_eq!(queue.pop_next("chat_1"), None);
+
+        assert!(queue.push("chat_1", "third".to_string()));
+        assert_eq!(queue.pop_next("chat_1").as_deref(), Some("third"));
+        assert_eq!(queue.pop_next("chat_2").as_deref(), Some("other"));
+    }
 
     #[test]
     fn panicking_request_handler_answers_with_internal_panic_error() {

@@ -33,6 +33,15 @@ const CHAT_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const CHAT_CANCEL_PROCESS_GRACE: Duration = Duration::from_secs(10);
 const MAX_PENDING_RUN_INPUTS: usize = 64;
 const MAX_PENDING_RUN_INPUT_CHARS: usize = 8_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRunInputDelivery {
+    Delivered,
+    Inactive,
+    Cancelled,
+    QueueFull,
+}
+
 #[derive(Default)]
 pub struct ChatRunRegistry {
     inner: Mutex<ChatRunRegistryState>,
@@ -135,7 +144,7 @@ impl ChatRunRegistry {
     }
 
     pub fn push_user_input(&self, run_id: &str, content: &str) -> bool {
-        self.push_input(
+        self.push_input_to_run(
             run_id,
             LlmChatMessage {
                 role: LlmChatRole::User,
@@ -144,14 +153,58 @@ impl ChatRunRegistry {
         )
     }
 
-    pub fn push_runtime_input(&self, run_id: &str, content: String) -> bool {
-        self.push_input(
-            run_id,
-            LlmChatMessage {
-                role: LlmChatRole::User,
-                content: bounded_pending_input(&content),
-            },
-        )
+    pub fn push_runtime_input(
+        &self,
+        run_id: &str,
+        chat_id: Option<&str>,
+        content: String,
+    ) -> ChatRunInputDelivery {
+        let input = LlmChatMessage {
+            role: LlmChatRole::User,
+            content: bounded_pending_input(&content),
+        };
+        let mut state = self.inner.lock().unwrap();
+        match push_input_to_active_run(&mut state.active, run_id, input.clone()) {
+            ChatRunInputDelivery::Inactive => {}
+            delivery => return delivery,
+        }
+        let Some(chat_id) = chat_id else {
+            return ChatRunInputDelivery::Inactive;
+        };
+
+        let mut newest_active: Option<(String, i64)> = None;
+        let mut saw_cancelled = false;
+        let mut saw_full = false;
+        for (candidate_run_id, run) in &state.active {
+            if run.summary.chat_id != chat_id {
+                continue;
+            }
+            if run.cancellation.is_cancelled() {
+                saw_cancelled = true;
+                continue;
+            }
+            if run.pending_inputs.len() >= MAX_PENDING_RUN_INPUTS {
+                saw_full = true;
+                continue;
+            }
+            let started_at = run.summary.started_at_ms;
+            if newest_active
+                .as_ref()
+                .is_none_or(|(_, previous_started_at)| started_at >= *previous_started_at)
+            {
+                newest_active = Some((candidate_run_id.clone(), started_at));
+            }
+        }
+        if let Some((target_run_id, _)) = newest_active {
+            return push_input_to_active_run(&mut state.active, &target_run_id, input);
+        }
+        if saw_cancelled {
+            return ChatRunInputDelivery::Cancelled;
+        }
+        if saw_full {
+            return ChatRunInputDelivery::QueueFull;
+        }
+        ChatRunInputDelivery::Inactive
     }
 
     pub(crate) fn drain_pending_inputs(&self, run_id: &str) -> Vec<LlmChatMessage> {
@@ -163,16 +216,10 @@ impl ChatRunRegistry {
             .unwrap_or_default()
     }
 
-    fn push_input(&self, run_id: &str, input: LlmChatMessage) -> bool {
+    fn push_input_to_run(&self, run_id: &str, input: LlmChatMessage) -> bool {
         let mut state = self.inner.lock().unwrap();
-        let Some(run) = state.active.get_mut(run_id) else {
-            return false;
-        };
-        if run.cancellation.is_cancelled() || run.pending_inputs.len() >= MAX_PENDING_RUN_INPUTS {
-            return false;
-        }
-        run.pending_inputs.push(input);
-        true
+        push_input_to_active_run(&mut state.active, run_id, input)
+            == ChatRunInputDelivery::Delivered
     }
 
     /// The kill handle of the adapter process serving `run_id`, if that run is
@@ -193,6 +240,24 @@ impl ChatRunRegistry {
         state.active.remove(run_id);
         state.pending_cancelled.remove(run_id);
     }
+}
+
+fn push_input_to_active_run(
+    active: &mut HashMap<String, ActiveChatRun>,
+    run_id: &str,
+    input: LlmChatMessage,
+) -> ChatRunInputDelivery {
+    let Some(run) = active.get_mut(run_id) else {
+        return ChatRunInputDelivery::Inactive;
+    };
+    if run.cancellation.is_cancelled() {
+        return ChatRunInputDelivery::Cancelled;
+    }
+    if run.pending_inputs.len() >= MAX_PENDING_RUN_INPUTS {
+        return ChatRunInputDelivery::QueueFull;
+    }
+    run.pending_inputs.push(input);
+    ChatRunInputDelivery::Delivered
 }
 
 fn bounded_pending_input(content: &str) -> String {
@@ -339,12 +404,13 @@ impl<'a> ChatRunService<'a> {
         let runtime_kind =
             ensure_adapter_can_run_chat(&entry).map_err(MothershipError::InvalidRequest)?;
 
-        let messages = database.llm_chat_context(
+        let mut messages = database.llm_chat_context(
             &run.chat.id,
             &run.assistant_message.id,
             CHAT_CONTEXT_LIMIT,
             &run.context,
         )?;
+        messages.extend(run.context.runtime_messages.clone());
         if messages.is_empty() {
             return Err(MothershipError::InvalidRequest(
                 "chat context is empty".to_string(),
@@ -571,35 +637,59 @@ impl<'a> ChatRunService<'a> {
         sink: &mut DbForwardingSink<'_>,
     ) -> Result<()> {
         let provider_id = request.provider_id.clone();
+        let base_request = request.clone();
+        let policy = AgenticLoopPolicy::default();
         let run_id = sink.run_id;
         let mut round_request = LlmChatRoundRequest::from_completion(request);
-        round_request.state = self
+        let mut state = self
             .database
             .chat_provider_state(sink.chat_id, &provider_id)?;
+        round_request.state = state.clone();
 
-        let round = track_round_adapter(registry, run_id, || {
-            self.providers.complete_subprocess_round(
-                entry,
-                vault,
-                Some(run_id.to_string()),
-                round_request,
-                self.tool_handler.clone(),
-                cancellation,
-                sink,
-            )
-        })?;
-        sink.flush();
+        for _ in 0..policy.max_rounds() {
+            round_request
+                .extra_messages
+                .extend(registry.drain_pending_inputs(run_id));
+            let round = track_round_adapter(registry, run_id, || {
+                self.providers.complete_subprocess_round(
+                    entry.clone(),
+                    vault.clone(),
+                    Some(run_id.to_string()),
+                    round_request,
+                    self.tool_handler.clone(),
+                    cancellation,
+                    sink,
+                )
+            })?;
+            sink.flush();
 
-        if !round.tool_calls.is_empty() {
-            return Err(MothershipError::InvalidRequest(
-                "self-managed agent adapter returned Core tool calls; advertise core-managed chat instead"
-                    .to_string(),
-            ));
-        }
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
+            if !round.tool_calls.is_empty() {
+                return Err(MothershipError::InvalidRequest(
+                    "self-managed agent adapter returned Core tool calls; advertise core-managed chat instead"
+                        .to_string(),
+                ));
+            }
 
-        if let Some(state) = round.state {
-            self.database
-                .save_chat_provider_state(sink.chat_id, &provider_id, &state)?;
+            if let Some(next_state) = round.state {
+                self.database
+                    .save_chat_provider_state(sink.chat_id, &provider_id, &next_state)?;
+                state = Some(next_state);
+            }
+
+            let extra_messages = registry.drain_pending_inputs(run_id);
+            if extra_messages.is_empty() {
+                return Ok(());
+            }
+            round_request = next_round_request(
+                &base_request,
+                state.clone().unwrap_or(serde_json::Value::Null),
+                Vec::new(),
+                extra_messages,
+                true,
+            );
         }
 
         Ok(())
@@ -1084,6 +1174,48 @@ mod tests {
 
         registry.finish("run_1");
         assert!(registry.snapshot().is_empty());
+    }
+
+    #[test]
+    fn runtime_input_moves_to_active_run_for_same_chat_when_source_finished() {
+        let registry = ChatRunRegistry::new();
+        let token = ChatCancellationToken::default();
+        registry.register("run_new", test_summary("run_new", "provider_a"), token);
+
+        let delivery =
+            registry.push_runtime_input("run_old", Some("chat_1"), "background done".to_string());
+
+        assert_eq!(delivery, ChatRunInputDelivery::Delivered);
+        let pending = registry.drain_pending_inputs("run_new");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].content, "background done");
+    }
+
+    #[test]
+    fn runtime_input_does_not_deliver_to_cancelled_run() {
+        let registry = ChatRunRegistry::new();
+        let token = ChatCancellationToken::default();
+        registry.register("run_1", test_summary("run_1", "provider_a"), token);
+        assert_eq!(registry.cancel("run_1").as_deref(), Some("provider_a"));
+
+        let delivery =
+            registry.push_runtime_input("run_1", Some("chat_1"), "background done".to_string());
+
+        assert_eq!(delivery, ChatRunInputDelivery::Cancelled);
+        assert!(registry.drain_pending_inputs("run_1").is_empty());
+    }
+
+    #[test]
+    fn runtime_input_reports_inactive_when_no_run_for_chat_exists() {
+        let registry = ChatRunRegistry::new();
+
+        let delivery = registry.push_runtime_input(
+            "run_missing",
+            Some("chat_1"),
+            "background done".to_string(),
+        );
+
+        assert_eq!(delivery, ChatRunInputDelivery::Inactive);
     }
 
     #[test]

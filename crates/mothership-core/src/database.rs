@@ -575,6 +575,102 @@ impl Database {
         self.begin_chat_run(chat_id, project_id, content, None, false)
     }
 
+    pub fn begin_runtime_chat_run(
+        &self,
+        chat_id: &str,
+        content: &str,
+    ) -> Result<SendChatMessageResult> {
+        validate_identifier("chat_id", chat_id)?;
+        let content = content.trim();
+        if content.is_empty() {
+            return Err(MothershipError::InvalidRequest(
+                "runtime message cannot be empty".to_string(),
+            ));
+        }
+        let run_id = generate_id("chat_run")?;
+        let assistant_message_id = generate_id("chat_message")?;
+        let runtime_message_id = generate_id("runtime_message")?;
+
+        let mut connection = self.connect()?;
+        let selected_model = selected_llm_model(&connection)?;
+        let tx = connection.transaction()?;
+        let chat = select_chat_summary(&tx, chat_id)?;
+        let selected_model = chat_run_model(&chat, &selected_model);
+        if selected_model.model_id.trim().is_empty() {
+            return Err(MothershipError::InvalidRequest(
+                "no LLM model selected; connect a provider and choose a model first".to_string(),
+            ));
+        }
+        persist_chat_model(
+            &tx,
+            &chat.id,
+            &selected_model.provider_id,
+            &selected_model.model_id,
+        )?;
+
+        let now = current_timestamp();
+        let mut assistant_message = ChatMessage {
+            id: assistant_message_id,
+            chat_id: chat.id.clone(),
+            position: 0,
+            role: ChatMessageRole::Assistant,
+            content: String::new(),
+            status: ChatMessageStatus::Sending,
+            created_at: now.clone(),
+            error: None,
+            provider_id: Some(selected_model.provider_id.clone()),
+            model_id: Some(selected_model.model_id.clone()),
+        };
+        assistant_message.position = insert_chat_message(&tx, &assistant_message)?;
+
+        let updated_chat = ChatThreadSummary {
+            id: chat.id.clone(),
+            project_id: chat.project_id,
+            title: chat.title,
+            preview: derive_chat_preview(content),
+            message_count: chat.message_count + 1,
+            provider_id: Some(selected_model.provider_id.clone()),
+            model_id: Some(selected_model.model_id.clone()),
+            approval_mode: chat.approval_mode,
+            reasoning: chat.reasoning,
+            fast_mode: chat.fast_mode,
+            draft: chat.draft,
+            created_at: chat.created_at,
+            updated_at: now.clone(),
+        };
+        update_chat_summary(&tx, &updated_chat)?;
+        tx.commit()?;
+
+        let runtime_trigger = ChatMessage {
+            id: runtime_message_id,
+            chat_id: updated_chat.id.clone(),
+            position: 0,
+            role: ChatMessageRole::User,
+            content: content.to_string(),
+            status: ChatMessageStatus::Complete,
+            created_at: now,
+            error: None,
+            provider_id: None,
+            model_id: None,
+        };
+
+        Ok(SendChatMessageResult {
+            run_id,
+            chat: updated_chat,
+            user_message: runtime_trigger,
+            assistant_message,
+            removed_message_ids: Vec::new(),
+            context: ChatRunContextSpec {
+                fast_mode: chat.fast_mode.unwrap_or(false),
+                runtime_messages: vec![LlmChatMessage {
+                    role: LlmChatRole::User,
+                    content: content.to_string(),
+                }],
+                ..ChatRunContextSpec::default()
+            },
+        })
+    }
+
     pub fn recover_interrupted_chat_runs(&self) -> Result<usize> {
         let connection = self.connect()?;
         let interrupted_message =
@@ -1200,6 +1296,7 @@ impl Database {
                 include_failed_assistant_message_id: Some(failed_assistant_message.id),
                 reasoning: None,
                 fast_mode: run_fast_mode,
+                runtime_messages: Vec::new(),
             },
         })
     }
@@ -4601,6 +4698,83 @@ mod tests {
             .get_chat(&result.chat.id, 200)
             .expect("restore conversation");
         assert_eq!(restored.messages.len(), 2);
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn runtime_chat_run_adds_model_context_without_persisting_user_message() {
+        let database_path = temp_database_path("runtime_chat_run_context");
+        let database = Database::open(database_path.clone()).expect("open database");
+        database
+            .set_selected_llm_model("openai", "test-model")
+            .expect("select model");
+        let project = create_project(&database, &database_path, "runtime_context");
+
+        let first = database
+            .begin_chat_run(None, Some(&project.id), "Original prompt", None, false)
+            .expect("begin first run");
+        database
+            .append_chat_run_delta(
+                &first.run_id,
+                &first.chat.id,
+                &first.assistant_message.id,
+                "Original answer",
+            )
+            .expect("append answer");
+        database
+            .complete_chat_run(&first.run_id, &first.chat.id, &first.assistant_message.id)
+            .expect("complete first run");
+
+        let runtime = database
+            .begin_runtime_chat_run(&first.chat.id, "background command finished")
+            .expect("begin runtime wake");
+
+        assert_eq!(runtime.chat.message_count, 3);
+        assert_eq!(runtime.user_message.role, ChatMessageRole::User);
+        assert_eq!(runtime.user_message.content, "background command finished");
+        assert_eq!(runtime.context.runtime_messages.len(), 1);
+        assert_eq!(runtime.context.runtime_messages[0].role, LlmChatRole::User);
+        assert_eq!(
+            runtime.context.runtime_messages[0].content,
+            "background command finished"
+        );
+
+        let conversation = database
+            .get_chat(&runtime.chat.id, 200)
+            .expect("get conversation");
+        assert_eq!(conversation.messages.len(), 3);
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .all(|message| message.id != runtime.user_message.id),
+            "runtime trigger is transient and must not be persisted as chat history"
+        );
+        assert_eq!(conversation.messages[0].role, ChatMessageRole::User);
+        assert_eq!(conversation.messages[1].role, ChatMessageRole::Assistant);
+        assert_eq!(conversation.messages[2].role, ChatMessageRole::Assistant);
+        assert_eq!(conversation.messages[2].id, runtime.assistant_message.id);
+        assert_eq!(conversation.messages[2].status, ChatMessageStatus::Sending);
+
+        let mut model_context = database
+            .llm_chat_context(
+                &runtime.chat.id,
+                &runtime.assistant_message.id,
+                20,
+                &runtime.context,
+            )
+            .expect("model context");
+        assert_eq!(model_context.len(), 2);
+        model_context.extend(runtime.context.runtime_messages.clone());
+        assert_eq!(
+            model_context
+                .last()
+                .expect("runtime context")
+                .content
+                .as_str(),
+            "background command finished"
+        );
 
         let _ = fs::remove_file(database_path);
     }

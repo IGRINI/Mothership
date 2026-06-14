@@ -59,7 +59,10 @@ pub use personalization::{ModelInstruction, PersonalizationSettings, ProviderIns
 pub use project::{ProjectSnapshot, ProjectSummary};
 pub use prompt::{PromptPreview, PromptPreviewSection};
 pub use provider_runtime::{ProviderRuntimeHealth, ProviderRuntimeManager, ProviderRuntimeStatus};
-pub use run::{chat_prompt_preview, schedule_cancel_fallback, ChatRunRegistry, ChatRunService};
+pub use run::{
+    chat_prompt_preview, schedule_cancel_fallback, ChatRunInputDelivery, ChatRunRegistry,
+    ChatRunService,
+};
 pub use subprocess_gateway::SubprocessChatGateway;
 pub use tools::{
     apply_patch as run_apply_patch_tool, canonical_catalog_bytes, canonical_json,

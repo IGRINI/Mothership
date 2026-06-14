@@ -6,7 +6,7 @@ use std::sync::{
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::tools::ToolExecutionRecord;
+use crate::{llm::LlmChatMessage, tools::ToolExecutionRecord};
 use mothership_adapter_host::protocol::ReasoningConfig;
 
 // `optional_fields`: every `#[serde(default)] Option<_>` field deserializes fine
@@ -156,6 +156,7 @@ pub struct ChatRunContextSpec {
     pub include_failed_assistant_message_id: Option<String>,
     pub reasoning: Option<ReasoningConfig>,
     pub fast_mode: bool,
+    pub runtime_messages: Vec<LlmChatMessage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

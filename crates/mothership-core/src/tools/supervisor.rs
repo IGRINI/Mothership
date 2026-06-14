@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify};
 
-use crate::{MothershipError, Result};
+use crate::{ChatCancellationToken, MothershipError, Result};
 
 use super::cancellation::ToolCancellationToken;
 use super::orchestrator::ResourceLease;
@@ -92,22 +92,26 @@ impl ToolSupervisor {
     /// Run the command process: spawn, stream stdout/stderr (emitting `Output`
     /// events and spilling to the output store when requested), and wait with
     /// timeout/cancellation. Returns the bounded result. This is the only command
-    /// step that touches a process — Queued/Started/terminal events, approval, the
-    /// repeat guard, and the resource lease are all owned by the orchestrator.
+    /// step that touches a process — Queued/Started/terminal events, approval, and
+    /// the repeat guard are owned by the orchestrator; the resource lease is moved
+    /// here so background processes keep their permits until real completion.
     pub async fn run_command_process(
         &self,
         request: &ToolExecutionRequest,
         cancellation: &ToolCancellationToken,
+        chat_cancellation: &ChatCancellationToken,
         sink: &Arc<dyn ToolExecutionEventSink>,
         background_completion: Option<Arc<dyn ToolBackgroundCompletionSink>>,
+        lease: ResourceLease,
     ) -> Result<ToolExecutionResult> {
-        let running = self.start_command_process(request, sink).await?;
+        let running = self.start_command_process(request, sink, lease).await?;
         let yield_ms = request.yield_ms.filter(|value| *value > 0);
         if request.background || yield_ms.is_some() {
             return self
                 .run_command_process_with_background_option(
                     running,
                     cancellation.clone(),
+                    chat_cancellation.clone(),
                     sink,
                     background_completion,
                     request.background,
@@ -116,7 +120,7 @@ impl ToolSupervisor {
                 .await;
         }
 
-        finish_command_process(running, cancellation).await
+        finish_command_process(running, cancellation, chat_cancellation).await
     }
 
     /// Record a command's terminal outcome into the repeat guard (a no-op for
@@ -135,6 +139,7 @@ impl ToolSupervisor {
         &self,
         request: &ToolExecutionRequest,
         sink: &Arc<dyn ToolExecutionEventSink>,
+        lease: ResourceLease,
     ) -> Result<RunningCommandProcess> {
         let mut process = self.sandbox.spawn(process_spec(request)).await?;
 
@@ -199,6 +204,7 @@ impl ToolSupervisor {
             stdout_task,
             stderr_task,
             writer,
+            _lease: lease,
         })
     }
 
@@ -206,6 +212,7 @@ impl ToolSupervisor {
         &self,
         running: RunningCommandProcess,
         cancellation: ToolCancellationToken,
+        chat_cancellation: ChatCancellationToken,
         sink: &Arc<dyn ToolExecutionEventSink>,
         completion_sink: Option<Arc<dyn ToolBackgroundCompletionSink>>,
         force_background: bool,
@@ -220,6 +227,7 @@ impl ToolSupervisor {
             spawn_command_completion_task(
                 running,
                 cancellation,
+                chat_cancellation,
                 Arc::clone(sink),
                 completion_sink,
                 self.repeat_guard.clone(),
@@ -230,6 +238,7 @@ impl ToolSupervisor {
         spawn_command_completion_task(
             running,
             cancellation,
+            chat_cancellation,
             Arc::clone(sink),
             completion_sink,
             self.repeat_guard.clone(),
@@ -265,6 +274,7 @@ struct RunningCommandProcess {
     stdout_task: DrainTask,
     stderr_task: DrainTask,
     writer: Option<SharedToolOutputWriter>,
+    _lease: ResourceLease,
 }
 
 #[derive(Default)]
@@ -284,6 +294,7 @@ enum BackgroundRunDecision {
 fn spawn_command_completion_task(
     running: RunningCommandProcess,
     cancellation: ToolCancellationToken,
+    chat_cancellation: ChatCancellationToken,
     sink: Arc<dyn ToolExecutionEventSink>,
     completion_sink: Option<Arc<dyn ToolBackgroundCompletionSink>>,
     repeat_guard: Option<Arc<ToolRepeatGuard>>,
@@ -291,7 +302,7 @@ fn spawn_command_completion_task(
 ) {
     tokio::spawn(async move {
         let request = running.request.clone();
-        let result = finish_command_process(running, &cancellation)
+        let result = finish_command_process(running, &cancellation, &chat_cancellation)
             .await
             .unwrap_or_else(|error| failed_background_result(&request, error.to_string()));
 
@@ -339,9 +350,15 @@ async fn wait_for_background_decision(
 async fn finish_command_process(
     mut running: RunningCommandProcess,
     cancellation: &ToolCancellationToken,
+    chat_cancellation: &ChatCancellationToken,
 ) -> Result<ToolExecutionResult> {
-    let (status, exit_code, terminal_message) =
-        wait_for_process(&running.request, &mut *running.process, cancellation).await?;
+    let (status, exit_code, terminal_message) = wait_for_process(
+        &running.request,
+        &mut *running.process,
+        cancellation,
+        chat_cancellation,
+    )
+    .await?;
 
     let stdout = join_drain(running.stdout_task).await?;
     let stderr = join_drain(running.stderr_task).await?;
@@ -514,6 +531,7 @@ async fn wait_for_process(
     request: &ToolExecutionRequest,
     process: &mut dyn super::process::SpawnedToolProcess,
     cancellation: &ToolCancellationToken,
+    chat_cancellation: &ChatCancellationToken,
 ) -> Result<(ToolExecutionStatus, Option<i32>, Option<String>)> {
     if let Some(timeout) = request.timeout_ms.map(Duration::from_millis) {
         tokio::select! {
@@ -530,6 +548,11 @@ async fn wait_for_process(
                 process.kill_tree().await?;
                 let _ = process.wait().await;
                 Ok((ToolExecutionStatus::Cancelled, None, Some("tool call cancelled".to_string())))
+            }
+            _ = chat_cancelled(chat_cancellation.clone()) => {
+                process.kill_tree().await?;
+                let _ = process.wait().await;
+                Ok((ToolExecutionStatus::Cancelled, None, Some("chat run cancelled".to_string())))
             }
             _ = tokio::time::sleep(timeout) => {
                 process.kill_tree().await?;
@@ -553,7 +576,21 @@ async fn wait_for_process(
                 let _ = process.wait().await;
                 Ok((ToolExecutionStatus::Cancelled, None, Some("tool call cancelled".to_string())))
             }
+            _ = chat_cancelled(chat_cancellation.clone()) => {
+                process.kill_tree().await?;
+                let _ = process.wait().await;
+                Ok((ToolExecutionStatus::Cancelled, None, Some("chat run cancelled".to_string())))
+            }
         }
+    }
+}
+
+async fn chat_cancelled(cancellation: ChatCancellationToken) {
+    loop {
+        if cancellation.is_cancelled() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
