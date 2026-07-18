@@ -201,6 +201,11 @@ pub enum CoreRequest {
         model_id: Option<String>,
         content: String,
     },
+    /// Store the global default response language used in the runtime prompt.
+    SetResponseLanguage {
+        language_id: String,
+        custom_language: String,
+    },
     /// The persisted command allow/deny lists and disabled-tool set.
     GetToolPolicy,
     /// Replace the command allow/deny lists and disabled-tool set (sanitized and

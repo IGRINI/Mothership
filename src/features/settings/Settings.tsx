@@ -1,4 +1,5 @@
 import {
+  createEffect,
   createMemo,
   createSignal,
   For,
@@ -18,6 +19,7 @@ import {
   Plug,
   RefreshCw,
   Route,
+  Search,
   ShieldCheck,
   Sparkles,
   type LucideProps,
@@ -45,59 +47,62 @@ import { ConnectorsTab } from "./tabs/ConnectorsTab";
 import { PermissionsTab } from "./tabs/PermissionsTab";
 import { PersonalizationTab } from "./tabs/PersonalizationTab";
 import { ServicesTab } from "./tabs/ServicesTab";
-
-type TabId =
-  | "appearance"
-  | "chat"
-  | "connectors"
-  | "personalization"
-  | "permissions"
-  | "services";
+import { settingsCopy, type SettingsTabId } from "./settings-copy";
+import {
+  EMPTY_SETTINGS_SEARCH,
+  searchSettings,
+  SettingsHighlight,
+  tabMatches,
+  type SettingsSearchResult,
+} from "./settings-search";
 
 interface TabDef {
-  id: TabId;
-  label: string;
+  id: SettingsTabId;
   icon: Component<LucideProps>;
 }
 
-const NAV_GROUPS: { label: string; items: TabDef[] }[] = [
+const NAV_GROUPS: { id: string; items: TabDef[] }[] = [
   {
-    label: "General",
+    id: "general",
     items: [
-      { id: "appearance", label: "Appearance", icon: Palette },
-      { id: "chat", label: "Chat", icon: MessageSquare },
+      { id: "appearance", icon: Palette },
+      { id: "chat", icon: MessageSquare },
     ],
   },
   {
-    label: "Providers",
+    id: "providers",
     items: [
-      { id: "connectors", label: "Connectors", icon: Plug },
-      { id: "services", label: "Services", icon: Route },
-      { id: "personalization", label: "Personalization", icon: Sparkles },
+      { id: "connectors", icon: Plug },
+      { id: "services", icon: Route },
+      { id: "personalization", icon: Sparkles },
     ],
   },
   {
-    label: "Tools & safety",
-    items: [{ id: "permissions", label: "Permissions", icon: ShieldCheck }],
+    id: "tools",
+    items: [{ id: "permissions", icon: ShieldCheck }],
   },
 ];
 
 export function Settings(props: { onBack: () => void }) {
-  const [tab, setTab] = createSignal<TabId>("appearance");
+  const [tab, setTab] = createSignal<SettingsTabId>("appearance");
   const [settings, setSettings] = createSignal<ConnectorSettingsSnapshot>();
   const [error, setError] = createSignal("");
   const [status, setStatus] = createSignal("");
   const [isLoading, setIsLoading] = createSignal(true);
   const [authorizingId, setAuthorizingId] = createSignal<string>();
+  const [query, setQuery] = createSignal("");
+  const [paletteOpen, setPaletteOpen] = createSignal(false);
+  let searchInput: HTMLInputElement | undefined;
   let unlistenConnectorSettings: (() => void) | undefined;
   let statusTimer: number | undefined;
 
-  const tabLabel = createMemo(
-    () =>
-      NAV_GROUPS.flatMap((group) => group.items).find(
-        (item) => item.id === tab(),
-      )?.label ?? "",
+  const copy = () => settingsCopy();
+  const searchState = createMemo(() =>
+    query().trim()
+      ? searchSettings(query(), copy().search.documents)
+      : EMPTY_SETTINGS_SEARCH,
   );
+  const tabLabel = createMemo(() => copy().nav.tabs[tab()] ?? "");
   const initialConnectorLoading = () => isLoading() && !settings();
 
   onMount(() => {
@@ -121,6 +126,17 @@ export function Settings(props: { onBack: () => void }) {
     }
   });
 
+  createEffect(() => {
+    const search = searchState();
+    if (!search.active || tabMatches(search, tab())) {
+      return;
+    }
+    const nextTab = search.results[0]?.tabId;
+    if (nextTab) {
+      setTab(nextTab);
+    }
+  });
+
   // Leaving Settings while an authorization is in flight cancels it (kills the
   // adapter process), so an abandoned browser flow doesn't linger.
   onCleanup(() => {
@@ -132,6 +148,20 @@ export function Settings(props: { onBack: () => void }) {
     if (statusTimer !== undefined) {
       window.clearTimeout(statusTimer);
     }
+  });
+
+  function handleKeyDown(event: KeyboardEvent) {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      setPaletteOpen(true);
+      searchInput?.focus();
+      searchInput?.select();
+    }
+  }
+
+  onMount(() => {
+    window.addEventListener("keydown", handleKeyDown);
+    onCleanup(() => window.removeEventListener("keydown", handleKeyDown));
   });
 
   function notify(message: string) {
@@ -154,6 +184,19 @@ export function Settings(props: { onBack: () => void }) {
       void cancelAuthenticateAdapter(inFlight);
     }
     props.onBack();
+  }
+
+  function openSearchResult(result: SettingsSearchResult) {
+    setTab(result.tabId);
+    setPaletteOpen(false);
+    window.requestAnimationFrame(() => {
+      const section = document.querySelector<HTMLElement>(
+        `[data-settings-section="${result.id}"]`,
+      );
+      section?.scrollIntoView({ block: "start", behavior: "smooth" });
+      section?.classList.add("settings-card--flash");
+      window.setTimeout(() => section?.classList.remove("settings-card--flash"), 900);
+    });
   }
 
   async function reloadSettings() {
@@ -210,7 +253,7 @@ export function Settings(props: { onBack: () => void }) {
         })),
       }),
       () => setSelectedModel(providerId, modelId),
-      () => notify("Model selection saved."),
+      () => notify(copy().shell.modelSelectionSaved),
     );
   }
 
@@ -241,7 +284,7 @@ export function Settings(props: { onBack: () => void }) {
         };
       },
       () => setFeatureRoute(feature, providerId, modelId),
-      () => notify("Service selection saved."),
+      () => notify(copy().shell.serviceSelectionSaved),
     );
   }
 
@@ -260,7 +303,7 @@ export function Settings(props: { onBack: () => void }) {
     setSavingAdapterId(providerId);
     try {
       setSettings(await saveAdapterSettings(providerId, patch));
-      notify("Adapter settings saved.");
+      notify(copy().shell.adapterSettingsSaved);
     } catch (caughtError) {
       fail(errorMessage(caughtError));
     } finally {
@@ -277,7 +320,10 @@ export function Settings(props: { onBack: () => void }) {
         ),
       }),
       () => setProviderEnabled(providerId, enabled),
-      () => notify(enabled ? "Connector enabled." : "Connector disabled."),
+      () =>
+        notify(
+          enabled ? copy().shell.connectorEnabled : copy().shell.connectorDisabled,
+        ),
     );
   }
 
@@ -286,14 +332,18 @@ export function Settings(props: { onBack: () => void }) {
       return;
     }
     setError("");
-    notify("Authorizing — finish the flow in your browser…");
+    notify(copy().shell.authorizing);
     setAuthorizingId(providerId);
 
     try {
       const snapshot = await authenticateAdapter(providerId);
       setSettings(snapshot);
       const provider = snapshot.providers.find((item) => item.id === providerId);
-      notify(provider?.authenticated ? "Authorized." : "Authorization cancelled.");
+      notify(
+        provider?.authenticated
+          ? copy().shell.authorized
+          : copy().shell.authorizationCancelled,
+      );
     } catch (caughtError) {
       fail(errorMessage(caughtError));
     } finally {
@@ -319,7 +369,7 @@ export function Settings(props: { onBack: () => void }) {
 
     try {
       setSettings(await logoutAdapter(providerId));
-      notify("Logged out.");
+      notify(copy().shell.loggedOut);
     } catch (caughtError) {
       fail(errorMessage(caughtError));
     } finally {
@@ -332,11 +382,53 @@ export function Settings(props: { onBack: () => void }) {
       <header class="settings-header" onMouseDown={startWindowDrag}>
         <button class="settings-back" type="button" onClick={goBack}>
           <ChevronLeft size={17} />
-          Back
+          {copy().shell.back}
         </button>
         <div>
-          <h1>Settings</h1>
+          <h1>{copy().shell.title}</h1>
           <span>{tabLabel()}</span>
+        </div>
+        <div class="settings-search" onMouseDown={(event) => event.stopPropagation()}>
+          <Search size={15} />
+          <input
+            ref={searchInput}
+            type="search"
+            value={query()}
+            placeholder={copy().shell.searchPlaceholder}
+            spellcheck={false}
+            onFocus={() => setPaletteOpen(true)}
+            onInput={(event) => {
+              setQuery(event.currentTarget.value);
+              setPaletteOpen(true);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                setPaletteOpen(false);
+                searchInput?.blur();
+              }
+              if (event.key === "Enter") {
+                const first = searchState().results[0];
+                if (first) {
+                  event.preventDefault();
+                  openSearchResult(first);
+                }
+              }
+            }}
+          />
+          <kbd>{copy().shell.searchShortcut}</kbd>
+          <Show when={paletteOpen()}>
+            <SettingsCommandPalette
+              query={query()}
+              results={searchState().results}
+              emptyText={copy().search.empty}
+              hintText={copy().search.hint}
+              noMatchesText={copy().search.noMatches}
+              openHint={copy().search.openHint}
+              search={searchState()}
+              tabLabel={(id) => copy().nav.tabs[id]}
+              onOpen={openSearchResult}
+            />
+          </Show>
         </div>
         <Show
           when={tab() === "connectors" || tab() === "services"}
@@ -345,7 +437,7 @@ export function Settings(props: { onBack: () => void }) {
           <button
             class="icon-button icon-button--ghost"
             type="button"
-            title="Refresh connectors"
+            title={copy().shell.refreshConnectors}
             onClick={() => void reloadSettings()}
           >
             <RefreshCw size={16} />
@@ -358,19 +450,30 @@ export function Settings(props: { onBack: () => void }) {
           <For each={NAV_GROUPS}>
             {(group) => (
               <div class="settings-nav__group">
-                <span class="settings-nav__label">{group.label}</span>
+                <span class="settings-nav__label">
+                  {copy().nav.groups.find((item) => item.id === group.id)?.label ??
+                    group.id}
+                </span>
                 <For each={group.items}>
                   {(item) => (
                     <button
                       type="button"
+                      disabled={!tabMatches(searchState(), item.id)}
                       classList={{
                         "settings-nav__item": true,
                         "settings-nav__item--active": tab() === item.id,
+                        "settings-nav__item--dimmed": !tabMatches(
+                          searchState(),
+                          item.id,
+                        ),
                       }}
                       onClick={() => setTab(item.id)}
                     >
                       <Dynamic component={item.icon} size={17} />
-                      {item.label}
+                      <SettingsHighlight
+                        text={copy().nav.tabs[item.id]}
+                        search={searchState()}
+                      />
                     </button>
                   )}
                 </For>
@@ -382,10 +485,10 @@ export function Settings(props: { onBack: () => void }) {
         <div class="settings-pane">
           <Switch>
             <Match when={tab() === "appearance"}>
-              <AppearanceTab />
+              <AppearanceTab search={searchState()} />
             </Match>
             <Match when={tab() === "chat"}>
-              <ChatTab />
+              <ChatTab search={searchState()} />
             </Match>
             <Match when={tab() === "connectors"}>
               <ConnectorsTab
@@ -399,6 +502,7 @@ export function Settings(props: { onBack: () => void }) {
                 onSetEnabled={(id, enabled) => void setEnabled(id, enabled)}
                 onSaveSettings={(id, patch) => void saveAdapter(id, patch)}
                 savingId={savingAdapterId()}
+                search={searchState()}
               />
             </Match>
             <Match when={tab() === "services"}>
@@ -409,6 +513,7 @@ export function Settings(props: { onBack: () => void }) {
                 onSelectFeatureRoute={(feature, id, modelId) =>
                   void selectFeatureRoute(feature, id, modelId)
                 }
+                search={searchState()}
               />
             </Match>
             <Match when={tab() === "personalization"}>
@@ -416,10 +521,15 @@ export function Settings(props: { onBack: () => void }) {
                 providers={settings()?.providers ?? []}
                 onError={fail}
                 onStatus={notify}
+                search={searchState()}
               />
             </Match>
             <Match when={tab() === "permissions"}>
-              <PermissionsTab onError={fail} onStatus={notify} />
+              <PermissionsTab
+                onError={fail}
+                onStatus={notify}
+                search={searchState()}
+              />
             </Match>
           </Switch>
         </div>
@@ -445,6 +555,69 @@ export function Settings(props: { onBack: () => void }) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function SettingsCommandPalette(props: {
+  query: string;
+  results: SettingsSearchResult[];
+  emptyText: string;
+  hintText: string;
+  noMatchesText: string;
+  openHint: string;
+  search: ReturnType<typeof searchSettings>;
+  tabLabel: (id: SettingsTabId) => string;
+  onOpen: (result: SettingsSearchResult) => void;
+}) {
+  return (
+    <div class="settings-command-palette">
+      <Show
+        when={props.query.trim().length > 0}
+        fallback={
+          <div class="settings-command-palette__empty">
+            <span>{props.emptyText}</span>
+            <small>{props.hintText}</small>
+          </div>
+        }
+      >
+        <Show
+          when={props.results.length > 0}
+          fallback={
+            <div class="settings-command-palette__empty">
+              <span>{props.noMatchesText}</span>
+              <small>{props.hintText}</small>
+            </div>
+          }
+        >
+          <div class="settings-command-palette__list">
+            <For each={props.results.slice(0, 9)}>
+              {(result) => (
+                <button
+                  class="settings-command-palette__item"
+                  type="button"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => props.onOpen(result)}
+                >
+                  <span>
+                    <strong>
+                      <SettingsHighlight text={result.title} search={props.search} />
+                    </strong>
+                    <small>{props.tabLabel(result.tabId)}</small>
+                  </span>
+                  <span class="settings-command-palette__desc">
+                    <SettingsHighlight
+                      text={result.description}
+                      search={props.search}
+                    />
+                  </span>
+                  <kbd>{props.openHint}</kbd>
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
+      </Show>
+    </div>
+  );
 }
 
 function isTauriRuntime() {

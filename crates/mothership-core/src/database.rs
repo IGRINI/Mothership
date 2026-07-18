@@ -14,10 +14,10 @@ use crate::{
     ChatMessagePartKind, ChatMessageRole, ChatMessageStatus, ChatRunContextSpec, ChatRunEvent,
     ChatRunEventKind, ChatThreadSummary, DashboardMetric, DashboardSnapshot, FeatureRoute,
     LlmChatMessage, LlmChatRole, ModelInstruction, MothershipError, PersonalizationSettings,
-    ProjectSnapshot, ProjectSummary, ProviderInstruction, Result, SelectedLlmModel,
-    SendChatMessageResult, SidecarStatus, ToolArtifact, ToolCommand, ToolExecutionEvent,
-    ToolExecutionEventKind, ToolExecutionRecord, ToolExecutionResult, ToolKind, ToolOutputStream,
-    ToolPolicySettings, WorkspaceItem,
+    ProjectSnapshot, ProjectSummary, ProviderInstruction, ResponseLanguageSettings, Result,
+    SelectedLlmModel, SendChatMessageResult, SidecarStatus, ToolArtifact, ToolCommand,
+    ToolExecutionEvent, ToolExecutionEventKind, ToolExecutionRecord, ToolExecutionResult, ToolKind,
+    ToolOutputStream, ToolPolicySettings, WorkspaceItem,
 };
 
 const WORKSPACE_LIMIT: i64 = 2_500;
@@ -31,6 +31,8 @@ const ACTIVE_PROJECT_SETTING_KEY: &str = "active_project_id";
 const PERSONALIZATION_GLOBAL_KEY: &str = "personalization.global";
 const PERSONALIZATION_PROVIDER_PREFIX: &str = "personalization.provider.";
 const PERSONALIZATION_MODEL_PREFIX: &str = "personalization.model.";
+const RESPONSE_LANGUAGE_ID_KEY: &str = "personalization.response_language.id";
+const RESPONSE_LANGUAGE_CUSTOM_KEY: &str = "personalization.response_language.custom";
 const PROVIDER_DISABLED_PREFIX: &str = "provider.disabled.";
 const PERMISSIONS_COMMAND_ALLOW_KEY: &str = "permissions.command.allow";
 const PERMISSIONS_COMMAND_DENY_KEY: &str = "permissions.command.deny";
@@ -1918,6 +1920,35 @@ impl Database {
         personalization_settings(&connection)
     }
 
+    /// Store the global default response language. `auto` clears the prompt-level
+    /// preference; `custom` is kept only when the custom label is non-empty.
+    pub fn set_response_language(
+        &self,
+        language_id: &str,
+        custom_language: &str,
+    ) -> Result<PersonalizationSettings> {
+        let response_language = ResponseLanguageSettings::normalized(language_id, custom_language);
+        let connection = self.connect()?;
+        let now = current_timestamp();
+        set_setting(
+            &connection,
+            RESPONSE_LANGUAGE_ID_KEY,
+            &response_language.language_id,
+            &now,
+        )?;
+        if response_language.custom_language.is_empty() {
+            delete_setting(&connection, RESPONSE_LANGUAGE_CUSTOM_KEY)?;
+        } else {
+            set_setting(
+                &connection,
+                RESPONSE_LANGUAGE_CUSTOM_KEY,
+                &response_language.custom_language,
+                &now,
+            )?;
+        }
+        personalization_settings(&connection)
+    }
+
     /// The non-empty instruction scopes that apply to a run, ordered broad →
     /// specific (global, provider, provider+model). Each entry is a stable scope
     /// id and its content, ready to append as prompt sections.
@@ -1928,6 +1959,9 @@ impl Database {
     ) -> Result<Vec<(String, String)>> {
         let connection = self.connect()?;
         let mut out = Vec::new();
+        if let Some(instruction) = response_language_settings(&connection)?.prompt_instruction() {
+            out.push(("response_language".to_string(), instruction));
+        }
         if let Some(value) = get_setting(&connection, PERSONALIZATION_GLOBAL_KEY)? {
             if !value.trim().is_empty() {
                 out.push(("global".to_string(), value));
@@ -2721,6 +2755,7 @@ fn personalization_key(provider_id: Option<&str>, model_id: Option<&str>) -> Res
 
 fn personalization_settings(connection: &Connection) -> Result<PersonalizationSettings> {
     let global = get_setting(connection, PERSONALIZATION_GLOBAL_KEY)?.unwrap_or_default();
+    let response_language = response_language_settings(connection)?;
 
     let mut providers = Vec::new();
     for (key, content) in settings_with_prefix(connection, PERSONALIZATION_PROVIDER_PREFIX)? {
@@ -2751,7 +2786,18 @@ fn personalization_settings(connection: &Connection) -> Result<PersonalizationSe
         global,
         providers,
         models,
+        response_language,
     })
+}
+
+fn response_language_settings(connection: &Connection) -> Result<ResponseLanguageSettings> {
+    let language_id = get_setting(connection, RESPONSE_LANGUAGE_ID_KEY)?.unwrap_or_default();
+    let custom_language =
+        get_setting(connection, RESPONSE_LANGUAGE_CUSTOM_KEY)?.unwrap_or_default();
+    Ok(ResponseLanguageSettings::normalized(
+        &language_id,
+        &custom_language,
+    ))
 }
 
 fn clear_chat_provider_state(connection: &Connection, chat_id: &str) -> Result<()> {
@@ -4505,6 +4551,7 @@ mod tests {
 
         let settings = database.personalization_settings().expect("settings");
         assert_eq!(settings.global, "global text");
+        assert_eq!(settings.response_language.language_id, "auto");
         assert_eq!(settings.providers.len(), 1);
         assert_eq!(settings.providers[0].provider_id, "codex");
         assert_eq!(settings.providers[0].content, "provider text");
@@ -4521,12 +4568,59 @@ mod tests {
             vec!["global text", "provider text", "model text"]
         );
 
+        database
+            .set_response_language("ru", "")
+            .expect("set response language");
+        let settings = database.personalization_settings().expect("settings");
+        assert_eq!(settings.response_language.language_id, "ru");
+        assert!(settings.response_language.custom_language.is_empty());
+
+        let layered = database
+            .personalization_for("codex", "gpt-5.5")
+            .expect("layered");
+        assert_eq!(layered[0].0, "response_language");
+        assert!(layered[0].1.contains("Russian"));
+        assert_eq!(
+            layered
+                .iter()
+                .skip(1)
+                .map(|(_, c)| c.as_str())
+                .collect::<Vec<_>>(),
+            vec!["global text", "provider text", "model text"]
+        );
+
+        database
+            .set_response_language("custom", "Brazilian Portuguese")
+            .expect("set custom response language");
+        let custom = database.personalization_settings().expect("settings");
+        assert_eq!(custom.response_language.language_id, "custom");
+        assert_eq!(
+            custom.response_language.custom_language,
+            "Brazilian Portuguese"
+        );
+
         // A different provider only sees the global scope.
         let other = database
             .personalization_for("openrouter", "whatever")
             .expect("other");
         assert_eq!(
             other.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>(),
+            vec![
+                "Response language preference: respond in Brazilian Portuguese unless the user explicitly asks for another language.",
+                "global text"
+            ]
+        );
+
+        database
+            .set_response_language("auto", "")
+            .expect("clear response language");
+        assert_eq!(
+            database
+                .personalization_for("openrouter", "whatever")
+                .expect("other")
+                .iter()
+                .map(|(_, c)| c.as_str())
+                .collect::<Vec<_>>(),
             vec!["global text"]
         );
 

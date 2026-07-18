@@ -55,7 +55,9 @@ pub use mothership_adapter_host::protocol::{
     AudioTranscriptionResult, ProviderMediaBlob, ReasoningCapabilities, ReasoningConfig,
     ReasoningEffort, ReasoningOption, ReasoningSummary, ToolDescriptor,
 };
-pub use personalization::{ModelInstruction, PersonalizationSettings, ProviderInstruction};
+pub use personalization::{
+    ModelInstruction, PersonalizationSettings, ProviderInstruction, ResponseLanguageSettings,
+};
 pub use project::{ProjectSnapshot, ProjectSummary};
 pub use prompt::{PromptPreview, PromptPreviewSection};
 pub use provider_runtime::{ProviderRuntimeHealth, ProviderRuntimeManager, ProviderRuntimeStatus};

@@ -8,36 +8,66 @@ import type {
 import {
   getPersonalization,
   setPersonalization,
+  setResponseLanguage,
 } from "../../../shared/api/mothership";
+import { settingsCopy } from "../settings-copy";
+import {
+  sectionMatches,
+  SettingsHighlight,
+  type SettingsSearchState,
+} from "../settings-search";
 
 type ScopeKind = "global" | "provider" | "model";
 
-const EMPTY: PersonalizationSettings = { global: "", providers: [], models: [] };
+const EMPTY: PersonalizationSettings = {
+  global: "",
+  providers: [],
+  models: [],
+  responseLanguage: { languageId: "auto", customLanguage: "" },
+};
 
-/**
- * Personalization tab: user-authored text appended to the base system prompt,
- * at three scopes — global, per provider, or per provider+model. The provider
- * and model pickers come from the installed connectors; every applicable scope
- * is appended (broad → specific) at runtime, so they stack rather than replace.
- */
+const RESPONSE_LANGUAGE_IDS = [
+  "auto",
+  "en",
+  "ru",
+  "es",
+  "de",
+  "fr",
+  "it",
+  "pt",
+  "zh",
+  "ja",
+  "ko",
+  "uk",
+  "pl",
+  "tr",
+  "ar",
+  "hi",
+  "custom",
+] as const;
+
 export function PersonalizationTab(props: {
   providers: ConnectorProviderSummary[];
   onError: (message: string) => void;
   onStatus: (message: string) => void;
+  search: SettingsSearchState;
 }) {
   const [settings, setSettings] = createSignal<PersonalizationSettings>(EMPTY);
   const [scope, setScope] = createSignal<ScopeKind>("global");
   const [providerId, setProviderId] = createSignal<string>("");
   const [modelId, setModelId] = createSignal<string>("");
   const [draft, setDraft] = createSignal("");
-  const [saving, setSaving] = createSignal(false);
+  const [languageId, setLanguageId] = createSignal("auto");
+  const [customLanguage, setCustomLanguage] = createSignal("");
+  const [savingInstructions, setSavingInstructions] = createSignal(false);
+  const [savingLanguage, setSavingLanguage] = createSignal(false);
+  const copy = () => settingsCopy().personalization;
 
   const providerOptions = () => props.providers;
   const modelOptions = () =>
     props.providers.find((provider) => provider.id === providerId())?.models ??
     [];
 
-  // The currently-stored text for the active scope selection.
   const storedContent = createMemo(() => {
     const current = settings();
     if (scope() === "global") {
@@ -58,13 +88,20 @@ export function PersonalizationTab(props: {
   });
 
   const dirty = () => draft() !== storedContent();
+  const languageDirty = () =>
+    languageId() !== settings().responseLanguage.languageId ||
+    customLanguage() !== settings().responseLanguage.customLanguage;
   const resetDraft = () => setDraft(storedContent());
+  const syncLanguage = (loaded: PersonalizationSettings) => {
+    setLanguageId(loaded.responseLanguage.languageId);
+    setCustomLanguage(loaded.responseLanguage.customLanguage);
+  };
 
   onMount(async () => {
     try {
       const loaded = await getPersonalization();
       setSettings(loaded);
-      // Default the pickers to the first installed provider/model.
+      syncLanguage(loaded);
       const firstProvider = props.providers[0];
       if (firstProvider) {
         setProviderId(firstProvider.id);
@@ -105,20 +142,31 @@ export function PersonalizationTab(props: {
   async function persist(content: string) {
     const scopeProvider = scope() === "global" ? null : providerId();
     const scopeModel = scope() === "model" ? modelId() : null;
-    setSaving(true);
+    setSavingInstructions(true);
     try {
       const updated = await setPersonalization(scopeProvider, scopeModel, content);
       setSettings(updated);
+      syncLanguage(updated);
       setDraft(content.trim());
-      props.onStatus(
-        content.trim()
-          ? "Custom instructions saved."
-          : "Custom instructions cleared.",
-      );
+      props.onStatus(content.trim() ? copy().saved : copy().cleared);
     } catch (error) {
       props.onError(errorMessage(error));
     } finally {
-      setSaving(false);
+      setSavingInstructions(false);
+    }
+  }
+
+  async function persistResponseLanguage() {
+    setSavingLanguage(true);
+    try {
+      const updated = await setResponseLanguage(languageId(), customLanguage());
+      setSettings(updated);
+      syncLanguage(updated);
+      props.onStatus(copy().responseLanguageSaved);
+    } catch (error) {
+      props.onError(errorMessage(error));
+    } finally {
+      setSavingLanguage(false);
     }
   }
 
@@ -129,31 +177,121 @@ export function PersonalizationTab(props: {
 
   const scopeLabel = () => {
     if (scope() === "global") {
-      return "Global — applied to every model";
+      return copy().labels.globalApplied;
     }
     const provider = props.providers.find((item) => item.id === providerId());
     if (scope() === "provider") {
-      return `Provider — ${provider?.label ?? providerId()}`;
+      return copy().labels.provider(provider?.label ?? providerId());
     }
     const model = modelOptions().find((item) => item.id === modelId());
-    return `Model — ${provider?.label ?? providerId()} · ${model?.label ?? modelId()}`;
+    return copy().labels.model(
+      provider?.label ?? providerId(),
+      model?.label ?? modelId(),
+    );
   };
+
+  const languageCanSave = () =>
+    languageDirty() &&
+    !savingLanguage() &&
+    (languageId() !== "custom" || customLanguage().trim().length > 0);
 
   return (
     <div class="settings-pane__inner">
       <div class="settings-pane__intro">
-        <h2>Personalization</h2>
+        <h2>
+          <SettingsHighlight text={copy().title} search={props.search} />
+        </h2>
         <p>
-          Append your own instructions to Mothership's system prompt. Set a
-          global baseline, then layer more specific overrides per provider or per
-          model — all applicable scopes are added together, broad to specific.
+          <SettingsHighlight text={copy().intro} search={props.search} />
         </p>
       </div>
 
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "personalization.response-language",
+          ),
+        }}
+        data-settings-section="personalization.response-language"
+      >
         <div class="settings-card__head">
-          <h3>Scope</h3>
-          <p>Choose what these instructions apply to.</p>
+          <h3>
+            <SettingsHighlight
+              text={copy().responseLanguageTitle}
+              search={props.search}
+            />
+          </h3>
+          <p>
+            <SettingsHighlight
+              text={copy().responseLanguageDescription}
+              search={props.search}
+            />
+          </p>
+        </div>
+        <div class="scope-grid">
+          <label class="field-row">
+            <span>{copy().responseLanguageSelect}</span>
+            <select
+              class="settings-select"
+              value={languageId()}
+              onChange={(event) => setLanguageId(event.currentTarget.value)}
+            >
+              <For each={RESPONSE_LANGUAGE_IDS}>
+                {(id) => (
+                  <option value={id}>{copy().responseLanguages[id]}</option>
+                )}
+              </For>
+            </select>
+          </label>
+          <Show when={languageId() === "custom"}>
+            <label class="field-row">
+              <span>{copy().customLanguage}</span>
+              <input
+                class="settings-input"
+                type="text"
+                value={customLanguage()}
+                placeholder={copy().customLanguagePlaceholder}
+                onInput={(event) => setCustomLanguage(event.currentTarget.value)}
+              />
+            </label>
+          </Show>
+        </div>
+        <div class="prompt-actions">
+          <span class="muted-line">{copy().responseLanguageChatNote}</span>
+          <button
+            class="settings-primary-button"
+            type="button"
+            disabled={!languageCanSave()}
+            onClick={() => void persistResponseLanguage()}
+          >
+            <Save size={15} />
+            {savingLanguage() ? settingsCopy().common.saving : settingsCopy().common.save}
+          </button>
+        </div>
+      </section>
+
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "personalization.scope",
+          ),
+        }}
+        data-settings-section="personalization.scope"
+      >
+        <div class="settings-card__head">
+          <h3>
+            <SettingsHighlight text={copy().scopeTitle} search={props.search} />
+          </h3>
+          <p>
+            <SettingsHighlight
+              text={copy().scopeDescription}
+              search={props.search}
+            />
+          </p>
         </div>
         <div class="segmented segmented--block" role="group">
           <button
@@ -165,7 +303,7 @@ export function PersonalizationTab(props: {
             onClick={() => chooseScope("global")}
           >
             <Globe size={14} />
-            Global
+            {copy().global}
           </button>
           <button
             type="button"
@@ -175,7 +313,7 @@ export function PersonalizationTab(props: {
             }}
             onClick={() => chooseScope("provider")}
           >
-            Per provider
+            {copy().perProvider}
           </button>
           <button
             type="button"
@@ -185,23 +323,18 @@ export function PersonalizationTab(props: {
             }}
             onClick={() => chooseScope("model")}
           >
-            Per model
+            {copy().perModel}
           </button>
         </div>
 
         <Show when={scope() !== "global"}>
           <Show
             when={providerOptions().length > 0}
-            fallback={
-              <p class="muted-line">
-                No connectors are loaded yet. Open the Connectors tab and
-                authorize a provider first.
-              </p>
-            }
+            fallback={<p class="muted-line">{copy().noConnectors}</p>}
           >
             <div class="scope-grid">
               <label class="field-row">
-                <span>Provider</span>
+                <span>{copy().provider}</span>
                 <select
                   class="settings-select"
                   value={providerId()}
@@ -216,14 +349,10 @@ export function PersonalizationTab(props: {
               </label>
               <Show when={scope() === "model"}>
                 <label class="field-row">
-                  <span>Model</span>
+                  <span>{copy().model}</span>
                   <Show
                     when={modelOptions().length > 0}
-                    fallback={
-                      <p class="muted-line">
-                        This provider has no models loaded yet.
-                      </p>
-                    }
+                    fallback={<p class="muted-line">{copy().noModels}</p>}
                   >
                     <select
                       class="settings-select"
@@ -244,29 +373,39 @@ export function PersonalizationTab(props: {
         </Show>
       </section>
 
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "personalization.instructions",
+          ),
+        }}
+        data-settings-section="personalization.instructions"
+      >
         <div class="settings-card__head">
-          <h3>Custom instructions</h3>
+          <h3>
+            <SettingsHighlight
+              text={copy().customInstructionsTitle}
+              search={props.search}
+            />
+          </h3>
           <p>{scopeLabel()}</p>
         </div>
         <Show
           when={canEditScopedScope()}
-          fallback={
-            <p class="muted-line">Pick a provider and model to edit this scope.</p>
-          }
+          fallback={<p class="muted-line">{copy().pickScope}</p>}
         >
           <textarea
             class="prompt-textarea"
             value={draft()}
-            placeholder="e.g. Always respond in Russian. Prefer concise answers and explain trade-offs before recommending one option."
+            placeholder={copy().placeholder}
             spellcheck={false}
             onInput={(event) => setDraft(event.currentTarget.value)}
           />
           <div class="prompt-actions">
-            <span class="char-count">{draft().length} characters</span>
+            <span class="char-count">{copy().characters(draft().length)}</span>
             <div class="prompt-actions__right">
-              {/* Kept in the layout (visibility, not Show) so switching scopes
-                  never nudges the Save button sideways. */}
               <button
                 class="settings-secondary-button"
                 type="button"
@@ -274,20 +413,22 @@ export function PersonalizationTab(props: {
                   visibility:
                     storedContent().length > 0 ? "visible" : "hidden",
                 }}
-                disabled={saving() || storedContent().length === 0}
+                disabled={savingInstructions() || storedContent().length === 0}
                 onClick={() => void persist("")}
               >
                 <Trash2 size={15} />
-                Clear
+                {copy().clear}
               </button>
               <button
                 class="settings-primary-button"
                 type="button"
-                disabled={!dirty() || saving()}
+                disabled={!dirty() || savingInstructions()}
                 onClick={() => void persist(draft())}
               >
                 <Save size={15} />
-                {saving() ? "Saving…" : "Save"}
+                {savingInstructions()
+                  ? settingsCopy().common.saving
+                  : settingsCopy().common.save}
               </button>
             </div>
           </div>
@@ -297,6 +438,7 @@ export function PersonalizationTab(props: {
       <SavedScopes
         settings={settings()}
         providers={props.providers}
+        search={props.search}
         onOpenProvider={(id) => {
           setScope("provider");
           setProviderId(id);
@@ -316,9 +458,11 @@ export function PersonalizationTab(props: {
 function SavedScopes(props: {
   settings: PersonalizationSettings;
   providers: ConnectorProviderSummary[];
+  search: SettingsSearchState;
   onOpenProvider: (providerId: string) => void;
   onOpenModel: (providerId: string, modelId: string) => void;
 }) {
+  const copy = () => settingsCopy().personalization;
   const hasAny = () =>
     props.settings.global.trim().length > 0 ||
     props.settings.providers.length > 0 ||
@@ -329,16 +473,35 @@ function SavedScopes(props: {
 
   return (
     <Show when={hasAny()}>
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "personalization.saved",
+          ),
+        }}
+        data-settings-section="personalization.saved"
+      >
         <div class="settings-card__head">
-          <h3>Configured scopes</h3>
-          <p>Everything you've personalized so far.</p>
+          <h3>
+            <SettingsHighlight
+              text={copy().configuredTitle}
+              search={props.search}
+            />
+          </h3>
+          <p>
+            <SettingsHighlight
+              text={copy().configuredDescription}
+              search={props.search}
+            />
+          </p>
         </div>
         <div class="rule-list">
           <Show when={props.settings.global.trim().length > 0}>
             <span class="rule-chip rule-chip--allow">
               <Check size={12} />
-              Global
+              {copy().labels.globalScope}
             </span>
           </Show>
           <For each={props.settings.providers}>

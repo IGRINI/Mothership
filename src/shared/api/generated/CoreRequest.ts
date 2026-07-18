@@ -69,6 +69,11 @@ export type CoreRequest =
     model_id: string | null;
     content: string;
   }
+  | {
+    "op": "set_response_language";
+    language_id: string;
+    custom_language: string;
+  }
   | { "op": "get_tool_policy" }
   | { "op": "set_tool_policy"; settings: ToolPolicySettings }
   | {

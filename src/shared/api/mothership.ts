@@ -78,6 +78,7 @@ import {
   setPreviewPersonalization,
   setPreviewProjectAppearance,
   setPreviewProviderEnabled,
+  setPreviewResponseLanguage,
   setPreviewSelectedModel,
   setPreviewToolPolicy,
 } from "./preview-backend";
@@ -913,6 +914,20 @@ export function setPersonalization(
     providerId,
     modelId,
     content,
+  });
+}
+
+export function setResponseLanguage(
+  languageId: string,
+  customLanguage: string,
+): Promise<PersonalizationSettings> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve(setPreviewResponseLanguage(languageId, customLanguage));
+  }
+
+  return invoke<PersonalizationSettings>("set_response_language", {
+    languageId,
+    customLanguage,
   });
 }
 

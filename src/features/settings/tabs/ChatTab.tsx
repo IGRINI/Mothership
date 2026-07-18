@@ -11,10 +11,13 @@ import { WorkSpoiler } from "../../../shared/ui/WorkSpoiler";
 import { InlineToolCall } from "../../dashboard/components/InlineToolCall";
 import { BrandMark } from "../../dashboard/components/BrandMark";
 import type { ToolExecutionView } from "../../dashboard/types";
+import { settingsCopy, type SettingsCopy } from "../settings-copy";
+import {
+  sectionMatches,
+  SettingsHighlight,
+  type SettingsSearchState,
+} from "../settings-search";
 
-// Sample tool calls rendered through the REAL InlineToolCall component, so the
-// preview is byte-for-byte the same as the live chat (icon + headline + chevron,
-// the same collapsed spoiler), never a hand-rolled lookalike.
 const SAMPLE_TOOLS: ToolExecutionView[] = [
   {
     toolCallId: "preview-read",
@@ -45,15 +48,10 @@ const SAMPLE_TOOLS: ToolExecutionView[] = [
   },
 ];
 
-/**
- * Chat tab: how chat messages render — message font/size (inherit from the
- * global appearance or override), and toggles for the provider avatar, the
- * model name, and collapsing the run's work under one spoiler. A live sample
- * reflects every change instantly (the prefs apply to the document root, so the
- * sample — built from the real message classes — re-skins with the real chat).
- */
-export function ChatTab() {
+export function ChatTab(props: { search: SettingsSearchState }) {
   const settings = () => chatSettings();
+  const copy = () => settingsCopy().chat;
+  const appearanceCopy = () => settingsCopy().appearance;
   const update = (patch: Partial<ChatSettings>) => updateChatSettings(patch);
 
   const sizeValue = () =>
@@ -64,31 +62,68 @@ export function ChatTab() {
   return (
     <div class="settings-pane__inner">
       <div class="settings-pane__intro">
-        <h2>Chat</h2>
+        <h2>
+          <SettingsHighlight text={copy().title} search={props.search} />
+        </h2>
         <p>
-          Control how chat messages look. These preferences are stored on this
-          device and apply live — the example below updates as you change them.
+          <SettingsHighlight text={copy().intro} search={props.search} />
         </p>
       </div>
 
-      {/* Live preview */}
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "chat.preview",
+          ),
+        }}
+        data-settings-section="chat.preview"
+      >
         <div class="settings-card__head">
-          <h3>Preview</h3>
-          <p>A sample exchange rendered with your current settings.</p>
+          <h3>
+            <SettingsHighlight
+              text={copy().previewTitle}
+              search={props.search}
+            />
+          </h3>
+          <p>
+            <SettingsHighlight
+              text={copy().previewDescription}
+              search={props.search}
+            />
+          </p>
         </div>
-        <ChatPreview />
+        <ChatPreview copy={settingsCopy()} />
       </section>
 
-      {/* Typography */}
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "chat.message-font",
+          ),
+        }}
+        data-settings-section="chat.message-font"
+      >
         <div class="settings-card__head">
-          <h3>Message font</h3>
-          <p>Use the interface font from Appearance, or pick a different one.</p>
+          <h3>
+            <SettingsHighlight
+              text={copy().messageFontTitle}
+              search={props.search}
+            />
+          </h3>
+          <p>
+            <SettingsHighlight
+              text={copy().messageFontDescription}
+              search={props.search}
+            />
+          </p>
         </div>
         <div class="scope-grid">
           <label class="field-row">
-            <span>Font</span>
+            <span>{copy().font}</span>
             <select
               class="settings-select"
               value={settings().font}
@@ -98,25 +133,29 @@ export function ChatTab() {
                 })
               }
             >
-              <option value="inherit">Same as interface</option>
+              <option value="inherit">{copy().sameAsInterface}</option>
               <For each={SANS_FONT_OPTIONS}>
-                {(font) => <option value={font.id}>{font.label}</option>}
+                {(font) => (
+                  <option value={font.id}>
+                    {appearanceCopy().fontOptions[font.id] ?? font.label}
+                  </option>
+                )}
               </For>
             </select>
           </label>
 
           <div class="field-row">
-            <span>Message size</span>
+            <span>{copy().messageSize}</span>
             <div class="tool-row" style={{ "border-radius": "9px" }}>
               <div class="tool-row__meta">
-                <span class="tool-row__name">Override size</span>
+                <span class="tool-row__name">{copy().overrideSize}</span>
                 <span class="tool-row__desc">
                   {settings().fontSize === "inherit"
-                    ? "Using the default chat size."
-                    : `Custom: ${sizeValue()}px`}
+                    ? copy().defaultSize
+                    : copy().customSize(sizeValue())}
                 </span>
               </div>
-              <label class="switch" title="Override message size">
+              <label class="switch" title={copy().overrideSize}>
                 <input
                   type="checkbox"
                   checked={settings().fontSize !== "inherit"}
@@ -132,8 +171,6 @@ export function ChatTab() {
                 <span class="switch__thumb" />
               </label>
             </div>
-            {/* Reserve the slider's row whether or not it's shown, so toggling
-                the override never shifts anything below it. */}
             <div class="size-slider-slot">
               <Show when={settings().fontSize !== "inherit"}>
                 <div class="scale-control__row">
@@ -155,28 +192,43 @@ export function ChatTab() {
         </div>
       </section>
 
-      {/* Message chrome */}
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "chat.layout",
+          ),
+        }}
+        data-settings-section="chat.layout"
+      >
         <div class="settings-card__head">
-          <h3>Message layout</h3>
-          <p>Trim the assistant byline to taste.</p>
+          <h3>
+            <SettingsHighlight text={copy().layoutTitle} search={props.search} />
+          </h3>
+          <p>
+            <SettingsHighlight
+              text={copy().layoutDescription}
+              search={props.search}
+            />
+          </p>
         </div>
         <div class="tool-list">
           <ToggleRow
-            label="Hide provider avatar"
-            description="Drop the provider icon next to assistant replies."
+            label={copy().hideAvatar}
+            description={copy().hideAvatarDescription}
             checked={settings().hideAvatar}
             onChange={(value) => update({ hideAvatar: value })}
           />
           <ToggleRow
-            label="Hide model name"
-            description="Drop the model label above each assistant reply."
+            label={copy().hideModelName}
+            description={copy().hideModelNameDescription}
             checked={settings().hideModelName}
             onChange={(value) => update({ hideModelName: value })}
           />
           <ToggleRow
-            label="Collapse work under a spoiler"
-            description="Hide every tool call and intermediate step behind one collapsible header, leaving only the final answer."
+            label={copy().collapseWork}
+            description={copy().collapseWorkDescription}
             checked={settings().collapseWork}
             onChange={(value) => update({ collapseWork: value })}
           />
@@ -211,10 +263,7 @@ function ToggleRow(props: {
   );
 }
 
-/** Sample conversation built from the REAL chat components/classes (Avatar mark,
- * message rows, InlineToolCall, WorkSpoiler), so it's identical to the live chat
- * and reflects every global chat pref (font/size/hide attributes). */
-function ChatPreview() {
+function ChatPreview(props: { copy: SettingsCopy }) {
   const collapse = () => chatSettings().collapseWork;
 
   return (
@@ -222,7 +271,11 @@ function ChatPreview() {
       <article class="message-row message-row--user">
         <div class="message-row__content">
           <div class="message-md">
-            <p>Can you refactor the auth module and run the tests?</p>
+            <p>
+              {props.copy.nav.tabs.chat === "Чат"
+                ? "Можешь отрефакторить auth module и запустить тесты?"
+                : "Can you refactor the auth module and run the tests?"}
+            </p>
           </div>
         </div>
       </article>
@@ -234,19 +287,36 @@ function ChatPreview() {
         <div class="message-row__content">
           <div class="message-meta">
             <strong>GPT-5.5</strong>
-            <span>just now</span>
+            <span>{props.copy.nav.tabs.chat === "Чат" ? "только что" : "just now"}</span>
           </div>
           <div class="message-parts">
             <Show when={collapse()} fallback={<SampleTools />}>
-              <WorkSpoiler label="Worked for 1m 12s" count={SAMPLE_TOOLS.length}>
+              <WorkSpoiler
+                label={
+                  props.copy.nav.tabs.chat === "Чат"
+                    ? "Работал 1м 12с"
+                    : "Worked for 1m 12s"
+                }
+                count={SAMPLE_TOOLS.length}
+              >
                 <SampleTools />
               </WorkSpoiler>
             </Show>
             <div class="message-part message-part--text">
               <div class="message-md">
                 <p>
-                  Done — extracted the token logic into <code>auth/token.ts</code>{" "}
-                  and updated the call sites. All 42 tests pass.
+                  {props.copy.nav.tabs.chat === "Чат" ? (
+                    <>
+                      Готово - вынес token logic в <code>auth/token.ts</code> и
+                      обновил call sites. Все 42 теста проходят.
+                    </>
+                  ) : (
+                    <>
+                      Done - extracted the token logic into{" "}
+                      <code>auth/token.ts</code> and updated the call sites. All
+                      42 tests pass.
+                    </>
+                  )}
                 </p>
               </div>
             </div>

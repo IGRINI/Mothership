@@ -17,6 +17,12 @@ import type {
   ConnectorProviderSummary,
 } from "../../../shared/api/mothership";
 import { parseSettingsList } from "../../../shared/settings-lists";
+import { settingsCopy, type SettingsCopy } from "../settings-copy";
+import {
+  sectionMatches,
+  SettingsHighlight,
+  type SettingsSearchState,
+} from "../settings-search";
 
 interface ConnectorActions {
   onAuthorize: (providerId: string) => void;
@@ -50,6 +56,7 @@ export function ConnectorsTab(
     providers: ConnectorProviderSummary[];
     authorizingId: string | undefined;
     savingId?: string | undefined;
+    search: SettingsSearchState;
   } & ConnectorActions,
 ) {
   const [detailId, setDetailId] = createSignal<string>();
@@ -70,6 +77,7 @@ export function ConnectorsTab(
             authorizingId={props.authorizingId}
             onOpen={setDetailId}
             onSetEnabled={props.onSetEnabled}
+            search={props.search}
           />
         }
       >
@@ -91,6 +99,7 @@ export function ConnectorsTab(
               props.onSaveSettings(provider().id, patch)
             }
             saving={props.savingId === provider().id}
+            search={props.search}
           />
         )}
       </Show>
@@ -104,30 +113,30 @@ function ConnectorOverview(props: {
   authorizingId: string | undefined;
   onOpen: (providerId: string) => void;
   onSetEnabled: (providerId: string, enabled: boolean) => void;
+  search: SettingsSearchState;
 }) {
+  const copy = () => settingsCopy().connectors;
   return (
     <>
-      <div class="settings-pane__intro">
-        <h2>Connectors</h2>
+      <div
+        class="settings-pane__intro"
+        data-settings-section="connectors.overview"
+      >
+        <h2>
+          <SettingsHighlight text={copy().title} search={props.search} />
+        </h2>
         <p>
-          Each provider is a runtime-loaded adapter that authorizes itself. Turn
-          one off to hide it from model selection without losing its setup; open
-          Settings to authorize, pick models, and configure it.
+          <SettingsHighlight text={copy().intro} search={props.search} />
         </p>
       </div>
 
       <Show
         when={!props.loading}
-        fallback={<div class="settings-empty">Loading connectors…</div>}
+        fallback={<div class="settings-empty">{copy().loading}</div>}
       >
         <Show
           when={props.providers.length > 0}
-          fallback={
-            <div class="settings-empty">
-              No connectors found. Restart the app; if this keeps happening,
-              reinstall Mothership.
-            </div>
-          }
+          fallback={<div class="settings-empty">{copy().empty}</div>}
         >
           <div class="provider-grid">
             <Index each={props.providers}>
@@ -139,6 +148,7 @@ function ConnectorOverview(props: {
                   onSetEnabled={(enabled) =>
                     props.onSetEnabled(provider().id, enabled)
                   }
+                  copy={settingsCopy()}
                 />
               )}
             </Index>
@@ -154,9 +164,11 @@ function ProviderCard(props: {
   busy: boolean;
   onOpen: () => void;
   onSetEnabled: (enabled: boolean) => void;
+  copy: SettingsCopy;
 }) {
   const provider = () => props.provider;
-  const status = createMemo(() => providerStatus(provider()));
+  const copy = () => props.copy.connectors;
+  const status = createMemo(() => providerStatus(provider(), props.copy));
   const modelCount = () => provider().models.length;
 
   return (
@@ -176,14 +188,14 @@ function ProviderCard(props: {
           <h3 title={provider().label}>{provider().label}</h3>
           <span class="provider-card__sub">
             {modelCount() > 0
-              ? `${modelCount()} ${modelCount() === 1 ? "model" : "models"}`
-              : runtimeKindLabel(provider())}
+              ? copy().modelCount(modelCount())
+              : runtimeKindLabel(provider(), props.copy)}
           </span>
         </div>
         <ToggleSwitch
           checked={provider().enabled}
           disabled={props.busy}
-          label={`Enable ${provider().label}`}
+          label={copy().enable(provider().label)}
           onChange={props.onSetEnabled}
         />
       </div>
@@ -199,7 +211,7 @@ function ProviderCard(props: {
           onClick={props.onOpen}
         >
           <Settings2 size={15} />
-          Settings
+          {copy().settings}
         </button>
       </div>
     </article>
@@ -219,10 +231,12 @@ function ConnectorDetail(
     onSelectModel: (modelId: string) => void;
     onSaveSettings: (patch: Record<string, AdapterSettingPatchValue>) => void;
     saving?: boolean;
+    search: SettingsSearchState;
   },
 ) {
   const provider = () => props.provider;
-  const status = createMemo(() => providerStatus(provider()));
+  const copy = () => settingsCopy().connectors;
+  const status = createMemo(() => providerStatus(provider(), settingsCopy()));
   const needsAuthorize = () =>
     provider().authKind === "oauth_internal" ||
     provider().authKind === "external_process";
@@ -232,7 +246,7 @@ function ConnectorDetail(
     <div class="connector-detail">
       <button class="connector-detail__back" type="button" onClick={props.onBack}>
         <ChevronLeft size={16} />
-        Connectors
+        {copy().back}
       </button>
 
       <header class="connector-detail__hero">
@@ -249,28 +263,39 @@ function ConnectorDetail(
           </span>
         </div>
         <label class="connector-detail__power">
-          <span>{provider().enabled ? "On" : "Off"}</span>
+          <span>{provider().enabled ? settingsCopy().common.on : settingsCopy().common.off}</span>
           <ToggleSwitch
             checked={provider().enabled}
             disabled={props.busy}
-            label={`Enable ${provider().label}`}
+            label={copy().enable(provider().label)}
             onChange={props.onSetEnabled}
           />
         </label>
       </header>
 
       <Show when={!provider().enabled}>
-        <p class="connector-detail__hint">
-          This connector is turned off, so it won't appear when choosing a model.
-          Turn it on to use it in chat — your setup below is kept either way.
-        </p>
+        <p class="connector-detail__hint">{copy().disabledHint}</p>
       </Show>
 
       <Show when={needsAuthorize()}>
-        <section class="connector-detail__section">
-          <h3>Authorization</h3>
+        <section
+          classList={{
+            "connector-detail__section": true,
+            "settings-card--search-muted": !sectionMatches(
+              props.search,
+              "connectors.authorization",
+            ),
+          }}
+          data-settings-section="connectors.authorization"
+        >
+          <h3>
+            <SettingsHighlight
+              text={copy().authorization}
+              search={props.search}
+            />
+          </h3>
           <div class="connector-auth">
-            <p class="muted-line">{authDetail(provider())}</p>
+            <p class="muted-line">{authDetail(provider(), settingsCopy())}</p>
             <Show
               when={props.busy}
               fallback={
@@ -283,7 +308,7 @@ function ConnectorDetail(
                       onClick={props.onAuthorize}
                     >
                       <LogIn size={15} />
-                      Authorize
+                      {copy().authorize}
                     </button>
                   }
                 >
@@ -293,7 +318,7 @@ function ConnectorDetail(
                     onClick={props.onLogout}
                   >
                     <LogOut size={15} />
-                    Log out
+                    {copy().logout}
                   </button>
                 </Show>
               }
@@ -304,18 +329,27 @@ function ConnectorDetail(
                 onClick={props.onCancelAuthorize}
               >
                 <X size={15} />
-                Cancel
+                {copy().cancel}
               </button>
             </Show>
           </div>
         </section>
       </Show>
 
-      <section class="connector-detail__section">
+      <section
+        classList={{
+          "connector-detail__section": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "connectors.models",
+          ),
+        }}
+        data-settings-section="connectors.models"
+      >
         <h3>{provider().settingsSchema.modelManagement.title}</h3>
         <Show when={provider().modelError}>
           {(modelError) => (
-            <p class="muted-line">Connector unavailable: {modelError()}</p>
+            <p class="muted-line">{copy().unavailable(modelError())}</p>
           )}
         </Show>
         <div class="model-list">
@@ -325,10 +359,10 @@ function ConnectorDetail(
               <p class="muted-line">
                 {provider().refreshStatus === "refreshing" ||
                 provider().refreshStatus === "pending"
-                  ? "Loading models…"
+                  ? copy().loadingModels
                   : needsAuthorize()
-                    ? "No models loaded — authorize to fetch them."
-                    : "No models loaded."}
+                    ? copy().noModelsAuthorize
+                    : copy().noModels}
               </p>
             }
           >
@@ -361,12 +395,27 @@ function ConnectorDetail(
       <Show when={provider().adapterSettings}>
         {(settings) => (
           <Show when={settings().fields.length > 0}>
-            <section class="connector-detail__section">
-              <h3>Settings</h3>
+            <section
+              classList={{
+                "connector-detail__section": true,
+                "settings-card--search-muted": !sectionMatches(
+                  props.search,
+                  "connectors.adapter-settings",
+                ),
+              }}
+              data-settings-section="connectors.adapter-settings"
+            >
+              <h3>
+                <SettingsHighlight
+                  text={copy().adapterSettings}
+                  search={props.search}
+                />
+              </h3>
               <AdapterSettingsForm
                 view={settings()}
                 onSave={props.onSaveSettings}
                 saving={props.saving}
+                copy={settingsCopy()}
               />
             </section>
           </Show>
@@ -397,61 +446,69 @@ function ToggleSwitch(props: {
   );
 }
 
-function runtimeKindLabel(provider: ConnectorProviderSummary) {
-  return provider.runtimeKind === "self_managed" ? "Agent runtime" : "Connector";
+function runtimeKindLabel(provider: ConnectorProviderSummary, copy: SettingsCopy) {
+  return provider.runtimeKind === "self_managed"
+    ? copy.connectors.agentRuntime
+    : copy.connectors.connector;
 }
 
-function providerStatus(provider: ConnectorProviderSummary): ProviderStatus {
+function providerStatus(
+  provider: ConnectorProviderSummary,
+  copy: SettingsCopy,
+): ProviderStatus {
   if (!provider.enabled) {
-    return { tone: "off", text: "Disabled" };
+    return { tone: "off", text: copy.connectors.statusDisabled };
   }
   if (provider.refreshStatus === "refreshing") {
-    return { tone: "pending", text: "Updating models…" };
+    return { tone: "pending", text: copy.connectors.statusUpdating };
   }
   if (provider.modelError) {
-    return { tone: "error", text: "Unavailable" };
+    return { tone: "error", text: copy.connectors.statusUnavailable };
   }
 
   const needsAuthorize =
     provider.authKind === "oauth_internal" ||
     provider.authKind === "external_process";
   if (needsAuthorize && !provider.authenticated) {
-    return { tone: "warn", text: "Not connected" };
+    return { tone: "warn", text: copy.connectors.statusNotConnected };
   }
   if (provider.authKind === "api_key" && !provider.authenticated) {
-    return { tone: "warn", text: "Needs API key" };
+    return { tone: "warn", text: copy.connectors.statusNeedsApiKey };
   }
 
   const accountLabel = provider.authStatus.accountLabel;
   if (provider.authenticated) {
     return {
       tone: "ok",
-      text: accountLabel ? `Connected · ${accountLabel}` : "Connected",
+      text: accountLabel
+        ? copy.connectors.statusConnectedAs(accountLabel)
+        : copy.connectors.statusConnected,
     };
   }
   if (provider.refreshStatus === "pending") {
-    return { tone: "pending", text: "Waiting for connector…" };
+    return { tone: "pending", text: copy.connectors.statusWaiting };
   }
-  return { tone: "ok", text: "Ready" };
+  return { tone: "ok", text: copy.connectors.statusReady };
 }
 
-function authDetail(provider: ConnectorProviderSummary) {
+function authDetail(provider: ConnectorProviderSummary, copy: SettingsCopy) {
   const status = provider.authStatus;
   if (status.accountLabel) {
-    return `Signed in as ${status.accountLabel}.`;
+    return copy.connectors.signedInAs(status.accountLabel);
   }
   if (status.detail) {
     return status.detail;
   }
   return provider.authenticated
-    ? "Authorized."
-    : "Authorize this connector to fetch its models.";
+    ? copy.connectors.authAuthorized
+    : copy.connectors.authAuthorize;
 }
 
 function AdapterSettingsForm(props: {
   view: AdapterSettingsView;
   onSave: (patch: Record<string, AdapterSettingPatchValue>) => void;
   saving?: boolean;
+  copy: SettingsCopy;
 }) {
   // Secret inputs intentionally start empty: the backend returns only sanitized
   // metadata, and an empty secret input means "leave existing value unchanged".
@@ -557,12 +614,12 @@ function AdapterSettingsForm(props: {
   function secretDescription(key: string) {
     const state = props.view.secrets?.[key];
     if (!state?.hasValue) {
-      return "No secret saved.";
+      return props.copy.connectors.noSecretSaved;
     }
 
     return state.last4
-      ? `Saved secret ending in ${state.last4}. Leave empty to keep it.`
-      : "Saved secret configured. Leave empty to keep it.";
+      ? props.copy.connectors.savedSecretLast4(state.last4)
+      : props.copy.connectors.savedSecret;
   }
 
   function hasSavedSecret(key: string) {
@@ -611,7 +668,7 @@ function AdapterSettingsForm(props: {
                             value={secrets()[field().key] ?? ""}
                             placeholder={
                               hasSavedSecret(field().key)
-                                ? "Leave blank to keep saved secret"
+                                ? props.copy.connectors.leaveBlankSecret
                                 : ""
                             }
                             onInput={(event) =>
@@ -633,7 +690,7 @@ function AdapterSettingsForm(props: {
                                   )
                                 }
                               />
-                              <span>Clear saved secret</span>
+                              <span>{props.copy.connectors.clearSavedSecret}</span>
                             </label>
                           </Show>
                         </div>
@@ -667,14 +724,14 @@ function AdapterSettingsForm(props: {
                   <div class="adapter-list">
                     <Index
                       each={lists()[field().key] ?? []}
-                      fallback={<p class="muted-line">None yet.</p>}
+                      fallback={<p class="muted-line">{props.copy.common.noneYet}</p>}
                     >
                       {(item, index) => (
                         <div class="adapter-list__row">
                           <input
                             type="text"
                             value={item()}
-                            placeholder="provider/model-id"
+                            placeholder={props.copy.connectors.modelPlaceholder}
                             onInput={(event) =>
                               setListItem(
                                 field().key,
@@ -686,7 +743,7 @@ function AdapterSettingsForm(props: {
                           <button
                             class="adapter-list__remove"
                             type="button"
-                            aria-label="Remove"
+                            aria-label={props.copy.common.remove}
                             onClick={() => removeListItem(field().key, index)}
                           >
                             <X size={14} />
@@ -700,7 +757,7 @@ function AdapterSettingsForm(props: {
                       onClick={() => addListItem(field().key)}
                     >
                       <Plus size={14} />
-                      Add model
+                      {props.copy.connectors.addModel}
                     </button>
                   </div>
                 </div>
@@ -715,7 +772,7 @@ function AdapterSettingsForm(props: {
               <div class="adapter-visibility-list">
                 <Index
                   each={field().options}
-                  fallback={<p class="muted-line">None yet.</p>}
+                  fallback={<p class="muted-line">{props.copy.common.noneYet}</p>}
                 >
                   {(option) => (
                     <label class="adapter-visibility-row">
@@ -747,7 +804,7 @@ function AdapterSettingsForm(props: {
         disabled={props.saving}
         onClick={submit}
       >
-        {props.saving ? "Saving…" : "Save settings"}
+        {props.saving ? props.copy.common.saving : props.copy.connectors.saveSettings}
       </button>
     </div>
   );

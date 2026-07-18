@@ -993,6 +993,12 @@ fn compute(
         } => response(CoreResponse::Personalization(
             database.set_personalization(provider_id.as_deref(), model_id.as_deref(), &content)?,
         )),
+        CoreRequest::SetResponseLanguage {
+            language_id,
+            custom_language,
+        } => response(CoreResponse::Personalization(
+            database.set_response_language(&language_id, &custom_language)?,
+        )),
         CoreRequest::GetChangeJournalRetention => response(CoreResponse::ChangeJournalRetention(
             database.change_journal_retention()?,
         )),

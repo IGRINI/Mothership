@@ -4,6 +4,12 @@ import type {
   ConnectorProviderSummary,
   FeatureRoute,
 } from "../../../shared/api/mothership";
+import { settingsCopy } from "../settings-copy";
+import {
+  sectionMatches,
+  SettingsHighlight,
+  type SettingsSearchState,
+} from "../settings-search";
 
 type ServiceRouteOption = {
   providerId: string;
@@ -30,7 +36,9 @@ export function ServicesTab(props: {
     providerId: string,
     modelId: string,
   ) => void;
+  search: SettingsSearchState;
 }) {
+  const copy = () => settingsCopy().services;
   const currentServiceGroups = createMemo<ServiceRouteGroup[]>(() => {
     const groups = new Map<string, ServiceRouteGroup>();
 
@@ -121,7 +129,7 @@ export function ServicesTab(props: {
   const selectedHint = (group: ServiceRouteGroup) => {
     const route = selectedRoute(group.feature);
     if (!route) {
-      return "No route selected";
+      return copy().noRoute;
     }
 
     const option = group.options.find(
@@ -130,7 +138,7 @@ export function ServicesTab(props: {
     );
     return option
       ? `${option.providerLabel} · ${option.modelLabel}`
-      : "Selected route is unavailable";
+      : copy().unavailableRoute;
   };
 
   function selectRoute(feature: string, value: string) {
@@ -144,30 +152,47 @@ export function ServicesTab(props: {
   return (
     <div class="settings-pane__inner">
       <div class="settings-pane__intro">
-        <h2>Services</h2>
+        <h2>
+          <SettingsHighlight text={copy().title} search={props.search} />
+        </h2>
         <p>
-          Choose provider-backed tools that every chat model can use, independent
-          of the selected chat model.
+          <SettingsHighlight text={copy().intro} search={props.search} />
         </p>
       </div>
 
       <Show
         when={!props.loading || serviceGroups().length > 0}
-        fallback={<div class="settings-empty">Loading services...</div>}
+        fallback={<div class="settings-empty">{copy().loading}</div>}
       >
-        <section class="settings-card service-routes">
+        <section
+          classList={{
+            "settings-card": true,
+            "service-routes": true,
+            "settings-card--search-muted": !sectionMatches(
+              props.search,
+              "services.routes",
+            ),
+          }}
+          data-settings-section="services.routes"
+        >
           <div class="settings-card__head">
-            <h3>Service routes</h3>
-            <p>Image, audio, and speech features are routed here.</p>
+            <h3>
+              <SettingsHighlight
+                text={copy().routesTitle}
+                search={props.search}
+              />
+            </h3>
+            <p>
+              <SettingsHighlight
+                text={copy().routesDescription}
+                search={props.search}
+              />
+            </p>
           </div>
 
           <Show
             when={serviceGroups().length > 0}
-            fallback={
-              <p class="muted-line">
-                No image, audio, or speech service models are available yet.
-              </p>
-            }
+            fallback={<p class="muted-line">{copy().empty}</p>}
           >
             <div class="service-routes__list">
               <For each={serviceGroups()}>
@@ -186,8 +211,8 @@ export function ServicesTab(props: {
                     >
                       <option value="" disabled>
                         {selectedRoute(group.feature)
-                          ? "Selected route unavailable"
-                          : "Not selected"}
+                          ? copy().unavailableRoute
+                          : copy().notSelected}
                       </option>
                       <For each={group.options}>
                         {(option) => (
@@ -198,7 +223,9 @@ export function ServicesTab(props: {
                             )}
                           >
                             {option.providerLabel} · {option.modelLabel}
-                            {option.recommended ? " · recommended" : ""}
+                            {option.recommended
+                              ? ` · ${settingsCopy().common.recommended}`
+                              : ""}
                           </option>
                         )}
                       </For>
@@ -215,15 +242,16 @@ export function ServicesTab(props: {
 }
 
 function serviceLabel(feature: string, fallback: string) {
+  const copy = settingsCopy().services;
   switch (feature) {
     case "media.image.generate":
-      return "Image generation";
+      return copy.imageGeneration;
     case "media.image.edit":
-      return "Image editing";
+      return copy.imageEditing;
     case "audio.transcribe":
-      return "STT";
+      return copy.stt;
     case "audio.speech":
-      return "Speech";
+      return copy.speech;
     default:
       return fallback || feature;
   }

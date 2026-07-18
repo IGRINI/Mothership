@@ -95,6 +95,7 @@ pub fn run() {
             commands::set_project_appearance,
             commands::set_feature_route,
             commands::set_tool_policy,
+            commands::set_response_language,
             commands::set_selected_model,
             commands::set_provider_enabled,
         ])

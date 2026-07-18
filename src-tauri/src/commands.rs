@@ -527,6 +527,23 @@ pub async fn set_personalization(
 }
 
 #[tauri::command]
+pub async fn set_response_language(
+    state: State<'_, AppState>,
+    language_id: String,
+    custom_language: String,
+) -> Result<PersonalizationSettings, String> {
+    let response = state
+        .sidecar()
+        .clone()
+        .request(CoreRequest::SetResponseLanguage {
+            language_id,
+            custom_language,
+        })
+        .await?;
+    expect_variant!(response, CoreResponse::Personalization)
+}
+
+#[tauri::command]
 pub async fn get_tool_policy(state: State<'_, AppState>) -> Result<ToolPolicySettings, String> {
     let response = state
         .sidecar()

@@ -14,6 +14,18 @@ import {
   updateAppearance,
   type AppearanceSettings,
 } from "../../../shared/appearance";
+import {
+  setUiLocale,
+  uiLocale,
+  UI_LOCALE_OPTIONS,
+  type UiLocale,
+} from "../../../shared/locale";
+import { settingsCopy } from "../settings-copy";
+import {
+  sectionMatches,
+  SettingsHighlight,
+  type SettingsSearchState,
+} from "../settings-search";
 
 /**
  * Appearance tab: theme mode, accent, interface + code fonts, and UI scale.
@@ -22,8 +34,9 @@ import {
  * which writes CSS variables / data attributes on the document root, so the
  * whole app re-skins instantly.
  */
-export function AppearanceTab() {
+export function AppearanceTab(props: { search: SettingsSearchState }) {
   const settings = appearance;
+  const copy = () => settingsCopy().appearance;
 
   const update = (patch: Partial<AppearanceSettings>) => updateAppearance(patch);
 
@@ -42,17 +55,74 @@ export function AppearanceTab() {
   return (
     <div class="settings-pane__inner">
       <div class="settings-pane__intro">
-        <h2>Appearance</h2>
+        <h2>
+          <SettingsHighlight text={copy().title} search={props.search} />
+        </h2>
         <p>
-          Tune the look of Mothership. These preferences are stored on this
-          device and apply instantly across the whole app.
+          <SettingsHighlight text={copy().intro} search={props.search} />
         </p>
       </div>
 
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "appearance.language",
+          ),
+        }}
+        data-settings-section="appearance.language"
+      >
         <div class="settings-card__head">
-          <h3>Mode</h3>
-          <p>Light, dark, or follow the operating system.</p>
+          <h3>
+            <SettingsHighlight
+              text={copy().interfaceLanguageTitle}
+              search={props.search}
+            />
+          </h3>
+          <p>
+            <SettingsHighlight
+              text={copy().interfaceLanguageDescription}
+              search={props.search}
+            />
+          </p>
+        </div>
+        <label class="field-row">
+          <span>{copy().interfaceLanguageTitle}</span>
+          <select
+            class="settings-select"
+            value={uiLocale()}
+            onChange={(event) =>
+              setUiLocale(event.currentTarget.value as UiLocale)
+            }
+          >
+            <For each={UI_LOCALE_OPTIONS}>
+              {(locale) => <option value={locale.id}>{locale.label}</option>}
+            </For>
+          </select>
+        </label>
+      </section>
+
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "appearance.mode",
+          ),
+        }}
+        data-settings-section="appearance.mode"
+      >
+        <div class="settings-card__head">
+          <h3>
+            <SettingsHighlight text={copy().modeTitle} search={props.search} />
+          </h3>
+          <p>
+            <SettingsHighlight
+              text={copy().modeDescription}
+              search={props.search}
+            />
+          </p>
         </div>
         <div class="option-grid">
           <For each={THEME_OPTIONS}>
@@ -82,30 +152,55 @@ export function AppearanceTab() {
                   />
                 </span>
                 <span class="option-card__label">
-                  {theme.label}
+                  <SettingsHighlight
+                    text={copy().themeOptions[theme.id]?.label ?? theme.label}
+                    search={props.search}
+                  />
                   <Show when={settings().theme === theme.id}>
                     <span class="option-card__check">
                       <Check size={14} />
                     </span>
                   </Show>
                 </span>
-                <span class="option-card__hint">{theme.description}</span>
+                <span class="option-card__hint">
+                  <SettingsHighlight
+                    text={
+                      copy().themeOptions[theme.id]?.description ??
+                      theme.description
+                    }
+                    search={props.search}
+                  />
+                </span>
               </button>
             )}
           </For>
         </div>
       </section>
 
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "appearance.palette",
+          ),
+        }}
+        data-settings-section="appearance.palette"
+      >
         <div class="settings-card__head">
-          <h3>Palette</h3>
-          <p>The surface color flavor — applies in both light and dark.</p>
+          <h3>
+            <SettingsHighlight text={copy().paletteTitle} search={props.search} />
+          </h3>
+          <p>
+            <SettingsHighlight
+              text={copy().paletteDescription}
+              search={props.search}
+            />
+          </p>
         </div>
         <div class="option-grid">
           <For each={PALETTE_OPTIONS}>
             {(palette) => {
-              // Show the swatch for the active mode — the palette renders light
-              // in light mode, so the preview must too.
               const sw = () =>
                 resolvedTheme() === "light"
                   ? palette.lightSwatch
@@ -134,14 +229,28 @@ export function AppearanceTab() {
                     />
                   </span>
                   <span class="option-card__label">
-                    {palette.label}
+                    <SettingsHighlight
+                      text={
+                        copy().paletteOptions[palette.id]?.label ??
+                        palette.label
+                      }
+                      search={props.search}
+                    />
                     <Show when={settings().palette === palette.id}>
                       <span class="option-card__check">
                         <Check size={14} />
                       </span>
                     </Show>
                   </span>
-                  <span class="option-card__hint">{palette.description}</span>
+                  <span class="option-card__hint">
+                    <SettingsHighlight
+                      text={
+                        copy().paletteOptions[palette.id]?.description ??
+                        palette.description
+                      }
+                      search={props.search}
+                    />
+                  </span>
                 </button>
               );
             }}
@@ -149,10 +258,26 @@ export function AppearanceTab() {
         </div>
       </section>
 
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "appearance.accent",
+          ),
+        }}
+        data-settings-section="appearance.accent"
+      >
         <div class="settings-card__head">
-          <h3>Accent</h3>
-          <p>The highlight color for buttons, selections, and focus.</p>
+          <h3>
+            <SettingsHighlight text={copy().accentTitle} search={props.search} />
+          </h3>
+          <p>
+            <SettingsHighlight
+              text={copy().accentDescription}
+              search={props.search}
+            />
+          </p>
         </div>
         <div class="option-grid">
           <For each={ACCENT_OPTIONS}>
@@ -172,7 +297,10 @@ export function AppearanceTab() {
                   style={{ "background-color": accent.color }}
                 />
                 <span class="option-card__label">
-                  {accent.label}
+                  <SettingsHighlight
+                    text={copy().accentOptions[accent.id] ?? accent.label}
+                    search={props.search}
+                  />
                   <Show when={settings().accent === accent.id}>
                     <span class="option-card__check">
                       <Check size={14} />
@@ -185,43 +313,68 @@ export function AppearanceTab() {
         </div>
       </section>
 
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "appearance.typography",
+          ),
+        }}
+        data-settings-section="appearance.typography"
+      >
         <div class="settings-card__head">
-          <h3>Typography</h3>
-          <p>Pick the interface and code typefaces.</p>
+          <h3>
+            <SettingsHighlight
+              text={copy().typographyTitle}
+              search={props.search}
+            />
+          </h3>
+          <p>
+            <SettingsHighlight
+              text={copy().typographyDescription}
+              search={props.search}
+            />
+          </p>
         </div>
         <div class="scope-grid">
           <label class="field-row">
-            <span>Interface font</span>
+            <span>{copy().interfaceFont}</span>
             <select
               class="settings-select"
               value={settings().sans}
               onChange={(event) =>
                 update({
-                  sans: event.currentTarget
-                    .value as AppearanceSettings["sans"],
+                  sans: event.currentTarget.value as AppearanceSettings["sans"],
                 })
               }
             >
               <For each={SANS_FONT_OPTIONS}>
-                {(font) => <option value={font.id}>{font.label}</option>}
+                {(font) => (
+                  <option value={font.id}>
+                    {copy().fontOptions[font.id] ?? font.label}
+                  </option>
+                )}
               </For>
             </select>
           </label>
           <label class="field-row">
-            <span>Code font</span>
+            <span>{copy().codeFont}</span>
             <select
               class="settings-select"
               value={settings().mono}
               onChange={(event) =>
                 update({
-                  mono: event.currentTarget
-                    .value as AppearanceSettings["mono"],
+                  mono: event.currentTarget.value as AppearanceSettings["mono"],
                 })
               }
             >
               <For each={MONO_FONT_OPTIONS}>
-                {(font) => <option value={font.id}>{font.label}</option>}
+                {(font) => (
+                  <option value={font.id}>
+                    {copy().fontOptions[font.id] ?? font.label}
+                  </option>
+                )}
               </For>
             </select>
           </label>
@@ -237,12 +390,25 @@ export function AppearanceTab() {
         </p>
       </section>
 
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "appearance.scale",
+          ),
+        }}
+        data-settings-section="appearance.scale"
+      >
         <div class="settings-card__head">
-          <h3>UI scale</h3>
+          <h3>
+            <SettingsHighlight text={copy().scaleTitle} search={props.search} />
+          </h3>
           <p>
-            Zoom the interface. The window controls and status bar stay at their
-            native size.
+            <SettingsHighlight
+              text={copy().scaleDescription}
+              search={props.search}
+            />
           </p>
         </div>
         <div class="scale-control">
@@ -266,7 +432,7 @@ export function AppearanceTab() {
 
       <div class="prompt-actions">
         <span class="muted-line">
-          {isDefault() ? "Using the default appearance." : "Custom appearance."}
+          {isDefault() ? copy().defaultState : copy().customState}
         </span>
         <button
           class="settings-secondary-button"
@@ -275,7 +441,7 @@ export function AppearanceTab() {
           onClick={() => update({ ...DEFAULT_APPEARANCE })}
         >
           <RotateCcw size={15} />
-          Reset to defaults
+          {copy().reset}
         </button>
       </div>
     </div>

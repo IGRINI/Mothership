@@ -65,6 +65,7 @@ export type * from "./ReasoningConfig";
 export type * from "./ReasoningEffort";
 export type * from "./ReasoningOption";
 export type * from "./ReasoningSummary";
+export type * from "./ResponseLanguageSettings";
 export type * from "./RevertOutcome";
 export type * from "./SecretSettingState";
 export type * from "./SelectedLlmModel";

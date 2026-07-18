@@ -667,6 +667,13 @@ export function getPreviewPromptPreview(chatId: string): PromptPreview {
 
   const personalization = getPreviewPersonalization();
   const personalized = [
+    [
+      "response_language",
+      previewResponseLanguageInstruction(
+        personalization.responseLanguage.languageId,
+        personalization.responseLanguage.customLanguage,
+      ),
+    ] as const,
     ["global", personalization.global] as const,
     [
       "provider",
@@ -700,6 +707,56 @@ export function getPreviewPromptPreview(chatId: string): PromptPreview {
     sections,
     renderedText: sections.map((section) => section.content).join("\n\n"),
   };
+}
+
+function previewResponseLanguageInstruction(
+  languageId: string,
+  customLanguage: string,
+) {
+  const language =
+    languageId === "custom"
+      ? customLanguage.trim()
+      : previewResponseLanguageName(languageId);
+  return language
+    ? `Response language preference: respond in ${language} unless the user explicitly asks for another language.`
+    : "";
+}
+
+function previewResponseLanguageName(languageId: string) {
+  switch (languageId) {
+    case "en":
+      return "English";
+    case "ru":
+      return "Russian";
+    case "es":
+      return "Spanish";
+    case "de":
+      return "German";
+    case "fr":
+      return "French";
+    case "it":
+      return "Italian";
+    case "pt":
+      return "Portuguese";
+    case "zh":
+      return "Chinese";
+    case "ja":
+      return "Japanese";
+    case "ko":
+      return "Korean";
+    case "uk":
+      return "Ukrainian";
+    case "pl":
+      return "Polish";
+    case "tr":
+      return "Turkish";
+    case "ar":
+      return "Arabic";
+    case "hi":
+      return "Hindi";
+    default:
+      return "";
+  }
 }
 
 // --- Connector settings -------------------------------------------------------------
@@ -1191,7 +1248,12 @@ export function getPreviewPersonalizationSnapshot(): PersonalizationSettings {
 }
 
 function getPreviewPersonalization(): PersonalizationSettings {
-  previewPersonalization ??= { global: "", providers: [], models: [] };
+  previewPersonalization ??= {
+    global: "",
+    providers: [],
+    models: [],
+    responseLanguage: { languageId: "auto", customLanguage: "" },
+  };
   return previewPersonalization;
 }
 
@@ -1223,6 +1285,26 @@ export function setPreviewPersonalization(
   return copyPersonalization(settings);
 }
 
+export function setPreviewResponseLanguage(
+  languageId: string,
+  customLanguage: string,
+): PersonalizationSettings {
+  const normalizedLanguageId = languageId.trim().toLowerCase();
+  const normalizedCustomLanguage = customLanguage.trim();
+  const settings = getPreviewPersonalization();
+  settings.responseLanguage =
+    normalizedLanguageId === "custom" && normalizedCustomLanguage
+      ? {
+          languageId: "custom",
+          customLanguage: normalizedCustomLanguage,
+        }
+      : normalizedLanguageId && normalizedLanguageId !== "custom"
+        ? { languageId: normalizedLanguageId, customLanguage: "" }
+        : { languageId: "auto", customLanguage: "" };
+  previewPersonalization = settings;
+  return copyPersonalization(settings);
+}
+
 function copyPersonalization(
   settings: PersonalizationSettings,
 ): PersonalizationSettings {
@@ -1230,6 +1312,7 @@ function copyPersonalization(
     global: settings.global,
     providers: settings.providers.map((provider) => ({ ...provider })),
     models: settings.models.map((model) => ({ ...model })),
+    responseLanguage: { ...settings.responseLanguage },
   };
 }
 

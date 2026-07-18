@@ -8,39 +8,21 @@ import {
   setChangeJournalRetention,
   setToolPolicy,
 } from "../../../shared/api/mothership";
+import { settingsCopy } from "../settings-copy";
+import {
+  sectionMatches,
+  SettingsHighlight,
+  type SettingsSearchState,
+} from "../settings-search";
 
-const TOOL_CATALOG: { name: string; label: string; description: string }[] = [
-  {
-    name: "run_command",
-    label: "Run commands",
-    description: "Execute local shell / OS commands.",
-  },
-  {
-    name: "read_file",
-    label: "Read files",
-    description: "Read a workspace file (read-only).",
-  },
-  {
-    name: "write_file",
-    label: "Write files",
-    description: "Create or overwrite a workspace file.",
-  },
-  {
-    name: "edit_file",
-    label: "Edit files",
-    description: "Content-addressed string replacement in a file.",
-  },
-  {
-    name: "apply_patch",
-    label: "Apply patches",
-    description: "Multi-file patch applied all-or-nothing.",
-  },
-  {
-    name: "search_text",
-    label: "Search text",
-    description: "Content search across the workspace (read-only).",
-  },
-];
+const TOOL_CATALOG = [
+  "run_command",
+  "read_file",
+  "write_file",
+  "edit_file",
+  "apply_patch",
+  "search_text",
+] as const;
 
 const EMPTY_POLICY: ToolPolicySettings = {
   commandAllow: [],
@@ -57,10 +39,12 @@ const EMPTY_POLICY: ToolPolicySettings = {
 export function PermissionsTab(props: {
   onError: (message: string) => void;
   onStatus: (message: string) => void;
+  search: SettingsSearchState;
 }) {
   const [policy, setPolicy] = createSignal<ToolPolicySettings>(EMPTY_POLICY);
   const [loading, setLoading] = createSignal(true);
   const [retention, setRetention] = createSignal(10);
+  const copy = () => settingsCopy().permissions;
 
   onMount(async () => {
     try {
@@ -87,8 +71,8 @@ export function PermissionsTab(props: {
         setRetention(stored);
         props.onStatus(
           stored === 0
-            ? "Change journal: keeping everything."
-            : `Change journal: keeping changes from the last ${stored} messages per project.`,
+            ? copy().keepEverything
+            : copy().keepLast(stored),
         );
       })
       .catch((error: unknown) => {
@@ -102,7 +86,7 @@ export function PermissionsTab(props: {
     setPolicy(next);
     try {
       setPolicy(await setToolPolicy(next));
-      props.onStatus("Permission rules saved.");
+      props.onStatus(copy().rulesSaved);
     } catch (error) {
       setPolicy(previous);
       props.onError(errorMessage(error));
@@ -141,58 +125,96 @@ export function PermissionsTab(props: {
   return (
     <div class="settings-pane__inner">
       <div class="settings-pane__intro">
-        <h2>Permissions</h2>
+        <h2>
+          <SettingsHighlight text={copy().title} search={props.search} />
+        </h2>
         <p>
-          Control how the agent uses tools: an allowlist / denylist for shell
-          commands, and which tools are available at all. The approval mode
-          (manual / auto / yolo) is per-chat — set it under the chat's input.
+          <SettingsHighlight text={copy().intro} search={props.search} />
         </p>
       </div>
 
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "permissions.allowlist",
+          ),
+        }}
+        data-settings-section="permissions.allowlist"
+      >
         <div class="settings-card__head">
-          <h3>Command allowlist</h3>
+          <h3>
+            <SettingsHighlight text={copy().allowTitle} search={props.search} />
+          </h3>
           <p>
-            Programs here are auto-approved — they skip the approval prompt
-            regardless of mode. Match is by name (e.g. <code>npm</code>,{" "}
-            <code>git</code>).
+            <SettingsHighlight
+              text={copy().allowDescription}
+              search={props.search}
+            />
           </p>
         </div>
         <CommandRules
           tone="allow"
           values={policy().commandAllow}
-          placeholder="e.g. npm"
+          placeholder={copy().allowPlaceholder}
           onAdd={(value) => addCommand("commandAllow", value)}
           onRemove={(value) => removeCommand("commandAllow", value)}
         />
       </section>
 
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "permissions.denylist",
+          ),
+        }}
+        data-settings-section="permissions.denylist"
+      >
         <div class="settings-card__head">
-          <h3>Command denylist</h3>
+          <h3>
+            <SettingsHighlight text={copy().denyTitle} search={props.search} />
+          </h3>
           <p>
-            Programs here are always blocked, even in Yolo mode. Deny wins over
-            allow if a program is in both.
+            <SettingsHighlight
+              text={copy().denyDescription}
+              search={props.search}
+            />
           </p>
         </div>
         <CommandRules
           tone="deny"
           values={policy().commandDeny}
-          placeholder="e.g. rm"
+          placeholder={copy().denyPlaceholder}
           onAdd={(value) => addCommand("commandDeny", value)}
           onRemove={(value) => removeCommand("commandDeny", value)}
         />
       </section>
 
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "permissions.change-journal",
+          ),
+        }}
+        data-settings-section="permissions.change-journal"
+      >
         <div class="settings-card__head">
-          <h3>Change journal</h3>
+          <h3>
+            <SettingsHighlight
+              text={copy().changeJournalTitle}
+              search={props.search}
+            />
+          </h3>
           <p>
-            Every file change an agent makes is snapshotted so it can be
-            reviewed and reverted. History is kept for the last N agent{" "}
-            <em>messages</em> per project — one message may carry hundreds of
-            edits and they're kept (or pruned) together. <code>0</code> keeps
-            everything.
+            <SettingsHighlight
+              text={copy().changeJournalDescription}
+              search={props.search}
+            />
           </p>
         </div>
         <div class="rule-editor">
@@ -209,38 +231,65 @@ export function PermissionsTab(props: {
             />
             <span class="rule-empty">
               {retention() === 0
-                ? "Unlimited history"
-                : `Changes from the last ${retention()} messages per project`}
+                ? copy().unlimitedHistory
+                : copy().changesFromLast(retention())}
             </span>
           </div>
         </div>
       </section>
 
-      <section class="settings-card">
+      <section
+        classList={{
+          "settings-card": true,
+          "settings-card--search-muted": !sectionMatches(
+            props.search,
+            "permissions.tool-access",
+          ),
+        }}
+        data-settings-section="permissions.tool-access"
+      >
         <div class="settings-card__head">
-          <h3>Tool access</h3>
-          <p>Turn individual tools off so the agent can never call them.</p>
+          <h3>
+            <SettingsHighlight
+              text={copy().toolAccessTitle}
+              search={props.search}
+            />
+          </h3>
+          <p>
+            <SettingsHighlight
+              text={copy().toolAccessDescription}
+              search={props.search}
+            />
+          </p>
         </div>
         <div class="tool-list">
           <For each={TOOL_CATALOG}>
             {(tool) => {
-              const enabled = () => !policy().disabledTools.includes(tool.name);
+              const enabled = () => !policy().disabledTools.includes(tool);
+              const info = () => copy().toolCatalog[tool];
               return (
                 <div class="tool-row">
                   <div class="tool-row__meta">
                     <span class="tool-row__name">
-                      {tool.label}
-                      <code>{tool.name}</code>
+                      {info().label}
+                      <code>{tool}</code>
                     </span>
-                    <span class="tool-row__desc">{tool.description}</span>
+                    <span class="tool-row__desc">{info().description}</span>
                   </div>
-                  <label class="switch" title={enabled() ? "Enabled" : "Disabled"}>
+                  <label
+                    class="switch"
+                    title={
+                      enabled()
+                        ? settingsCopy().common.enabled
+                        : settingsCopy().common.disabled
+                    }
+                  >
                     <input
                       type="checkbox"
                       checked={enabled()}
                       disabled={loading()}
                       onChange={(event) =>
-                        toggleTool(tool.name, event.currentTarget.checked)
+                        toggleTool(tool, event.currentTarget.checked)
                       }
                     />
                     <span class="switch__track" />
@@ -294,12 +343,12 @@ function CommandRules(props: {
           onClick={submit}
         >
           <Plus size={15} />
-          Add
+          {settingsCopy().common.add}
         </button>
       </div>
       <Show
         when={props.values.length > 0}
-        fallback={<span class="rule-empty">Nothing here yet.</span>}
+        fallback={<span class="rule-empty">{settingsCopy().common.noneYet}</span>}
       >
         <div class="rule-list">
           <For each={props.values}>
@@ -314,7 +363,7 @@ function CommandRules(props: {
                 <button
                   class="rule-chip__remove"
                   type="button"
-                  aria-label={`Remove ${value}`}
+                  aria-label={`${settingsCopy().common.remove} ${value}`}
                   onClick={() => props.onRemove(value)}
                 >
                   <X size={12} />
